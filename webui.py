@@ -75,7 +75,18 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
  <button onclick="doConsent()">Accept</button> <span id="c-msg"></span>
 </section>
 
-<section id="s-source" class="locked"><h2>2 · Signal source</h2>
+<section id="s-llm" class="locked"><h2>2 · Connect your AI (recommended)</h2>
+ <p class="muted">Your agent becomes a real AI agent with an Anthropic API key
+ (pay-per-use, separate from a Claude subscription — get one at
+ console.anthropic.com). It powers the help chat below, your plain-English
+ trading policy, and the dashboard Q&A. Skippable; add it later any time.</p>
+ <input type="password" id="llm-key" placeholder="sk-ant-…">
+ <button onclick="doLLM()">Connect</button>
+ <button onclick="skipLLM()" style="background:#374151">Skip for now</button>
+ <span id="llm-msg"></span>
+</section>
+
+<section id="s-source" class="locked"><h2>3 · Signal source</h2>
  <select id="src" onchange="srcChanged()">
   <option value="agenthc">AgentHC Agentic Day Trade Ideas (journal feed, sats-priced)</option>
   <option value="manual">My own commands (commands.jsonl)</option>
@@ -114,14 +125,14 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
  <button onclick="doSource()">Save source</button> <span id="src-msg"></span>
 </section>
 
-<section id="s-broker" class="locked"><h2>3 · Robinhood (Agentic account)</h2>
+<section id="s-broker" class="locked"><h2>4 · Robinhood (Agentic account)</h2>
  <p class="muted">Click the button, approve in the Robinhood tab that opens
  (log in if needed) — you'll be sent straight back here.</p>
  <button onclick="rhStart()">Connect Robinhood</button> <span id="rh-msg"></span>
  <div id="rh-accounts"></div>
 </section>
 
-<section id="s-sizing" class="locked"><h2>4 · Position sizing</h2>
+<section id="s-sizing" class="locked"><h2>5 · Position sizing</h2>
  <p class="muted">Nobody here is an investment advisor and none of this
  software can advise position sizing — this number is YOUR decision, made
  with money you can afford to lose entirely.</p>
@@ -133,7 +144,7 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
  <button onclick="doSizing()">Save sizing</button> <span id="sz-msg"></span>
 </section>
 
-<section id="s-safety" class="locked"><h2>5 · Safety rails & extras</h2>
+<section id="s-safety" class="locked"><h2>6 · Safety rails & extras</h2>
  <p><label><input type="checkbox" id="sf-dry" checked> Start in
  <b>dry-run</b> mode (log actions, place no orders — recommended)</label></p>
  <label>Max new entries per day</label>
@@ -151,8 +162,20 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
  <button onclick="doSafety()">Finish setup</button> <span id="sf-msg"></span>
 </section>
 
-<section id="s-done" class="locked"><h2>6 · Done</h2>
+<section id="s-done" class="locked"><h2>7 · Done — where should your agent live?</h2>
  <div id="done-body"></div>
+ <div id="deploy-box">
+  <p><b>Option A — this computer:</b> run the command above; keep it awake
+  during market hours.</p>
+  <p><b>Option B — let your agent create its own cloud server</b> (~$6/mo on
+  YOUR DigitalOcean account): it provisions the server, moves its completed
+  setup there, and starts itself. Your token is used once and not stored.</p>
+  <input type="password" id="do-token" placeholder="DigitalOcean API token (write scope)">
+  <select id="do-region"><option>nyc3</option><option>sfo3</option><option>tor1</option>
+   <option>lon1</option><option>fra1</option><option>sgp1</option></select>
+  <button onclick="deploy()">Create my agent's server</button>
+  <div id="deploy-msg"></div>
+ </div>
 </section>
 
 <section><h2>Need help? Ask your agent</h2>
@@ -180,7 +203,8 @@ function srcChanged(){
 async function boot(){
   const st=await api('/api/state');
   document.getElementById('disclaimer').textContent=st.disclaimer;
-  if(st.consent){done('s-consent');unlock('s-source');}
+  if(st.consent){done('s-consent');unlock('s-llm');}
+  if(st.llm){done('s-llm');unlock('s-source');}
   if(st.source){done('s-source');unlock('s-broker');}
   if(st.broker){done('s-broker');unlock('s-sizing');
     document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ account ····'+st.broker+'</span>';}
@@ -191,7 +215,31 @@ async function doConsent(){
   const r=await api('/api/consent',{phrase:document.getElementById('c-phrase').value});
   document.getElementById('c-msg').innerHTML=r.ok?'<span class="ok">accepted ✓</span>'
     :'<span class="err">'+r.error+'</span>';
-  if(r.ok){done('s-consent');unlock('s-source');}
+  if(r.ok){done('s-consent');unlock('s-llm');}
+}
+async function doLLM(){
+  const r=await api('/api/llm',{key:document.getElementById('llm-key').value});
+  document.getElementById('llm-msg').innerHTML=r.ok?' <span class="ok">connected ✓ — the help chat below is live</span>'
+    :' <span class="err">'+r.error+'</span>';
+  if(r.ok){done('s-llm');unlock('s-source');}
+}
+async function skipLLM(){done('s-llm');unlock('s-source');}
+async function deploy(){
+  const el=document.getElementById('deploy-msg');
+  el.innerHTML='creating server… (takes 1–3 minutes)';
+  const r=await api('/api/deploy',{token:document.getElementById('do-token').value,
+    region:document.getElementById('do-region').value});
+  if(!r.ok){el.innerHTML='<span class="err">'+r.error+'</span>';return;}
+  const poll=async()=>{
+    const s=await api('/api/deploy/status');
+    if(s.ip){el.innerHTML='<span class="ok">Your agent is live on its own server at '
+      +s.ip+' ✓</span><br><span class="muted">It started automatically (systemd) and '
+      +'will send your startup notification shortly. This computer no longer needs '
+      +'to run anything. Dashboard from here: ssh -L 8722:127.0.0.1:8722 trader@'+s.ip
+      +' then open http://127.0.0.1:8722</span>';}
+    else{el.textContent='server status: '+s.status+' — waiting…';setTimeout(poll,5000);}
+  };
+  poll();
 }
 let walletMade=false, balTimer=null;
 async function makeWallet(){
@@ -399,6 +447,7 @@ def run_wizard():
                       (cfg.get("robinhood_account", "")[-4:]
                        if cfg.get("robinhood_account") else ""),
             "rh_warning": pending["rh_warning"],
+            "llm": bool(cfg.get("anthropic_api_key")),
         }
 
     def consent(_h, data):
@@ -456,6 +505,47 @@ def run_wizard():
                         "error": "create a wallet above, or provide your own / an API key"}
         save()
         return {"ok": True, "note": note}
+
+    def llm(_h, data):
+        key = str(data.get("key", "")).strip()
+        if not key.startswith("sk-ant-"):
+            return {"ok": False, "error": "that doesn't look like an Anthropic key"}
+        try:
+            import requests as _rq
+            r = _rq.get("https://api.anthropic.com/v1/models",
+                        headers={"x-api-key": key,
+                                 "anthropic-version": "2023-06-01"}, timeout=10)
+            if r.status_code == 401:
+                return {"ok": False, "error": "key rejected (401)"}
+            if r.status_code != 200:
+                return {"ok": False, "error": f"validation failed HTTP {r.status_code}"}
+        except Exception as exc:
+            return {"ok": False, "error": f"could not validate: {str(exc)[:100]}"}
+        cfg["anthropic_api_key"] = key
+        cfg.setdefault("llm_model", "claude-opus-4-8")
+        cfg.setdefault("llm_fallback", "skip")
+        save()
+        return {"ok": True}
+
+    def deploy(_h, data):
+        import provision
+        token = str(data.get("token", "")).strip()
+        if not token:
+            return {"ok": False, "error": "paste a DigitalOcean API token"}
+        try:
+            droplet_id, msg = provision.create_droplet(
+                token, str(data.get("region", "nyc3")))
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)[:250]}
+        pending["deploy"] = (token, droplet_id)
+        return {"ok": True, "note": msg}
+
+    def deploy_status(_h):
+        import provision
+        if not pending.get("deploy"):
+            return {"status": "no deploy in progress", "ip": ""}
+        token, droplet_id = pending["deploy"]
+        return provision.droplet_status(token, droplet_id)
 
     def wallet_create(_h, _data):
         if not A.consent_ok():
@@ -589,7 +679,8 @@ def run_wizard():
         return {"ok": True}
 
     W.routes_get = {"/api/state": state, "/api/rh/start": rh_start,
-                    "/api/wallet/balance": wallet_balance}
+                    "/api/wallet/balance": wallet_balance,
+                    "/api/deploy/status": deploy_status}
     def ask(_h, data):
         q = str(data.get("question", "")).strip()
         wiz_state = {k: v for k, v in state(None).items() if k != "disclaimer"}
@@ -607,7 +698,8 @@ def run_wizard():
                      "/api/sizing": sizing, "/api/safety": safety,
                      "/api/finish": finish, "/api/ask": ask,
                      "/api/wallet/create": wallet_create,
-                     "/api/wallet/fund": wallet_fund}
+                     "/api/wallet/fund": wallet_fund,
+                     "/api/llm": llm, "/api/deploy": deploy}
 
     class _Redirect(Exception):
         pass
