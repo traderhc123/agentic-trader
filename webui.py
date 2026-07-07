@@ -471,7 +471,10 @@ _DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div class="s">your decision — not advice</div></div>
  <div class="tile"><div class="k">Policy brain</div>
   <div class="v" id="t-policy" style="font-size:1.05rem">–</div>
-  <div class="s" id="t-source"></div></div>
+  <div class="s" id="t-policy-hint"></div></div>
+ <div class="tile"><div class="k">Signal source</div>
+  <div class="v" id="t-source" style="font-size:1.05rem">–</div>
+  <div class="s">where trade ideas come from</div></div>
 </div>
 
 <div class="grid">
@@ -546,9 +549,11 @@ async function refresh(){
         esc(a[2]||'')+'</td><td>'+esc(a[3]==='C'?'CALL':a[3]==='P'?'PUT':'')+'</td></tr>';
       }).join('')+'</table>' : '<span class="muted">none</span>';
     document.getElementById('t-sizing').textContent=s.fields['sizing']||'–';
-    document.getElementById('t-policy').textContent=
-      (s.fields['policy brain']==='on')?'ON (your rules)':'off';
-    document.getElementById('t-source').textContent='source: '+(s.fields['source']||'–');
+    const polOn=s.fields['policy brain']==='on';
+    document.getElementById('t-policy').textContent=polOn?'ON (your rules)':'off';
+    document.getElementById('t-policy-hint').textContent=
+      polOn?'checks every entry':'add rules in Setup → Safety to enable';
+    document.getElementById('t-source').textContent=s.fields['source']||'–';
     try{
       const p=await api('/api/proposal');
       const panel=document.getElementById('p-proposal');
