@@ -15,11 +15,17 @@ config with 0600 permissions. Keep only what you're willing to spend in this
 wallet (e.g. a month of day-passes), never your savings.
 """
 
+import os
 import time
 
 import requests
 
 _TIMEOUT = 20
+
+# Instance used when the agent creates its own wallet. Hosted instances with
+# open registration are custodial — the agent keeps only spending money there
+# (see SECURITY.md). Override with AGENTIC_TRADER_LNBITS (e.g. your own node).
+DEFAULT_LNBITS = os.getenv("AGENTIC_TRADER_LNBITS", "https://demo.lnbits.com")
 
 
 class WalletError(RuntimeError):
@@ -39,10 +45,64 @@ def print_funding_invoice(wallet, sats):
     print("\n(Strike, Cash App, Phoenix, Alby, Wallet of Satoshi, etc. — scan or paste.)")
 
 
+def create_wallet(instance_url=None, name="agentic-trader"):
+    """The agent creates ITS OWN wallet on an open-registration LNbits
+    instance. Returns (url, admin_key). Raises WalletError on failure."""
+    url = (instance_url or DEFAULT_LNBITS).rstrip("/")
+    try:
+        resp = requests.post(f"{url}/api/v1/account",
+                             json={"name": name}, timeout=_TIMEOUT)
+    except requests.RequestException as exc:
+        raise WalletError(f"could not reach {url}: {exc}")
+    if resp.status_code not in (200, 201):
+        raise WalletError(
+            f"wallet creation failed HTTP {resp.status_code} — this instance "
+            "may not allow open registration; set AGENTIC_TRADER_LNBITS to "
+            f"one that does, or supply your own wallet. {resp.text[:150]}")
+
+    def _find_key(obj):
+        if isinstance(obj, dict):
+            for k in ("adminkey", "admin_key", "adminKey"):
+                if obj.get(k):
+                    return str(obj[k])
+            for v in obj.values():
+                found = _find_key(v)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for v in obj:
+                found = _find_key(v)
+                if found:
+                    return found
+        return ""
+
+    key = _find_key(resp.json())
+    if not key:
+        raise WalletError(f"no adminkey in response: {resp.text[:150]}")
+    return url, key
+
+
 def wallet_setup(cfg):
-    """Attach an LNbits wallet so the agent can pay sats-priced feeds."""
-    print("\nGive this agent a Lightning wallet it can pay from (see README")
-    print("'Give your agent sats' — an LNbits wallet takes ~2 minutes to make).")
+    """Attach a Lightning wallet the agent can pay from."""
+    print("\nThe agent needs a Lightning wallet to pay sats-priced feeds.")
+    print("  1) Create one for me automatically (recommended)")
+    print("  2) I already have an LNbits wallet")
+    choice = input("Choose [1/2, default 1]: ").strip() or "1"
+    if choice == "1":
+        try:
+            url, key = create_wallet()
+        except WalletError as exc:
+            print(f"Automatic wallet creation failed: {exc}")
+            return cfg
+        cfg["lnbits_url"] = url
+        cfg["lnbits_admin_key"] = key
+        cfg.setdefault("max_autopay_sats", 30_000)
+        print(f"Wallet created on {url} ✓ (custodial hosted wallet — the agent "
+              "keeps only spending money here)")
+        raw = input("Fund it now — amount in sats (e.g. 50000; blank to skip): ").strip()
+        if raw.isdigit() and int(raw) > 0:
+            print_funding_invoice(LNbitsWallet(url, key), int(raw))
+        return cfg
     url = input("LNbits instance URL (e.g. https://demo.lnbits.com): ").strip()
     if url and not (url.startswith("https://")
                     or url.startswith("http://127.0.0.1")

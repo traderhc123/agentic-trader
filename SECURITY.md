@@ -24,7 +24,10 @@ you control, and what to check before running it.
 - **Robinhood blast radius**: the agent can only trade the dedicated Agentic
   account. Fund it with exactly what you're willing to lose; your main
   account is untouchable by design (Robinhood enforces `agentic_allowed`).
-- **Wallet blast radius**: the LNbits admin key can spend that wallet. Keep
+- **Wallet blast radius**: the agent's auto-created wallet lives on a hosted
+  LNbits instance (custodial — the operator of that instance technically holds
+  the sats; default demo.lnbits.com, override with AGENTIC_TRADER_LNBITS or
+  bring your own). This is exactly why the rule is: keep
   ~a month of feed fees in it, nothing more.
 - **API keys**: the Anthropic key (policy brain) should be a dedicated key
   with a spend limit set in the Anthropic console.

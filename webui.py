@@ -82,12 +82,29 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <option value="url">A JSON feed URL I provide</option>
  </select>
  <div id="src-agenthc">
-  <p class="muted">Pay-as-you-go (~$10/day in sats via the agent's Lightning
-  wallet, recommended) — or paste a Premium AgentHC API key.</p>
-  <input type="text" id="ln-url" placeholder="LNbits instance URL (https://…)">
-  <input type="password" id="ln-key" placeholder="LNbits wallet ADMIN key">
-  <p class="muted">— or —</p>
-  <input type="password" id="hc-key" placeholder="AgentHC Premium API key (optional)">
+  <p class="muted">Pay-as-you-go: ~$10/day in sats, paid automatically from the
+  agent's own Lightning wallet.</p>
+  <button onclick="makeWallet()">Create my agent's wallet for me</button>
+  <span id="mw-msg"></span>
+  <div id="fund-box" style="display:none">
+   <p>Wallet ready ✓ — now give your agent some sats. Pay this invoice from any
+   Lightning app (Strike, Cash App, Phoenix, Alby…):</p>
+   <label>Amount (sats — ~50,000 ≈ a month of market days)</label>
+   <input type="number" id="fund-sats" value="50000" min="1000">
+   <button onclick="fundInvoice()">Show invoice</button>
+   <pre id="bolt11" style="display:none"></pre>
+   <p id="fund-open" style="display:none"><a id="fund-link" href="#">Open in my
+   Lightning wallet app</a> · balance: <span id="fund-bal">0</span> sats
+   <span class="muted">(updates automatically after you pay)</span></p>
+   <p class="muted">Hosted wallet on demo.lnbits.com (custodial) — the agent
+   keeps only spending money here. Advanced: use your own instance below.</p>
+  </div>
+  <details><summary class="muted">Advanced: my own wallet or API key</summary>
+   <input type="text" id="ln-url" placeholder="LNbits instance URL (https://…)">
+   <input type="password" id="ln-key" placeholder="LNbits wallet ADMIN key">
+   <p class="muted">— or —</p>
+   <input type="password" id="hc-key" placeholder="AgentHC Premium API key">
+  </details>
  </div>
  <div id="src-url" style="display:none">
   <input type="text" id="src-url-input" placeholder="https://my-feed.example.com/events">
@@ -175,6 +192,26 @@ async function doConsent(){
   document.getElementById('c-msg').innerHTML=r.ok?'<span class="ok">accepted ✓</span>'
     :'<span class="err">'+r.error+'</span>';
   if(r.ok){done('s-consent');unlock('s-source');}
+}
+let walletMade=false, balTimer=null;
+async function makeWallet(){
+  document.getElementById('mw-msg').textContent=' creating…';
+  const r=await api('/api/wallet/create',{});
+  if(r.ok){walletMade=true;
+    document.getElementById('mw-msg').innerHTML=' <span class="ok">created ✓</span>';
+    document.getElementById('fund-box').style.display='';}
+  else document.getElementById('mw-msg').innerHTML=' <span class="err">'+r.error+'</span>';
+}
+async function fundInvoice(){
+  const sats=document.getElementById('fund-sats').value;
+  const r=await api('/api/wallet/fund',{sats:sats});
+  if(!r.ok){document.getElementById('mw-msg').innerHTML=' <span class="err">'+r.error+'</span>';return;}
+  const pre=document.getElementById('bolt11');pre.style.display='';pre.textContent=r.bolt11;
+  document.getElementById('fund-open').style.display='';
+  document.getElementById('fund-link').href='lightning:'+r.bolt11;
+  if(balTimer)clearInterval(balTimer);
+  balTimer=setInterval(async()=>{const b=await api('/api/wallet/balance');
+    if(b.ok)document.getElementById('fund-bal').textContent=b.sats.toLocaleString();},4000);
 }
 async function doSource(){
   const v=document.getElementById('src').value;
@@ -412,11 +449,53 @@ def run_wizard():
                 cfg["lnbits_admin_key"] = str(data["lnbits_key"]).strip()
                 cfg.setdefault("max_autopay_sats", 30_000)
                 note = f"wallet connected ✓ balance {bal:,} sats"
+            elif cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"):
+                note = "using the wallet created above ✓"
             else:
                 return {"ok": False,
-                        "error": "provide a wallet (URL + admin key) or an API key"}
+                        "error": "create a wallet above, or provide your own / an API key"}
         save()
         return {"ok": True, "note": note}
+
+    def wallet_create(_h, _data):
+        if not A.consent_ok():
+            return {"ok": False, "error": "accept the agreement first"}
+        from lightning_wallet import create_wallet
+        try:
+            url, key = create_wallet()
+        except WalletError as exc:
+            return {"ok": False, "error": str(exc)[:200]}
+        cfg["source"] = "agenthc"
+        cfg["lnbits_url"] = url
+        cfg["lnbits_admin_key"] = key
+        cfg.setdefault("max_autopay_sats", 30_000)
+        save()
+        return {"ok": True}
+
+    def wallet_fund(_h, data):
+        w = _wallet()
+        if w is None:
+            return {"ok": False, "error": "no wallet yet"}
+        try:
+            sats = max(1000, int(data.get("sats") or 50000))
+            return {"ok": True, "bolt11": w.create_invoice(
+                sats, memo="fund agentic-trader")}
+        except (WalletError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)[:200]}
+
+    def wallet_balance(_h):
+        w = _wallet()
+        if w is None:
+            return {"ok": False, "error": "no wallet"}
+        try:
+            return {"ok": True, "sats": w.balance_sats()}
+        except WalletError as exc:
+            return {"ok": False, "error": str(exc)[:150]}
+
+    def _wallet():
+        if cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"):
+            return LNbitsWallet(cfg["lnbits_url"], cfg["lnbits_admin_key"])
+        return None
 
     def rh_start(_h):
         rh = RobinhoodMCP(_token_path())
@@ -509,7 +588,8 @@ def run_wizard():
         pending["finished"].set()
         return {"ok": True}
 
-    W.routes_get = {"/api/state": state, "/api/rh/start": rh_start}
+    W.routes_get = {"/api/state": state, "/api/rh/start": rh_start,
+                    "/api/wallet/balance": wallet_balance}
     def ask(_h, data):
         q = str(data.get("question", "")).strip()
         wiz_state = {k: v for k, v in state(None).items() if k != "disclaimer"}
@@ -525,7 +605,9 @@ def run_wizard():
 
     W.routes_post = {"/api/consent": consent, "/api/source": source,
                      "/api/sizing": sizing, "/api/safety": safety,
-                     "/api/finish": finish, "/api/ask": ask}
+                     "/api/finish": finish, "/api/ask": ask,
+                     "/api/wallet/create": wallet_create,
+                     "/api/wallet/fund": wallet_fund}
 
     class _Redirect(Exception):
         pass

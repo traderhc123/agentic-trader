@@ -116,7 +116,7 @@ Full details: [SECURITY.md](SECURITY.md).
 - [ ] You read DISCLAIMER.md and accepted it yourself
 - [ ] Robinhood **Agentic account** exists, has **options approval**, and is
       funded with only what you can afford to lose
-- [ ] If using the AgentHC feed: agent wallet holds sats (~50k ≈ a month)
+- [ ] If using the AgentHC feed: the agent's wallet holds sats (~50k ≈ a month) — the wizard creates the wallet FOR the agent; you just pay one invoice from any Lightning app
 - [ ] Notifications tested (you got the test message)
 - [ ] You watched at least a few days of dry-run activity and it did what
       you expected
