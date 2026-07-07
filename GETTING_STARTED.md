@@ -65,11 +65,11 @@ pastes the lines, you use the browser.
    ```bash
    ./.venv/bin/python agent.py run
    ```
-   Leave that window open, then open **http://127.0.0.1:8722** — your
+   Leave that window open, then open **http://127.0.0.1:8721** — your
    agent's own dashboard: live status, every action it's taken, and a chat
    box where you can say `pause`, `resume`, `set budget 500`, `dry off`, or
    just ask it questions about what it's been doing. On a remote server,
-   tunnel first: `ssh -L 8722:127.0.0.1:8722 user@yourserver`.
+   tunnel first: `ssh -L 8721:127.0.0.1:8721 user@yourserver`.
 
 ### Option B — a $5 VPS (always-on, ~30 minutes)
 
