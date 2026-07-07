@@ -57,12 +57,16 @@ Your human pointed you at this repository to set them up. Follow
 
 ## 🧑 Quickstart
 
-One-liner (clones to `~/agentic-trader`, installs into a venv — it never
-runs the agent or accepts anything for you):
+One-liner — on a Mac/Linux desktop this is the whole setup: it installs
+(bootstrapping Python if needed) and **opens the browser setup wizard
+automatically**. You still read and accept the agreement yourself in the page.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | bash
 ```
+
+(Headless server? It prints the tunnel command instead. Opt out of auto-launch
+with `AGENTIC_TRADER_NO_LAUNCH=1`.)
 
 Or manually:
 

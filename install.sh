@@ -51,11 +51,34 @@ fi
 echo
 echo "Installed to $DIR"
 echo
-echo "Next steps (run these yourself — the agent will not act without your"
-echo "explicit, interactive consent to DISCLAIMER.md):"
-echo
-echo "  cd $DIR"
-echo "  ./.venv/bin/python agent.py setup --web   # browser wizard"
-echo "  ./.venv/bin/python agent.py run           # heartbeat + dashboard"
-echo
-echo "Not investment advice. You accept all liability — read DISCLAIMER.md."
+
+# One-paste experience: on a desktop, launch the browser setup wizard now.
+# The wizard collects consent IN THE BROWSER (you still read DISCLAIMER.md and
+# type the acceptance phrase yourself), so auto-launching does not bypass the
+# consent gate. On a headless server (no display) we print instructions
+# instead, since the browser must be reached over an SSH tunnel there.
+# Opt out with AGENTIC_TRADER_NO_LAUNCH=1.
+is_desktop() {
+  [ "$(uname -s)" = "Darwin" ] && return 0        # macOS
+  [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ] && return 0
+  return 1
+}
+
+if [ -z "${AGENTIC_TRADER_NO_LAUNCH:-}" ] && is_desktop; then
+  echo "Launching the setup wizard in your browser…"
+  echo "(read DISCLAIMER.md in the page and accept it yourself; Ctrl-C here to stop)"
+  echo
+  exec ./.venv/bin/python agent.py setup --web
+else
+  echo "Next steps (run these yourself — the agent will not act without your"
+  echo "explicit, in-browser consent to DISCLAIMER.md):"
+  echo
+  echo "  cd $DIR"
+  echo "  ./.venv/bin/python agent.py setup --web   # browser wizard"
+  echo "  ./.venv/bin/python agent.py run           # heartbeat + dashboard"
+  echo
+  echo "On a remote server, tunnel first, then open http://127.0.0.1:8721 :"
+  echo "  ssh -L 8721:127.0.0.1:8721 user@your-server"
+  echo
+  echo "Not investment advice. You accept all liability — read DISCLAIMER.md."
+fi

@@ -52,10 +52,10 @@ pastes the lines, you use the browser.
 2. Open Terminal (Mac: Cmd-Space, type "Terminal") and paste:
    ```bash
    curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | bash
-   cd ~/agentic-trader
-   ./.venv/bin/python agent.py setup --web
    ```
-   A setup page opens in your browser — read and accept the agreement, pick
+   On a Mac or Linux desktop that's the ONLY paste — the installer sets
+   everything up and **the setup wizard opens in your browser automatically**.
+   A setup page opens — read and accept the agreement, pick
    your signal source, click **Connect Robinhood** (it bounces you to
    Robinhood and straight back), choose a dollar budget per trade, and set
    the safety rails. It defaults to **dry-run mode** — no real orders — so
