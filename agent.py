@@ -6,10 +6,12 @@ from AgentHC's published hypothetical paper-trading journal) and, entirely
 under YOUR configuration and responsibility, mirrors those events as
 long-options orders in YOUR Robinhood Agentic account.
 
-    python agent.py setup    # one-time: consent gate -> AgentHC key/terms ->
-                             # Robinhood OAuth -> contracts-per-trade config
+    python agent.py setup    # one-time: consent gate -> feed access (Lightning
+                             # day-pass wallet OR API key) -> Robinhood OAuth ->
+                             # contracts-per-trade config
     python agent.py run      # heartbeat loop (refuses to run without consent)
-    python agent.py status   # show config, acceptance, and open positions
+    python agent.py status   # config, wallet balance, day-pass, open positions
+    python agent.py fund N   # print a Lightning invoice to add N sats
 
 HARD CONSENT GATE: this program will not perform ANY setup or trading action
 until you have accepted DISCLAIMER.md (all liability is yours; neither AgentHC
@@ -27,6 +29,7 @@ from datetime import datetime, timezone
 
 import requests
 
+from lightning_wallet import LNbitsWallet, WalletError
 from robinhood_mcp import RobinhoodMCP, content_json, tool_ok
 
 TERMS_VERSION = "agent-terms-2026.07"
@@ -115,10 +118,62 @@ def require_consent_or_exit():
     print("\nAcceptance recorded at", ACCEPTANCE_PATH)
 
 
+# ── Lightning wallet (pays the sats day-pass) ───────────────────────────────
+
+def wallet_from_cfg(cfg):
+    if cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"):
+        return LNbitsWallet(cfg["lnbits_url"], cfg["lnbits_admin_key"])
+    return None
+
+
+def wallet_setup(cfg):
+    """Attach an LNbits wallet so the agent can pay the Lightning day-pass."""
+    print("\nThe feed is sats-priced (~$10/day, floats with Bitcoin's price).")
+    print("Give this agent a Lightning wallet it can pay from (see README")
+    print("'Give your agent sats' — an LNbits wallet takes ~2 minutes to make).")
+    url = input("LNbits instance URL (e.g. https://demo.lnbits.com): ").strip()
+    key = input("Wallet ADMIN key (Wallet -> API info -> Admin key): ").strip()
+    if not url or not key:
+        print("Skipped — without a wallet the agent needs a Premium API key instead.")
+        return cfg
+    wallet = LNbitsWallet(url, key)
+    try:
+        bal = wallet.balance_sats()
+    except WalletError as exc:
+        print(f"Wallet check FAILED: {exc}")
+        print("Fix the URL/key and re-run setup.")
+        return cfg
+    cfg["lnbits_url"] = url
+    cfg["lnbits_admin_key"] = key
+    print(f"Wallet connected ✓  balance: {bal:,} sats")
+    if bal < 15_000:
+        print("Balance is low for a ~$10/day pass. Fund it now?")
+        raw = input("Amount in sats to request (blank to skip): ").strip()
+        if raw.isdigit() and int(raw) > 0:
+            _print_funding_invoice(wallet, int(raw))
+    # Safety cap: the agent will never auto-pay an invoice above this.
+    cfg.setdefault("max_autopay_sats", 30_000)
+    print(f"Auto-pay safety cap: {cfg['max_autopay_sats']:,} sats per invoice "
+          "(edit max_autopay_sats in config.json to change).")
+    return cfg
+
+
+def _print_funding_invoice(wallet, sats):
+    bolt11 = wallet.create_invoice(sats, memo="fund agentic day-trade agent")
+    print(f"\nPay this invoice from ANY Lightning wallet to add {sats:,} sats:\n")
+    print(bolt11)
+    print("\n(Strike, Cash App, Phoenix, Alby, Wallet of Satoshi, etc. — scan or paste.)")
+
+
 # ── AgentHC feed client ──────────────────────────────────────────────────────
 
-def agenthc_headers(cfg):
-    return {"X-API-Key": cfg["agenthc_api_key"]}
+def agenthc_headers(cfg, state=None):
+    if cfg.get("agenthc_api_key"):
+        return {"X-API-Key": cfg["agenthc_api_key"]}
+    tok = (state or {}).get("l402") or {}
+    if tok.get("token") and tok.get("expires_at", 0) > time.time():
+        return {"Authorization": tok["token"]}
+    return {}
 
 
 def agenthc_register():
@@ -144,15 +199,52 @@ def agenthc_accept_terms(cfg):
     return body.get("terms_version")
 
 
-def fetch_feed(cfg, limit=20):
+def _buy_day_pass(cfg, state, body):
+    """Pay the 402 Lightning invoice and cache the 24h L402 token."""
+    wallet = wallet_from_cfg(cfg)
+    if wallet is None:
+        raise RuntimeError(
+            "Feed requires payment and no Lightning wallet is configured — "
+            "run `python agent.py setup` (or use a Premium API key).")
+    payment = body.get("payment", {})
+    invoice = payment.get("payment_request")
+    macaroon = payment.get("macaroon")
+    amount = int(payment.get("amount_sats", 0) or 0)
+    if not invoice or not macaroon:
+        raise RuntimeError(f"402 without payable invoice: {str(body)[:200]}")
+    cap = int(cfg.get("max_autopay_sats", 30_000))
+    if amount > cap:
+        raise RuntimeError(
+            f"Day-pass costs {amount:,} sats which exceeds your auto-pay cap "
+            f"({cap:,}). Raise max_autopay_sats in config.json if intended.")
+    print(f"Buying 24h day-pass: paying {amount:,} sats "
+          "(terms accepted by payment — see `disclosure` in the 402 body) …")
+    preimage = wallet.pay_invoice(invoice)
+    state["l402"] = {"token": f"L402 {macaroon}:{preimage}",
+                     "expires_at": time.time() + 23 * 3600}
+    _save(STATE_PATH, state)
+    print("Day-pass active for ~23h.")
+
+
+def fetch_feed(cfg, limit=20, state=None, _retried=False):
+    state = state if state is not None else _load(STATE_PATH, {"seen": [], "positions": {}})
     resp = requests.get(f"{AGENTHC_API}{FEED_PATH}",
                         params={"limit": limit},
-                        headers=agenthc_headers(cfg), timeout=15)
+                        headers=agenthc_headers(cfg, state), timeout=15)
+    if resp.status_code == 402 and not _retried:
+        _buy_day_pass(cfg, state, resp.json())
+        return fetch_feed(cfg, limit, state=state, _retried=True)
+    if resp.status_code == 401 and not _retried and not cfg.get("agenthc_api_key"):
+        state.pop("l402", None)  # stale day-pass token — re-buy on next 402
+        _save(STATE_PATH, state)
+        return fetch_feed(cfg, limit, state=state, _retried=True)
     if resp.status_code == 403:
         detail = resp.json().get("detail", {})
         if isinstance(detail, dict) and detail.get("error") == "terms_acceptance_required":
             agenthc_accept_terms(cfg)
-            return fetch_feed(cfg, limit)
+            return fetch_feed(cfg, limit, state=state, _retried=True)
+        if isinstance(detail, dict) and detail.get("error") == "feed_not_live":
+            return []  # feed exists but isn't publishing yet — keep polling
         raise RuntimeError(f"403 from feed: {str(detail)[:200]}")
     resp.raise_for_status()
     return resp.json().get("events", [])
@@ -285,15 +377,25 @@ def cmd_setup():
     require_consent_or_exit()
     cfg = _load(CONFIG_PATH, {}) or {}
 
-    print("\n== Step 1/3: AgentHC feed access ==")
-    if not cfg.get("agenthc_api_key"):
-        have = input("Do you already have an AgentHC API key? [y/N]: ").strip().lower()
-        cfg["agenthc_api_key"] = (input("Paste your API key: ").strip()
-                                  if have == "y" else agenthc_register())
-    try:
-        agenthc_accept_terms(cfg)
-    except Exception as exc:
-        print(f"(terms acceptance deferred: {exc} — will retry on first run)")
+    print("\n== Step 1/3: AgentHC feed access (sats-based) ==")
+    print("  1) Lightning day-pass — the agent pays ~$10/day in sats from its")
+    print("     own wallet, no account needed (recommended for agents)")
+    print("  2) AgentHC Premium API key (sats-purchased subscription)")
+    choice = input("Choose [1/2, default 1]: ").strip() or "1"
+    if choice == "2":
+        if not cfg.get("agenthc_api_key"):
+            have = input("Do you already have an AgentHC API key? [y/N]: ").strip().lower()
+            cfg["agenthc_api_key"] = (input("Paste your API key: ").strip()
+                                      if have == "y" else agenthc_register())
+        try:
+            agenthc_accept_terms(cfg)
+        except Exception as exc:
+            print(f"(terms acceptance deferred: {exc} — will retry on first run)")
+    else:
+        cfg = wallet_setup(cfg)
+        if not wallet_from_cfg(cfg):
+            print("No wallet configured and no API key — the agent cannot access")
+            print("the feed until you re-run setup and complete one of the two.")
 
     print("\n== Step 2/3: Robinhood Agentic account ==")
     cfg = rh_setup(cfg)
@@ -319,7 +421,9 @@ def cmd_setup():
 def cmd_run():
     require_consent_or_exit()
     cfg = _load(CONFIG_PATH)
-    if not cfg or not cfg.get("agenthc_api_key") or not cfg.get("robinhood_account"):
+    has_access = cfg and (cfg.get("agenthc_api_key")
+                          or (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")))
+    if not cfg or not has_access or not cfg.get("robinhood_account"):
         print("Not configured — run: python agent.py setup")
         sys.exit(1)
     rh = rh_client()
@@ -356,12 +460,35 @@ def cmd_run():
 def cmd_status():
     print(f"consent accepted : {consent_ok()} ({ACCEPTANCE_PATH})")
     cfg = _load(CONFIG_PATH, {}) or {}
-    print(f"agenthc key      : {'set' if cfg.get('agenthc_api_key') else 'MISSING'}")
+    print(f"agenthc key      : {'set' if cfg.get('agenthc_api_key') else 'not set'}")
+    wallet = wallet_from_cfg(cfg)
+    if wallet:
+        try:
+            print(f"lightning wallet : connected, {wallet.balance_sats():,} sats")
+        except WalletError as exc:
+            print(f"lightning wallet : ERROR — {exc}")
+    else:
+        print("lightning wallet : not configured")
+    state = _load(STATE_PATH, {"positions": {}})
+    tok = state.get("l402") or {}
+    if tok.get("expires_at", 0) > time.time():
+        mins = int((tok["expires_at"] - time.time()) / 60)
+        print(f"day-pass         : active, ~{mins} min remaining")
+    else:
+        print("day-pass         : none (bought automatically on next 402)")
     acct = cfg.get("robinhood_account", "")
     print(f"robinhood account: {'••••' + acct[-4:] if acct else 'MISSING'}")
     print(f"contracts/trade  : {cfg.get('contracts_per_trade', 'unset')}")
-    state = _load(STATE_PATH, {"positions": {}})
     print(f"open positions   : {list(state.get('positions', {})) or 'none'}")
+
+
+def cmd_fund(sats):
+    cfg = _load(CONFIG_PATH, {}) or {}
+    wallet = wallet_from_cfg(cfg)
+    if wallet is None:
+        print("No Lightning wallet configured — run: python agent.py setup")
+        sys.exit(1)
+    _print_funding_invoice(wallet, sats)
 
 
 def main():
@@ -372,6 +499,12 @@ def main():
         cmd_run()
     elif cmd == "status":
         cmd_status()
+    elif cmd == "fund":
+        amount = sys.argv[2] if len(sys.argv) > 2 else "20000"
+        if not amount.isdigit():
+            print("Usage: python agent.py fund <sats>")
+            sys.exit(1)
+        cmd_fund(int(amount))
     else:
         print(__doc__)
         sys.exit(1)

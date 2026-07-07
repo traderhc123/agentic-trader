@@ -43,12 +43,21 @@ This walks through, in order:
    Acceptance (terms version + SHA-256 of the text + timestamp) is recorded at
    `~/.agentic-day-trade-agent/acceptance.json`. If DISCLAIMER.md ever changes,
    the gate re-triggers.
-2. **AgentHC feed access** — registers a free API key
-   (`POST https://api.traderhc.com/api/v1/agents/register`) or accepts an
-   existing one, then accepts the feed terms
-   (`POST /api/v1/trading/day-trade-ideas/accept-terms`). The feed requires
-   **Premium tier** — if feed calls return `tier_required`, direct the human to
-   `https://api.traderhc.com/docs` (`POST /api/v1/agents/upgrade`).
+2. **AgentHC feed access (sats-based)** — the wizard offers two paths:
+   - **Lightning day-pass (default, recommended)**: the agent gets its own
+     LNbits wallet and auto-buys a ~$10/day pass (price floats with Bitcoin's
+     USD price). Help the human create an LNbits wallet (any instance, e.g.
+     demo.lnbits.com — README "Give your agent sats" has the steps), paste the
+     instance URL + wallet **Admin key**, then fund it: `python agent.py fund
+     50000` prints a Lightning invoice payable from any wallet or exchange.
+     Note the safety cap: the agent refuses to auto-pay invoices above
+     `max_autopay_sats` (default 30,000). Paying a day-pass invoice
+     constitutes acceptance of the feed terms (stated in the 402 response).
+   - **Premium API key**: registers a free key
+     (`POST https://api.traderhc.com/api/v1/agents/register`), then upgrade to
+     Premium with sats (`https://api.traderhc.com/docs`,
+     `POST /api/v1/agents/upgrade`) and accept the feed terms
+     (`POST /api/v1/trading/day-trade-ideas/accept-terms`).
 3. **Robinhood Agentic account** — prints an OAuth URL. The human opens it in
    their browser (logged into Robinhood), approves, lands on a dead
    `http://127.0.0.1:8721/callback?...` page (expected), and pastes that full
@@ -88,8 +97,11 @@ oversight; it should not run unwatched for long periods.
 
 | Symptom | Cause / fix |
 |---|---|
+| `403 feed_not_live` | Feed isn't publishing yet — agent idles and keeps polling; normal |
+| `402` loops / "exceeds your auto-pay cap" | Day-pass price above `max_autopay_sats` — raise it in config.json if the price is legitimate |
+| `WalletError: payment failed` | Wallet balance too low — `python agent.py fund <sats>` and pay the invoice |
 | `403 terms_acceptance_required` | Agent auto-accepts and retries; if it loops, run setup again |
-| `403 tier_required` | AgentHC key is FREE tier — upgrade to Premium (`/docs`) |
+| `403 tier_required` | AgentHC key is FREE tier — upgrade to Premium (`/docs`) or switch to the day-pass |
 | `401 Invalid API key` | Key revoked/typo — re-run setup with a valid key |
 | Robinhood order rejected, options-level alert | Enable options on the Agentic account (upgrade link in setup) |
 | Robinhood order rejected, buying power | Fund the Agentic account |

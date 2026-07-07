@@ -42,9 +42,38 @@ Your human pointed you at this repository to set them up. Follow
 - A Robinhood account with an **Agentic account** (created during setup),
   **options approval on the Agentic account**, and funds you can afford to
   lose entirely
-- An AgentHC API key with **Premium tier** (registration is free at
-  `POST https://api.traderhc.com/api/v1/agents/register`; see
-  <https://api.traderhc.com/docs> for tier upgrades)
+- **Feed access is sats-based** — one of:
+  - a **Lightning wallet for the agent** (recommended — see "Give your agent
+    sats" below): the agent buys a ~$10/day pass automatically, or
+  - an AgentHC API key upgraded to **Premium** (registration free at
+    `POST https://api.traderhc.com/api/v1/agents/register`, upgrades at
+    <https://api.traderhc.com/docs>)
+
+### 💰 Give your agent sats (Lightning wallet)
+
+The feed costs **~$10/day, paid in bitcoin sats** — the sats amount floats
+with Bitcoin's price (the 402 invoice always reflects the current
+conversion). The agent pays this itself from a built-in Lightning wallet and
+receives a 24-hour access token; it re-buys automatically when the pass
+expires. Setup takes ~2 minutes:
+
+1. **Create an LNbits wallet** — on any LNbits instance (e.g.
+   <https://demo.lnbits.com>, another hosted instance, or your own server).
+   No signup needed on most instances: open the site, create a wallet,
+   bookmark the URL.
+2. **Get the Admin key** — in the wallet UI open *API info* and copy the
+   **Admin key** (it can spend, which is what lets the agent pay invoices).
+3. **Tell the agent** — `python agent.py setup` asks for the instance URL and
+   Admin key, verifies the connection, and shows the balance.
+4. **Fund it** — `python agent.py fund 50000` prints a Lightning invoice for
+   50,000 sats; pay it from any Lightning wallet or exchange (Strike, Cash
+   App, Coinbase, Phoenix, Alby, Wallet of Satoshi, …). At ~$10/day, ~50k
+   sats is roughly a month of market days at $100k/BTC.
+
+Safety rails: the agent never auto-pays an invoice above `max_autopay_sats`
+(default 30,000 — edit in `config.json`), and you should only keep what
+you're willing to spend in this wallet. The Admin key is stored locally with
+`0600` permissions.
 
 ### Quickstart
 
@@ -60,10 +89,11 @@ python agent.py status  # config, acceptance, open positions
 
 ### What the agent actually does
 
-- Polls `GET /api/v1/trading/day-trade-ideas` (default every 30s) with your
-  API key. First use requires accepting AgentHC's feed terms
-  (`POST .../accept-terms`) — the agent handles this and the full disclosure
-  is returned in every feed response.
+- Polls `GET /api/v1/trading/day-trade-ideas` (default every 30s). On a 402
+  it pays the Lightning day-pass from its wallet (within your auto-pay cap)
+  and caches the 24h token; with an API key it accepts the feed terms
+  (`POST .../accept-terms`) instead. Paying the invoice constitutes terms
+  acceptance and the full disclosure is embedded in every response.
 - On a new `ENTERED` event (e.g. `ENTERED — $SPY 07/10 $752 CALL`): resolves
   the option instrument on Robinhood and buys **your configured number of
   contracts** to open (market order, day) in your Agentic account.
@@ -91,6 +121,7 @@ python agent.py status  # config, acceptance, open positions
 | File | Purpose |
 |---|---|
 | `agent.py` | The agent: consent gate, setup wizard, heartbeat loop |
+| `lightning_wallet.py` | Built-in Lightning wallet (LNbits) — pays the day-pass, receives funding |
 | `robinhood_mcp.py` | Minimal Robinhood agentic-trading MCP client (OAuth + tools/call) |
 | `BOOT.md` | Step-by-step boot instructions written for LLM assistants |
 | `DISCLAIMER.md` | The agreement the consent gate enforces — versioned |
