@@ -26,6 +26,39 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_PORT = 8721      # one app, one port (also the Robinhood OAuth redirect port)
+
+
+def open_app_window(url):
+    """Open `url` as a chromeless 'app' window (feels native), falling back to
+    a normal browser tab. Never raises — a cosmetic nicety, not a dependency."""
+    import shutil
+    import subprocess
+    import sys
+    candidates = []
+    if sys.platform == "darwin":
+        candidates = [
+            ["open", "-na", "Google Chrome", "--args", f"--app={url}"],
+            ["open", "-na", "Microsoft Edge", "--args", f"--app={url}"],
+            ["open", "-na", "Brave Browser", "--args", f"--app={url}"],
+        ]
+    else:
+        for exe in ("google-chrome", "chromium", "chromium-browser",
+                    "brave-browser", "microsoft-edge"):
+            if shutil.which(exe):
+                candidates.append([exe, f"--app={url}"])
+    for cmd in candidates:
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            continue
+    try:
+        import webbrowser
+        webbrowser.open(url)
+    except Exception:
+        pass
+    return False
 WIZARD_PORT = APP_PORT
 DASH_PORT = APP_PORT
 

@@ -53,6 +53,7 @@ Your human pointed you at this repository to set them up. Follow
 - **Market-hours aware**: polls fast 9:25–16:15 ET, sleeps slow overnight/weekends
 - **Self-modifying (with your approval)**: `self-edit on`, then `code: add an RSS source` — the agent rewrites its own source, shows you the diff in the dashboard, and one click applies it with backup + compile-check + auto-rollback + self-restart. A **foundation layer** (consent gate, safety rails, terms, the self-edit governor itself) is immutable to the agent
 - **Web UI, self-served**: one paste on a desktop (or a few terminal lines on a server), then it's browser-only — a **setup wizard** (`setup --web`) with one-click Robinhood OAuth, and a **dashboard** your own agent serves at `127.0.0.1:8721` with live status, trade log, and a chat box (`pause`, `set budget 500`, `dry off`, or ask it anything about its trades). Localhost-only; no central server ever sees your keys. (Zero-terminal option: have Claude run the three lines for you — see GETTING_STARTED.md)
+- **Feels like an app**: `agent.py app` opens the dashboard as a chromeless desktop window (falls back to a normal browser tab). No packaging, no signing — the localhost UI in an app-mode window
 - **Always-on ready**: one-line installer, Dockerfile, hardened systemd unit
 
 ## 🧑 Quickstart

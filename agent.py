@@ -11,6 +11,8 @@ Robinhood's trading MCP).
                              # set up yet, otherwise run the agent
     python agent.py setup    # explicit setup (add --web for the browser wizard)
     python agent.py run      # heartbeat loop (refuses to run without consent)
+    python agent.py app      # same as run, but opens the dashboard as a desktop
+                             # app window (chromeless browser; --app on run too)
     python agent.py status   # config, wallet balance, open positions
     python agent.py fund N   # print a Lightning invoice to add N sats
 
@@ -461,7 +463,7 @@ def _apply_command(text):
     return False, ""
 
 
-def cmd_run():
+def cmd_run(app_window=False):
     require_consent_or_exit()
     cfg = _load(CONFIG_PATH)
     broker_ready = bool(cfg and (cfg.get("robinhood_account")
@@ -518,6 +520,9 @@ def cmd_run():
           f"{'ON' if llm_policy.enabled(cfg) else 'off'}. Ctrl-C to stop.")
     if dash_url:
         print(f"Dashboard: {dash_url}  (remote? tunnel: ssh -L 8721:127.0.0.1:8721 user@host)")
+        if app_window:
+            import webui
+            webui.open_app_window(dash_url)
     print("Reminder: you are responsible for every order this agent places.")
     notify(cfg, f"agentic-trader heartbeat started [{mode}], source={cfg['source']}"
                 + (f" — dashboard {dash_url}" if dash_url else ""))
@@ -629,8 +634,8 @@ def main():
             webui.run_wizard()
         else:
             cmd_setup()
-    elif cmd == "run":
-        cmd_run()
+    elif cmd in ("run", "app"):
+        cmd_run(app_window=(cmd == "app" or "--app" in sys.argv))
     elif cmd == "status":
         cmd_status()
     elif cmd == "fund":
