@@ -145,19 +145,25 @@ your agent's own wizard). Real money; read carefully.</p>
  <span id="src-msg"></span></div>
 </section>
 
-<section id="s-broker"><h2>Broker</h2>
- <p class="muted">Where should orders execute? Robinhood is one click; Alpaca
- takes API keys and offers a <b>paper mode</b> (simulated fills, zero real
- dollars — the safest full trial).</p>
+<section id="s-broker"><h2>Broker — where orders execute</h2>
+ <p class="muted">Pick your platform. Robinhood is one-click OAuth; key-based
+ platforms take API keys (many offer a paper/simulated mode — the safest trial).</p>
  <div class="navrow"><button onclick="rhStart()">Connect Robinhood</button>
  <span id="rh-msg"></span></div>
  <div id="rh-accounts"></div>
- <details><summary class="muted">Use Alpaca instead (paper or live)</summary>
-  <input type="text" id="ap-key" placeholder="Alpaca API Key ID">
-  <input type="password" id="ap-secret" placeholder="Alpaca API Secret">
-  <p><label><input type="checkbox" id="ap-paper" checked> Paper trading
-  (recommended)</label></p>
-  <button onclick="doAlpaca()">Connect Alpaca</button> <span id="ap-msg"></span>
+ <p class="muted" style="margin-top:1rem">— or a key-based platform —</p>
+ <select id="brk-sel" onchange="brkFields()"></select>
+ <div id="brk-fields"></div>
+ <div class="navrow" id="brk-connect" style="display:none">
+  <button onclick="brkConnect()">Connect</button> <span id="brk-msg"></span></div>
+ <details style="margin-top:1rem"><summary class="muted">Don't see your
+ platform? Your agent can build the connector</summary>
+  <p class="muted">Every platform needs a small adapter (different APIs). Your
+  agent can WRITE one for any platform with a trading API — after setup, in the
+  dashboard: <code>self-edit on</code> then
+  <code>code: add a broker adapter for &lt;platform&gt; using their API</code>.
+  You review the diff before it applies; it then appears here automatically.
+  moomoo, Interactive Brokers, Tastytrade, Tradier, etc. all work this way.</p>
  </details>
 </section>
 
@@ -259,6 +265,7 @@ async function boot(){
   if(st.broker){done('s-broker');
     document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ account ····'+st.broker+'</span>';}
   cur=Math.min(maxUnlocked,STEPS.length-1);render();
+  loadBrokers();
 }
 async function doConsent(){
   if(!document.getElementById('c-read').checked){
@@ -306,11 +313,33 @@ async function doSource(){
     :'<span class="err">'+r.error+'</span>';
   if(r.ok)done('s-source');
 }
-async function doAlpaca(){
-  const r=await api('/api/alpaca',{key:document.getElementById('ap-key').value,
-    secret:document.getElementById('ap-secret').value,
-    paper:document.getElementById('ap-paper').checked});
-  document.getElementById('ap-msg').innerHTML=r.ok?' <span class="ok">'+r.note+'</span>'
+let BRK=[];
+async function loadBrokers(){
+  const r=await api('/api/brokers');BRK=r.brokers||[];
+  const sel=document.getElementById('brk-sel');
+  sel.innerHTML='<option value="">— choose a key-based platform —</option>'+
+    BRK.map(b=>'<option value="'+b.id+'">'+esc(b.name)+'</option>').join('');
+  brkFields();
+}
+function brkFields(){
+  const id=document.getElementById('brk-sel').value;
+  const b=BRK.find(x=>x.id===id);const box=document.getElementById('brk-fields');
+  document.getElementById('brk-connect').style.display=b?'':'none';
+  if(!b){box.innerHTML='';return;}
+  box.innerHTML=b.fields.map(f=>{
+    if(f.type==='checkbox')return '<label><input type="checkbox" id="bf-'+f.id+'"'+
+      (f.default?' checked':'')+'> '+esc(f.label)+'</label><br>';
+    return '<input type="'+(f.type==='password'?'password':'text')+
+      '" id="bf-'+f.id+'" placeholder="'+esc(f.label)+'">';
+  }).join('');
+}
+async function brkConnect(){
+  const id=document.getElementById('brk-sel').value;
+  const b=BRK.find(x=>x.id===id);if(!b)return;
+  const vals={};b.fields.forEach(f=>{const el=document.getElementById('bf-'+f.id);
+    vals[f.id]=(f.type==='checkbox')?el.checked:el.value;});
+  const r=await api('/api/broker/connect',{broker:id,values:vals});
+  document.getElementById('brk-msg').innerHTML=r.ok?' <span class="ok">'+r.note+'</span>'
     :' <span class="err">'+r.error+'</span>';
   if(r.ok)done('s-broker');
 }
@@ -746,18 +775,21 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         token, droplet_id = pending["deploy"]
         return provision.droplet_status(token, droplet_id)
 
-    def alpaca_connect(_h, data):
+    def brokers_list(_h):
+        from brokers import key_brokers
+        return {"brokers": key_brokers()}
+
+    def broker_connect(_h, data):
         if not A.consent_ok():
             return {"ok": False, "error": "accept the agreement first"}
-        from brokers import alpaca as _ap
-        cfg["alpaca_key_id"] = str(data.get("key", "")).strip()
-        cfg["alpaca_secret"] = str(data.get("secret", "")).strip()
-        cfg["alpaca_paper"] = bool(data.get("paper", True))
-        cfg["broker"] = "alpaca"
-        ok, msg = _ap.verify(cfg)
+        from brokers import BROKERS
+        mod = BROKERS.get(str(data.get("broker", "")))
+        if mod is None or not callable(getattr(mod, "connect", None)):
+            return {"ok": False, "error": "unknown broker"}
+        ok, msg = mod.connect(cfg, data.get("values", {}) or {})
         if not ok:
             return {"ok": False, "error": msg}
-        pending["broker_last4"] = "alp·" + ("PPR" if cfg["alpaca_paper"] else "LIV")
+        pending["broker_last4"] = str(data.get("broker", ""))[:6]
         save()
         return {"ok": True, "note": msg}
 
@@ -935,6 +967,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     W.routes_get = {"/api/state": state, "/api/rh/start": rh_start,
                     "/api/wallet/balance": wallet_balance,
                     "/api/deploy/status": deploy_status,
+                    "/api/brokers": brokers_list,
                     "/api/status": d_status, "/api/trades": d_trades,
                     "/api/proposal": proposal_get}
     def ask(_h, data):
@@ -956,7 +989,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/wallet/create": wallet_create,
                      "/api/wallet/fund": wallet_fund,
                      "/api/llm": llm, "/api/deploy": deploy,
-                     "/api/alpaca": alpaca_connect,
+                     "/api/broker/connect": broker_connect,
                      "/api/proposal/apply": proposal_apply,
                      "/api/proposal/reject": proposal_reject,
                      "/api/command": d_command}

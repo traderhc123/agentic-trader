@@ -14,6 +14,28 @@ import requests
 
 _TIMEOUT = 15
 
+# Wizard descriptor — lets the web setup render this broker's fields generically
+# (any key-based broker adapter can ship one of these).
+WIZARD = {
+    "id": "alpaca",
+    "name": "Alpaca (paper or live)",
+    "fields": [
+        {"id": "alpaca_key_id", "label": "API Key ID", "type": "text"},
+        {"id": "alpaca_secret", "label": "API Secret", "type": "password"},
+        {"id": "alpaca_paper", "label": "Paper trading (recommended)",
+         "type": "checkbox", "default": True},
+    ],
+}
+
+
+def connect(cfg, values):
+    """Generic wizard connect: apply field values, verify. (ok, note)."""
+    cfg["alpaca_key_id"] = str(values.get("alpaca_key_id", "")).strip()
+    cfg["alpaca_secret"] = str(values.get("alpaca_secret", "")).strip()
+    cfg["alpaca_paper"] = bool(values.get("alpaca_paper", True))
+    cfg["broker"] = "alpaca"
+    return verify(cfg)
+
 
 def _base(cfg):
     return ("https://paper-api.alpaca.markets" if cfg.get("alpaca_paper", True)
