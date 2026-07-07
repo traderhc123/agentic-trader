@@ -1,0 +1,20 @@
+#cloud-config
+# Auto-provision recipe: pass this as "user data" when creating a VPS
+# (DigitalOcean/Hetzner/Vultr all accept cloud-init). The droplet installs
+# agentic-trader on first boot. Setup itself stays INTERACTIVE by design —
+# SSH in (or have your AI assistant SSH in) and run setup: the consent gate
+# and Robinhood OAuth must be completed by the human.
+users:
+  - name: trader
+    groups: sudo
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+package_update: true
+packages: [git, python3, python3-venv, python3-pip, tmux]
+runcmd:
+  - sudo -u trader bash -c 'curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | AGENTIC_TRADER_DIR=/home/trader/agentic-trader bash'
+  - cp /home/trader/agentic-trader/deploy/agentic-trader.service /etc/systemd/system/
+  - systemctl daemon-reload
+  # NOT enabled yet on purpose — run setup first:
+  #   ssh trader@<ip>  ->  cd agentic-trader && ./.venv/bin/python agent.py setup
+  #   then: sudo systemctl enable --now agentic-trader

@@ -124,3 +124,21 @@ watched several days of activity and explicitly ask to go live.
 | Robinhood order rejected, buying power | Fund the Agentic account |
 | `invalid_grant` during OAuth | Code expired (minutes) — rerun setup, paste faster |
 | Feed returns `events: []` | Normal — no journal events published yet today, or the feed is paused upstream |
+
+
+## Optional: provisioning a VPS for the human
+
+If the human wants always-on operation and asks you to handle hosting, you can
+create the server for them — with their cloud API token, on their account:
+
+1. Ask which provider (DigitalOcean / Hetzner / Vultr) and for an API token
+   (read-write). Never store the token in the agent's config; use it once.
+2. Create the smallest Ubuntu instance via the provider's API, passing
+   `deploy/cloud-init.yaml` as user-data — the box installs agentic-trader on
+   first boot. (e.g. DigitalOcean: POST /v2/droplets with `user_data`.)
+3. SSH in as `trader` and run `./.venv/bin/python agent.py setup`,
+   relaying the interactive steps to the human — the consent phrase and the
+   Robinhood browser login are theirs alone; you must not perform them.
+4. Enable always-on: `sudo systemctl enable --now agentic-trader`, confirm
+   with `systemctl status agentic-trader`, and make sure the human received
+   the test notification before you disconnect.
