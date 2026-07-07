@@ -40,6 +40,12 @@ catches up when it wakes (and refuses to act on entries older than 5
 minutes — a safety feature), but exits can be delayed. Fine for dry-run
 trials; not ideal for live money.
 
+**How much terminal is involved, really?** Three pasted lines, once — the
+install, `setup --web`, and `run`. Every decision and all day-to-day use
+happens in your browser (the setup wizard, then the dashboard). If you'd
+rather touch a terminal zero times, use the AI-assistant path above: Claude
+pastes the lines, you use the browser.
+
 ### Option A — your computer (10 minutes, start here)
 
 1. Install Python 3.10+ (python.org, or it's already on Macs).
@@ -52,10 +58,10 @@ trials; not ideal for live money.
    A setup page opens in your browser — read and accept the agreement, pick
    your signal source, click **Connect Robinhood** (it bounces you to
    Robinhood and straight back), choose a dollar budget per trade, and set
-   the safety rails. No terminal knowledge needed beyond pasting the above.
-3. Answer the setup questions (it defaults to **dry-run mode** — no real
-   orders — so you can watch it for a few days risk-free).
-4. Start it:
+   the safety rails. It defaults to **dry-run mode** — no real orders — so
+   you can watch it for a few days risk-free. That's the last of the
+   terminal apart from one more pasted line below.
+3. Start it:
    ```bash
    ./.venv/bin/python agent.py run
    ```
