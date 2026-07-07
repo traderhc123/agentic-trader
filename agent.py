@@ -384,6 +384,82 @@ def cmd_setup():
     print("Start the heartbeat with: python agent.py run")
 
 
+def _sizing_desc(cfg):
+    if str(cfg.get("sizing_mode", "contracts")) == "budget":
+        return f"${float(cfg.get('budget_per_trade_usd', 0) or 0):,.0f}/trade budget"
+    return f"{int(cfg.get('contracts_per_trade', 1))} contract(s)/trade"
+
+
+def _apply_command(text):
+    """Fixed command allowlist for the dashboard chat. Returns (handled, reply).
+
+    The dashboard's free-text box first tries this allowlist; anything not
+    matched here falls through to answer-only LLM Q&A. The LLM can never
+    reach these controls — it can only ANSWER.
+    """
+    import webui
+    t = text.lower().strip()
+    cfg = _load(CONFIG_PATH, {}) or {}
+    if t == "pause":
+        webui.CONTROLS["paused"] = True
+        return True, "Paused — no new events processed until you say 'resume'."
+    if t == "resume":
+        webui.CONTROLS["paused"] = False
+        return True, "Resumed."
+    if t == "stop":
+        webui.CONTROLS["stop"] = True
+        return True, ("Stopping after this cycle. Open positions remain in your "
+                      "brokerage account — close them there if needed.")
+    if t in ("dry on", "dry-run on"):
+        cfg["dry_run"] = True
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, "Dry-run ON — actions logged, no real orders."
+    if t in ("dry off", "dry-run off", "go live"):
+        cfg["dry_run"] = False
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, "Dry-run OFF — the agent will place REAL orders from now on."
+    if t.startswith("set budget"):
+        try:
+            val = float(t.split()[-1].lstrip("$").replace(",", ""))
+            assert val > 0
+        except (ValueError, AssertionError, IndexError):
+            return True, "Usage: set budget 500"
+        cfg["sizing_mode"] = "budget"
+        cfg["budget_per_trade_usd"] = val
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, f"Per-trade budget set to ${val:,.0f} (your decision — see DISCLAIMER.md)."
+    if t.startswith("set cap"):
+        try:
+            val = int(t.split()[-1])
+            assert val >= 1
+        except (ValueError, AssertionError, IndexError):
+            return True, "Usage: set cap 3"
+        cfg["max_entries_per_day"] = val
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, f"Daily entry cap set to {val}."
+    if t in ("self-edit on", "self edit on"):
+        cfg["self_edit_enabled"] = True
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, ("Self-edit ON. Ask for changes with:  code: <what to change>"
+                      " — you review every diff before it applies; applies are "
+                      "backed up, compile-checked, and auto-rolled-back on failure.")
+    if t in ("self-edit off", "self edit off"):
+        cfg["self_edit_enabled"] = False
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, "Self-edit OFF."
+    if text.lower().startswith("code:"):
+        import self_edit
+        _ok, msg = self_edit.propose(cfg, text[5:].strip())
+        return True, msg
+    if t == "status":
+        st = _load(STATE_PATH, {"positions": {}})
+        return True, (f"{'DRY-RUN' if cfg.get('dry_run') else 'LIVE'} · "
+                      f"{_sizing_desc(cfg)} · entries today {_entries_today()}/"
+                      f"{cfg.get('max_entries_per_day', 5)} · open: "
+                      f"{', '.join(st.get('positions', {})) or 'none'}")
+    return False, ""
+
+
 def cmd_run():
     require_consent_or_exit()
     cfg = _load(CONFIG_PATH)
