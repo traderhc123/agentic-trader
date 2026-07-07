@@ -322,22 +322,90 @@ boot();
 </script></body></html>"""
 
 _DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
-<title>agentic-trader</title>""" + _STYLE + """</head><body>
-<h1>agentic-trader <span class="badge" id="b-mode">…</span>
-<span class="badge" id="b-paused"></span></h1>
-<section><h2>Status</h2><div id="status">loading…</div></section>
-<section><h2>Talk to your agent</h2>
- <div id="chatlog"></div>
- <input type="text" id="cmd" placeholder="pause · resume · dry on|off · set budget 500 · set cap 3 · stop — or ask anything about your trades"
-  onkeydown="if(event.key==='Enter')send()">
- <button onclick="send()">Send</button>
-</section>
-<section><h2>Recent activity</h2><div id="trades"></div></section>
-<p class="muted">Settings change right here in chat (<code>set budget 500</code>,
-<code>set cap 3</code>, <code>dry off</code>…). Want to change how the agent
-<i>works</i> — new sources, different rules in code? For safety this chat can't
-rewrite the agent's own code; instead run <b>Claude Code</b> in the repo folder
-on this machine and describe the change — then restart the agent.</p>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentic-trader</title>""" + _STYLE + """
+<style>
+ body{max-width:1180px}
+ header{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:.4rem 0 1rem}
+ header h1{margin:0;font-size:1.25rem}
+ header .sp{flex:1}
+ .qbtn{background:#232936;color:#e6e6e6;border:1px solid #2a2f3a;font-size:.85rem}
+ .qbtn:hover{background:#2a3242}
+ .grid{display:grid;grid-template-columns:2fr 1fr;gap:1rem;align-items:start}
+ @media(max-width:900px){.grid{grid-template-columns:1fr}}
+ .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+        gap:.8rem;margin-bottom:1rem}
+ .tile{border:1px solid #2a2f3a;border-radius:10px;background:#161a22;
+       padding:.7rem .9rem}
+ .tile .k{font-size:.72rem;color:#9aa3b2;text-transform:uppercase;
+          letter-spacing:.04em}
+ .tile .v{font-size:1.35rem;font-weight:600;margin-top:.15rem}
+ .tile .s{font-size:.75rem;color:#9aa3b2}
+ .panel{border:1px solid #2a2f3a;border-radius:10px;background:#161a22;
+        display:flex;flex-direction:column;min-height:0}
+ .panel h2{margin:0;padding:.6rem .9rem;border-bottom:1px solid #232936;
+           font-size:.85rem;text-transform:uppercase;letter-spacing:.04em;
+           color:#9aa3b2}
+ .panel .body{padding:.4rem .9rem .7rem;overflow-y:auto}
+ #p-activity .body{max-height:320px}
+ #p-positions .body{max-height:160px}
+ .col-left{display:flex;flex-direction:column;gap:1rem;min-width:0}
+ #p-chat{position:sticky;top:1rem;height:calc(100vh - 2rem);max-height:640px}
+ #p-chat .body{flex:1;display:flex;flex-direction:column;gap:.5rem}
+ #chatlog{flex:1;height:auto}
+ .chatrow{display:flex;gap:.4rem}
+ .chatrow input{margin:0;flex:1}
+ .pill{display:inline-block;font-size:.72rem;padding:.05rem .5rem;
+       border-radius:99px;border:1px solid #2a2f3a;color:#9aa3b2}
+ .pill.live{border-color:#7f1d1d;color:#fca5a5}
+ .pill.dry{border-color:#1e3a8a;color:#93c5fd}
+ .pill.paused{border-color:#78350f;color:#fbbf24}
+</style></head><body>
+<header>
+ <h1>agentic-trader</h1>
+ <span class="pill" id="b-mode">…</span>
+ <span class="pill" id="b-market"></span>
+ <span class="pill paused" id="b-paused" style="display:none">⏸ PAUSED</span>
+ <span class="sp"></span>
+ <button class="qbtn" id="q-pause" onclick="quick(this.dataset.cmd)" data-cmd="pause">Pause</button>
+ <button class="qbtn" id="q-dry" onclick="quick(this.dataset.cmd)" data-cmd="dry on">Dry-run</button>
+</header>
+
+<div class="tiles">
+ <div class="tile"><div class="k">Entries today</div>
+  <div class="v" id="t-entries">–</div><div class="s" id="t-cap"></div></div>
+ <div class="tile"><div class="k">Open positions</div>
+  <div class="v" id="t-pos">–</div><div class="s">only ones this agent opened</div></div>
+ <div class="tile"><div class="k">Sizing</div>
+  <div class="v" id="t-sizing" style="font-size:1.05rem">–</div>
+  <div class="s">your decision — not advice</div></div>
+ <div class="tile"><div class="k">Policy brain</div>
+  <div class="v" id="t-policy" style="font-size:1.05rem">–</div>
+  <div class="s" id="t-source"></div></div>
+</div>
+
+<div class="grid">
+ <div class="col-left">
+  <div class="panel" id="p-positions"><h2>Open positions</h2>
+   <div class="body" id="positions"><span class="muted">none</span></div></div>
+  <div class="panel" id="p-activity"><h2>Activity</h2>
+   <div class="body" id="trades"><span class="muted">nothing yet</span></div></div>
+  <p class="muted" style="font-size:.78rem">Settings change in chat
+  (<code>set budget 500</code>, <code>set cap 3</code>, <code>dry off</code>,
+  <code>stop</code>). Code changes: run Claude Code in the repo folder on this
+  machine, then restart the agent.</p>
+ </div>
+ <div class="panel" id="p-chat"><h2>Talk to your agent</h2>
+  <div class="body">
+   <div id="chatlog"></div>
+   <div class="chatrow">
+    <input type="text" id="cmd" placeholder="pause · set budget 500 · or ask anything…"
+     onkeydown="if(event.key==='Enter')send()">
+    <button onclick="send()">Send</button>
+   </div>
+  </div>
+ </div>
+</div>
 <script>
 async function api(p, body){
   const r=await fetch(p, body?{method:'POST',headers:{'Content-Type':'application/json'},
@@ -348,20 +416,47 @@ function esc(s){const d=document.createElement('div');d.textContent=s;return d.i
 async function refresh(){
   try{
     const s=await api('/api/status');
-    document.getElementById('b-mode').textContent=s.mode;
-    document.getElementById('b-mode').className='badge '+(s.mode==='DRY-RUN'?'on':'');
-    document.getElementById('b-paused').textContent=s.paused?'PAUSED':'';
-    document.getElementById('status').innerHTML =
-      '<table>'+Object.entries(s.fields).map(([k,v])=>
-        '<tr><th>'+esc(k)+'</th><td>'+esc(String(v))+'</td></tr>').join('')+'</table>';
+    const live=s.mode==='LIVE';
+    const bm=document.getElementById('b-mode');
+    bm.textContent=live?'● LIVE — real orders':'◌ DRY-RUN — no orders';
+    bm.className='pill '+(live?'live':'dry');
+    document.getElementById('b-market').textContent=
+      (s.fields['market']||'').startsWith('open')?'market open':'market closed';
+    document.getElementById('b-paused').style.display=s.paused?'':'none';
+    const qp=document.getElementById('q-pause');
+    qp.textContent=s.paused?'Resume':'Pause';qp.dataset.cmd=s.paused?'resume':'pause';
+    const qd=document.getElementById('q-dry');
+    qd.textContent=live?'Switch to dry-run':'Go live';
+    qd.dataset.cmd=live?'dry on':'dry off';
+    const ent=(s.fields['entries today']||'').split('/');
+    document.getElementById('t-entries').textContent=(ent[0]||'–').trim();
+    document.getElementById('t-cap').textContent='of '+((ent[1]||'').replace('cap','').trim()||'?')+' daily cap';
+    const pos=(s.fields['open positions']||'none');
+    const list=pos==='none'?[]:pos.split(', ');
+    document.getElementById('t-pos').textContent=list.length;
+    document.getElementById('positions').innerHTML = list.length ?
+      '<table>'+list.map(p=>{const a=p.split('|');
+        return '<tr><td>'+esc(a[0]||p)+'</td><td>'+esc(a[1]||'')+'</td><td>$'+
+        esc(a[2]||'')+'</td><td>'+esc(a[3]==='C'?'CALL':a[3]==='P'?'PUT':'')+'</td></tr>';
+      }).join('')+'</table>' : '<span class="muted">none</span>';
+    document.getElementById('t-sizing').textContent=s.fields['sizing']||'–';
+    document.getElementById('t-policy').textContent=
+      (s.fields['policy brain']==='on')?'ON (your rules)':'off';
+    document.getElementById('t-source').textContent='source: '+(s.fields['source']||'–');
     const t=await api('/api/trades');
     document.getElementById('trades').innerHTML = t.trades.length ?
       '<table><tr><th>time (UTC)</th><th>action</th><th>contract</th><th>note</th></tr>'+
-      t.trades.map(x=>'<tr><td>'+esc((x.ts||'').replace('T',' ').slice(0,16))+
+      t.trades.map(x=>'<tr><td>'+esc((x.ts||'').replace('T',' ').slice(5,16))+
         '</td><td>'+esc(x.action||'')+'</td><td>'+esc(x.contract||'')+
-        '</td><td>'+esc(x.reason||'')+'</td></tr>').join('')+'</table>'
-      : '<p class="muted">nothing yet</p>';
-  }catch(e){document.getElementById('status').innerHTML='<span class="err">agent unreachable</span>';}
+        '</td><td>'+esc((x.reason||'').slice(0,80))+'</td></tr>').join('')+'</table>'
+      : '<span class="muted">nothing yet</span>';
+  }catch(e){document.getElementById('status')&&(document.getElementById('status').textContent='agent unreachable');}
+}
+async function quick(cmd){
+  const r=await api('/api/command',{text:cmd});
+  const log=document.getElementById('chatlog');
+  log.innerHTML+='<div class="me">you: '+esc(cmd)+'</div><div class="agent">'+esc(r.reply)+'</div>';
+  log.scrollTop=log.scrollHeight;refresh();
 }
 async function send(){
   const box=document.getElementById('cmd');const text=box.value.trim();if(!text)return;
