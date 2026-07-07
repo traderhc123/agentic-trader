@@ -51,6 +51,7 @@ Your human pointed you at this repository to set them up. Follow
 - **LLM policy brain (optional)**: write plain-English rules in `policy.md` — the agent checks every entry against *your* policy with *your* Anthropic API key (veto-only; fails safe to skip)
 - **Notifications**: Discord / ntfy / Telegram message on every action, veto, and error + a daily digest after the close
 - **Market-hours aware**: polls fast 9:25–16:15 ET, sleeps slow overnight/weekends
+- **Self-modifying (with your approval)**: `self-edit on`, then `code: add an RSS source` — the agent rewrites its own source, shows you the diff in the dashboard, and one click applies it with backup + compile-check + auto-rollback + self-restart. A **foundation layer** (consent gate, safety rails, terms, the self-edit governor itself) is immutable to the agent
 - **Web UI, self-served**: paste three terminal lines once, then it's browser-only — a **setup wizard** (`setup --web`) with one-click Robinhood OAuth, and a **dashboard** your own agent serves at `127.0.0.1:8722` with live status, trade log, and a chat box (`pause`, `set budget 500`, `dry off`, or ask it anything about its trades). Localhost-only; no central server ever sees your keys. (Zero-terminal option: have Claude run the three lines for you — see GETTING_STARTED.md)
 - **Always-on ready**: one-line installer, Dockerfile, hardened systemd unit
 

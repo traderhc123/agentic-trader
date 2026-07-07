@@ -447,6 +447,17 @@ _DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 
 <div class="grid">
  <div class="col-left">
+  <div class="panel" id="p-proposal" style="display:none;border-color:#78350f">
+   <h2>Proposed code change — review before it applies</h2>
+   <div class="body">
+    <p id="prop-expl"></p><p id="prop-warn" class="err"></p>
+    <pre id="prop-diff" style="max-height:260px;overflow-y:auto"></pre>
+    <div class="navrow">
+     <button onclick="propApply()">Apply & restart</button>
+     <button class="back" onclick="propReject()">Reject</button>
+     <span id="prop-msg"></span>
+    </div>
+   </div></div>
   <div class="panel" id="p-positions"><h2>Open positions</h2>
    <div class="body" id="positions"><span class="muted">none</span></div></div>
   <div class="panel" id="p-activity"><h2>Activity</h2>
@@ -509,6 +520,15 @@ async function refresh(){
     document.getElementById('t-policy').textContent=
       (s.fields['policy brain']==='on')?'ON (your rules)':'off';
     document.getElementById('t-source').textContent='source: '+(s.fields['source']||'–');
+    try{
+      const p=await api('/api/proposal');
+      const panel=document.getElementById('p-proposal');
+      if(p.pending){panel.style.display='';
+        document.getElementById('prop-expl').textContent=p.explanation;
+        document.getElementById('prop-warn').textContent=(p.warnings||[]).join('  ');
+        document.getElementById('prop-diff').textContent=p.diff;}
+      else panel.style.display='none';
+    }catch(e){}
     const t=await api('/api/trades');
     document.getElementById('trades').innerHTML = t.trades.length ?
       '<table><tr><th>time (UTC)</th><th>action</th><th>contract</th><th>note</th></tr>'+
@@ -517,6 +537,14 @@ async function refresh(){
         '</td><td>'+esc((x.reason||'').slice(0,80))+'</td></tr>').join('')+'</table>'
       : '<span class="muted">nothing yet</span>';
   }catch(e){document.getElementById('status')&&(document.getElementById('status').textContent='agent unreachable');}
+}
+async function propApply(){
+  document.getElementById('prop-msg').textContent='applying…';
+  const r=await api('/api/proposal/apply',{});
+  document.getElementById('prop-msg').textContent=r.reply;
+}
+async function propReject(){
+  await api('/api/proposal/reject',{});refresh();
 }
 async function quick(cmd){
   const r=await api('/api/command',{text:cmd});
@@ -733,6 +761,25 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         save()
         return {"ok": True, "note": msg}
 
+    def proposal_get(_h):
+        import self_edit
+        p = self_edit.current()
+        if not p:
+            return {"pending": False}
+        return {"pending": True, "explanation": p.get("explanation", ""),
+                "warnings": p.get("warnings", []),
+                "diff": "\n".join(c["diff"] for c in p.get("changes", []))[:200000]}
+
+    def proposal_apply(_h, _data):
+        import self_edit
+        ok, msg = self_edit.apply_and_restart(restart=get_status is not None)
+        return {"ok": ok, "reply": msg}
+
+    def proposal_reject(_h, _data):
+        import self_edit
+        self_edit.reject()
+        return {"ok": True, "reply": "proposal rejected"}
+
     def wallet_create(_h, _data):
         if not A.consent_ok():
             return {"ok": False, "error": "accept the agreement first"}
@@ -888,7 +935,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     W.routes_get = {"/api/state": state, "/api/rh/start": rh_start,
                     "/api/wallet/balance": wallet_balance,
                     "/api/deploy/status": deploy_status,
-                    "/api/status": d_status, "/api/trades": d_trades}
+                    "/api/status": d_status, "/api/trades": d_trades,
+                    "/api/proposal": proposal_get}
     def ask(_h, data):
         q = str(data.get("question", "")).strip()
         wiz_state = {k: v for k, v in state(None).items() if k != "disclaimer"}
@@ -909,6 +957,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/wallet/fund": wallet_fund,
                      "/api/llm": llm, "/api/deploy": deploy,
                      "/api/alpaca": alpaca_connect,
+                     "/api/proposal/apply": proposal_apply,
+                     "/api/proposal/reject": proposal_reject,
                      "/api/command": d_command}
 
     class _Redirect(Exception):
