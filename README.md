@@ -42,6 +42,15 @@ Your human pointed you at this repository to set them up. Follow
 
 ## 🧑 Quickstart
 
+One-liner (clones to `~/agentic-trader`, installs into a venv — it never
+runs the agent or accepts anything for you):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | bash
+```
+
+Or manually:
+
 ```bash
 git clone https://github.com/traderhc123/agentic-trader
 cd agentic-trader
@@ -101,6 +110,7 @@ spend in this wallet. The Admin key is stored locally with `0600` perms.
 | `sources/` | Signal source adapters (`manual`, `url`, `agenthc`) — PRs welcome |
 | `brokers/` | Broker adapters (Robinhood agentic MCP) — PRs welcome |
 | `lightning_wallet.py` | Built-in Lightning wallet (LNbits) for sats-priced sources |
+| `install.sh` | One-line installer (clone + venv + deps; never auto-consents) |
 | `BOOT.md` | Boot instructions written for LLM assistants |
 | `DISCLAIMER.md` | The agreement the consent gate enforces — versioned |
 | `SKILL.md` | OpenClaw/ClawHub skill definition |

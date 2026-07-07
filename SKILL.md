@@ -33,10 +33,10 @@ on a heartbeat.
 ## Setup
 
 ```bash
-git clone https://github.com/traderhc123/agentic-trader
-cd agentic-trader && pip install -r requirements.txt
-python agent.py setup    # follow BOOT.md — written for you
-python agent.py run
+curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | bash
+cd ~/agentic-trader
+./.venv/bin/python agent.py setup    # follow BOOT.md — written for you
+./.venv/bin/python agent.py run
 ```
 
 Signal sources: `manual` (human's own commands), `url` (any JSON feed), or
