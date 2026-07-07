@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+config.json
+acceptance.json
+state.json
+robinhood_oauth.json
+.agentic-day-trade-agent/
