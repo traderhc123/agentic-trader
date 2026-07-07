@@ -387,8 +387,10 @@ def cmd_setup():
 def cmd_run():
     require_consent_or_exit()
     cfg = _load(CONFIG_PATH)
-    if not cfg or not cfg.get("source") or not cfg.get("robinhood_account"):
-        print("Not configured — run: python agent.py setup")
+    broker_ready = bool(cfg and (cfg.get("robinhood_account")
+                                 or cfg.get("alpaca_key_id")))
+    if not cfg or not cfg.get("source") or not broker_ready:
+        print("Not configured — run: python agent.py setup   (or setup --web)")
         sys.exit(1)
     source = SOURCES.get(cfg["source"])
     broker = BROKERS.get(cfg.get("broker", "robinhood"))

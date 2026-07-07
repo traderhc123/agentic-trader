@@ -39,11 +39,15 @@ FOUNDATION = frozenset({
     "agent.py",          # consent gate, event safety pipeline, caps
     "self_edit.py",      # this governor (or it could ungate itself)
     "llm_policy.py",     # the veto-only policy brain
+    "lightning_wallet.py",  # the spend path (a rewrite could drain the wallet)
     "DISCLAIMER.md",     # the legal terms the human accepted
     "SECURITY.md",       # the promises this table makes
     "install.sh",        # what new users pipe into bash
     "LICENSE",
 })
+# NOTE: brokers/ and sources/ are deliberately NOT locked — extending them is
+# a supported use of self-edit. Order-placement code changes are still gated
+# by human diff-review; the wallet spend path is not, hence its lock above.
 _GUARDED_MARKERS = ("consent_ok", "require_consent_or_exit", "TERMS_VERSION")
 
 
