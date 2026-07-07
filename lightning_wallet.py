@@ -44,6 +44,12 @@ def wallet_setup(cfg):
     print("\nGive this agent a Lightning wallet it can pay from (see README")
     print("'Give your agent sats' — an LNbits wallet takes ~2 minutes to make).")
     url = input("LNbits instance URL (e.g. https://demo.lnbits.com): ").strip()
+    if url and not (url.startswith("https://")
+                    or url.startswith("http://127.0.0.1")
+                    or url.startswith("http://localhost")):
+        print("Refusing non-HTTPS wallet URL — the admin key would travel in "
+              "cleartext. Use https:// or a localhost URL.")
+        return cfg
     key = input("Wallet ADMIN key (Wallet -> API info -> Admin key): ").strip()
     if not url or not key:
         print("Skipped — configure a wallet later by re-running setup.")

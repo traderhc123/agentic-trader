@@ -21,12 +21,19 @@ is a registered investment adviser). See Section 3 of DISCLAIMER.md.
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
+MARKET_TZ = ZoneInfo("America/New_York")
+
+import llm_policy
 from brokers import BROKERS
 from lightning_wallet import WalletError, print_funding_invoice, wallet_from_cfg
+from notifications import notify
+from notifications import setup as notifications_setup
 from sources import SOURCES
 
 TERMS_VERSION = "agent-terms-2026.07.1"
@@ -35,6 +42,10 @@ HOME = os.path.expanduser(os.getenv("AGENT_HOME", "~/.agentic-trader"))
 ACCEPTANCE_PATH = os.path.join(HOME, "acceptance.json")
 CONFIG_PATH = os.path.join(HOME, "config.json")
 STATE_PATH = os.path.join(HOME, "state.json")
+TRADES_PATH = os.path.join(HOME, "trades.jsonl")
+
+_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
+_EXPIRY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 SIZING_NOTICE = (
     "Nobody involved in this software — not AgentHC, not any signal source,\n"
@@ -56,12 +67,109 @@ def _load(path, default=None):
 
 def _save(path, payload, private=False):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        os.chmod(os.path.dirname(path), 0o700)  # keys/tokens live here
+    except OSError:
+        pass
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=2)
     if private:
         os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+
+
+# ── event safety rails (see SECURITY.md) ─────────────────────────────────────
+
+def _valid_event(ev):
+    """Sanity-check a normalized event before it can trigger any order."""
+    try:
+        return bool(
+            ev.get("event") in ("ENTERED", "EXITED")
+            and _TICKER_RE.match(str(ev.get("ticker", "")))
+            and _EXPIRY_RE.match(str(ev.get("expiry", "")))
+            and 0 < float(ev.get("strike", 0)) < 100_000
+            and ev.get("type") in ("C", "P")
+            and ev.get("event_id")
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _stale(ev, cfg):
+    """True for ENTERED events older than max_event_age_s (default 300s).
+
+    A laptop waking from sleep must not buy into an hours-old entry. Events
+    without a timestamp (manual/url sources) are treated as fresh; EXITED
+    events are never stale-blocked (closing an open position is always right).
+    """
+    if ev.get("event") != "ENTERED":
+        return False
+    ts = ev.get("occurred_at")
+    if not ts:
+        return False
+    try:
+        occurred = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - occurred).total_seconds()
+    except ValueError:
+        return False
+    return age > float(cfg.get("max_event_age_s", 300))
+
+
+def _log_trade(record):
+    record["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        os.makedirs(HOME, exist_ok=True)
+        with open(TRADES_PATH, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
+def _recent_trades(limit=50):
+    try:
+        with open(TRADES_PATH) as f:
+            lines = f.readlines()[-limit:]
+        return [json.loads(x) for x in lines if x.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def _entries_today():
+    today = datetime.now(timezone.utc).date().isoformat()
+    return sum(1 for t in _recent_trades(200)
+               if t.get("action") == "entry" and str(t.get("ts", "")).startswith(today))
+
+
+def _market_open_now():
+    """US equity market hours-ish (9:25–16:15 ET, Mon–Fri). Poll slow outside."""
+    now = datetime.now(MARKET_TZ)
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return (9 * 60 + 25) <= minutes <= (16 * 60 + 15)
+
+
+def _maybe_daily_digest(cfg, state, save_state):
+    """After the close, send a one-message summary of today's activity."""
+    now = datetime.now(MARKET_TZ)
+    day = now.date().isoformat()
+    if now.weekday() >= 5 or (now.hour, now.minute) < (16, 20):
+        return
+    if state.get("last_digest_day") == day:
+        return
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    todays = [t for t in _recent_trades(300) if str(t.get("ts", "")).startswith(today_utc)]
+    entries = sum(1 for t in todays if t.get("action") == "entry")
+    exits = sum(1 for t in todays if t.get("action") == "exit")
+    vetoes = sum(1 for t in todays if t.get("action") == "policy_veto")
+    skipped = sum(1 for t in todays if str(t.get("action", "")).startswith("skip"))
+    open_pos = list(state.get("positions", {})) or ["none"]
+    notify(cfg, (f"agentic-trader daily digest {day}: {entries} entries, "
+                 f"{exits} exits, {vetoes} policy vetoes, {skipped} skipped. "
+                 f"Open positions: {', '.join(open_pos)}"))
+    state["last_digest_day"] = day
+    save_state(state)
 
 
 def _disclaimer_text():
@@ -114,6 +222,82 @@ def require_consent_or_exit():
     print("\nAcceptance recorded at", ACCEPTANCE_PATH)
 
 
+# ── event pipeline: validate -> staleness -> caps -> policy -> execute ───────
+
+def _execute_dry(cfg, event, state):
+    """Dry-run bookkeeping: identical position tracking, zero orders."""
+    contract = f"{event['ticker']} {event['expiry']} ${event['strike']:g} " \
+               f"{'CALL' if event['type'] == 'C' else 'PUT'}"
+    pos_key = f"{event['ticker']}|{event['expiry']}|{event['strike']}|{event['type']}"
+    if event["event"] == "ENTERED" and pos_key not in state["positions"]:
+        qty = int(cfg.get("contracts_per_trade", 1))
+        state["positions"][pos_key] = {"option_id": "dry", "qty": qty, "dry": True}
+        print(f"[DRY-RUN] would buy {qty}x {contract}")
+        return "entry"
+    if event["event"] == "EXITED" and pos_key in state["positions"]:
+        pos = state["positions"].pop(pos_key)
+        print(f"[DRY-RUN] would sell {pos['qty']}x {contract}")
+        return "exit"
+    return None
+
+
+def handle_event(ev, cfg, state, broker, client, save_state):
+    """Run one new event through the safety pipeline. Returns a log line or None."""
+    contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
+
+    if not _valid_event(ev):
+        print(f"skipped invalid event from source: {str(ev)[:120]}")
+        return None
+    if _stale(ev, cfg):
+        msg = f"SKIPPED stale ENTERED ({contract}) — older than " \
+              f"{int(cfg.get('max_event_age_s', 300))}s"
+        print(msg)
+        _log_trade({"action": "skip_stale", "event_id": ev["event_id"],
+                    "contract": contract})
+        return msg
+
+    if ev["event"] == "ENTERED":
+        # Hard mechanical cap — independent of (and checked before) the LLM.
+        cap = int(cfg.get("max_entries_per_day", 5))
+        if _entries_today() >= cap:
+            msg = f"SKIPPED {contract}: daily entry cap reached ({cap})"
+            print(msg)
+            _log_trade({"action": "skip_daily_cap", "event_id": ev["event_id"],
+                        "contract": contract})
+            return msg
+        # The user's own policy, applied by the LLM policy brain (veto-only).
+        verdict = llm_policy.evaluate(cfg, ev, _recent_trades(20))
+        if not verdict["act"]:
+            msg = f"POLICY VETO {contract}: {verdict['reason']}"
+            print(msg)
+            _log_trade({"action": "policy_veto", "event_id": ev["event_id"],
+                        "contract": contract, "reason": verdict["reason"]})
+            return msg
+        policy_reason = verdict["reason"]
+    else:
+        policy_reason = "exits always close what was opened"
+
+    # Never place a real order against a dry-run position.
+    pos_key = f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
+    existing = state["positions"].get(pos_key)
+    dry = bool(cfg.get("dry_run")) or bool(existing and existing.get("dry"))
+
+    if dry:
+        action = _execute_dry(cfg, ev, state)
+        prefix = "[DRY-RUN] "
+    else:
+        changed = broker.execute(client, cfg, ev, state)
+        action = ("entry" if ev["event"] == "ENTERED" else "exit") if changed else None
+        prefix = ""
+
+    if action:
+        _log_trade({"action": action, "event_id": ev["event_id"],
+                    "contract": contract, "dry": dry, "reason": policy_reason})
+        save_state(state)
+        return f"{prefix}{action.upper()}: {contract}"
+    return None
+
+
 # ── commands ─────────────────────────────────────────────────────────────────
 
 def cmd_setup():
@@ -148,9 +332,22 @@ def cmd_setup():
             pass
         print("Enter a positive integer.")
     cfg["contracts_per_trade"] = n
+
+    print("\n== Step 4/4: Safety rails & extras ==")
+    dry = input("Start in DRY-RUN mode (log actions, place NO orders — "
+                "recommended for the first days)? [Y/n]: ").strip().lower()
+    cfg["dry_run"] = dry != "n"
+    raw = input("Max new entries per day (hard cap) [5]: ").strip()
+    cfg["max_entries_per_day"] = int(raw) if raw.isdigit() else 5
+    cfg.setdefault("max_event_age_s", 300)
+    cfg = notifications_setup(cfg)
+    cfg = llm_policy.setup(cfg)
+
     cfg["poll_seconds"] = int(cfg.get("poll_seconds", 30))
     _save(CONFIG_PATH, cfg, private=True)
     print(f"\nSetup complete. Config at {CONFIG_PATH}.")
+    if cfg["dry_run"]:
+        print("DRY-RUN is ON — set \"dry_run\": false in config.json to go live.")
     print("Start the heartbeat with: python agent.py run")
 
 
@@ -176,16 +373,21 @@ def cmd_run():
     def save_state(st):
         _save(STATE_PATH, st)
 
-    print(f"Heartbeat started: source={cfg['source']}, polling every {poll}s, "
-          f"{cfg['contracts_per_trade']} contract(s) per trade. Ctrl-C to stop.")
+    mode = "DRY-RUN (no orders)" if cfg.get("dry_run") else "LIVE"
+    print(f"Heartbeat started [{mode}]: source={cfg['source']}, polling every "
+          f"{poll}s, {cfg['contracts_per_trade']} contract(s) per trade, "
+          f"policy brain {'ON' if llm_policy.enabled(cfg) else 'off'}. Ctrl-C to stop.")
     print("Reminder: you are responsible for every order this agent places.")
+    notify(cfg, f"agentic-trader heartbeat started [{mode}], source={cfg['source']}")
     while True:
         try:
             events = source.poll(cfg, state, save_state)
             for ev in events:
-                if ev["event_id"] in seen:
+                if ev.get("event_id") in seen:
                     continue
-                broker.execute(client, cfg, ev, state)
+                outcome = handle_event(ev, cfg, state, broker, client, save_state)
+                if outcome:
+                    notify(cfg, f"agentic-trader: {outcome}")
                 seen.add(ev["event_id"])
                 state["seen"] = sorted(seen)[-500:]
                 seen = set(state["seen"])
@@ -196,7 +398,14 @@ def cmd_run():
             return
         except Exception as exc:
             print(f"heartbeat error (will retry): {str(exc)[:200]}")
-        time.sleep(poll)
+        try:
+            _maybe_daily_digest(cfg, state, save_state)
+        except Exception:
+            pass
+        # Market-hours-aware cadence: fast while the market can move, slow
+        # overnight/weekends (saves feed polling and battery; exits for open
+        # positions still get picked up on the slow cadence).
+        time.sleep(poll if _market_open_now() else max(poll, 300))
 
 
 def cmd_status():
@@ -222,6 +431,10 @@ def cmd_status():
     acct = cfg.get("robinhood_account", "")
     print(f"robinhood account: {'••••' + acct[-4:] if acct else 'MISSING'}")
     print(f"contracts/trade  : {cfg.get('contracts_per_trade', 'unset')}")
+    print(f"mode             : {'DRY-RUN' if cfg.get('dry_run') else 'LIVE'}")
+    print(f"policy brain     : {'ON (' + llm_policy.policy_path() + ')' if llm_policy.enabled(cfg) else 'off'}")
+    print(f"daily entry cap  : {cfg.get('max_entries_per_day', 5)}")
+    print(f"entries today    : {_entries_today()}")
     print(f"open positions   : {list(state.get('positions', {})) or 'none'}")
 
 

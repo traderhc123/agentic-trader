@@ -40,6 +40,18 @@ Your human pointed you at this repository to set them up. Follow
 3. Start the heartbeat with `python agent.py run` and explain how to stop it
    (Ctrl-C) and that open positions remain in their account afterwards.
 
+**New to this / not technical? Start with [GETTING_STARTED.md](GETTING_STARTED.md)** — plain-English instructions for running it on your computer, a home machine, or a $5 cloud server, including how to have Claude set it all up for you.
+
+## What you get
+
+- **Consent-gated**: refuses to run until you accept the agreement yourself
+- **Dry-run by default**: watch what it *would* do for days before real orders
+- **Safety rails**: daily entry cap, event validation, staleness guard, wallet auto-pay cap ([SECURITY.md](SECURITY.md))
+- **LLM policy brain (optional)**: write plain-English rules in `policy.md` — the agent checks every entry against *your* policy with *your* Anthropic API key (veto-only; fails safe to skip)
+- **Notifications**: Discord / ntfy / Telegram message on every action, veto, and error + a daily digest after the close
+- **Market-hours aware**: polls fast 9:25–16:15 ET, sleeps slow overnight/weekends
+- **Always-on ready**: one-line installer, Dockerfile, hardened systemd unit
+
 ## 🧑 Quickstart
 
 One-liner (clones to `~/agentic-trader`, installs into a venv — it never
@@ -111,6 +123,11 @@ spend in this wallet. The Admin key is stored locally with `0600` perms.
 | `brokers/` | Broker adapters (Robinhood agentic MCP) — PRs welcome |
 | `lightning_wallet.py` | Built-in Lightning wallet (LNbits) for sats-priced sources |
 | `install.sh` | One-line installer (clone + venv + deps; never auto-consents) |
+| `GETTING_STARTED.md` | Plain-English setup guide (local / home server / VPS / Docker) |
+| `SECURITY.md` | Security model: built-in rails, blast radii, threat notes |
+| `llm_policy.py` | Optional LLM policy brain (your rules, your API key, veto-only) |
+| `notifications.py` | Discord / ntfy / Telegram notifications |
+| `Dockerfile` + `deploy/` | Container + systemd unit for always-on operation |
 | `BOOT.md` | Boot instructions written for LLM assistants |
 | `DISCLAIMER.md` | The agreement the consent gate enforces — versioned |
 | `SKILL.md` | OpenClaw/ClawHub skill definition |

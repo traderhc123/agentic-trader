@@ -47,5 +47,12 @@ def poll(cfg, state, save_state=lambda s: None):
 
 def setup(cfg):
     print("\n-- Generic JSON feed --")
-    cfg["source_url"] = input("Feed URL (returns {\"events\": [...]}): ").strip()
+    url = input("Feed URL (returns {\"events\": [...]}): ").strip()
+    if url and not (url.startswith("https://")
+                    or url.startswith("http://127.0.0.1")
+                    or url.startswith("http://localhost")):
+        print("Refusing non-HTTPS feed URL (trade signals over plain HTTP can be "
+              "tampered with in transit). Use https:// or a localhost URL.")
+        url = ""
+    cfg["source_url"] = url
     return cfg

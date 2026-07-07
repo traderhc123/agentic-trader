@@ -84,6 +84,16 @@ Confirm: consent accepted, AgentHC key set, Robinhood account selected,
 contracts/trade as the human intended. Also confirm with the human that their
 Agentic account has options approval and cash in it.
 
+### Step 2.5 — safety rails (setup step 4)
+
+The wizard asks about dry-run (default ON — keep it on for new users and say
+why), a daily entry cap, notifications (strongly encourage configuring at
+least one channel), and the optional LLM policy brain (plain-English rules in
+`~/.agentic-trader/policy.md`, checked with the human's own Anthropic API
+key; veto-only). Help the human write their policy rules if they enable it —
+the rules are theirs; you may translate their intent into clear bullet
+points but never invent rules they didn't express.
+
 ### Step 3 — heartbeat
 
 ```bash
@@ -94,9 +104,11 @@ Polls the feed every 30s. On new `ENTERED` events it buys the configured
 contracts to open; on matching `EXITED` events it sells to close positions it
 opened. Logs every action. Runs until Ctrl-C.
 
-For long-running operation suggest the human use `tmux`/`screen` or a systemd
-user service — and remind them autonomous trading software requires human
-oversight; it should not run unwatched for long periods.
+For long-running operation, walk the human through GETTING_STARTED.md's
+options (tmux, the `deploy/agentic-trader.service` systemd unit, or Docker) —
+and remind them autonomous trading software requires human oversight; it
+should not run unwatched for long periods. Keep dry-run ON until they have
+watched several days of activity and explicitly ask to go live.
 
 ## Troubleshooting map
 

@@ -1,0 +1,32 @@
+# systemd unit for always-on operation (Linux VPS / home server).
+#
+#   sudo cp deploy/agentic-trader.service /etc/systemd/system/
+#   # edit User= and the path below to match your install
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now agentic-trader
+#   journalctl -u agentic-trader -f
+#
+# Run `python agent.py setup` interactively as the same user FIRST — the
+# consent gate and OAuth steps are interactive and the service will exit
+# until they're completed.
+
+[Unit]
+Description=agentic-trader heartbeat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/home/trader/agentic-trader
+ExecStart=/home/trader/agentic-trader/.venv/bin/python agent.py run
+Restart=on-failure
+RestartSec=30
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/trader/.agentic-trader
+
+[Install]
+WantedBy=multi-user.target
