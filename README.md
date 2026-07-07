@@ -51,6 +51,7 @@ Your human pointed you at this repository to set them up. Follow
 - **LLM policy brain (optional)**: write plain-English rules in `policy.md` — the agent checks every entry against *your* policy with *your* Anthropic API key (veto-only; fails safe to skip)
 - **Notifications**: Discord / ntfy / Telegram message on every action, veto, and error + a daily digest after the close
 - **Market-hours aware**: polls fast 9:25–16:15 ET, sleeps slow overnight/weekends
+- **Web UI, self-served**: a browser **setup wizard** (`setup --web`) with one-click Robinhood OAuth, and a **dashboard** your own agent serves at `127.0.0.1:8722` — live status, trade log, and a chat box (`pause`, `set budget 500`, `dry off`, or ask it anything about its trades). Localhost-only; no central server ever sees your keys
 - **Always-on ready**: one-line installer, Dockerfile, hardened systemd unit
 
 ## 🧑 Quickstart
@@ -69,10 +70,12 @@ git clone https://github.com/traderhc123/agentic-trader
 cd agentic-trader
 pip install -r requirements.txt
 
-python agent.py setup   # consent gate -> signal source -> Robinhood OAuth -> sizing
-python agent.py run     # heartbeat: watch the source, act on new events
-python agent.py status  # config, wallet balance, day-pass, open positions
+python agent.py setup --web  # browser wizard: consent, source, one-click Robinhood OAuth, sizing
+python agent.py run          # heartbeat + dashboard at http://127.0.0.1:8722
+python agent.py status       # or use the dashboard
 ```
+
+Prefer the terminal? `python agent.py setup` runs the same steps as prompts.
 
 **Prerequisites:** Python 3.10+; a Robinhood account with an **Agentic
 account** (created during setup), **options approval on the Agentic

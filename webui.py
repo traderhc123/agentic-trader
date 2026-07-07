@@ -1,0 +1,644 @@
+"""Local web UI — a setup wizard and a live dashboard, no terminal needed.
+
+Both servers bind 127.0.0.1 ONLY (never exposed to the network). On a remote
+VPS, reach them through an SSH tunnel:  ssh -L 8722:127.0.0.1:8722 user@host
+
+Wizard (``python agent.py setup --web``, port 8721):
+    Full setup in the browser — the consent gate (checkbox + typed phrase,
+    still the human's own affirmative act), signal source + Lightning wallet,
+    Robinhood OAuth (seamless: the wizard listens on the same 127.0.0.1:8721
+    the OAuth redirect targets, so approval lands back here automatically),
+    dollar-budget or contract sizing, and the safety rails.
+
+Dashboard (started automatically by ``python agent.py run``, port 8722):
+    The user's OWN agent serves its own UI: live status, trade log, and a
+    command box — pause / resume / dry on|off / set budget N / set cap N /
+    stop, plus free-text questions answered by the LLM (user's API key)
+    against the live status and trade log. Command handling is deliberately
+    a fixed allowlist; the LLM can only ANSWER, never trade.
+
+Stdlib only (http.server + threading) — no new dependencies.
+"""
+
+import json
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+WIZARD_PORT = 8721   # == the Robinhood OAuth redirect port (deliberate)
+DASH_PORT = 8722
+
+# Run-loop controls the dashboard can flip; agent.py polls these.
+CONTROLS = {"paused": False, "stop": False}
+
+_STYLE = """
+<style>
+ body{font-family:system-ui,sans-serif;max-width:760px;margin:2rem auto;
+      padding:0 1rem;background:#0f1115;color:#e6e6e6;line-height:1.5}
+ h1{font-size:1.4rem} h2{font-size:1.05rem;margin:1.6rem 0 .4rem}
+ section{border:1px solid #2a2f3a;border-radius:10px;padding:1rem;margin:1rem 0;
+         background:#161a22}
+ section.done{border-color:#2e7d32} section.locked{opacity:.45;pointer-events:none}
+ input[type=text],input[type=password],input[type=number],textarea,select{
+   width:100%;box-sizing:border-box;padding:.5rem;margin:.25rem 0 .6rem;
+   background:#0f1115;color:#e6e6e6;border:1px solid #2a2f3a;border-radius:6px}
+ button{padding:.5rem 1rem;border:0;border-radius:6px;background:#3b82f6;
+        color:#fff;cursor:pointer;font-size:.95rem} button:disabled{background:#333}
+ .muted{color:#9aa3b2;font-size:.85rem} .ok{color:#4ade80} .err{color:#f87171}
+ pre{background:#0b0d11;padding:.7rem;border-radius:6px;overflow-x:auto;
+     white-space:pre-wrap;word-break:break-word;font-size:.8rem}
+ .disc{max-height:280px;overflow-y:auto;border:1px solid #2a2f3a;padding:.8rem;
+       border-radius:6px;font-size:.82rem;background:#0b0d11}
+ .badge{font-size:.75rem;padding:.1rem .5rem;border-radius:99px;
+        background:#2a2f3a;margin-left:.5rem}
+ .badge.on{background:#14532d;color:#4ade80}
+ #chatlog{height:300px;overflow-y:auto;background:#0b0d11;border-radius:6px;
+          padding:.7rem;font-size:.85rem}
+ .me{color:#93c5fd} .agent{color:#e6e6e6;margin-bottom:.6rem;white-space:pre-wrap}
+ table{width:100%;border-collapse:collapse;font-size:.82rem}
+ td,th{padding:.3rem .5rem;border-bottom:1px solid #232936;text-align:left}
+</style>"""
+
+_WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<title>agentic-trader setup</title>""" + _STYLE + """</head><body>
+<h1>agentic-trader — setup</h1>
+<p class="muted">Everything happens on YOUR machine (this page is served from
+127.0.0.1 by the agent's own setup wizard). Real money; read carefully.</p>
+
+<section id="s-consent"><h2>1 · Agreement</h2>
+ <div class="disc" id="disclaimer">loading…</div>
+ <p><label><input type="checkbox" id="c-read"> I have read the entire agreement
+ above and I accept all of its terms, including that <b>all liability is mine</b>
+ and that no party here is a registered investment adviser.</label></p>
+ <p>Type exactly <b>I AGREE AND ACCEPT ALL LIABILITY</b> to accept:</p>
+ <input type="text" id="c-phrase" autocomplete="off">
+ <button onclick="doConsent()">Accept</button> <span id="c-msg"></span>
+</section>
+
+<section id="s-source" class="locked"><h2>2 · Signal source</h2>
+ <select id="src" onchange="srcChanged()">
+  <option value="agenthc">AgentHC Agentic Day Trade Ideas (journal feed, sats-priced)</option>
+  <option value="manual">My own commands (commands.jsonl)</option>
+  <option value="url">A JSON feed URL I provide</option>
+ </select>
+ <div id="src-agenthc">
+  <p class="muted">Pay-as-you-go (~$10/day in sats via the agent's Lightning
+  wallet, recommended) — or paste a Premium AgentHC API key.</p>
+  <input type="text" id="ln-url" placeholder="LNbits instance URL (https://…)">
+  <input type="password" id="ln-key" placeholder="LNbits wallet ADMIN key">
+  <p class="muted">— or —</p>
+  <input type="password" id="hc-key" placeholder="AgentHC Premium API key (optional)">
+ </div>
+ <div id="src-url" style="display:none">
+  <input type="text" id="src-url-input" placeholder="https://my-feed.example.com/events">
+ </div>
+ <div id="src-manual" style="display:none"><p class="muted">You'll append JSON
+  lines to <code>~/.agentic-trader/commands.jsonl</code> — see the README.</p></div>
+ <button onclick="doSource()">Save source</button> <span id="src-msg"></span>
+</section>
+
+<section id="s-broker" class="locked"><h2>3 · Robinhood (Agentic account)</h2>
+ <p class="muted">Click the button, approve in the Robinhood tab that opens
+ (log in if needed) — you'll be sent straight back here.</p>
+ <button onclick="rhStart()">Connect Robinhood</button> <span id="rh-msg"></span>
+ <div id="rh-accounts"></div>
+</section>
+
+<section id="s-sizing" class="locked"><h2>4 · Position sizing</h2>
+ <p class="muted">Nobody here is an investment advisor and none of this
+ software can advise position sizing — this number is YOUR decision, made
+ with money you can afford to lose entirely.</p>
+ <label><input type="radio" name="szmode" value="budget" checked> Dollar budget
+ per trade (buys what fits; skips trades that exceed it)</label><br>
+ <label><input type="radio" name="szmode" value="contracts"> Fixed contracts
+ per trade</label>
+ <input type="number" id="sz-val" placeholder="e.g. 500" min="1" step="any">
+ <button onclick="doSizing()">Save sizing</button> <span id="sz-msg"></span>
+</section>
+
+<section id="s-safety" class="locked"><h2>5 · Safety rails & extras</h2>
+ <p><label><input type="checkbox" id="sf-dry" checked> Start in
+ <b>dry-run</b> mode (log actions, place no orders — recommended)</label></p>
+ <label>Max new entries per day</label>
+ <input type="number" id="sf-cap" value="5" min="1">
+ <label>Notifications (any/all, optional)</label>
+ <input type="text" id="nt-discord" placeholder="Discord webhook URL">
+ <input type="text" id="nt-ntfy" placeholder="ntfy.sh topic">
+ <input type="text" id="nt-tg-token" placeholder="Telegram bot token">
+ <input type="text" id="nt-tg-chat" placeholder="Telegram chat id">
+ <label>My trading policy (optional — plain-English rules the agent's LLM
+ checks before every entry; veto-only; uses YOUR Anthropic API key)</label>
+ <textarea id="pol-text" rows="5"
+  placeholder="- Never trade more than 2 new entries per day.&#10;- Skip puts.&#10;- Only tickers: SPY, QQQ, NVDA."></textarea>
+ <input type="password" id="pol-key" placeholder="Anthropic API key (only if policy set)">
+ <button onclick="doSafety()">Finish setup</button> <span id="sf-msg"></span>
+</section>
+
+<section id="s-done" class="locked"><h2>6 · Done</h2>
+ <div id="done-body"></div>
+</section>
+
+<section><h2>Need help? Ask your agent</h2>
+ <p class="muted">Questions about any step (uses your Anthropic API key if
+ you've entered one; otherwise points you at the docs).</p>
+ <div id="chatlog"></div>
+ <input type="text" id="cmd" placeholder="e.g. what is an LNbits admin key? · is dry-run really safe?"
+  onkeydown="if(event.key==='Enter')ask()">
+ <button onclick="ask()">Ask</button>
+</section>
+
+<script>
+async function api(p, body){
+  const r = await fetch(p, body?{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body)}:{});
+  return await r.json();
+}
+function unlock(id){const el=document.getElementById(id);el.classList.remove('locked');}
+function done(id){document.getElementById(id).classList.add('done');}
+function srcChanged(){
+  const v=document.getElementById('src').value;
+  for(const k of ['agenthc','url','manual'])
+    document.getElementById('src-'+k).style.display = (k===v)?'':'none';
+}
+async function boot(){
+  const st=await api('/api/state');
+  document.getElementById('disclaimer').textContent=st.disclaimer;
+  if(st.consent){done('s-consent');unlock('s-source');}
+  if(st.source){done('s-source');unlock('s-broker');}
+  if(st.broker){done('s-broker');unlock('s-sizing');
+    document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ account ····'+st.broker+'</span>';}
+}
+async function doConsent(){
+  if(!document.getElementById('c-read').checked){
+    document.getElementById('c-msg').innerHTML='<span class="err">check the box after reading</span>';return;}
+  const r=await api('/api/consent',{phrase:document.getElementById('c-phrase').value});
+  document.getElementById('c-msg').innerHTML=r.ok?'<span class="ok">accepted ✓</span>'
+    :'<span class="err">'+r.error+'</span>';
+  if(r.ok){done('s-consent');unlock('s-source');}
+}
+async function doSource(){
+  const v=document.getElementById('src').value;
+  const r=await api('/api/source',{source:v,
+    lnbits_url:document.getElementById('ln-url').value,
+    lnbits_key:document.getElementById('ln-key').value,
+    agenthc_key:document.getElementById('hc-key').value,
+    source_url:document.getElementById('src-url-input').value});
+  document.getElementById('src-msg').innerHTML=r.ok?'<span class="ok">'+r.note+'</span>'
+    :'<span class="err">'+r.error+'</span>';
+  if(r.ok){done('s-source');unlock('s-broker');}
+}
+async function rhStart(){
+  const r=await api('/api/rh/start');
+  if(r.url){document.getElementById('rh-msg').textContent='waiting for approval…';
+    window.open(r.url,'_blank');poll();}
+  else document.getElementById('rh-msg').innerHTML='<span class="err">'+r.error+'</span>';
+}
+async function poll(){
+  const st=await api('/api/state');
+  if(st.broker){done('s-broker');unlock('s-sizing');
+    document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ account ····'+st.broker+'</span>';
+    if(st.rh_warning)document.getElementById('rh-accounts').innerHTML=
+      '<p class="err">'+st.rh_warning+'</p>';}
+  else setTimeout(poll,1500);
+}
+async function doSizing(){
+  const mode=document.querySelector('input[name=szmode]:checked').value;
+  const r=await api('/api/sizing',{mode:mode,value:document.getElementById('sz-val').value});
+  document.getElementById('sz-msg').innerHTML=r.ok?'<span class="ok">saved ✓</span>'
+    :'<span class="err">'+r.error+'</span>';
+  if(r.ok){done('s-sizing');unlock('s-safety');}
+}
+async function doSafety(){
+  const r=await api('/api/safety',{dry:document.getElementById('sf-dry').checked,
+    cap:document.getElementById('sf-cap').value,
+    discord:document.getElementById('nt-discord').value,
+    ntfy:document.getElementById('nt-ntfy').value,
+    tg_token:document.getElementById('nt-tg-token').value,
+    tg_chat:document.getElementById('nt-tg-chat').value,
+    policy:document.getElementById('pol-text').value,
+    anthropic_key:document.getElementById('pol-key').value});
+  if(r.ok){done('s-safety');unlock('s-done');
+    document.getElementById('done-body').innerHTML=
+     '<p class="ok">Setup complete.</p><pre>'+r.next+'</pre>'+
+     '<p class="muted">This wizard will shut down now; the dashboard lives at '+
+     'http://127.0.0.1:8722 once the agent is running.</p>';
+    api('/api/finish',{});}
+  else document.getElementById('sf-msg').innerHTML='<span class="err">'+r.error+'</span>';
+}
+async function ask(){
+  const box=document.getElementById('cmd');const q=box.value.trim();if(!q)return;
+  box.value='';const log=document.getElementById('chatlog');
+  const esc=s=>{const d=document.createElement('div');d.textContent=s;return d.innerHTML;};
+  log.innerHTML+='<div class="me">you: '+esc(q)+'</div>';log.scrollTop=log.scrollHeight;
+  const r=await api('/api/ask',{question:q});
+  log.innerHTML+='<div class="agent">'+esc(r.reply)+'</div>';log.scrollTop=log.scrollHeight;
+}
+boot();
+</script></body></html>"""
+
+_DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<title>agentic-trader</title>""" + _STYLE + """</head><body>
+<h1>agentic-trader <span class="badge" id="b-mode">…</span>
+<span class="badge" id="b-paused"></span></h1>
+<section><h2>Status</h2><div id="status">loading…</div></section>
+<section><h2>Talk to your agent</h2>
+ <div id="chatlog"></div>
+ <input type="text" id="cmd" placeholder="pause · resume · dry on|off · set budget 500 · set cap 3 · stop — or ask anything about your trades"
+  onkeydown="if(event.key==='Enter')send()">
+ <button onclick="send()">Send</button>
+</section>
+<section><h2>Recent activity</h2><div id="trades"></div></section>
+<p class="muted">Settings change right here in chat (<code>set budget 500</code>,
+<code>set cap 3</code>, <code>dry off</code>…). Want to change how the agent
+<i>works</i> — new sources, different rules in code? For safety this chat can't
+rewrite the agent's own code; instead run <b>Claude Code</b> in the repo folder
+on this machine and describe the change — then restart the agent.</p>
+<script>
+async function api(p, body){
+  const r=await fetch(p, body?{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body)}:{});
+  return await r.json();
+}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+async function refresh(){
+  try{
+    const s=await api('/api/status');
+    document.getElementById('b-mode').textContent=s.mode;
+    document.getElementById('b-mode').className='badge '+(s.mode==='DRY-RUN'?'on':'');
+    document.getElementById('b-paused').textContent=s.paused?'PAUSED':'';
+    document.getElementById('status').innerHTML =
+      '<table>'+Object.entries(s.fields).map(([k,v])=>
+        '<tr><th>'+esc(k)+'</th><td>'+esc(String(v))+'</td></tr>').join('')+'</table>';
+    const t=await api('/api/trades');
+    document.getElementById('trades').innerHTML = t.trades.length ?
+      '<table><tr><th>time (UTC)</th><th>action</th><th>contract</th><th>note</th></tr>'+
+      t.trades.map(x=>'<tr><td>'+esc((x.ts||'').replace('T',' ').slice(0,16))+
+        '</td><td>'+esc(x.action||'')+'</td><td>'+esc(x.contract||'')+
+        '</td><td>'+esc(x.reason||'')+'</td></tr>').join('')+'</table>'
+      : '<p class="muted">nothing yet</p>';
+  }catch(e){document.getElementById('status').innerHTML='<span class="err">agent unreachable</span>';}
+}
+async function send(){
+  const box=document.getElementById('cmd');const text=box.value.trim();if(!text)return;
+  box.value='';const log=document.getElementById('chatlog');
+  log.innerHTML+='<div class="me">you: '+esc(text)+'</div>';
+  log.scrollTop=log.scrollHeight;
+  const r=await api('/api/command',{text:text});
+  log.innerHTML+='<div class="agent">'+esc(r.reply)+'</div>';
+  log.scrollTop=log.scrollHeight;refresh();
+}
+refresh();setInterval(refresh,5000);
+</script></body></html>"""
+
+
+# ── shared handler plumbing ──────────────────────────────────────────────────
+
+class _Handler(BaseHTTPRequestHandler):
+    routes_get = {}
+    routes_post = {}
+    page = ""
+
+    def log_message(self, *a):  # quiet
+        pass
+
+    def _send(self, obj, status=200, html=None):
+        body = html.encode() if html is not None else json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type",
+                         "text/html; charset=utf-8" if html is not None
+                         else "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/":
+            return self._send(None, html=self.page)
+        fn = self.routes_get.get(path)
+        if fn is None:
+            return self._send({"error": "not found"}, 404)
+        try:
+            return self._send(fn(self))
+        except Exception as exc:
+            return self._send({"ok": False, "error": str(exc)[:200]}, 500)
+
+    def do_POST(self):
+        fn = self.routes_post.get(self.path.split("?")[0])
+        if fn is None:
+            return self._send({"error": "not found"}, 404)
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            data = json.loads(self.rfile.read(length) or b"{}")
+            return self._send(fn(self, data))
+        except Exception as exc:
+            return self._send({"ok": False, "error": str(exc)[:200]}, 500)
+
+
+# ── the setup wizard ─────────────────────────────────────────────────────────
+
+def run_wizard():
+    import agent as A
+    from brokers.robinhood import RobinhoodMCP, _token_path, content_json
+    from lightning_wallet import LNbitsWallet, WalletError
+
+    cfg = A._load(A.CONFIG_PATH, {}) or {}
+    pending = {"oauth": None, "broker_last4": "", "rh_warning": "",
+               "finished": threading.Event()}
+
+    def save():
+        A._save(A.CONFIG_PATH, cfg, private=True)
+
+    class W(_Handler):
+        page = _WIZARD_HTML
+        routes_get, routes_post = {}, {}
+
+    def state(_h):
+        return {
+            "disclaimer": A._disclaimer_text(),
+            "consent": A.consent_ok(),
+            "source": cfg.get("source"),
+            "broker": pending["broker_last4"] or
+                      (cfg.get("robinhood_account", "")[-4:]
+                       if cfg.get("robinhood_account") else ""),
+            "rh_warning": pending["rh_warning"],
+        }
+
+    def consent(_h, data):
+        phrase = "I AGREE AND ACCEPT ALL LIABILITY"
+        if str(data.get("phrase", "")).strip() != phrase:
+            return {"ok": False, "error": "phrase does not match exactly"}
+        import hashlib
+        from datetime import datetime, timezone
+        A._save(A.ACCEPTANCE_PATH, {
+            "accepted": True,
+            "terms_version": A.TERMS_VERSION,
+            "disclaimer_sha256": hashlib.sha256(
+                A._disclaimer_text().encode()).hexdigest(),
+            "accepted_at": datetime.now(timezone.utc)
+                .isoformat(timespec="seconds"),
+            "via": "web_wizard",
+        })
+        return {"ok": True}
+
+    def source(_h, data):
+        if not A.consent_ok():
+            return {"ok": False, "error": "accept the agreement first"}
+        src = data.get("source")
+        if src not in ("agenthc", "manual", "url"):
+            return {"ok": False, "error": "unknown source"}
+        cfg["source"] = src
+        note = "saved ✓"
+        if src == "url":
+            url = str(data.get("source_url", "")).strip()
+            if not (url.startswith("https://") or url.startswith("http://127.0.0.1")
+                    or url.startswith("http://localhost")):
+                return {"ok": False, "error": "feed URL must be https:// (or localhost)"}
+            cfg["source_url"] = url
+        if src == "agenthc":
+            if data.get("agenthc_key"):
+                cfg["agenthc_api_key"] = str(data["agenthc_key"]).strip()
+                note = "API key saved ✓"
+            elif data.get("lnbits_url") and data.get("lnbits_key"):
+                url = str(data["lnbits_url"]).strip()
+                if not (url.startswith("https://") or url.startswith("http://127.0.0.1")
+                        or url.startswith("http://localhost")):
+                    return {"ok": False, "error": "wallet URL must be https://"}
+                try:
+                    bal = LNbitsWallet(url, str(data["lnbits_key"]).strip()).balance_sats()
+                except WalletError as exc:
+                    return {"ok": False, "error": f"wallet check failed: {exc}"}
+                cfg["lnbits_url"] = url
+                cfg["lnbits_admin_key"] = str(data["lnbits_key"]).strip()
+                cfg.setdefault("max_autopay_sats", 30_000)
+                note = f"wallet connected ✓ balance {bal:,} sats"
+            else:
+                return {"ok": False,
+                        "error": "provide a wallet (URL + admin key) or an API key"}
+        save()
+        return {"ok": True, "note": note}
+
+    def rh_start(_h):
+        rh = RobinhoodMCP(_token_path())
+        url, p = rh.auth_start()
+        pending["oauth"] = (rh, p)
+        return {"url": url}
+
+    def rh_callback(h):
+        # Robinhood redirected the browser here — finish the exchange inline.
+        from urllib.parse import parse_qs, urlparse
+        if not pending["oauth"]:
+            return {"ok": False, "error": "no auth in progress"}
+        rh, p = pending["oauth"]
+        qs = parse_qs(urlparse(h.path).query)
+        redirect = "http://127.0.0.1:8721/callback?" + "&".join(
+            f"{k}={v[0]}" for k, v in qs.items())
+        rh.auth_finish(p, redirect)
+        payload = content_json(rh.call_tool("get_accounts", {})) or {}
+        warning = ""
+        for acct in ((payload.get("data") or {}).get("accounts") or []):
+            if acct.get("agentic_allowed") and acct.get("state") == "active":
+                cfg["robinhood_account"] = str(acct["account_number"])
+                cfg["broker"] = "robinhood"
+                pending["broker_last4"] = cfg["robinhood_account"][-4:]
+                if not acct.get("option_level") or acct.get("option_level") == "option_level_0":
+                    warning = ("Options are NOT enabled on your Agentic account — "
+                               "orders will be rejected until you apply: "
+                               "https://applink.robinhood.com/upgrade_options"
+                               f"?account_number={cfg['robinhood_account']}")
+        pending["rh_warning"] = warning
+        save()
+        # human-friendly landing: bounce back to the wizard tab
+        raise _Redirect()
+
+    def sizing(_h, data):
+        mode = data.get("mode")
+        try:
+            val = float(data.get("value") or 0)
+        except (TypeError, ValueError):
+            val = 0
+        if val <= 0:
+            return {"ok": False, "error": "enter a positive number"}
+        if mode == "budget":
+            cfg["sizing_mode"] = "budget"
+            cfg["budget_per_trade_usd"] = val
+            cfg.setdefault("contracts_per_trade", 1)
+        else:
+            cfg["sizing_mode"] = "contracts"
+            cfg["contracts_per_trade"] = max(1, int(val))
+        cfg.setdefault("max_contracts_per_trade", 25)
+        save()
+        return {"ok": True}
+
+    def safety(_h, data):
+        cfg["dry_run"] = bool(data.get("dry", True))
+        try:
+            cfg["max_entries_per_day"] = max(1, int(data.get("cap") or 5))
+        except (TypeError, ValueError):
+            cfg["max_entries_per_day"] = 5
+        cfg.setdefault("max_event_age_s", 300)
+        for src_key, cfg_key in (("discord", "discord_webhook_url"),
+                                 ("ntfy", "ntfy_topic"),
+                                 ("tg_token", "telegram_bot_token"),
+                                 ("tg_chat", "telegram_chat_id")):
+            v = str(data.get(src_key, "")).strip()
+            if v:
+                cfg[cfg_key] = v
+        policy = str(data.get("policy", "")).strip()
+        if policy:
+            import llm_policy
+            path = llm_policy.policy_path()
+            import os as _os
+            _os.makedirs(_os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(policy + "\n")
+            key = str(data.get("anthropic_key", "")).strip()
+            if key:
+                cfg["anthropic_api_key"] = key
+            cfg.setdefault("llm_model", "claude-opus-4-8")
+            cfg.setdefault("llm_fallback", "skip")
+        cfg["poll_seconds"] = int(cfg.get("poll_seconds", 30))
+        save()
+        nxt = ("cd " + _repo_dir() + "\n"
+               "./.venv/bin/python agent.py run\n\n"
+               "(or enable the systemd service / Docker container — see "
+               "GETTING_STARTED.md)")
+        return {"ok": True, "next": nxt}
+
+    def finish(_h, _data):
+        pending["finished"].set()
+        return {"ok": True}
+
+    W.routes_get = {"/api/state": state, "/api/rh/start": rh_start}
+    def ask(_h, data):
+        q = str(data.get("question", "")).strip()
+        wiz_state = {k: v for k, v in state(None).items() if k != "disclaimer"}
+        reply = _ask_llm(cfg, q, wiz_state, [], system=(
+            "You are the setup assistant embedded in the user's own "
+            "agentic-trader install wizard. Help them complete setup: explain "
+            "LNbits wallets and admin keys, the sats day-pass, Robinhood "
+            "Agentic accounts and options approval, dry-run mode, sizing "
+            "choices, and the policy file. Never advise position sizing or "
+            "whether to trade; never tell them to skip the agreement. Point "
+            "at GETTING_STARTED.md / SECURITY.md for detail. Be concise."))
+        return {"reply": reply}
+
+    W.routes_post = {"/api/consent": consent, "/api/source": source,
+                     "/api/sizing": sizing, "/api/safety": safety,
+                     "/api/finish": finish, "/api/ask": ask}
+
+    class _Redirect(Exception):
+        pass
+
+    # patch GET to turn /callback success into a browser redirect to /
+    orig_get = W.do_GET
+
+    def do_GET(self):
+        if self.path.startswith("/callback"):
+            try:
+                rh_callback(self)
+            except _Redirect:
+                pass
+            except Exception as exc:
+                return self._send(None, html=f"<h3>OAuth failed: {exc}</h3>"
+                                             f"<p><a href='/'>back to setup</a></p>")
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
+        return orig_get(self)
+
+    W.do_GET = do_GET
+
+    server = ThreadingHTTPServer(("127.0.0.1", WIZARD_PORT), W)
+    url = f"http://127.0.0.1:{WIZARD_PORT}/"
+    print(f"Setup wizard running at {url}  (Ctrl-C to abort)")
+    print("On a remote server, tunnel first:  "
+          f"ssh -L {WIZARD_PORT}:127.0.0.1:{WIZARD_PORT} user@host")
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        pending["finished"].wait()
+        print("Setup complete — wizard shutting down.")
+    except KeyboardInterrupt:
+        print("\nWizard aborted.")
+    server.shutdown()
+
+
+def _repo_dir():
+    import os
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+# ── the dashboard (served BY the running agent) ──────────────────────────────
+
+def _ask_llm(cfg, question, status_fields, trades, system=None):
+    """Free-text Q&A about the agent's own state. Answer-only, never trades."""
+    try:
+        import anthropic
+    except ImportError:
+        return ("I can answer questions if you add your Anthropic API key "
+                "(anthropic_api_key in config.json) and `pip install anthropic`.")
+    if not (cfg.get("anthropic_api_key") or __import__("os").getenv("ANTHROPIC_API_KEY")):
+        return ("Add your Anthropic API key (anthropic_api_key in config.json "
+                "or ANTHROPIC_API_KEY) to enable Q&A.")
+    try:
+        client = anthropic.Anthropic(api_key=cfg.get("anthropic_api_key") or None)
+        response = client.messages.create(
+            model=cfg.get("llm_model", "claude-opus-4-8"),
+            max_tokens=1024,
+            system=system or (
+                "You are the status assistant embedded in the user's own "
+                "agentic-trader instance. Answer questions using ONLY the "
+                "status and trade-log data provided. You cannot place, "
+                "modify, or size trades — for control, tell the user the "
+                "exact command (pause, resume, dry on/off, set budget N, "
+                "set cap N, stop). Never give investment advice; you may "
+                "explain what the agent did and why (per its logs). Be "
+                "concise and plain-spoken."),
+            output_config={"effort": "low"},
+            messages=[{"role": "user", "content":
+                       f"STATUS:\n{json.dumps(status_fields, indent=1)}\n\n"
+                       f"RECENT TRADE LOG:\n{json.dumps(trades, indent=1)}\n\n"
+                       f"QUESTION: {question}"}],
+        )
+        if response.stop_reason == "refusal":
+            return "I can't help with that one."
+        return next((b.text for b in response.content if b.type == "text"),
+                    "(no answer)")
+    except Exception as exc:
+        return f"Q&A failed: {str(exc)[:150]}"
+
+
+def start_dashboard(get_status, get_trades, apply_command, cfg_getter):
+    """Serve the dashboard from inside the running agent (daemon thread)."""
+
+    class D(_Handler):
+        page = _DASH_HTML
+
+    def status(_h):
+        return get_status()
+
+    def trades(_h):
+        return {"trades": get_trades()}
+
+    def command(_h, data):
+        text = str(data.get("text", "")).strip()
+        handled, reply = apply_command(text)
+        if handled:
+            return {"reply": reply}
+        s = get_status()
+        return {"reply": _ask_llm(cfg_getter(), text, s.get("fields", {}),
+                                  get_trades())}
+
+    D.routes_get = {"/api/status": status, "/api/trades": trades}
+    D.routes_post = {"/api/command": command}
+
+    server = ThreadingHTTPServer(("127.0.0.1", DASH_PORT), D)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return f"http://127.0.0.1:{DASH_PORT}/"

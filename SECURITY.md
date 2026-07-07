@@ -16,6 +16,7 @@ you control, and what to check before running it.
 | **Exit pairing** | The agent only ever sells positions it opened; dry-run positions can never trigger real orders. |
 | **LLM policy brain — veto-only** | The LLM can only BLOCK entries against YOUR written policy; it can never initiate, enlarge, or redirect a trade. On any LLM error the default is skip (fail-safe). Events fed to it are treated as untrusted data — embedded "ignore the policy" text is grounds for a veto, and the worst-case injection outcome equals not having a policy at all. |
 | **File permissions** | `~/.agentic-trader/` is `0700`; config (wallet admin key, API keys) and broker tokens are `0600`. |
+| **Web UI localhost-only** | The setup wizard (:8721) and dashboard (:8722) bind 127.0.0.1 exclusively — nothing is exposed to the network; remote access requires an SSH tunnel. The dashboard chat is a fixed command allowlist plus answer-only LLM Q&A; it cannot place trades or modify the agent's code. |
 | **HTTPS enforcement** | Custom feed URLs and wallet URLs must be HTTPS (or localhost) — signals and spend keys never travel cleartext. |
 
 ## What YOU control (read before going live)

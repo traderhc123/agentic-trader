@@ -47,16 +47,23 @@ trials; not ideal for live money.
    ```bash
    curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | bash
    cd ~/agentic-trader
-   ./.venv/bin/python agent.py setup
+   ./.venv/bin/python agent.py setup --web
    ```
+   A setup page opens in your browser — read and accept the agreement, pick
+   your signal source, click **Connect Robinhood** (it bounces you to
+   Robinhood and straight back), choose a dollar budget per trade, and set
+   the safety rails. No terminal knowledge needed beyond pasting the above.
 3. Answer the setup questions (it defaults to **dry-run mode** — no real
    orders — so you can watch it for a few days risk-free).
 4. Start it:
    ```bash
    ./.venv/bin/python agent.py run
    ```
-   Leave that window open. Ctrl-C stops it. `./.venv/bin/python agent.py
-   status` shows what it's doing.
+   Leave that window open, then open **http://127.0.0.1:8722** — your
+   agent's own dashboard: live status, every action it's taken, and a chat
+   box where you can say `pause`, `resume`, `set budget 500`, `dry off`, or
+   just ask it questions about what it's been doing. On a remote server,
+   tunnel first: `ssh -L 8722:127.0.0.1:8722 user@yourserver`.
 
 ### Option B — a $5 VPS (always-on, ~30 minutes)
 

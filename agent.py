@@ -398,30 +398,68 @@ def cmd_run():
         sys.exit(1)
     state = _load(STATE_PATH, {"seen": [], "positions": {}})
     seen = set(state["seen"])
-    poll = max(10, int(cfg.get("poll_seconds", 30)))
 
     def save_state(st):
         _save(STATE_PATH, st)
 
+    # The agent serves its OWN dashboard — status, trade log, and a command/
+    # chat box — on localhost. No central server involved.
+    import webui
+
+    def get_status():
+        c = _load(CONFIG_PATH, {}) or {}
+        st = _load(STATE_PATH, {"positions": {}})
+        return {
+            "mode": "DRY-RUN" if c.get("dry_run") else "LIVE",
+            "paused": webui.CONTROLS["paused"],
+            "fields": {
+                "source": c.get("source"),
+                "sizing": _sizing_desc(c),
+                "entries today": f"{_entries_today()} / cap {c.get('max_entries_per_day', 5)}",
+                "policy brain": "on" if llm_policy.enabled(c) else "off",
+                "market": "open" if _market_open_now() else "closed (slow polling)",
+                "open positions": ", ".join(st.get("positions", {})) or "none",
+            },
+        }
+
+    dash_url = None
+    try:
+        dash_url = webui.start_dashboard(
+            get_status, lambda: list(reversed(_recent_trades(25))),
+            _apply_command, lambda: _load(CONFIG_PATH, {}) or {})
+    except OSError as exc:
+        print(f"dashboard not started ({exc}) — continuing headless")
+
     mode = "DRY-RUN (no orders)" if cfg.get("dry_run") else "LIVE"
-    print(f"Heartbeat started [{mode}]: source={cfg['source']}, polling every "
-          f"{poll}s, {cfg['contracts_per_trade']} contract(s) per trade, "
-          f"policy brain {'ON' if llm_policy.enabled(cfg) else 'off'}. Ctrl-C to stop.")
+    print(f"Heartbeat started [{mode}]: source={cfg['source']}, "
+          f"{_sizing_desc(cfg)}, policy brain "
+          f"{'ON' if llm_policy.enabled(cfg) else 'off'}. Ctrl-C to stop.")
+    if dash_url:
+        print(f"Dashboard: {dash_url}  (remote? tunnel: ssh -L 8722:127.0.0.1:8722 user@host)")
     print("Reminder: you are responsible for every order this agent places.")
-    notify(cfg, f"agentic-trader heartbeat started [{mode}], source={cfg['source']}")
+    notify(cfg, f"agentic-trader heartbeat started [{mode}], source={cfg['source']}"
+                + (f" — dashboard {dash_url}" if dash_url else ""))
     while True:
+        cfg = _load(CONFIG_PATH, cfg) or cfg  # dashboard edits apply live
+        poll = max(10, int(cfg.get("poll_seconds", 30)))
+        if webui.CONTROLS["stop"]:
+            print("Stopped via dashboard. Open positions remain in your account:",
+                  list(state["positions"]) or "none")
+            notify(cfg, "agentic-trader stopped via dashboard")
+            return
         try:
-            events = source.poll(cfg, state, save_state)
-            for ev in events:
-                if ev.get("event_id") in seen:
-                    continue
-                outcome = handle_event(ev, cfg, state, broker, client, save_state)
-                if outcome:
-                    notify(cfg, f"agentic-trader: {outcome}")
-                seen.add(ev["event_id"])
-                state["seen"] = sorted(seen)[-500:]
-                seen = set(state["seen"])
-                save_state(state)
+            if not webui.CONTROLS["paused"]:
+                events = source.poll(cfg, state, save_state)
+                for ev in events:
+                    if ev.get("event_id") in seen:
+                        continue
+                    outcome = handle_event(ev, cfg, state, broker, client, save_state)
+                    if outcome:
+                        notify(cfg, f"agentic-trader: {outcome}")
+                    seen.add(ev["event_id"])
+                    state["seen"] = sorted(seen)[-500:]
+                    seen = set(state["seen"])
+                    save_state(state)
         except KeyboardInterrupt:
             print("\nStopped. Open positions remain in your account:",
                   list(state["positions"]) or "none")
@@ -433,9 +471,11 @@ def cmd_run():
         except Exception:
             pass
         # Market-hours-aware cadence: fast while the market can move, slow
-        # overnight/weekends (saves feed polling and battery; exits for open
-        # positions still get picked up on the slow cadence).
-        time.sleep(poll if _market_open_now() else max(poll, 300))
+        # overnight/weekends; snappy while paused so 'resume' feels instant.
+        if webui.CONTROLS["paused"]:
+            time.sleep(2)
+        else:
+            time.sleep(poll if _market_open_now() else max(poll, 300))
 
 
 def cmd_status():
@@ -480,7 +520,11 @@ def cmd_fund(sats):
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     if cmd == "setup":
-        cmd_setup()
+        if "--web" in sys.argv:
+            import webui
+            webui.run_wizard()
+        else:
+            cmd_setup()
     elif cmd == "run":
         cmd_run()
     elif cmd == "status":
