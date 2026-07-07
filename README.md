@@ -52,7 +52,7 @@ Your human pointed you at this repository to set them up. Follow
 - **Notifications**: Discord / ntfy / Telegram message on every action, veto, and error + a daily digest after the close
 - **Market-hours aware**: polls fast 9:25–16:15 ET, sleeps slow overnight/weekends
 - **Self-modifying (with your approval)**: `self-edit on`, then `code: add an RSS source` — the agent rewrites its own source, shows you the diff in the dashboard, and one click applies it with backup + compile-check + auto-rollback + self-restart. A **foundation layer** (consent gate, safety rails, terms, the self-edit governor itself) is immutable to the agent
-- **Web UI, self-served**: paste three terminal lines once, then it's browser-only — a **setup wizard** (`setup --web`) with one-click Robinhood OAuth, and a **dashboard** your own agent serves at `127.0.0.1:8722` with live status, trade log, and a chat box (`pause`, `set budget 500`, `dry off`, or ask it anything about its trades). Localhost-only; no central server ever sees your keys. (Zero-terminal option: have Claude run the three lines for you — see GETTING_STARTED.md)
+- **Web UI, self-served**: paste three terminal lines once, then it's browser-only — a **setup wizard** (`setup --web`) with one-click Robinhood OAuth, and a **dashboard** your own agent serves at `127.0.0.1:8721` with live status, trade log, and a chat box (`pause`, `set budget 500`, `dry off`, or ask it anything about its trades). Localhost-only; no central server ever sees your keys. (Zero-terminal option: have Claude run the three lines for you — see GETTING_STARTED.md)
 - **Always-on ready**: one-line installer, Dockerfile, hardened systemd unit
 
 ## 🧑 Quickstart
@@ -68,19 +68,31 @@ curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/ins
 (Headless server? It prints the tunnel command instead. Opt out of auto-launch
 with `AGENTIC_TRADER_NO_LAUNCH=1`.)
 
-Or manually:
+That single line is the whole thing on a desktop. After setup finishes, start
+the agent (the wizard prints this command; it also runs on boot if you use the
+systemd service or Docker):
+
+```bash
+cd ~/agentic-trader
+./.venv/bin/python agent.py run     # heartbeat + dashboard at http://127.0.0.1:8721
+```
+
+The setup wizard and the live dashboard are one app on **http://127.0.0.1:8721**
+— `/` shows the dashboard once the agent is running, the setup stepper
+otherwise, cross-linked both ways.
+
+<details><summary>Manual install (no curl-pipe), or prefer the terminal</summary>
 
 ```bash
 git clone https://github.com/traderhc123/agentic-trader
 cd agentic-trader
-pip install -r requirements.txt
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 
-python agent.py setup --web  # browser wizard: consent, source, one-click Robinhood OAuth, sizing
-python agent.py run          # heartbeat + dashboard at http://127.0.0.1:8722
-python agent.py status       # or use the dashboard
+./.venv/bin/python agent.py setup --web   # browser wizard (or: setup, for terminal prompts)
+./.venv/bin/python agent.py run           # heartbeat + dashboard at http://127.0.0.1:8721
+./.venv/bin/python agent.py status        # or just use the dashboard
 ```
-
-Prefer the terminal? `python agent.py setup` runs the same steps as prompts.
+</details>
 
 **Prerequisites:** Python 3.10+; a Robinhood account with an **Agentic
 account** (created during setup), **options approval on the Agentic
