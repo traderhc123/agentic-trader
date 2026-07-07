@@ -81,17 +81,22 @@ The setup wizard and the live dashboard are one app on **http://127.0.0.1:8721**
 — `/` shows the dashboard once the agent is running, the setup stepper
 otherwise, cross-linked both ways.
 
-<details><summary>Manual install (no curl-pipe), or prefer the terminal</summary>
+<details><summary>Manual install (no curl-pipe)</summary>
+
+One command — clone, install, and launch. `agent.py` with no arguments does
+the right thing: it opens the browser setup wizard if you haven't set up yet,
+or runs the agent if you have. Nothing trades until you accept the agreement
+in the wizard, so a single launch command is safe:
 
 ```bash
-git clone https://github.com/traderhc123/agentic-trader
-cd agentic-trader
-python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
-
-./.venv/bin/python agent.py setup --web   # browser wizard (or: setup, for terminal prompts)
-./.venv/bin/python agent.py run           # heartbeat + dashboard at http://127.0.0.1:8721
-./.venv/bin/python agent.py status        # or just use the dashboard
+git clone https://github.com/traderhc123/agentic-trader && cd agentic-trader \
+  && python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt \
+  && ./.venv/bin/python agent.py
 ```
+
+After setup, `./.venv/bin/python agent.py` again just runs the agent (dashboard
+at http://127.0.0.1:8721). Prefer terminal prompts to the browser? Use
+`agent.py setup`. Other commands: `status`, `fund <sats>`.
 </details>
 
 **Prerequisites:** Python 3.10+; a Robinhood account with an **Agentic

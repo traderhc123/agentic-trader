@@ -7,10 +7,11 @@ under YOUR configuration and responsibility, executes long-options orders
 through a BROKER adapter (currently: your own Robinhood Agentic account via
 Robinhood's trading MCP).
 
-    python agent.py setup    # one-time: consent gate -> pick signal source ->
-                             # broker auth (Robinhood OAuth) -> sizing
+    python agent.py          # do the right thing: open the setup wizard if not
+                             # set up yet, otherwise run the agent
+    python agent.py setup    # explicit setup (add --web for the browser wizard)
     python agent.py run      # heartbeat loop (refuses to run without consent)
-    python agent.py status   # config, wallet balance, day-pass, open positions
+    python agent.py status   # config, wallet balance, open positions
     python agent.py fund N   # print a Lightning invoice to add N sats
 
 HARD CONSENT GATE: this program will not perform ANY setup or trading action
@@ -598,8 +599,30 @@ def cmd_fund(sats):
     print_funding_invoice(wallet, sats)
 
 
+def _is_ready():
+    """Consent accepted AND a source + broker are configured."""
+    if not consent_ok():
+        return False
+    cfg = _load(CONFIG_PATH) or {}
+    return bool(cfg.get("source") and (cfg.get("robinhood_account")
+                                       or cfg.get("alpaca_key_id")))
+
+
 def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+    # No subcommand = do the right thing. Safe because nothing can trade until
+    # the legal agreement is accepted: not set up -> open the browser wizard;
+    # set up -> run the agent. So `python agent.py` is the whole thing.
+    if len(sys.argv) <= 1:
+        if _is_ready():
+            cmd_run()
+        else:
+            print("Not set up yet — opening the setup wizard in your browser.")
+            print("(Nothing runs or trades until you accept DISCLAIMER.md there.)")
+            import webui
+            webui.run_wizard()
+        return
+
+    cmd = sys.argv[1]
     if cmd == "setup":
         if "--web" in sys.argv:
             import webui
