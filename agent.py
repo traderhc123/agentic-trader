@@ -326,8 +326,11 @@ def cmd_setup():
         cfg["source"] = default
     cfg = SOURCES[cfg["source"]].setup(cfg)
 
-    print("\n== Step 2/4: Broker (Robinhood Agentic account) ==")
-    cfg["broker"] = "robinhood"
+    print("\n== Step 2/4: Broker ==")
+    print("  1) Robinhood Agentic account (OAuth)")
+    print("  2) Alpaca — paper or live (API keys; paper = zero real dollars)")
+    bc = input("Choose [1/2, default 1]: ").strip() or "1"
+    cfg["broker"] = "alpaca" if bc == "2" else "robinhood"
     cfg = BROKERS[cfg["broker"]].setup(cfg)
 
     print("\n== Step 3/4: Position sizing ==")

@@ -25,8 +25,9 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-WIZARD_PORT = 8721   # == the Robinhood OAuth redirect port (deliberate)
-DASH_PORT = 8722
+APP_PORT = 8721      # one app, one port (also the Robinhood OAuth redirect port)
+WIZARD_PORT = APP_PORT
+DASH_PORT = APP_PORT
 
 # Run-loop controls the dashboard can flip; agent.py polls these.
 CONTROLS = {"paused": False, "stop": False}
@@ -60,33 +61,51 @@ _STYLE = """
 </style>"""
 
 _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
-<title>agentic-trader setup</title>""" + _STYLE + """</head><body>
-<h1>agentic-trader — setup</h1>
-<p class="muted">Everything happens on YOUR machine (this page is served from
-127.0.0.1 by the agent's own setup wizard). Real money; read carefully.</p>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentic-trader setup</title>""" + _STYLE + """
+<style>
+ body{max-width:820px}
+ .stepbar{display:flex;gap:.35rem;flex-wrap:wrap;margin:1rem 0 1.2rem}
+ .chip{font-size:.75rem;padding:.25rem .7rem;border-radius:99px;
+       border:1px solid #2a2f3a;color:#9aa3b2;cursor:default;user-select:none}
+ .chip.done{border-color:#2e7d32;color:#4ade80;cursor:pointer}
+ .chip.cur{border-color:#3b82f6;color:#93c5fd;background:#101827}
+ section{display:none}
+ section.active{display:block}
+ .navrow{display:flex;gap:.6rem;margin-top:.8rem}
+ .navrow .back{background:#232936;border:1px solid #2a2f3a}
+ #help{margin-top:1.4rem;border-top:1px solid #232936;padding-top:.8rem}
+ #chatlog{height:170px}
+ .chatrow{display:flex;gap:.4rem}.chatrow input{margin:0;flex:1}
+</style></head><body>
+<h1>agentic-trader — setup <a class="chip done" href="/dash" style="text-decoration:none">→ dashboard</a></h1>
+<p class="muted">Everything happens on YOUR machine (served from 127.0.0.1 by
+your agent's own wizard). Real money; read carefully.</p>
+<div class="stepbar" id="stepbar"></div>
 
-<section id="s-consent"><h2>1 · Agreement</h2>
+<section id="s-consent"><h2>Agreement</h2>
  <div class="disc" id="disclaimer">loading…</div>
  <p><label><input type="checkbox" id="c-read"> I have read the entire agreement
  above and I accept all of its terms, including that <b>all liability is mine</b>
  and that no party here is a registered investment adviser.</label></p>
  <p>Type exactly <b>I AGREE AND ACCEPT ALL LIABILITY</b> to accept:</p>
  <input type="text" id="c-phrase" autocomplete="off">
- <button onclick="doConsent()">Accept</button> <span id="c-msg"></span>
+ <div class="navrow"><button onclick="doConsent()">Accept & continue</button>
+ <span id="c-msg"></span></div>
 </section>
 
-<section id="s-llm" class="locked"><h2>2 · Connect your AI (recommended)</h2>
+<section id="s-llm"><h2>Connect your AI (recommended)</h2>
  <p class="muted">Your agent becomes a real AI agent with an Anthropic API key
- (pay-per-use, separate from a Claude subscription — get one at
- console.anthropic.com). It powers the help chat below, your plain-English
- trading policy, and the dashboard Q&A. Skippable; add it later any time.</p>
+ (pay-per-use, separate from a Claude subscription — console.anthropic.com).
+ It powers the help chat, your plain-English trading policy, and the dashboard
+ Q&A. Skippable; add it later any time.</p>
  <input type="password" id="llm-key" placeholder="sk-ant-…">
- <button onclick="doLLM()">Connect</button>
- <button onclick="skipLLM()" style="background:#374151">Skip for now</button>
- <span id="llm-msg"></span>
+ <div class="navrow"><button onclick="doLLM()">Connect & continue</button>
+ <button class="back" onclick="skipLLM()">Skip for now</button>
+ <span id="llm-msg"></span></div>
 </section>
 
-<section id="s-source" class="locked"><h2>3 · Signal source</h2>
+<section id="s-source"><h2>Signal source</h2>
  <select id="src" onchange="srcChanged()">
   <option value="agenthc">AgentHC Agentic Day Trade Ideas (journal feed, sats-priced)</option>
   <option value="manual">My own commands (commands.jsonl)</option>
@@ -122,17 +141,27 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
  </div>
  <div id="src-manual" style="display:none"><p class="muted">You'll append JSON
   lines to <code>~/.agentic-trader/commands.jsonl</code> — see the README.</p></div>
- <button onclick="doSource()">Save source</button> <span id="src-msg"></span>
+ <div class="navrow"><button onclick="doSource()">Save & continue</button>
+ <span id="src-msg"></span></div>
 </section>
 
-<section id="s-broker" class="locked"><h2>4 · Robinhood (Agentic account)</h2>
- <p class="muted">Click the button, approve in the Robinhood tab that opens
- (log in if needed) — you'll be sent straight back here.</p>
- <button onclick="rhStart()">Connect Robinhood</button> <span id="rh-msg"></span>
+<section id="s-broker"><h2>Broker</h2>
+ <p class="muted">Where should orders execute? Robinhood is one click; Alpaca
+ takes API keys and offers a <b>paper mode</b> (simulated fills, zero real
+ dollars — the safest full trial).</p>
+ <div class="navrow"><button onclick="rhStart()">Connect Robinhood</button>
+ <span id="rh-msg"></span></div>
  <div id="rh-accounts"></div>
+ <details><summary class="muted">Use Alpaca instead (paper or live)</summary>
+  <input type="text" id="ap-key" placeholder="Alpaca API Key ID">
+  <input type="password" id="ap-secret" placeholder="Alpaca API Secret">
+  <p><label><input type="checkbox" id="ap-paper" checked> Paper trading
+  (recommended)</label></p>
+  <button onclick="doAlpaca()">Connect Alpaca</button> <span id="ap-msg"></span>
+ </details>
 </section>
 
-<section id="s-sizing" class="locked"><h2>5 · Position sizing</h2>
+<section id="s-sizing"><h2>Position sizing</h2>
  <p class="muted">Nobody here is an investment advisor and none of this
  software can advise position sizing — this number is YOUR decision, made
  with money you can afford to lose entirely.</p>
@@ -141,10 +170,11 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
  <label><input type="radio" name="szmode" value="contracts"> Fixed contracts
  per trade</label>
  <input type="number" id="sz-val" placeholder="e.g. 500" min="1" step="any">
- <button onclick="doSizing()">Save sizing</button> <span id="sz-msg"></span>
+ <div class="navrow"><button onclick="doSizing()">Save & continue</button>
+ <span id="sz-msg"></span></div>
 </section>
 
-<section id="s-safety" class="locked"><h2>6 · Safety rails & extras</h2>
+<section id="s-safety"><h2>Safety rails & extras</h2>
  <p><label><input type="checkbox" id="sf-dry" checked> Start in
  <b>dry-run</b> mode (log actions, place no orders — recommended)</label></p>
  <label>Max new entries per day</label>
@@ -158,11 +188,12 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
  checks before every entry; veto-only; uses YOUR Anthropic API key)</label>
  <textarea id="pol-text" rows="5"
   placeholder="- Never trade more than 2 new entries per day.&#10;- Skip puts.&#10;- Only tickers: SPY, QQQ, NVDA."></textarea>
- <input type="password" id="pol-key" placeholder="Anthropic API key (only if policy set)">
- <button onclick="doSafety()">Finish setup</button> <span id="sf-msg"></span>
+ <input type="password" id="pol-key" placeholder="Anthropic API key (if not connected earlier)">
+ <div class="navrow"><button onclick="doSafety()">Finish setup</button>
+ <span id="sf-msg"></span></div>
 </section>
 
-<section id="s-done" class="locked"><h2>7 · Done — where should your agent live?</h2>
+<section id="s-done"><h2>Done — where should your agent live?</h2>
  <div id="done-body"></div>
  <div id="deploy-box">
   <p><b>Option A — this computer:</b> run the command above; keep it awake
@@ -178,23 +209,42 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
  </div>
 </section>
 
-<section><h2>Need help? Ask your agent</h2>
- <p class="muted">Questions about any step (uses your Anthropic API key if
- you've entered one; otherwise points you at the docs).</p>
+<div id="help">
+ <p class="muted">Need help with this step? Ask your agent (works once your
+ Anthropic key is connected).</p>
  <div id="chatlog"></div>
- <input type="text" id="cmd" placeholder="e.g. what is an LNbits admin key? · is dry-run really safe?"
-  onkeydown="if(event.key==='Enter')ask()">
- <button onclick="ask()">Ask</button>
-</section>
+ <div class="chatrow">
+  <input type="text" id="cmd" placeholder="e.g. what is dry-run? · is the hosted wallet safe?"
+   onkeydown="if(event.key==='Enter')ask()">
+  <button onclick="ask()">Ask</button>
+ </div>
+</div>
 
 <script>
+const STEPS=[["s-consent","Agreement"],["s-llm","Your AI"],["s-source","Source"],
+ ["s-broker","Robinhood"],["s-sizing","Sizing"],["s-safety","Safety"],["s-done","Launch"]];
+let doneSet=new Set(), cur=0, maxUnlocked=0;
+function idx(id){return STEPS.findIndex(s=>s[0]===id);}
+function render(){
+  const bar=document.getElementById('stepbar');bar.innerHTML='';
+  STEPS.forEach((s,i)=>{
+    const c=document.createElement('span');
+    c.className='chip'+(doneSet.has(s[0])?' done':'')+(i===cur?' cur':'');
+    c.textContent=(doneSet.has(s[0])?'✓ ':'')+(i+1)+' · '+s[1];
+    if(i<=maxUnlocked)c.onclick=()=>{cur=i;render();};
+    bar.appendChild(c);
+  });
+  STEPS.forEach((s,i)=>{document.getElementById(s[0]).className=(i===cur)?'active':'';});
+}
+function done(id){doneSet.add(id);
+  maxUnlocked=Math.max(maxUnlocked,Math.min(idx(id)+1,STEPS.length-1));
+  cur=Math.min(idx(id)+1,STEPS.length-1);render();}
+function unlock(id){maxUnlocked=Math.max(maxUnlocked,idx(id));render();}
 async function api(p, body){
   const r = await fetch(p, body?{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)}:{});
   return await r.json();
 }
-function unlock(id){const el=document.getElementById(id);el.classList.remove('locked');}
-function done(id){document.getElementById(id).classList.add('done');}
 function srcChanged(){
   const v=document.getElementById('src').value;
   for(const k of ['agenthc','url','manual'])
@@ -203,11 +253,12 @@ function srcChanged(){
 async function boot(){
   const st=await api('/api/state');
   document.getElementById('disclaimer').textContent=st.disclaimer;
-  if(st.consent){done('s-consent');unlock('s-llm');}
-  if(st.llm){done('s-llm');unlock('s-source');}
-  if(st.source){done('s-source');unlock('s-broker');}
-  if(st.broker){done('s-broker');unlock('s-sizing');
+  if(st.consent)done('s-consent');
+  if(st.llm)done('s-llm');
+  if(st.source)done('s-source');
+  if(st.broker){done('s-broker');
     document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ account ····'+st.broker+'</span>';}
+  cur=Math.min(maxUnlocked,STEPS.length-1);render();
 }
 async function doConsent(){
   if(!document.getElementById('c-read').checked){
@@ -215,32 +266,15 @@ async function doConsent(){
   const r=await api('/api/consent',{phrase:document.getElementById('c-phrase').value});
   document.getElementById('c-msg').innerHTML=r.ok?'<span class="ok">accepted ✓</span>'
     :'<span class="err">'+r.error+'</span>';
-  if(r.ok){done('s-consent');unlock('s-llm');}
+  if(r.ok)done('s-consent');
 }
 async function doLLM(){
   const r=await api('/api/llm',{key:document.getElementById('llm-key').value});
-  document.getElementById('llm-msg').innerHTML=r.ok?' <span class="ok">connected ✓ — the help chat below is live</span>'
+  document.getElementById('llm-msg').innerHTML=r.ok?' <span class="ok">connected ✓</span>'
     :' <span class="err">'+r.error+'</span>';
-  if(r.ok){done('s-llm');unlock('s-source');}
+  if(r.ok)done('s-llm');
 }
-async function skipLLM(){done('s-llm');unlock('s-source');}
-async function deploy(){
-  const el=document.getElementById('deploy-msg');
-  el.innerHTML='creating server… (takes 1–3 minutes)';
-  const r=await api('/api/deploy',{token:document.getElementById('do-token').value,
-    region:document.getElementById('do-region').value});
-  if(!r.ok){el.innerHTML='<span class="err">'+r.error+'</span>';return;}
-  const poll=async()=>{
-    const s=await api('/api/deploy/status');
-    if(s.ip){el.innerHTML='<span class="ok">Your agent is live on its own server at '
-      +s.ip+' ✓</span><br><span class="muted">It started automatically (systemd) and '
-      +'will send your startup notification shortly. This computer no longer needs '
-      +'to run anything. Dashboard from here: ssh -L 8722:127.0.0.1:8722 trader@'+s.ip
-      +' then open http://127.0.0.1:8722</span>';}
-    else{el.textContent='server status: '+s.status+' — waiting…';setTimeout(poll,5000);}
-  };
-  poll();
-}
+async function skipLLM(){done('s-llm');}
 let walletMade=false, balTimer=null;
 async function makeWallet(){
   document.getElementById('mw-msg').textContent=' creating…';
@@ -270,7 +304,15 @@ async function doSource(){
     source_url:document.getElementById('src-url-input').value});
   document.getElementById('src-msg').innerHTML=r.ok?'<span class="ok">'+r.note+'</span>'
     :'<span class="err">'+r.error+'</span>';
-  if(r.ok){done('s-source');unlock('s-broker');}
+  if(r.ok)done('s-source');
+}
+async function doAlpaca(){
+  const r=await api('/api/alpaca',{key:document.getElementById('ap-key').value,
+    secret:document.getElementById('ap-secret').value,
+    paper:document.getElementById('ap-paper').checked});
+  document.getElementById('ap-msg').innerHTML=r.ok?' <span class="ok">'+r.note+'</span>'
+    :' <span class="err">'+r.error+'</span>';
+  if(r.ok)done('s-broker');
 }
 async function rhStart(){
   const r=await api('/api/rh/start');
@@ -280,10 +322,11 @@ async function rhStart(){
 }
 async function poll(){
   const st=await api('/api/state');
-  if(st.broker){done('s-broker');unlock('s-sizing');
+  if(st.broker){
     document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ account ····'+st.broker+'</span>';
     if(st.rh_warning)document.getElementById('rh-accounts').innerHTML=
-      '<p class="err">'+st.rh_warning+'</p>';}
+      '<p class="err">'+st.rh_warning+'</p>';
+    done('s-broker');}
   else setTimeout(poll,1500);
 }
 async function doSizing(){
@@ -291,7 +334,7 @@ async function doSizing(){
   const r=await api('/api/sizing',{mode:mode,value:document.getElementById('sz-val').value});
   document.getElementById('sz-msg').innerHTML=r.ok?'<span class="ok">saved ✓</span>'
     :'<span class="err">'+r.error+'</span>';
-  if(r.ok){done('s-sizing');unlock('s-safety');}
+  if(r.ok)done('s-sizing');
 }
 async function doSafety(){
   const r=await api('/api/safety',{dry:document.getElementById('sf-dry').checked,
@@ -302,13 +345,30 @@ async function doSafety(){
     tg_chat:document.getElementById('nt-tg-chat').value,
     policy:document.getElementById('pol-text').value,
     anthropic_key:document.getElementById('pol-key').value});
-  if(r.ok){done('s-safety');unlock('s-done');
+  if(r.ok){done('s-safety');
     document.getElementById('done-body').innerHTML=
      '<p class="ok">Setup complete.</p><pre>'+r.next+'</pre>'+
-     '<p class="muted">This wizard will shut down now; the dashboard lives at '+
-     'http://127.0.0.1:8722 once the agent is running.</p>';
+     '<p class="muted">The dashboard lives at http://127.0.0.1:8722 once the '+
+     'agent is running.</p>';
     api('/api/finish',{});}
   else document.getElementById('sf-msg').innerHTML='<span class="err">'+r.error+'</span>';
+}
+async function deploy(){
+  const el=document.getElementById('deploy-msg');
+  el.innerHTML='creating server… (takes 1–3 minutes)';
+  const r=await api('/api/deploy',{token:document.getElementById('do-token').value,
+    region:document.getElementById('do-region').value});
+  if(!r.ok){el.innerHTML='<span class="err">'+r.error+'</span>';return;}
+  const poll2=async()=>{
+    const s=await api('/api/deploy/status');
+    if(s.ip){el.innerHTML='<span class="ok">Your agent is live on its own server at '
+      +s.ip+' ✓</span><br><span class="muted">It started automatically and will send '
+      +'your startup notification shortly. This computer no longer needs to run '
+      +'anything. Dashboard from here: ssh -L 8721:127.0.0.1:8721 trader@'+s.ip
+      +' then open http://127.0.0.1:8721/dash</span>';}
+    else{el.textContent='server status: '+s.status+' — waiting…';setTimeout(poll2,5000);}
+  };
+  poll2();
 }
 async function ask(){
   const box=document.getElementById('cmd');const q=box.value.trim();if(!q)return;
@@ -367,6 +427,7 @@ _DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
  <span class="pill" id="b-market"></span>
  <span class="pill paused" id="b-paused" style="display:none">⏸ PAUSED</span>
  <span class="sp"></span>
+ <a class="qbtn" href="/setup" style="text-decoration:none;padding:.5rem 1rem;border-radius:6px">⚙ settings</a>
  <button class="qbtn" id="q-pause" onclick="quick(this.dataset.cmd)" data-cmd="pause">Pause</button>
  <button class="qbtn" id="q-dry" onclick="quick(this.dataset.cmd)" data-cmd="dry on">Dry-run</button>
 </header>
@@ -416,6 +477,11 @@ function esc(s){const d=document.createElement('div');d.textContent=s;return d.i
 async function refresh(){
   try{
     const s=await api('/api/status');
+    if(s.mode==='OFFLINE'){
+      document.getElementById('b-mode').textContent='agent not running';
+      document.getElementById('b-mode').className='pill paused';
+      document.getElementById('t-source').textContent='start it: agent.py run';
+      return;}
     const live=s.mode==='LIVE';
     const bm=document.getElementById('b-mode');
     bm.textContent=live?'● LIVE — real orders':'◌ DRY-RUN — no orders';
@@ -476,7 +542,8 @@ refresh();setInterval(refresh,5000);
 class _Handler(BaseHTTPRequestHandler):
     routes_get = {}
     routes_post = {}
-    page = ""
+    pages = {}
+    landing = "/setup"
 
     def log_message(self, *a):  # quiet
         pass
@@ -487,6 +554,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type",
                          "text/html; charset=utf-8" if html is not None
                          else "application/json")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -494,7 +562,12 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/":
-            return self._send(None, html=self.page)
+            self.send_response(302)
+            self.send_header("Location", self.landing)
+            self.end_headers()
+            return
+        if path in self.pages:
+            return self._send(None, html=self.pages[path])
         fn = self.routes_get.get(path)
         if fn is None:
             return self._send({"error": "not found"}, 404)
@@ -517,7 +590,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 # ── the setup wizard ─────────────────────────────────────────────────────────
 
-def run_wizard():
+def start_app(get_status=None, get_trades=None, apply_command=None,
+              cfg_getter=None, wait_finish=False):
+    """One server, one port: /setup (wizard) + /dash (dashboard) + all APIs."""
     import agent as A
     from brokers.robinhood import RobinhoodMCP, _token_path, content_json
     from lightning_wallet import LNbitsWallet, WalletError
@@ -530,7 +605,8 @@ def run_wizard():
         A._save(A.CONFIG_PATH, cfg, private=True)
 
     class W(_Handler):
-        page = _WIZARD_HTML
+        pages = {"/setup": _WIZARD_HTML, "/dash": _DASH_HTML}
+        landing = "/dash" if get_status else "/setup"
         routes_get, routes_post = {}, {}
 
     def state(_h):
@@ -641,6 +717,21 @@ def run_wizard():
             return {"status": "no deploy in progress", "ip": ""}
         token, droplet_id = pending["deploy"]
         return provision.droplet_status(token, droplet_id)
+
+    def alpaca_connect(_h, data):
+        if not A.consent_ok():
+            return {"ok": False, "error": "accept the agreement first"}
+        from brokers import alpaca as _ap
+        cfg["alpaca_key_id"] = str(data.get("key", "")).strip()
+        cfg["alpaca_secret"] = str(data.get("secret", "")).strip()
+        cfg["alpaca_paper"] = bool(data.get("paper", True))
+        cfg["broker"] = "alpaca"
+        ok, msg = _ap.verify(cfg)
+        if not ok:
+            return {"ok": False, "error": msg}
+        pending["broker_last4"] = "alp·" + ("PPR" if cfg["alpaca_paper"] else "LIV")
+        save()
+        return {"ok": True, "note": msg}
 
     def wallet_create(_h, _data):
         if not A.consent_ok():
@@ -773,9 +864,31 @@ def run_wizard():
         pending["finished"].set()
         return {"ok": True}
 
+    def d_status(_h):
+        if get_status is None:
+            return {"mode": "OFFLINE", "paused": False, "fields": {}}
+        return get_status()
+
+    def d_trades(_h):
+        return {"trades": get_trades() if get_trades else []}
+
+    def d_command(_h, data):
+        text = str(data.get("text", "")).strip()
+        if apply_command is None:
+            return {"reply": "The agent isn't running yet — finish setup, then "
+                             "start it with: agent.py run"}
+        handled, reply = apply_command(text)
+        if handled:
+            return {"reply": reply}
+        s = d_status(None)
+        return {"reply": _ask_llm((cfg_getter() if cfg_getter else cfg), text,
+                                  s.get("fields", {}),
+                                  get_trades() if get_trades else [])}
+
     W.routes_get = {"/api/state": state, "/api/rh/start": rh_start,
                     "/api/wallet/balance": wallet_balance,
-                    "/api/deploy/status": deploy_status}
+                    "/api/deploy/status": deploy_status,
+                    "/api/status": d_status, "/api/trades": d_trades}
     def ask(_h, data):
         q = str(data.get("question", "")).strip()
         wiz_state = {k: v for k, v in state(None).items() if k != "disclaimer"}
@@ -794,7 +907,9 @@ def run_wizard():
                      "/api/finish": finish, "/api/ask": ask,
                      "/api/wallet/create": wallet_create,
                      "/api/wallet/fund": wallet_fund,
-                     "/api/llm": llm, "/api/deploy": deploy}
+                     "/api/llm": llm, "/api/deploy": deploy,
+                     "/api/alpaca": alpaca_connect,
+                     "/api/command": d_command}
 
     class _Redirect(Exception):
         pass
@@ -819,23 +934,31 @@ def run_wizard():
 
     W.do_GET = do_GET
 
-    server = ThreadingHTTPServer(("127.0.0.1", WIZARD_PORT), W)
-    url = f"http://127.0.0.1:{WIZARD_PORT}/"
-    print(f"Setup wizard running at {url}  (Ctrl-C to abort)")
-    print("On a remote server, tunnel first:  "
-          f"ssh -L {WIZARD_PORT}:127.0.0.1:{WIZARD_PORT} user@host")
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
+    server = ThreadingHTTPServer(("127.0.0.1", APP_PORT), W)
+    url = f"http://127.0.0.1:{APP_PORT}/"
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
-    try:
-        pending["finished"].wait()
-        print("Setup complete — wizard shutting down.")
-    except KeyboardInterrupt:
-        print("\nWizard aborted.")
-    server.shutdown()
+    if wait_finish:
+        print(f"Setup running at {url}setup  (Ctrl-C to abort)")
+        print("On a remote server, tunnel first:  "
+              f"ssh -L {APP_PORT}:127.0.0.1:{APP_PORT} user@host")
+        try:
+            webbrowser.open(url + "setup")
+        except Exception:
+            pass
+        try:
+            pending["finished"].wait()
+            print("Setup complete — start the agent with: agent.py run "
+                  "(the same URL then serves the dashboard).")
+        except KeyboardInterrupt:
+            print("\nWizard aborted.")
+        server.shutdown()
+        return None
+    return url + "dash"
+
+
+def run_wizard():
+    start_app(wait_finish=True)
 
 
 def _repo_dir():
@@ -884,30 +1007,5 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
 
 
 def start_dashboard(get_status, get_trades, apply_command, cfg_getter):
-    """Serve the dashboard from inside the running agent (daemon thread)."""
-
-    class D(_Handler):
-        page = _DASH_HTML
-
-    def status(_h):
-        return get_status()
-
-    def trades(_h):
-        return {"trades": get_trades()}
-
-    def command(_h, data):
-        text = str(data.get("text", "")).strip()
-        handled, reply = apply_command(text)
-        if handled:
-            return {"reply": reply}
-        s = get_status()
-        return {"reply": _ask_llm(cfg_getter(), text, s.get("fields", {}),
-                                  get_trades())}
-
-    D.routes_get = {"/api/status": status, "/api/trades": trades}
-    D.routes_post = {"/api/command": command}
-
-    server = ThreadingHTTPServer(("127.0.0.1", DASH_PORT), D)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    return f"http://127.0.0.1:{DASH_PORT}/"
+    """Serve the combined app (dashboard + settings) from the running agent."""
+    return start_app(get_status, get_trades, apply_command, cfg_getter)
