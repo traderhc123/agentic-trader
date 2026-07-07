@@ -26,6 +26,50 @@ class WalletError(RuntimeError):
     pass
 
 
+def wallet_from_cfg(cfg):
+    if cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"):
+        return LNbitsWallet(cfg["lnbits_url"], cfg["lnbits_admin_key"])
+    return None
+
+
+def print_funding_invoice(wallet, sats):
+    bolt11 = wallet.create_invoice(sats, memo="fund agentic trader")
+    print(f"\nPay this invoice from ANY Lightning wallet to add {sats:,} sats:\n")
+    print(bolt11)
+    print("\n(Strike, Cash App, Phoenix, Alby, Wallet of Satoshi, etc. — scan or paste.)")
+
+
+def wallet_setup(cfg):
+    """Attach an LNbits wallet so the agent can pay sats-priced feeds."""
+    print("\nGive this agent a Lightning wallet it can pay from (see README")
+    print("'Give your agent sats' — an LNbits wallet takes ~2 minutes to make).")
+    url = input("LNbits instance URL (e.g. https://demo.lnbits.com): ").strip()
+    key = input("Wallet ADMIN key (Wallet -> API info -> Admin key): ").strip()
+    if not url or not key:
+        print("Skipped — configure a wallet later by re-running setup.")
+        return cfg
+    wallet = LNbitsWallet(url, key)
+    try:
+        bal = wallet.balance_sats()
+    except WalletError as exc:
+        print(f"Wallet check FAILED: {exc}")
+        print("Fix the URL/key and re-run setup.")
+        return cfg
+    cfg["lnbits_url"] = url
+    cfg["lnbits_admin_key"] = key
+    print(f"Wallet connected ✓  balance: {bal:,} sats")
+    if bal < 15_000:
+        print("Balance looks low for a ~$10/day pass. Fund it now?")
+        raw = input("Amount in sats to request (blank to skip): ").strip()
+        if raw.isdigit() and int(raw) > 0:
+            print_funding_invoice(wallet, int(raw))
+    # Safety cap: the agent will never auto-pay an invoice above this.
+    cfg.setdefault("max_autopay_sats", 30_000)
+    print(f"Auto-pay safety cap: {cfg['max_autopay_sats']:,} sats per invoice "
+          "(edit max_autopay_sats in config.json to change).")
+    return cfg
+
+
 class LNbitsWallet:
     def __init__(self, url: str, admin_key: str):
         self.url = url.rstrip("/")

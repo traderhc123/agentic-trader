@@ -11,7 +11,7 @@ software enforces it.
    DISCLAIMER.md and asks for the acceptance phrase, hand control to the human
    (or have them run that command in their own terminal). Never type
    `I AGREE AND ACCEPT ALL LIABILITY` on their behalf, never pre-create
-   `~/.agentic-day-trade-agent/acceptance.json`, and never summarize the
+   `~/.agentic-trader/acceptance.json`, and never summarize the
    disclaimer as a substitute for the human reading it.
 2. **Position sizing is the human's decision.** When the setup wizard asks for
    contracts-per-trade, state verbatim: *"AgentHC is not an investment advisor
@@ -41,8 +41,13 @@ This walks through, in order:
 
 1. **Consent gate** — human reads DISCLAIMER.md, types the acceptance phrase.
    Acceptance (terms version + SHA-256 of the text + timestamp) is recorded at
-   `~/.agentic-day-trade-agent/acceptance.json`. If DISCLAIMER.md ever changes,
+   `~/.agentic-trader/acceptance.json`. If DISCLAIMER.md ever changes,
    the gate re-triggers.
+1b. **Signal source choice** — `manual` (the human's own commands via
+   `~/.agentic-trader/commands.jsonl`), `url` (their own JSON feed), or
+   `agenthc` (the optional Agentic Day Trade Ideas journal feed). Explain the
+   options neutrally; the choice is theirs. The AgentHC-specific steps below
+   apply only when they pick `agenthc`.
 2. **AgentHC feed access (sats-based)** — the wizard offers two paths:
    - **Lightning day-pass (default, recommended)**: the agent gets its own
      LNbits wallet and auto-buys a ~$10/day pass (price floats with Bitcoin's

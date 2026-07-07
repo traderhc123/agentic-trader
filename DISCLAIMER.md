@@ -1,6 +1,6 @@
 # Agentic Day Trade Ideas — User Agreement & Full Disclaimer
 
-**Terms version: `agent-terms-2026.07`**
+**Terms version: `agent-terms-2026.07.1`**
 
 > This agent template will not run until you have read this entire document
 > and affirmatively accepted it. Your acceptance is recorded locally with the
@@ -9,12 +9,16 @@
 
 ## 1. What this software is
 
-This repository is an open-source **template** for an autonomous AI trading
-agent. It (a) reads the "Agentic Day Trade Ideas" feed published by AgentHC —
-a machine-readable feed of AgentHC's own published, **hypothetical
+This repository is an open-source **template** for a general-purpose
+autonomous trading agent. It (a) reads a **signal source that you choose and
+configure** — your own local command file, any JSON feed URL you supply, or
+(optionally) the "Agentic Day Trade Ideas" feed published by AgentHC, a
+machine-readable feed of AgentHC's own published, **hypothetical
 paper-trading journal** (past-tense statements of fact such as "ENTERED" and
 "EXITED") — and (b) can place real-money options orders in **your** Robinhood
-Agentic brokerage account, under **your** configuration, at **your** direction.
+Agentic brokerage account, under **your** configuration, at **your**
+direction. The software is signal-source-agnostic; which source to use, and
+whether to act on anything it reports, is entirely your choice.
 
 ## 2. Not investment advice; no adviser relationship
 
@@ -64,9 +68,9 @@ RESULTS HAVE INHERENT LIMITATIONS. NO REPRESENTATION IS BEING MADE THAT ANY
 ACCOUNT WILL OR IS LIKELY TO ACHIEVE PROFITS OR LOSSES SIMILAR TO THOSE SHOWN.
 Past performance is not indicative of future results.
 
-## 5. Positions, conflicts, and feed-first publication
+## 5. Positions, conflicts, and feed-first publication (AgentHC feed)
 
-Sky Manor Trading LLC and its principals may hold, and may buy or sell,
+When you use the optional AgentHC feed: Sky Manor Trading LLC and its principals may hold, and may buy or sell,
 positions in the securities or options referenced in journal events. Journal
 events are published to all subscribers first; AgentHC and its principals may
 or may not subsequently enter a corresponding position in their own accounts,
@@ -95,7 +99,7 @@ obligations in your account.
 
 Always do your own research and consult a licensed financial professional
 before making any investment decision. By typing the acceptance phrase when
-prompted (or placing a valid acceptance record at `~/.agentic-day-trade-agent/
+prompted (or placing a valid acceptance record at `~/.agentic-trader/
 acceptance.json`), you represent that you have read and understood this entire
 agreement, that you accept all of its terms including the liability terms in
 Section 3, and that you are legally able to enter into it.
