@@ -516,7 +516,7 @@ def cmd_run():
           f"{_sizing_desc(cfg)}, policy brain "
           f"{'ON' if llm_policy.enabled(cfg) else 'off'}. Ctrl-C to stop.")
     if dash_url:
-        print(f"Dashboard: {dash_url}  (remote? tunnel: ssh -L 8722:127.0.0.1:8722 user@host)")
+        print(f"Dashboard: {dash_url}  (remote? tunnel: ssh -L 8721:127.0.0.1:8721 user@host)")
     print("Reminder: you are responsible for every order this agent places.")
     notify(cfg, f"agentic-trader heartbeat started [{mode}], source={cfg['source']}"
                 + (f" — dashboard {dash_url}" if dash_url else ""))

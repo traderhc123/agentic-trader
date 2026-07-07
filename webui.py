@@ -1,7 +1,7 @@
 """Local web UI — a setup wizard and a live dashboard, no terminal needed.
 
 Both servers bind 127.0.0.1 ONLY (never exposed to the network). On a remote
-VPS, reach them through an SSH tunnel:  ssh -L 8722:127.0.0.1:8722 user@host
+VPS, reach them through an SSH tunnel:  ssh -L 8721:127.0.0.1:8721 user@host
 
 Wizard (``python agent.py setup --web``, port 8721):
     Full setup in the browser — the consent gate (checkbox + typed phrase,
@@ -10,7 +10,7 @@ Wizard (``python agent.py setup --web``, port 8721):
     the OAuth redirect targets, so approval lands back here automatically),
     dollar-budget or contract sizing, and the safety rails.
 
-Dashboard (started automatically by ``python agent.py run``, port 8722):
+Dashboard (served by the same app once ``python agent.py run`` starts, /dash):
     The user's OWN agent serves its own UI: live status, trade log, and a
     command box — pause / resume / dry on|off / set budget N / set cap N /
     stop, plus free-text questions answered by the LLM (user's API key)
@@ -377,7 +377,7 @@ async function doSafety(){
   if(r.ok){done('s-safety');
     document.getElementById('done-body').innerHTML=
      '<p class="ok">Setup complete.</p><pre>'+r.next+'</pre>'+
-     '<p class="muted">The dashboard lives at http://127.0.0.1:8722 once the '+
+     '<p class="muted">The dashboard lives at http://127.0.0.1:8721 once the '+
      'agent is running.</p>';
     api('/api/finish',{});}
   else document.getElementById('sf-msg').innerHTML='<span class="err">'+r.error+'</span>';
