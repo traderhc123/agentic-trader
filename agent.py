@@ -224,15 +224,25 @@ def require_consent_or_exit():
 
 # ── event pipeline: validate -> staleness -> caps -> policy -> execute ───────
 
-def _execute_dry(cfg, event, state):
+def _execute_dry(cfg, event, state, broker=None, client=None):
     """Dry-run bookkeeping: identical position tracking, zero orders."""
     contract = f"{event['ticker']} {event['expiry']} ${event['strike']:g} " \
                f"{'CALL' if event['type'] == 'C' else 'PUT'}"
     pos_key = f"{event['ticker']}|{event['expiry']}|{event['strike']}|{event['type']}"
     if event["event"] == "ENTERED" and pos_key not in state["positions"]:
-        qty = int(cfg.get("contracts_per_trade", 1))
+        qty, note = int(cfg.get("contracts_per_trade", 1)), "fixed contract count"
+        if broker is not None and client is not None:
+            try:  # read-only: resolve + quote so budget sizing previews accurately
+                option_id = broker.resolve_instrument(client, event)
+                if option_id:
+                    qty, note = broker.size_contracts(client, cfg, option_id)
+            except Exception:
+                pass
+        if qty < 1:
+            print(f"[DRY-RUN] would SKIP {contract}: {note}")
+            return None
         state["positions"][pos_key] = {"option_id": "dry", "qty": qty, "dry": True}
-        print(f"[DRY-RUN] would buy {qty}x {contract}")
+        print(f"[DRY-RUN] would buy {qty}x {contract} ({note})")
         return "entry"
     if event["event"] == "EXITED" and pos_key in state["positions"]:
         pos = state["positions"].pop(pos_key)
@@ -283,7 +293,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
     dry = bool(cfg.get("dry_run")) or bool(existing and existing.get("dry"))
 
     if dry:
-        action = _execute_dry(cfg, ev, state)
+        action = _execute_dry(cfg, ev, state, broker, client)
         prefix = "[DRY-RUN] "
     else:
         changed = broker.execute(client, cfg, ev, state)
@@ -304,7 +314,7 @@ def cmd_setup():
     require_consent_or_exit()
     cfg = _load(CONFIG_PATH, {}) or {}
 
-    print("\n== Step 1/3: Signal source ==")
+    print("\n== Step 1/4: Signal source ==")
     names = list(SOURCES)
     for i, name in enumerate(names, 1):
         print(f"  {i}) {name} — {SOURCES[name].DESCRIPTION}")
@@ -316,22 +326,42 @@ def cmd_setup():
         cfg["source"] = default
     cfg = SOURCES[cfg["source"]].setup(cfg)
 
-    print("\n== Step 2/3: Broker (Robinhood Agentic account) ==")
+    print("\n== Step 2/4: Broker (Robinhood Agentic account) ==")
     cfg["broker"] = "robinhood"
     cfg = BROKERS[cfg["broker"]].setup(cfg)
 
-    print("\n== Step 3/3: Position sizing ==")
+    print("\n== Step 3/4: Position sizing ==")
     print(SIZING_NOTICE)
-    while True:
-        raw = input("\nContracts per trade [1]: ").strip() or "1"
-        try:
-            n = int(raw)
-            if n >= 1:
-                break
-        except ValueError:
-            pass
-        print("Enter a positive integer.")
-    cfg["contracts_per_trade"] = n
+    print("\n  1) Dollar budget per trade — buys as many contracts as fit;")
+    print("     skips the trade if even one contract exceeds the budget")
+    print("  2) Fixed number of contracts per trade")
+    mode = input("Choose [1/2, default 1]: ").strip() or "1"
+    if mode == "2":
+        cfg["sizing_mode"] = "contracts"
+        while True:
+            raw = input("Contracts per trade [1]: ").strip() or "1"
+            try:
+                n = int(raw)
+                if n >= 1:
+                    break
+            except ValueError:
+                pass
+            print("Enter a positive integer.")
+        cfg["contracts_per_trade"] = n
+    else:
+        cfg["sizing_mode"] = "budget"
+        while True:
+            raw = input("Budget per trade in USD (e.g. 500): ").strip()
+            try:
+                b = float(raw)
+                if b > 0:
+                    break
+            except ValueError:
+                pass
+            print("Enter a positive dollar amount.")
+        cfg["budget_per_trade_usd"] = b
+        cfg.setdefault("contracts_per_trade", 1)  # dry-run fallback estimate
+    cfg.setdefault("max_contracts_per_trade", 25)
 
     print("\n== Step 4/4: Safety rails & extras ==")
     dry = input("Start in DRY-RUN mode (log actions, place NO orders — "

@@ -87,6 +87,62 @@ def resolve_instrument(rh, event):
     return find_id(payload) if payload else ""
 
 
+def _find_number(obj, keys):
+    """Walk a payload for the first parseable number under any of `keys`."""
+    if isinstance(obj, dict):
+        for k in keys:
+            if k in obj:
+                try:
+                    v = float(obj[k])
+                    if v > 0:
+                        return v
+                except (TypeError, ValueError):
+                    pass
+        for v in obj.values():
+            found = _find_number(v, keys)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_number(v, keys)
+            if found:
+                return found
+    return 0.0
+
+
+def quote_price(rh, option_id):
+    """Approximate fill price per share for a market buy (ask, else mark)."""
+    result = rh.call_tool("get_option_quotes", {"instrument_ids": [option_id]})
+    payload = content_json(result)
+    if payload is None:
+        return 0.0
+    return _find_number(payload, ["ask_price", "adjusted_mark_price", "mark_price"])
+
+
+def size_contracts(rh, cfg, option_id):
+    """How many contracts to buy, per the user's sizing config.
+
+    sizing_mode "contracts": fixed contracts_per_trade.
+    sizing_mode "budget": floor(budget_per_trade_usd / (price*100)); if even
+    one contract exceeds the budget, SKIP (respecting the budget beats
+    forcing a trade). Returns (qty, note) — qty 0 means skip.
+    """
+    if str(cfg.get("sizing_mode", "contracts")) == "budget":
+        budget = float(cfg.get("budget_per_trade_usd", 0) or 0)
+        if budget <= 0:
+            return 0, "budget mode but budget_per_trade_usd unset — skipped"
+        price = quote_price(rh, option_id)
+        if price <= 0:
+            return 0, "no quote available for budget sizing — skipped"
+        qty = int(budget // (price * 100))
+        if qty < 1:
+            return 0, (f"1 contract ≈ ${price * 100:,.0f} exceeds your "
+                       f"${budget:,.0f} per-trade budget — skipped")
+        qty = min(qty, int(cfg.get("max_contracts_per_trade", 25)))
+        return qty, f"${budget:,.0f} budget @ ~${price:.2f} → {qty} contract(s)"
+    return max(1, int(cfg.get("contracts_per_trade", 1))), "fixed contract count"
+
+
 def place(rh, cfg, option_id, side, effect, qty):
     args = {
         "account_number": cfg["robinhood_account"],
@@ -118,8 +174,11 @@ def execute(rh, cfg, event, state):
         if not option_id:
             print(f"  could not resolve instrument for {contract} — skipped")
             return False
-        qty = int(cfg.get("contracts_per_trade", 1))
-        print(f"ENTERED event -> buying {qty}x {contract} (your configuration)")
+        qty, note = size_contracts(rh, cfg, option_id)
+        if qty < 1:
+            print(f"SKIPPED {contract}: {note}")
+            return False
+        print(f"ENTERED event -> buying {qty}x {contract} ({note} — your configuration)")
         if place(rh, cfg, option_id, "buy", "open", qty):
             state["positions"][pos_key] = {"option_id": option_id, "qty": qty,
                                            "opened_event": event.get("event_id")}
