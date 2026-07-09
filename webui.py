@@ -12,7 +12,7 @@ Wizard (``python agent.py setup --web``, port 8721):
 
 Dashboard (served by the same app once ``python agent.py run`` starts, /dash):
     The user's OWN agent serves its own UI: live status, trade log, and a
-    command box — pause / resume / dry on|off / set budget N / set cap N /
+    command box — pause / resume / dry on|off / set budget N / set cap N / set positions N /
     stop, plus free-text questions answered by the LLM (user's API key)
     against the live status and trade log. Command handling is deliberately
     a fixed allowlist; the LLM can only ANSWER, never trade.
@@ -528,7 +528,7 @@ _DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div class="panel" id="p-activity"><h2>Activity</h2>
    <div class="body" id="trades"><span class="muted">nothing yet</span></div></div>
   <p class="muted" style="font-size:.78rem">Settings change in chat
-  (<code>set budget 500</code>, <code>set cap 3</code>, <code>dry off</code>,
+  (<code>set budget 500</code>, <code>set cap 3</code>, <code>set positions 5</code>, <code>dry off</code>,
   <code>stop</code>). Code changes: run Claude Code in the repo folder on this
   machine, then restart the agent.</p>
  </div>
@@ -1110,6 +1110,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "status and trade-log data provided. You cannot place, "
                 "modify, or size trades — for control, tell the user the "
                 "exact command (pause, resume, dry on/off, set budget N, "
+                "set positions N, "
                 "set cap N, stop). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),

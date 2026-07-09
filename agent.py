@@ -289,12 +289,22 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         return msg
 
     if ev["event"] == "ENTERED":
-        # Hard mechanical cap — independent of (and checked before) the LLM.
+        # Hard mechanical caps — independent of (and checked before) the LLM.
         cap = int(cfg.get("max_entries_per_day", 5))
         if _entries_today() >= cap:
             msg = f"SKIPPED {contract}: daily entry cap reached ({cap})"
             print(msg)
             _log_trade({"action": "skip_daily_cap", "event_id": ev["event_id"],
+                        "contract": contract})
+            return msg
+        # Concurrent-exposure cap: the daily cap resets every day, so without
+        # this a feed could accumulate unbounded open positions across days.
+        pos_cap = int(cfg.get("max_open_positions", 10))
+        if len(state.get("positions", {})) >= pos_cap:
+            msg = (f"SKIPPED {contract}: max open positions reached "
+                   f"({pos_cap}) — close positions or raise max_open_positions")
+            print(msg)
+            _log_trade({"action": "skip_position_cap", "event_id": ev["event_id"],
                         "contract": contract})
             return msg
         # The user's own policy, applied by the LLM policy brain (veto-only).
@@ -394,6 +404,7 @@ def cmd_setup():
     cfg["dry_run"] = dry != "n"
     raw = input("Max new entries per day (hard cap) [5]: ").strip()
     cfg["max_entries_per_day"] = int(raw) if raw.isdigit() else 5
+    cfg.setdefault("max_open_positions", 10)
     cfg.setdefault("max_event_age_s", 300)
     cfg = notifications_setup(cfg)
     cfg = llm_policy.setup(cfg)
@@ -459,6 +470,15 @@ def _apply_command(text):
         cfg["max_entries_per_day"] = val
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Daily entry cap set to {val}."
+    if t.startswith("set positions"):
+        try:
+            val = int(t.split()[-1])
+            assert val >= 1
+        except (ValueError, AssertionError, IndexError):
+            return True, "Usage: set positions 5"
+        cfg["max_open_positions"] = val
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, f"Max concurrent open positions set to {val}."
     if t in ("self-edit on", "self edit on"):
         cfg["self_edit_enabled"] = True
         _save(CONFIG_PATH, cfg, private=True)

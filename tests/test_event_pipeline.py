@@ -119,6 +119,37 @@ def test_daily_cap_not_bypassed_by_log_flooding(home, broker, no_policy):
     assert broker.calls == []
 
 
+def test_open_position_cap_blocks_new_entries(home, broker, no_policy):
+    """The daily cap resets every day — the concurrent cap must not."""
+    cfg = {"max_open_positions": 2, "dry_run": False}
+    state = {"positions": {"A|2026-07-10|1.0|C": {"qty": 1},
+                           "B|2026-07-10|1.0|C": {"qty": 1}}}
+    out = agent.handle_event(make_event(), cfg, state, broker, object(),
+                             lambda s: None)
+    assert "max open positions" in out
+    assert broker.calls == []
+    assert agent._recent_trades(5)[-1]["action"] == "skip_position_cap"
+
+
+def test_open_position_cap_never_blocks_exits(home, broker, no_policy):
+    cfg = {"max_open_positions": 1, "dry_run": False}
+    state = {"positions": {"SPY|2026-07-10|752.0|C": {"option_id": "x",
+                                                      "qty": 1}}}
+    out = agent.handle_event(make_event(event="EXITED"), cfg, state, broker,
+                             object(), lambda s: None)
+    assert out == "EXIT: SPY 2026-07-10 $752.0 C"
+    assert state["positions"] == {}
+
+
+def test_open_position_cap_default_allows_normal_use(home, broker, no_policy):
+    cfg = {"dry_run": True}
+    state = {"positions": {f"T{i}|2026-07-10|1.0|C": {"qty": 1, "dry": True}
+                           for i in range(9)}}
+    out = agent.handle_event(make_event(), cfg, state, None, None,
+                             lambda s: None)
+    assert out.startswith("[DRY-RUN] ENTRY")  # 9 open < default 10
+
+
 def test_exits_bypass_cap_and_policy(home, broker, monkeypatch):
     import llm_policy
 

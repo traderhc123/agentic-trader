@@ -48,7 +48,7 @@ Your human pointed you at this repository to set them up. Follow
 
 - **Consent-gated**: refuses to run until you accept the agreement yourself
 - **Dry-run by default**: watch what it *would* do for days before real orders
-- **Safety rails**: daily entry cap, event validation, staleness guard, wallet auto-pay cap ([SECURITY.md](SECURITY.md))
+- **Safety rails**: daily entry cap, concurrent open-positions cap, event validation, staleness guard, wallet auto-pay cap ([SECURITY.md](SECURITY.md))
 - **Dollar-budget sizing**: set a per-trade budget (e.g. $500) — the agent quotes the option, buys what fits, and skips trades that would exceed it (or use fixed contract counts)
 - **LLM policy brain (optional)**: write plain-English rules in `policy.md` — the agent checks every entry against *your* policy with *your* Anthropic API key (veto-only; fails safe to skip)
 - **Notifications**: Discord / ntfy / Telegram message on every action, veto, and error + a daily digest after the close

@@ -9,7 +9,8 @@ you control, and what to check before running it.
 |---|---|
 | **Hard consent gate** | The agent refuses ALL setup/trading actions until you personally accept the versioned DISCLAIMER.md (SHA-pinned; re-triggers if the text changes). Scripts and LLMs are instructed never to accept for you, and the one-line installer never touches it. |
 | **Dry-run mode** (default ON at setup) | No orders while you trial the source and policy — actions are logged/notified only. |
-| **Daily entry cap** (`max_entries_per_day`, default 5) | A runaway or malicious feed cannot open unlimited positions. Mechanical — checked before the LLM policy. |
+| **Daily entry cap** (`max_entries_per_day`, default 5) | A runaway or malicious feed cannot open unlimited positions in a day. Counted from the full trade log — flooding the log with skippable events cannot push today's entries out of view. Mechanical — checked before the LLM policy. |
+| **Open-positions cap** (`max_open_positions`, default 10) | The daily cap resets each day; this one doesn't — total concurrent exposure stays bounded no matter how many days a feed misbehaves. Exits are never blocked. |
 | **Event validation** | Ticker/expiry/strike/type are sanity-checked before any instrument lookup; malformed or absurd events are dropped. |
 | **Staleness guard** (`max_event_age_s`, default 300) | A machine waking from sleep will not buy into an hours-old entry. Exits are never stale-blocked. |
 | **Auto-pay cap** (`max_autopay_sats`, default 30,000) | The wallet never pays an oversized Lightning invoice, even if a paywall misbehaves. |
