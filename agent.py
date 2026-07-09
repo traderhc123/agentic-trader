@@ -139,9 +139,28 @@ def _recent_trades(limit=50):
 
 
 def _entries_today():
+    """Count today's entries by scanning the FULL trade log.
+
+    Deliberately not a tail read: every skip/veto also appends a log line, so
+    a hostile or misbehaving feed could emit enough skippable events to push
+    today's real entries out of a fixed-size tail and slip past the daily cap.
+    """
     today = datetime.now(timezone.utc).date().isoformat()
-    return sum(1 for t in _recent_trades(200)
-               if t.get("action") == "entry" and str(t.get("ts", "")).startswith(today))
+    count = 0
+    try:
+        with open(TRADES_PATH) as f:
+            for line in f:
+                if today not in line:
+                    continue
+                try:
+                    t = json.loads(line)
+                except ValueError:
+                    continue
+                if t.get("action") == "entry" and str(t.get("ts", "")).startswith(today):
+                    count += 1
+    except OSError:
+        pass
+    return count
 
 
 def _market_open_now():
@@ -540,7 +559,16 @@ def cmd_run(app_window=False):
                 for ev in events:
                     if ev.get("event_id") in seen:
                         continue
-                    outcome = handle_event(ev, cfg, state, broker, client, save_state)
+                    try:
+                        outcome = handle_event(ev, cfg, state, broker, client,
+                                               save_state)
+                    except Exception as exc:
+                        # One malformed/erroring event must not block the rest
+                        # of the batch. Not marked seen — transient broker/net
+                        # errors get retried on the next poll.
+                        print(f"event error (will retry next poll): "
+                              f"{str(exc)[:200]}")
+                        continue
                     if outcome:
                         notify(cfg, f"agentic-trader: {outcome}")
                     seen.add(ev["event_id"])

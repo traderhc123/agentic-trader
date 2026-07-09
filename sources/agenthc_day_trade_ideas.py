@@ -111,10 +111,25 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     for ev in resp.json().get("events", []):
         if ev.get("event") not in ("ENTERED", "EXITED"):
             continue
-        ev = dict(ev)
-        ev["event_id"] = (f"{ev['event']}|{ev.get('ticker')}|{ev.get('expiry')}|"
-                          f"{ev.get('strike')}|{ev.get('type')}|{ev.get('occurred_at')}")
-        events.append(ev)
+        try:
+            # Normalize to the contract types (see sources/__init__.py) — a
+            # string strike from the wire must not reach the order path.
+            norm = {
+                "event": ev["event"],
+                "ticker": str(ev["ticker"]).upper(),
+                "expiry": str(ev["expiry"]),
+                "strike": float(ev["strike"]),
+                "type": "C" if str(ev["type"]).upper().startswith("C") else "P",
+                "occurred_at": ev.get("occurred_at"),
+                "message": ev.get("message", ""),
+            }
+            if "paper_pnl_pct" in ev:
+                norm["paper_pnl_pct"] = ev["paper_pnl_pct"]
+        except (KeyError, TypeError, ValueError):
+            continue
+        norm["event_id"] = (f"{norm['event']}|{norm['ticker']}|{norm['expiry']}|"
+                            f"{norm['strike']}|{norm['type']}|{norm.get('occurred_at')}")
+        events.append(norm)
     return events
 
 

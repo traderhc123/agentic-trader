@@ -1,5 +1,7 @@
 # agentic-trader
 
+[![CI](https://github.com/traderhc123/agentic-trader/actions/workflows/ci.yml/badge.svg)](https://github.com/traderhc123/agentic-trader/actions/workflows/ci.yml)
+
 A consent-gated, open-source **autonomous trading agent** for Robinhood's new
 [agentic trading](https://robinhood.com/us/en/agentic-trading/) platform.
 Pick a **signal source**, connect **your own brokerage** (Robinhood Agentic or Alpaca — including Alpaca's zero-dollar paper mode), set
@@ -166,6 +168,20 @@ A source is one file in `sources/` exposing `NAME`, `DESCRIPTION`,
 documented contract. A broker exposes `setup(cfg)`, `client(cfg)`, and
 `execute(client, cfg, event, state)`. Keep sources declarative (facts, not
 recommendations) and keep all sizing/risk decisions with the user.
+
+## Tests
+
+```bash
+pip install pytest && pytest
+```
+
+The suite covers the safety rails end-to-end with zero network access: event
+validation, the staleness guard, the daily entry cap (including the
+log-flooding bypass it now resists), policy-brain fail-safe direction, both
+brokers' sizing/order builders, dry-run bookkeeping, the consent gate, and
+the self-edit FOUNDATION lock with rollback. CI runs it on Python 3.10 and
+3.12 for every push and PR. If you add a source or broker, please add tests
+in the same style — mock the network, drive the real functions.
 
 ## License
 

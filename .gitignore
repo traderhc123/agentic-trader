@@ -6,3 +6,4 @@ state.json
 robinhood_oauth.json
 .agentic-trader/
 commands.jsonl
+.pytest_cache/
