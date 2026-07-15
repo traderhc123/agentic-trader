@@ -7,9 +7,16 @@ The token is used for the creation calls and NOT stored.
 
 What gets copied to the droplet (the user's own files, to the user's own
 server): config.json, acceptance.json, robinhood_oauth.json, policy.md.
-Note: cloud-init user-data is readable from inside the droplet and by
-anyone with access to the user's cloud account — same trust domain as the
-server itself.
+
+Secret-exposure note: cloud-init user-data carries these files (base64) and is,
+by default, (a) stored on disk under /var/lib/cloud and (b) served for the life
+of the droplet by the link-local metadata service (169.254.169.254) to ANY
+process on the box. To shrink that blast radius, the runcmd below — after the
+config is restored — shreds the local user-data copies and firewalls the
+metadata endpoint (the agent needs neither once booted). The copy held in the
+user's DigitalOcean control panel remains until the droplet is rebuilt, and is
+in the same trust domain as the server; if the droplet is ever destroyed,
+rotate the Robinhood session and any API keys it carried.
 """
 
 import base64
@@ -64,6 +71,15 @@ def build_cloud_init():
             "/etc/systemd/system/",
             "systemctl daemon-reload",
             "systemctl enable --now agentic-trader",
+            # Secrets travelled in user-data; the config is now on disk (0600)
+            # so neither the local user-data copy nor the metadata service is
+            # needed again. Shred the copies and firewall the metadata endpoint
+            # so a later low-priv foothold cannot re-read them. Best-effort.
+            "shred -u /var/lib/cloud/instance/user-data.txt* 2>/dev/null || "
+            "rm -f /var/lib/cloud/instance/user-data.txt* || true",
+            "find /var/lib/cloud/instances -name 'user-data.txt*' -delete "
+            "2>/dev/null || true",
+            "iptables -A OUTPUT -d 169.254.169.254 -j REJECT || true",
         ],
     }
     return "#cloud-config\n" + json.dumps(doc, indent=1)

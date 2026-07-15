@@ -27,6 +27,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_PORT = 8721      # one app, one port (also the Robinhood OAuth redirect port)
 
+# The UI binds loopback only, but a webpage in the user's browser can still
+# reach 127.0.0.1: reject requests addressed to a foreign Host (DNS-rebinding)
+# and state-changing POSTs carrying a foreign Origin (classic CSRF). Same-origin
+# dashboard calls send our own Host/Origin (or, for top-level navigations, none).
+_ALLOWED_HOSTS = (f"127.0.0.1:{APP_PORT}", f"localhost:{APP_PORT}")
+_ALLOWED_ORIGINS = tuple(f"http://{h}" for h in _ALLOWED_HOSTS)
+
 
 def open_app_window(url):
     """Open `url` as a chromeless 'app' window (feels native), falling back to
@@ -643,6 +650,20 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         pass
 
+    def _guard(self, check_origin):
+        """Reject cross-site / rebinding requests. Returns False (and sends 403)
+        if the request must not be served."""
+        host = self.headers.get("Host")
+        if host and host not in _ALLOWED_HOSTS:
+            self._send({"error": "forbidden host"}, 403)
+            return False
+        if check_origin:
+            origin = self.headers.get("Origin")
+            if origin is not None and origin not in _ALLOWED_ORIGINS:
+                self._send({"error": "forbidden origin"}, 403)
+                return False
+        return True
+
     def _send(self, obj, status=200, html=None):
         body = html.encode() if html is not None else json.dumps(obj).encode()
         self.send_response(status)
@@ -655,6 +676,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._guard(check_origin=False):
+            return
         path = self.path.split("?")[0]
         if path == "/":
             self.send_response(302)
@@ -672,6 +695,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send({"ok": False, "error": str(exc)[:200]}, 500)
 
     def do_POST(self):
+        if not self._guard(check_origin=True):
+            return
         fn = self.routes_post.get(self.path.split("?")[0])
         if fn is None:
             return self._send({"error": "not found"}, 404)
@@ -1040,6 +1065,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
 
     def do_GET(self):
         if self.path.startswith("/callback"):
+            if not self._guard(check_origin=False):
+                return
             try:
                 rh_callback(self)
             except _Redirect:
