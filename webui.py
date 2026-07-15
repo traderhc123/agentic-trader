@@ -74,53 +74,99 @@ CONTROLS = {"paused": False, "stop": False}
 
 _STYLE = """
 <style>
- body{font-family:system-ui,sans-serif;max-width:760px;margin:2rem auto;
-      padding:0 1rem;background:#0f1115;color:#e6e6e6;line-height:1.5}
- h1{font-size:1.4rem} h2{font-size:1.05rem;margin:1.6rem 0 .4rem}
- section{border:1px solid #2a2f3a;border-radius:10px;padding:1rem;margin:1rem 0;
-         background:#161a22}
- section.done{border-color:#2e7d32} section.locked{opacity:.45;pointer-events:none}
+ :root{
+   --bg:#0b0e14; --panel:#141925; --panel-2:#161b28; --sink:#0a0c11;
+   --fg:#e8ebf2; --muted:#9aa4b6; --line:#232a38; --line-2:#2c3446;
+   --accent:#4c8dff; --accent-2:#82b0ff; --ok:#4ade80; --err:#f87171;
+   --shadow:0 1px 2px rgba(0,0,0,.45),0 10px 34px rgba(0,0,0,.30);
+ }
+ *{box-sizing:border-box}
+ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,system-ui,sans-serif;
+      max-width:760px;margin:2rem auto;padding:0 1.15rem;background:var(--bg);color:var(--fg);
+      line-height:1.55;-webkit-font-smoothing:antialiased;letter-spacing:.1px}
+ h1{font-size:1.5rem;font-weight:650;letter-spacing:-.02em}
+ h2{font-size:1.06rem;font-weight:600;margin:1.6rem 0 .5rem;letter-spacing:-.01em}
+ a{color:var(--accent-2);text-decoration:none} a:hover{text-decoration:underline}
+ section{border:1px solid var(--line);border-radius:12px;padding:1.15rem 1.2rem;margin:1rem 0;
+         background:linear-gradient(180deg,var(--panel),var(--panel-2));box-shadow:var(--shadow)}
+ section.done{border-color:#2f6f43} section.locked{opacity:.45;pointer-events:none}
+ label{display:block;font-size:.9rem;margin-top:.15rem}
  input[type=text],input[type=password],input[type=number],textarea,select{
-   width:100%;box-sizing:border-box;padding:.5rem;margin:.25rem 0 .6rem;
-   background:#0f1115;color:#e6e6e6;border:1px solid #2a2f3a;border-radius:6px}
- button{padding:.5rem 1rem;border:0;border-radius:6px;background:#3b82f6;
-        color:#fff;cursor:pointer;font-size:.95rem} button:disabled{background:#333}
- .muted{color:#9aa3b2;font-size:.85rem} .ok{color:#4ade80} .err{color:#f87171}
- pre{background:#0b0d11;padding:.7rem;border-radius:6px;overflow-x:auto;
+   width:100%;padding:.6rem .7rem;margin:.3rem 0 .7rem;background:var(--sink);color:var(--fg);
+   border:1px solid var(--line-2);border-radius:8px;font-size:.95rem;
+   transition:border-color .15s,box-shadow .15s}
+ input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent);
+   box-shadow:0 0 0 3px rgba(76,141,255,.18)}
+ button{padding:.55rem 1.1rem;border:0;border-radius:8px;color:#fff;cursor:pointer;
+        font-size:.95rem;font-weight:550;background:linear-gradient(180deg,var(--accent),#3a7bef);
+        box-shadow:0 1px 2px rgba(0,0,0,.35);transition:transform .08s,filter .15s}
+ button:hover{filter:brightness(1.08)} button:active{transform:translateY(1px)}
+ button:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(76,141,255,.38)}
+ button:disabled{background:#2a303c;color:#6b7280;cursor:not-allowed;box-shadow:none;filter:none}
+ .muted{color:var(--muted);font-size:.86rem} .ok{color:var(--ok)} .err{color:var(--err)}
+ pre{background:var(--sink);padding:.75rem;border-radius:8px;overflow-x:auto;border:1px solid var(--line);
      white-space:pre-wrap;word-break:break-word;font-size:.8rem}
- .disc{max-height:280px;overflow-y:auto;border:1px solid #2a2f3a;padding:.8rem;
-       border-radius:6px;font-size:.82rem;background:#0b0d11}
- .badge{font-size:.75rem;padding:.1rem .5rem;border-radius:99px;
-        background:#2a2f3a;margin-left:.5rem}
- .badge.on{background:#14532d;color:#4ade80}
- #chatlog{height:300px;overflow-y:auto;background:#0b0d11;border-radius:6px;
-          padding:.7rem;font-size:.85rem}
- .me{color:#93c5fd} .agent{color:#e6e6e6;margin-bottom:.6rem;white-space:pre-wrap}
+ .disc{max-height:280px;overflow-y:auto;border:1px solid var(--line-2);padding:.85rem;
+       border-radius:8px;font-size:.82rem;background:var(--sink)}
+ .badge{font-size:.72rem;padding:.12rem .55rem;border-radius:99px;
+        background:var(--line-2);margin-left:.5rem}
+ .badge.on{background:#14532d;color:var(--ok)}
+ #chatlog{height:300px;overflow-y:auto;background:var(--sink);border-radius:8px;
+          padding:.75rem;font-size:.85rem;border:1px solid var(--line)}
+ .me{color:var(--accent-2)} .agent{color:var(--fg);margin-bottom:.6rem;white-space:pre-wrap}
  table{width:100%;border-collapse:collapse;font-size:.82rem}
- td,th{padding:.3rem .5rem;border-bottom:1px solid #232936;text-align:left}
+ td,th{padding:.35rem .55rem;border-bottom:1px solid var(--line);text-align:left}
+ @media (prefers-reduced-motion:reduce){*{animation:none!important}}
 </style>"""
 
 _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agentic-trader setup</title>""" + _STYLE + """
 <style>
- body{max-width:820px}
- .stepbar{display:flex;gap:.35rem;flex-wrap:wrap;margin:1rem 0 1.2rem}
- .chip{font-size:.75rem;padding:.25rem .7rem;border-radius:99px;
-       border:1px solid #2a2f3a;color:#9aa3b2;cursor:default;user-select:none}
- .chip.done{border-color:#2e7d32;color:#4ade80;cursor:pointer}
- .chip.cur{border-color:#3b82f6;color:#93c5fd;background:#101827}
- section{display:none}
- section.active{display:block}
- .navrow{display:flex;gap:.6rem;margin-top:.8rem}
- .navrow .back{background:#232936;border:1px solid #2a2f3a}
- #help{margin-top:1.4rem;border-top:1px solid #232936;padding-top:.8rem}
+ html{background:
+   radial-gradient(1100px 720px at 82% -10%,rgba(76,141,255,.12),transparent 58%),
+   radial-gradient(900px 620px at 4% 2%,rgba(76,141,255,.07),transparent 55%),
+   var(--bg)}
+ body{max-width:880px;background:transparent}
+ #bg{position:fixed;inset:0;width:100%;height:100%;z-index:-1;display:block}
+ .hero{display:flex;align-items:center;gap:.85rem;margin:.5rem 0 .1rem}
+ .hero>div.txt{min-width:0}
+ .hero .tag{font-size:.7rem;letter-spacing:.18em;text-transform:uppercase;color:var(--muted)}
+ .hero h1{margin:.05rem 0 0}
+ .logo{width:42px;height:42px;flex:none;border-radius:12px;position:relative;overflow:hidden;
+   background:radial-gradient(125% 125% at 30% 18%,#6ea0ff,#2f6bff 52%,#1c3d97);
+   box-shadow:0 6px 20px rgba(58,110,255,.45),inset 0 1px 0 rgba(255,255,255,.4)}
+ .logo::after{content:"";position:absolute;inset:0;
+   background:conic-gradient(from 200deg,transparent,rgba(255,255,255,.4),transparent 42%)}
+ .grow{flex:1}
+ .lead{color:var(--muted);font-size:.9rem;margin:.55rem 0 .1rem;max-width:64ch}
+ .stepbar{display:flex;gap:.4rem;flex-wrap:wrap;margin:1.25rem 0 1.35rem}
+ .chip{font-size:.75rem;padding:.32rem .78rem;border-radius:99px;border:1px solid var(--line-2);
+   color:var(--muted);cursor:default;user-select:none;background:rgba(20,25,37,.55);transition:.15s}
+ .chip.done{border-color:#2f7d46;color:var(--ok);cursor:pointer}
+ .chip.done:hover{background:rgba(47,125,70,.14)}
+ .chip.cur{border-color:var(--accent);color:#bcd4ff;background:rgba(37,60,120,.4);
+   box-shadow:0 0 0 3px rgba(76,141,255,.12)}
+ section{display:none;background:linear-gradient(180deg,rgba(20,25,37,.82),rgba(22,27,40,.88));
+   backdrop-filter:blur(9px);-webkit-backdrop-filter:blur(9px)}
+ section.active{display:block;animation:rise .28s ease both}
+ @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+ .navrow{display:flex;gap:.6rem;margin-top:.9rem;align-items:center;flex-wrap:wrap}
+ .navrow .back{background:linear-gradient(180deg,#28303f,#222a38);border:1px solid var(--line-2)}
+ #help{margin-top:1.5rem;border-top:1px solid var(--line);padding-top:.9rem}
  #chatlog{height:170px}
  .chatrow{display:flex;gap:.4rem}.chatrow input{margin:0;flex:1}
 </style></head><body>
-<h1>agentic-trader — setup <a class="chip done" href="/dash" style="text-decoration:none">→ dashboard</a></h1>
-<p class="muted">Everything happens on YOUR machine (served from 127.0.0.1 by
-your agent's own wizard). Real money; read carefully.</p>
+<canvas id="bg" aria-hidden="true"></canvas>
+<div class="hero">
+ <div class="logo" aria-hidden="true"></div>
+ <div class="txt"><div class="tag">Agentic Trader</div>
+  <h1>Set up your trading agent</h1></div>
+ <span class="grow"></span>
+ <a class="chip done" href="/dash" style="align-self:center">Dashboard →</a>
+</div>
+<p class="lead">Everything runs on your own machine — this wizard is served from
+127.0.0.1 by your agent itself. It moves real money; read each step carefully.</p>
 <div class="stepbar" id="stepbar"></div>
 
 <section id="s-consent"><h2>Agreement</h2>
@@ -267,6 +313,9 @@ your agent's own wizard). Real money; read carefully.</p>
 </div>
 
 <script>
+// HTML-escape helper, hoisted so every builder can use it (loadBrokers/brkFields
+// run during boot(), before any local definition would exist).
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
 const STEPS=[["s-consent","Agreement"],["s-llm","Your AI"],["s-source","Source"],
  ["s-broker","Robinhood"],["s-sizing","Sizing"],["s-safety","Safety"],["s-done","Launch"]];
 let doneSet=new Set(), cur=0, maxUnlocked=0;
@@ -442,12 +491,86 @@ async function deploy(){
 async function ask(){
   const box=document.getElementById('cmd');const q=box.value.trim();if(!q)return;
   box.value='';const log=document.getElementById('chatlog');
-  const esc=s=>{const d=document.createElement('div');d.textContent=s;return d.innerHTML;};
   log.innerHTML+='<div class="me">you: '+esc(q)+'</div>';log.scrollTop=log.scrollHeight;
   const r=await api('/api/ask',{question:q});
   log.innerHTML+='<div class="agent">'+esc(r.reply)+'</div>';log.scrollTop=log.scrollHeight;
 }
 boot();
+</script>
+<script>
+/* Ambient background: a slowly drifting 3D node network, rendered in raw WebGL
+   (no library, no network, no external script) so it stays self-contained and
+   works offline. Degrades silently to the flat dark background if WebGL is
+   unavailable, and holds a single static frame when the OS asks to reduce
+   motion. Purely decorative — aria-hidden, never blocks the wizard. */
+(function(){
+  var c=document.getElementById('bg'); if(!c||!window.WebGLRenderingContext) return;
+  var gl=null; try{ gl=c.getContext('webgl',{alpha:true,antialias:true,premultipliedAlpha:false}); }catch(e){}
+  if(!gl) return;
+  // Accessibility: honour reduced-motion by skipping the animation entirely —
+  // the static CSS glow behind the page is the background in that case.
+  if(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  function sh(t,src){var s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);return s;}
+  var vs=sh(gl.VERTEX_SHADER,
+    'attribute vec2 a_pos;attribute float a_size;attribute float a_alpha;varying float v_a;'+
+    'void main(){v_a=a_alpha;gl_Position=vec4(a_pos,0.0,1.0);gl_PointSize=a_size;}');
+  var fs=sh(gl.FRAGMENT_SHADER,
+    /* rgb=u_col (not u_col*a): additive blend already scales by SRC_ALPHA, so
+       multiplying here too would darken to alpha^2 and vanish. */
+    'precision mediump float;varying float v_a;uniform int u_point;uniform vec3 u_col;'+
+    'void main(){if(u_point==1){vec2 d=gl_PointCoord-0.5;float r=length(d);if(r>0.5)discard;'+
+    'float a=v_a*(1.0-smoothstep(0.05,0.5,r));gl_FragColor=vec4(u_col,a);}'+
+    'else{gl_FragColor=vec4(u_col,v_a);}}');
+  var p=gl.createProgram();gl.attachShader(p,vs);gl.attachShader(p,fs);gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) return;
+  gl.useProgram(p);
+  var aPos=gl.getAttribLocation(p,'a_pos'),aSize=gl.getAttribLocation(p,'a_size'),
+      aAlpha=gl.getAttribLocation(p,'a_alpha'),uPoint=gl.getUniformLocation(p,'u_point'),
+      uCol=gl.getUniformLocation(p,'u_col');
+  gl.uniform3f(uCol,0.36,0.56,1.0);
+  var buf=gl.createBuffer();
+  gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE);gl.clearColor(0,0,0,0);
+  var DPR=Math.min(window.devicePixelRatio||1,2),W=0,H=0;
+  function resize(){W=c.clientWidth;H=c.clientHeight;
+    c.width=Math.max(1,Math.floor(W*DPR));c.height=Math.max(1,Math.floor(H*DPR));
+    gl.viewport(0,0,c.width,c.height);}
+  var N=58,nodes=[];
+  for(var i=0;i<N;i++)nodes.push({x:Math.random()*2-1,y:Math.random()*2-1,z:Math.random()*2-1,
+    vx:(Math.random()*2-1)*6e-4,vy:(Math.random()*2-1)*6e-4,vz:(Math.random()*2-1)*6e-4});
+  var pts=new Float32Array(N*4),lines=new Float32Array(N*N*8),ang=0;
+  var sx=new Float32Array(N),sy=new Float32Array(N),sd=new Float32Array(N);
+  function frame(){
+    ang+=0.0015;var ca=Math.cos(ang),sa=Math.sin(ang),asp=W/Math.max(H,1);
+    for(var i=0;i<N;i++){var n=nodes[i];
+      n.x+=n.vx;n.y+=n.vy;n.z+=n.vz;
+      if(n.x>1)n.x-=2;else if(n.x<-1)n.x+=2; if(n.y>1)n.y-=2;else if(n.y<-1)n.y+=2;
+      if(n.z>1)n.z-=2;else if(n.z<-1)n.z+=2;
+      var xr=n.x*ca-n.z*sa,zr=n.x*sa+n.z*ca,pp=1.0/(2.4-zr);
+      sx[i]=(xr*pp)/(asp>1?asp:1)*1.15; sy[i]=(n.y*pp)*(asp<1?asp:1)*1.15; sd[i]=pp;}
+    for(var i=0;i<N;i++){pts[i*4]=sx[i];pts[i*4+1]=sy[i];
+      pts[i*4+2]=Math.max(2.2,sd[i]*5.0*DPR);pts[i*4+3]=0.22+sd[i]*0.45;}
+    var li=0,TH=0.27;
+    for(var i=0;i<N;i++)for(var j=i+1;j<N;j++){
+      var dx=sx[i]-sx[j],dy=sy[i]-sy[j],d=Math.sqrt(dx*dx+dy*dy);
+      if(d<TH){var a=(1.0-d/TH)*0.42*Math.min(sd[i],sd[j]);
+        lines[li++]=sx[i];lines[li++]=sy[i];lines[li++]=0;lines[li++]=a;
+        lines[li++]=sx[j];lines[li++]=sy[j];lines[li++]=0;lines[li++]=a;}}
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+    gl.enableVertexAttribArray(aPos);gl.enableVertexAttribArray(aSize);gl.enableVertexAttribArray(aAlpha);
+    gl.bufferData(gl.ARRAY_BUFFER,lines.subarray(0,li),gl.DYNAMIC_DRAW);
+    gl.vertexAttribPointer(aPos,2,gl.FLOAT,false,16,0);gl.vertexAttribPointer(aSize,1,gl.FLOAT,false,16,8);
+    gl.vertexAttribPointer(aAlpha,1,gl.FLOAT,false,16,12);gl.uniform1i(uPoint,0);
+    gl.drawArrays(gl.LINES,0,li/4);
+    gl.bufferData(gl.ARRAY_BUFFER,pts,gl.DYNAMIC_DRAW);
+    gl.vertexAttribPointer(aPos,2,gl.FLOAT,false,16,0);gl.vertexAttribPointer(aSize,1,gl.FLOAT,false,16,8);
+    gl.vertexAttribPointer(aAlpha,1,gl.FLOAT,false,16,12);gl.uniform1i(uPoint,1);
+    gl.drawArrays(gl.POINTS,0,N);
+    requestAnimationFrame(frame);
+  }
+  window.addEventListener('resize',resize);
+  resize();requestAnimationFrame(frame);
+})();
 </script></body></html>"""
 
 _DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
