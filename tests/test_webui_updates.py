@@ -76,6 +76,19 @@ def test_diverged_history_refused(repos):
     assert "fast-forward" in note
 
 
+def test_pull_without_prior_check_fetches_itself(repos):
+    """Regression: pull merged a stale origin/<branch> ref and reported
+    success without updating when check (which fetched) hadn't run first."""
+    author, install = repos
+    (author / "f.txt").write_text("v2\n")
+    _run(author, "commit", "-am", "v2")
+    _run(author, "push", "origin", "main")
+
+    ok, note = webui.pull_code_updates()  # no check_code_updates() first
+    assert ok, note
+    assert (install / "f.txt").read_text() == "v2\n"
+
+
 def test_not_a_git_checkout(tmp_path, monkeypatch):
     monkeypatch.setattr(webui, "_repo_dir", lambda: str(tmp_path))
     r = webui.check_code_updates()

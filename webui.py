@@ -376,6 +376,14 @@ async function pullUpdates(){
   msg.innerHTML=r.ok?'<span class="ok">'+esc(r.note)+'</span>'
     :'<span class="err">'+esc(r.error)+'</span>';
   if(r.ok)document.getElementById('upd-pull').style.display='none';
+  if(r.ok&&r.restarting){
+    // Server is re-execing onto the new code — poll until it's back,
+    // then reload so the NEW UI is what's on screen.
+    setTimeout(async function waitBack(){
+      try{await api('/api/state');location.reload();}
+      catch(e){setTimeout(waitBack,1500);}
+    },2500);
+  }
 }
 function srcChanged(){
   const v=document.getElementById('src').value;
@@ -1060,23 +1068,34 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         ok, note = pull_code_updates()
         if not ok:
             return {"ok": False, "error": note}
-        if get_status is not None:
-            # Served by the running agent — restart onto the new code, same
-            # pattern as self_edit.apply_and_restart.
-            import os
-            import sys
-            import time as _time
+        import os
+        if os.getenv("AGENT_UPDATE_NO_RESTART"):
+            # Test/automation escape hatch — never re-exec the test runner.
+            return {"ok": True, "note": note + " — restart skipped "
+                    "(AGENT_UPDATE_NO_RESTART)"}
+        # Restart onto the new code in BOTH modes (running agent AND the
+        # standalone setup wizard) so server + UI changes apply immediately —
+        # a pulled webui.py otherwise keeps serving the old page from memory.
+        # Re-exec the exact original invocation (agent.py run / agent.py
+        # setup / …); config lives on disk and the wizard restores completed
+        # steps, so a setup-mode restart is safe. The page polls /api/state
+        # and reloads itself once the server is back.
+        import sys
+        import time as _time
+        # Stop new event polls so an in-flight order can finish its atomic
+        # state save before the exec; all durable state (config, positions,
+        # seen-events, trade log, daily cap) already lives on disk. CONTROLS
+        # resets on restart, so polling resumes automatically.
+        CONTROLS["paused"] = True
 
-            def _restart():
-                _time.sleep(1.5)  # let the HTTP response flush
-                os.execv(sys.executable, [sys.executable,
-                                          os.path.join(_repo_dir(),
-                                                       "agent.py"), "run"])
-            threading.Thread(target=_restart, daemon=True).start()
-            return {"ok": True, "note": note + " — restarting with the new "
-                    "code; this page will reconnect in a few seconds"}
-        return {"ok": True, "note": note + " — restart the wizard/agent to "
-                "load the new code"}
+        def _restart():
+            _time.sleep(3.0)  # response flush + in-flight event grace
+            os.environ["AGENT_UPDATE_RESTARTED"] = "1"  # skip browser popup
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        threading.Thread(target=_restart, daemon=True).start()
+        return {"ok": True, "restarting": True,
+                "note": note + " — restarting with the new code; this page "
+                "will reload in a few seconds"}
 
     def proposal_get(_h):
         import self_edit
@@ -1351,7 +1370,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         print("On a remote server, tunnel first:  "
               f"ssh -L {APP_PORT}:127.0.0.1:{APP_PORT} user@host")
         try:
-            webbrowser.open(url + "setup")
+            import os as _os
+            # After an update-button re-exec the user's tab reloads itself —
+            # opening a second tab would just duplicate the wizard.
+            if not _os.environ.pop("AGENT_UPDATE_RESTARTED", None):
+                webbrowser.open(url + "setup")
         except Exception:
             pass
         try:
@@ -1422,10 +1445,15 @@ def check_code_updates():
 
 
 def pull_code_updates():
-    """Fast-forward to the upstream fetched by check_code_updates.
-    Returns (ok, message). --ff-only so local commits/self-edits are never
+    """Fetch origin and fast-forward to the upstream. Returns (ok, message).
+    Fetches itself — never assume check_code_updates ran first (a stale
+    origin/<branch> ref would merge cleanly and report success without
+    actually updating). --ff-only so local commits/self-edits are never
     merged over silently — a diverged tree is reported, not resolved."""
     try:
+        f = _git(["fetch", "--quiet", "origin"], timeout=120)
+        if f.returncode != 0:
+            return False, "fetch failed: " + (f.stderr or f.stdout).strip()[:200]
         upstream = _update_upstream()
         r = _git(["merge", "--ff-only", upstream], timeout=120)
         if r.returncode != 0:
