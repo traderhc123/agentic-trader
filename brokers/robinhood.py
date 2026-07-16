@@ -1,16 +1,32 @@
 """Broker adapter: Robinhood agentic-trading MCP.
 
 Places long single-leg options orders (buy-to-open / sell-to-close, market,
-good-for-day) in the user's dedicated Robinhood Agentic account. The account
-must be agentic-enabled, options-approved, and funded — the setup wizard
-checks and explains each.
+good-for-day) in the user's dedicated Robinhood Agentic account. During the
+9:30-9:35 AM ET open, where Robinhood rejects market orders, orders go out
+as marketable limits instead. The account must be agentic-enabled,
+options-approved, and funded — the setup wizard checks and explains each.
 """
 
 import os
 import sys
 import uuid
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from .robinhood_mcp import RobinhoodMCP, content_json, tool_ok
+
+MARKET_TZ = ZoneInfo("America/New_York")
+
+# Robinhood rejects market option orders outside 9:35 AM-4:00 PM ET. Feed
+# events consumed just after the open can land inside the 9:30-9:35 window,
+# so orders firing before this cutoff go out as marketable limit orders
+# instead; the 5s pad covers clock skew.
+_OPENING_BLACKOUT_END = (9, 35, 5)
+
+
+def _in_opening_blackout(now=None):
+    now = now or datetime.now(MARKET_TZ)
+    return (now.hour, now.minute, now.second) < _OPENING_BLACKOUT_END
 
 
 def _token_path():
@@ -110,13 +126,38 @@ def _find_number(obj, keys):
     return 0.0
 
 
-def quote_price(rh, option_id):
-    """Approximate fill price per share for a market buy (ask, else mark)."""
+def quote_price(rh, option_id, side="buy"):
+    """Approximate fill price per share: ask for buys, bid for sells (falls
+    back to mark). 0.0 when no quote is available."""
     result = rh.call_tool("get_option_quotes", {"instrument_ids": [option_id]})
     payload = content_json(result)
     if payload is None:
         return 0.0
-    return _find_number(payload, ["ask_price", "adjusted_mark_price", "mark_price"])
+    keys = (["ask_price", "adjusted_mark_price", "mark_price"] if side == "buy"
+            else ["bid_price", "adjusted_mark_price", "mark_price"])
+    return _find_number(payload, keys)
+
+
+def _blackout_limit_price(rh, option_id, side):
+    """Marketable-limit price (per share) during the opening blackout; None
+    once market orders are allowed. Buys pay up to ask+5% (rounded up to a
+    $0.05 tick); sells accept bid-5% (rounded down, floor $0.01) — aggressive
+    enough to fill immediately, like the market order it replaces. With no
+    usable quote the caller falls through to a market order, whose rejection
+    is printed by place()."""
+    if not _in_opening_blackout():
+        return None
+    price = quote_price(rh, option_id, side=side)
+    if price <= 0:
+        return None
+    cents = int(round(price * 100))
+    if side == "buy":
+        buffered = -(-cents * 105 // 100)      # ceil(price * 1.05)
+        ticked = -(-buffered // 5) * 5         # round UP to a $0.05 tick
+    else:
+        buffered = cents * 95 // 100           # floor(price * 0.95)
+        ticked = max(1, buffered // 5 * 5)     # round DOWN, floor $0.01
+    return ticked / 100.0
 
 
 def size_contracts(rh, cfg, option_id):
@@ -144,14 +185,20 @@ def size_contracts(rh, cfg, option_id):
 
 
 def place(rh, cfg, option_id, side, effect, qty):
+    limit_price = _blackout_limit_price(rh, option_id, side)
     args = {
         "account_number": cfg["robinhood_account"],
         "legs": [{"option_id": option_id, "side": side, "position_effect": effect}],
         "quantity": str(int(qty)),
-        "type": "market",
+        "type": "market" if limit_price is None else "limit",
         "time_in_force": "gfd",
         "ref_id": str(uuid.uuid4()),
     }
+    if limit_price is not None:
+        # Schema: price (per-share premium) required for limit, omitted for market.
+        args["price"] = f"{limit_price:.2f}"
+        print(f"  opening blackout (pre-9:35 ET) — {side} placed as "
+              f"marketable limit @ ${limit_price:.2f}")
     result = rh.call_tool("place_option_order", args)
     if not tool_ok(result):
         print(f"  ORDER FAILED: {str(result)[:300]}")
