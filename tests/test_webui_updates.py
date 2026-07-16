@@ -93,3 +93,22 @@ def test_not_a_git_checkout(tmp_path, monkeypatch):
     monkeypatch.setattr(webui, "_repo_dir", lambda: str(tmp_path))
     r = webui.check_code_updates()
     assert not r["ok"] and "not a git checkout" in r["error"]
+
+
+def test_install_requirements_no_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(webui, "_repo_dir", lambda: str(tmp_path))
+    assert webui._install_requirements() == ""
+
+
+def test_install_requirements_success(tmp_path, monkeypatch):
+    (tmp_path / "requirements.txt").write_text("pip>=20\n")  # always satisfied
+    monkeypatch.setattr(webui, "_repo_dir", lambda: str(tmp_path))
+    assert webui._install_requirements() == " · dependencies installed"
+
+
+def test_install_requirements_failure_is_failsoft(tmp_path, monkeypatch):
+    (tmp_path / "requirements.txt").write_text(
+        "definitely-not-a-real-package-xyz==99.99\n")
+    monkeypatch.setattr(webui, "_repo_dir", lambda: str(tmp_path))
+    note = webui._install_requirements()
+    assert "FAILED" in note and "pip install -r requirements.txt" in note

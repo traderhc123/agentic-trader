@@ -962,6 +962,31 @@ class _Handler(BaseHTTPRequestHandler):
 
 # ── the setup wizard ─────────────────────────────────────────────────────────
 
+def _install_requirements():
+    """pip-install requirements.txt into the running interpreter after a code
+    pull. Returns a note suffix: '' on success/nothing-to-do, a warning
+    string on failure (never raises — deps are fail-soft by design)."""
+    import os
+    import subprocess
+    import sys
+    req = os.path.join(_repo_dir(), "requirements.txt")
+    if not os.path.isfile(req):
+        return ""
+    cmd = [sys.executable, "-m", "pip", "install", "-q", "-r", req]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0 and "externally-managed" in (r.stderr or ""):
+            r = subprocess.run(cmd + ["--break-system-packages"],
+                               capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            return (" · dependency install FAILED — run manually: "
+                    "pip install -r requirements.txt")
+        return " · dependencies installed"
+    except Exception:
+        return (" · dependency install skipped — run manually: "
+                "pip install -r requirements.txt")
+
+
 def _qr_matrix(data):
     """QR module matrix (list of 0/1 rows) for `data`, or None when the
     qrcode package isn't installed (fail-soft — the wizard still offers the
@@ -1190,6 +1215,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         if not ok:
             return {"ok": False, "error": note}
         import os
+        # New code may carry new dependencies (e.g. qrcode) — a pull without
+        # a dep install restarts onto ImportErrors or silently-degraded
+        # features. Fail-soft: a pip failure never blocks the update.
+        note += _install_requirements()
         if os.getenv("AGENT_UPDATE_NO_RESTART"):
             # Test/automation escape hatch — never re-exec the test runner.
             return {"ok": True, "note": note + " — restart skipped "
