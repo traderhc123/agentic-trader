@@ -167,6 +167,11 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
 </div>
 <p class="lead">Everything runs on your own machine — this wizard is served from
 127.0.0.1 by your agent itself. It moves real money; read each step carefully.</p>
+<div class="navrow" style="margin:0 0 .9rem">
+ <button onclick="checkUpdates()" id="upd-btn">⟳ Check for code updates</button>
+ <button onclick="pullUpdates()" id="upd-pull" style="display:none">Pull latest code</button>
+ <span id="upd-msg" class="muted"></span>
+</div>
 <div class="stepbar" id="stepbar"></div>
 
 <section id="s-consent"><h2>Agreement</h2>
@@ -354,6 +359,23 @@ async function api(p, body){
   const r = await fetch(p, body?{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)}:{});
   return await r.json();
+}
+async function checkUpdates(){
+  const msg=document.getElementById('upd-msg');msg.textContent='checking…';
+  document.getElementById('upd-pull').style.display='none';
+  const r=await api('/api/update/check');
+  if(!r.ok){msg.innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}
+  if(!r.behind){msg.innerHTML='<span class="ok">up to date ✓</span>';return;}
+  msg.innerHTML='<span class="ok">'+r.behind+' update'+(r.behind>1?'s':'')+
+    ' available</span>'+(r.summary?' — latest: '+esc(r.summary.split('\n')[0]):'');
+  document.getElementById('upd-pull').style.display='';
+}
+async function pullUpdates(){
+  const msg=document.getElementById('upd-msg');msg.textContent='pulling…';
+  const r=await api('/api/update/pull',{});
+  msg.innerHTML=r.ok?'<span class="ok">'+esc(r.note)+'</span>'
+    :'<span class="err">'+esc(r.error)+'</span>';
+  if(r.ok)document.getElementById('upd-pull').style.display='none';
 }
 function srcChanged(){
   const v=document.getElementById('src').value;
@@ -1031,6 +1053,31 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         save()
         return {"ok": True, "note": msg}
 
+    def update_check(_h):
+        return check_code_updates()
+
+    def update_pull(_h, _data):
+        ok, note = pull_code_updates()
+        if not ok:
+            return {"ok": False, "error": note}
+        if get_status is not None:
+            # Served by the running agent — restart onto the new code, same
+            # pattern as self_edit.apply_and_restart.
+            import os
+            import sys
+            import time as _time
+
+            def _restart():
+                _time.sleep(1.5)  # let the HTTP response flush
+                os.execv(sys.executable, [sys.executable,
+                                          os.path.join(_repo_dir(),
+                                                       "agent.py"), "run"])
+            threading.Thread(target=_restart, daemon=True).start()
+            return {"ok": True, "note": note + " — restarting with the new "
+                    "code; this page will reconnect in a few seconds"}
+        return {"ok": True, "note": note + " — restart the wizard/agent to "
+                "load the new code"}
+
     def proposal_get(_h):
         import self_edit
         p = self_edit.current()
@@ -1241,6 +1288,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/wallet/balance": wallet_balance,
                     "/api/deploy/status": deploy_status,
                     "/api/brokers": brokers_list,
+                    "/api/update/check": update_check,
                     "/api/status": d_status, "/api/trades": d_trades,
                     "/api/proposal": proposal_get}
     def ask(_h, data):
@@ -1263,6 +1311,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/wallet/create": wallet_create,
                      "/api/wallet/fund": wallet_fund,
                      "/api/llm": llm, "/api/deploy": deploy,
+                     "/api/update/pull": update_pull,
                      "/api/broker/connect": broker_connect,
                      "/api/proposal/apply": proposal_apply,
                      "/api/proposal/reject": proposal_reject,
@@ -1324,6 +1373,68 @@ def run_wizard():
 def _repo_dir():
     import os
     return os.path.dirname(os.path.abspath(__file__))
+
+
+# ── code updates (wizard "check for updates" button) ────────────────────────
+
+def _git(args, timeout=60):
+    import subprocess
+    return subprocess.run(["git", "-C", _repo_dir(), *args],
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def _update_upstream():
+    """The remote ref updates come from: the current branch's origin twin if
+    it exists, else origin/main (detached HEAD, local-only branches)."""
+    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+    candidate = f"origin/{branch}" if branch and branch != "HEAD" else "origin/main"
+    if _git(["rev-parse", "--verify", "--quiet", candidate]).returncode != 0:
+        candidate = "origin/main"
+    return candidate
+
+
+def check_code_updates():
+    """Fetch origin and report how far behind HEAD is. Never raises."""
+    import os
+    if not os.path.isdir(os.path.join(_repo_dir(), ".git")):
+        return {"ok": False, "error": "this install is not a git checkout — "
+                "update by re-running the installer"}
+    try:
+        r = _git(["fetch", "--quiet", "origin"], timeout=120)
+        if r.returncode != 0:
+            return {"ok": False, "error": "fetch failed: "
+                    + (r.stderr or r.stdout).strip()[:200]}
+        upstream = _update_upstream()
+        behind = _git(["rev-list", "--count", f"HEAD..{upstream}"])
+        if behind.returncode != 0:
+            return {"ok": False,
+                    "error": f"could not compare against {upstream}"}
+        n = int(behind.stdout.strip() or 0)
+        summary = ""
+        if n:
+            log = _git(["log", "--oneline", "--no-decorate", "-5",
+                        f"HEAD..{upstream}"])
+            summary = log.stdout.strip()
+        return {"ok": True, "behind": n, "upstream": upstream,
+                "summary": summary}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+
+
+def pull_code_updates():
+    """Fast-forward to the upstream fetched by check_code_updates.
+    Returns (ok, message). --ff-only so local commits/self-edits are never
+    merged over silently — a diverged tree is reported, not resolved."""
+    try:
+        upstream = _update_upstream()
+        r = _git(["merge", "--ff-only", upstream], timeout=120)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout).strip()[:200]
+            return False, ("cannot fast-forward (local changes or diverged "
+                           f"history): {err}")
+        return True, f"updated to {upstream}"
+    except Exception as exc:
+        return False, str(exc)[:200]
 
 
 # ── the dashboard (served BY the running agent) ──────────────────────────────
