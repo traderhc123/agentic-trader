@@ -220,10 +220,15 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
    <label>Amount (sats — ~50,000 ≈ a month of market days)</label>
    <input type="number" id="fund-sats" value="50000" min="1000">
    <button onclick="fundInvoice()">Show invoice</button>
+   <div id="fund-qr" style="display:none;margin:.6rem 0"></div>
    <pre id="bolt11" style="display:none"></pre>
-   <p id="fund-open" style="display:none"><a id="fund-link" href="#">Open in my
-   Lightning wallet app</a> · balance: <span id="fund-bal">0</span> sats
-   <span class="muted">(updates automatically after you pay)</span></p>
+   <p id="fund-open" style="display:none">
+   <button onclick="copyInvoice()">Copy invoice</button> <span id="copy-msg"></span>
+   <a id="fund-link" href="#">Open in my Lightning wallet app</a>
+   · balance: <span id="fund-bal">0</span> sats
+   <span class="muted">(scan the QR with your phone's wallet, or copy the
+   invoice and paste it in any Lightning app — updates automatically after
+   you pay)</span></p>
    <p class="muted">Hosted wallet on demo.lnbits.com (custodial) — the agent
    keeps only spending money here. Advanced: use your own instance below.</p>
   </div>
@@ -396,6 +401,25 @@ async function pullUpdates(){
     },2500);
   }
 }
+function renderQr(m){
+  // Server sends the QR as a 0/1 module matrix; draw it as one SVG path.
+  // No image bytes, no external assets — and the lightning: link stays as a
+  // fallback for desktops that DO have a handler registered.
+  const box=document.getElementById('fund-qr');
+  if(!m||!m.length){box.style.display='none';return;}
+  const n=m.length;let d='';
+  for(let y=0;y<n;y++)for(let x=0;x<m[y].length;x++)if(m[y][x])d+='M'+x+' '+y+'h1v1h-1z';
+  box.innerHTML='<svg viewBox="0 0 '+n+' '+n+'" width="230" height="230"'
+    +' shape-rendering="crispEdges" style="background:#fff;border-radius:6px">'
+    +'<path d="'+d+'" fill="#000"/></svg>';
+  box.style.display='';
+}
+async function copyInvoice(){
+  const t=document.getElementById('bolt11').textContent;
+  const msg=document.getElementById('copy-msg');
+  try{await navigator.clipboard.writeText(t);msg.textContent='copied ✓';}
+  catch(e){msg.textContent='clipboard blocked — select the invoice text above and copy it';}
+}
 function srcChanged(){
   const v=document.getElementById('src').value;
   for(const k of ['agenthc','url','manual'])
@@ -468,6 +492,8 @@ async function fundInvoice(){
   const r=await api('/api/wallet/fund',{sats:sats});
   if(!r.ok){document.getElementById('mw-msg').innerHTML=' <span class="err">'+r.error+'</span>';return;}
   const pre=document.getElementById('bolt11');pre.style.display='';pre.textContent=r.bolt11;
+  renderQr(r.qr);
+  document.getElementById('copy-msg').textContent='';
   document.getElementById('fund-open').style.display='';
   const fl=document.getElementById('fund-link');
   fl.href='lightning:'+r.bolt11;fl.style.display='';
@@ -936,6 +962,21 @@ class _Handler(BaseHTTPRequestHandler):
 
 # ── the setup wizard ─────────────────────────────────────────────────────────
 
+def _qr_matrix(data):
+    """QR module matrix (list of 0/1 rows) for `data`, or None when the
+    qrcode package isn't installed (fail-soft — the wizard still offers the
+    copy button and lightning: link). Rendered client-side as an SVG path so
+    no image bytes or external assets are involved."""
+    try:
+        import qrcode
+        q = qrcode.QRCode(border=2)
+        q.add_data(data)
+        q.make(fit=True)
+        return [[1 if cell else 0 for cell in row] for row in q.get_matrix()]
+    except Exception:
+        return None
+
+
 def _restore_notes(cfg, acceptance=None):
     """Per-tab 'already configured' summaries for the wizard restore path.
     Non-secret only — these render as plain text at the top of each completed
@@ -1219,8 +1260,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"ok": False, "error": "no wallet yet"}
         try:
             sats = max(1000, int(data.get("sats") or 50000))
-            return {"ok": True, "bolt11": w.create_invoice(
-                sats, memo="fund agentic-trader")}
+            bolt11 = w.create_invoice(sats, memo="fund agentic-trader")
+            # Uppercase bolt11 in the QR = alphanumeric mode = denser, easier
+            # scan (bech32 is case-insensitive; wallet scanners expect this).
+            return {"ok": True, "bolt11": bolt11,
+                    "qr": _qr_matrix(bolt11.upper())}
         except (WalletError, ValueError) as exc:
             return {"ok": False, "error": str(exc)[:200]}
 
