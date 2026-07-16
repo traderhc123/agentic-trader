@@ -257,6 +257,76 @@ def test_robinhood_failed_place_keeps_position(monkeypatch):
     assert "SPY|2026-07-10|752.0|C" in state["positions"]
 
 
+# ── robinhood: opening blackout (market orders rejected 9:30-9:35 ET) ───────
+
+def test_robinhood_place_market_outside_blackout(monkeypatch):
+    monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: False)
+    rh = FakeRH({"place_option_order": _mcp_result({"data": {"id": "o1"}})})
+    assert robinhood.place(rh, {"robinhood_account": "123"}, "opt-1",
+                           "buy", "open", 1)
+    _, args = rh.calls[-1]
+    assert args["type"] == "market"
+    assert "price" not in args        # schema: omitted for market orders
+
+
+def test_robinhood_place_blackout_buy_uses_marketable_limit(monkeypatch):
+    monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: True)
+    rh = FakeRH({
+        "get_option_quotes": _mcp_result(
+            {"data": {"results": [{"ask_price": "2.00", "bid_price": "1.90"}]}}),
+        "place_option_order": _mcp_result({"data": {"id": "o1"}}),
+    })
+    assert robinhood.place(rh, {"robinhood_account": "123"}, "opt-1",
+                           "buy", "open", 1)
+    _, args = rh.calls[-1]
+    assert args["type"] == "limit"
+    assert args["price"] == "2.10"    # ask 2.00 +5%, ticked UP to $0.05
+    assert args["time_in_force"] == "gfd"
+
+
+def test_robinhood_place_blackout_sell_uses_bid_based_limit(monkeypatch):
+    monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: True)
+    rh = FakeRH({
+        "get_option_quotes": _mcp_result(
+            {"data": {"results": [{"ask_price": "2.00", "bid_price": "1.90"}]}}),
+        "place_option_order": _mcp_result({"data": {"id": "o2"}}),
+    })
+    assert robinhood.place(rh, {"robinhood_account": "123"}, "opt-1",
+                           "sell", "close", 1)
+    _, args = rh.calls[-1]
+    assert args["type"] == "limit"
+    assert args["price"] == "1.80"    # bid 1.90 -5% = 1.805, ticked DOWN
+
+
+def test_robinhood_place_blackout_no_quote_stays_market(monkeypatch):
+    monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: True)
+    rh = FakeRH({"place_option_order": _mcp_result({"data": {"id": "o3"}})})
+    assert robinhood.place(rh, {"robinhood_account": "123"}, "opt-1",
+                           "buy", "open", 1)
+    _, args = rh.calls[-1]
+    assert args["type"] == "market"   # observable rejection beats a bad limit
+
+
+def test_robinhood_blackout_sell_floor_is_one_cent(monkeypatch):
+    monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: True)
+    monkeypatch.setattr(robinhood, "quote_price",
+                        lambda rh, oid, side="buy": 0.03)
+    assert robinhood._blackout_limit_price(None, "opt-1", "sell") == 0.01
+
+
+def test_robinhood_blackout_window_boundaries():
+    from datetime import datetime
+    tz = robinhood.MARKET_TZ
+    assert robinhood._in_opening_blackout(
+        datetime(2026, 7, 16, 9, 33, 10, tzinfo=tz))
+    assert robinhood._in_opening_blackout(
+        datetime(2026, 7, 16, 9, 35, 4, tzinfo=tz))
+    assert not robinhood._in_opening_blackout(
+        datetime(2026, 7, 16, 9, 35, 5, tzinfo=tz))
+    assert not robinhood._in_opening_blackout(
+        datetime(2026, 7, 16, 15, 12, 0, tzinfo=tz))
+
+
 # ── moomoo: option code builder ──────────────────────────────────────────────
 
 @pytest.mark.parametrize("ev,expected", [
