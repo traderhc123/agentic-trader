@@ -198,6 +198,13 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <option value="url">A JSON feed URL I provide</option>
  </select>
  <div id="src-agenthc">
+  <label>Which trade signals?</label>
+  <select id="hc-scope">
+   <option value="main">Main pick only — one high-conviction trade a day (default)</option>
+   <option value="all">Main pick + "other trades" — wider journal, several entries a day</option>
+  </select>
+  <p class="muted">"Other trades" follows AgentHC's broader shadow journal; your
+  daily entry cap and per-trade budget still apply to every signal.</p>
   <p class="muted">Pay-as-you-go: ~$10/day in sats, paid automatically from the
   agent's own Lightning wallet.</p>
   <button onclick="makeWallet()">Create my agent's wallet for me</button>
@@ -394,6 +401,7 @@ async function fundInvoice(){
 async function doSource(){
   const v=document.getElementById('src').value;
   const r=await api('/api/source',{source:v,
+    scope:document.getElementById('hc-scope').value,
     lnbits_url:document.getElementById('ln-url').value,
     lnbits_key:document.getElementById('ln-key').value,
     agenthc_key:document.getElementById('hc-key').value,
@@ -896,6 +904,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 return {"ok": False, "error": "feed URL must be https:// (or localhost)"}
             cfg["source_url"] = url
         if src == "agenthc":
+            cfg["include_other_trades"] = data.get("scope") == "all"
             if data.get("agenthc_key"):
                 cfg["agenthc_api_key"] = str(data["agenthc_key"]).strip()
                 note = "API key saved ✓"

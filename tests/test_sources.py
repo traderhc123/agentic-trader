@@ -133,6 +133,41 @@ def test_agenthc_event_id_is_identity_composed(monkeypatch):
                               "2026-07-09T14:00:00+00:00")
 
 
+def test_agenthc_requests_main_track_by_default(monkeypatch):
+    captured = {}
+
+    def fake_get(url, params=None, **kw):
+        captured.update(params or {})
+        return FakeResp({"events": [_feed_event()]})
+
+    monkeypatch.setattr(agenthc.requests, "get", fake_get)
+    ev = agenthc.poll({"agenthc_api_key": "k"}, {})[0]
+    assert captured["track"] == "main"
+    assert ev["track"] == "main"  # pre-track wire events count as main
+    # legacy event_id format preserved for main — upgrades must not reset
+    # the seen-events dedupe
+    assert "|main" not in ev["event_id"]
+
+
+def test_agenthc_other_trades_opt_in(monkeypatch):
+    captured = {}
+
+    def fake_get(url, params=None, **kw):
+        captured.update(params or {})
+        return FakeResp({"events": [_feed_event(track="other"),
+                                    _feed_event(track="main")]})
+
+    monkeypatch.setattr(agenthc.requests, "get", fake_get)
+    events = agenthc.poll({"agenthc_api_key": "k",
+                           "include_other_trades": True}, {})
+    assert captured["track"] == "all"
+    other, main = events[0], events[1]
+    assert other["track"] == "other"
+    assert other["event_id"].endswith("|other")
+    assert main["event_id"] == ("ENTERED|SPY|2026-07-10|752.0|C|"
+                                "2026-07-09T14:00:00+00:00")
+
+
 def test_agenthc_drops_malformed_events(monkeypatch):
     payload = {"events": [_feed_event(strike="not-a-price"),
                           _feed_event(strike=None),

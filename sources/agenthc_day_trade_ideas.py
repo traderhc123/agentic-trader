@@ -88,8 +88,16 @@ def _buy_day_pass(cfg, state, body, save_state):
 
 
 def poll(cfg, state, save_state=lambda s: None, _retried=False):
-    """Fetch recent journal events (normalized contract shape)."""
-    resp = requests.get(f"{AGENTHC_API}{FEED_PATH}", params={"limit": 20},
+    """Fetch recent journal events (normalized contract shape).
+
+    Signal scope (config `include_other_trades`, default False): the main
+    daily pick only, or main + AgentHC's "other trades" journal (its wider
+    shadow book — several entries a day; your daily entry cap and budget
+    still apply per trade).
+    """
+    track = "all" if cfg.get("include_other_trades") else "main"
+    resp = requests.get(f"{AGENTHC_API}{FEED_PATH}",
+                        params={"limit": 20, "track": track},
                         headers=_headers(cfg, state), timeout=15)
     if resp.status_code == 402 and not _retried:
         _buy_day_pass(cfg, state, resp.json(), save_state)
@@ -122,6 +130,8 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
                 "type": "C" if str(ev["type"]).upper().startswith("C") else "P",
                 "occurred_at": ev.get("occurred_at"),
                 "message": ev.get("message", ""),
+                # pre-track feeds send no track field — those are main-pick events
+                "track": str(ev.get("track", "main")),
             }
             if "paper_pnl_pct" in ev:
                 norm["paper_pnl_pct"] = ev["paper_pnl_pct"]
@@ -129,12 +139,22 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             continue
         norm["event_id"] = (f"{norm['event']}|{norm['ticker']}|{norm['expiry']}|"
                             f"{norm['strike']}|{norm['type']}|{norm.get('occurred_at')}")
+        # Suffix only for the non-default track: main-pick IDs must stay
+        # byte-identical across upgrades or the seen-events dedupe resets.
+        if norm["track"] != "main":
+            norm["event_id"] += f"|{norm['track']}"
         events.append(norm)
     return events
 
 
 def setup(cfg):
     print("\n-- AgentHC Agentic Day Trade Ideas (sats-based access) --")
+    print("Which trade signals?")
+    print("  1) Main pick only — one high-conviction day trade (default)")
+    print("  2) Main pick + \"other trades\" — AgentHC's wider journal;")
+    print("     several entries a day (your daily cap + budget still apply)")
+    scope = input("Choose [1/2, default 1]: ").strip() or "1"
+    cfg["include_other_trades"] = scope == "2"
     print("  1) Lightning day-pass — the agent pays ~$10/day in sats from its")
     print("     own wallet, no account needed (recommended for agents)")
     print("  2) AgentHC Premium API key (sats-purchased subscription)")
