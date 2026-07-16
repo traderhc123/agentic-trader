@@ -217,9 +217,10 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div id="fund-box" style="display:none">
    <p>Wallet ready ✓ — now give your agent some sats. Pay this invoice from any
    Lightning app (Strike, Cash App, Phoenix, Alby…):</p>
-   <label>Amount (sats — ~50,000 ≈ a month of market days)</label>
-   <input type="number" id="fund-sats" value="50000" min="1000">
+   <label>Amount (sats)</label>
+   <input type="number" id="fund-sats" value="50000" min="1000" oninput="satsChanged()">
    <button onclick="fundInvoice()">Show invoice</button>
+   <p id="fund-quote" class="muted" style="display:none"></p>
    <div id="fund-qr" style="display:none;margin:.6rem 0"></div>
    <pre id="bolt11" style="display:none"></pre>
    <p id="fund-open" style="display:none">
@@ -401,6 +402,23 @@ async function pullUpdates(){
     },2500);
   }
 }
+let quoteTimer=null,satsEdited=false;
+async function updateQuote(){
+  const el=document.getElementById('fund-quote');
+  const sats=parseInt(document.getElementById('fund-sats').value||'0',10);
+  if(!sats){el.style.display='none';return;}
+  try{
+    const r=await api('/api/wallet/quote?sats='+sats);
+    if(!r.ok){el.style.display='none';return;}
+    let t=sats.toLocaleString()+' sats ≈ $'+r.usd.toFixed(2)
+      +' (BTC $'+Math.round(r.btc_usd).toLocaleString()+')'
+      +' · covers ~'+r.day_passes+' day-pass'+(r.day_passes===1?'':'es')+' at ~$10';
+    if(r.suggested_month_sats)
+      t+=' — a month of market days ≈ '+r.suggested_month_sats.toLocaleString()+' sats';
+    el.textContent=t;el.style.display='';
+  }catch(e){el.style.display='none';}
+}
+function satsChanged(){satsEdited=true;clearTimeout(quoteTimer);quoteTimer=setTimeout(updateQuote,400);}
 function renderQr(m){
   // Server sends the QR as a 0/1 module matrix; draw it as one SVG path.
   // No image bytes, no external assets — and the lightning: link stays as a
@@ -471,6 +489,14 @@ function showWallet(page,label){
     mw.appendChild(a);
   }
   document.getElementById('fund-box').style.display='';
+  // Price-aware default: sats for ~a month of day-passes at the CURRENT BTC
+  // price (the old fixed 50,000 drifted to ~3 days) — unless the user
+  // already typed an amount.
+  api('/api/wallet/quote?sats=0').then(function(r){
+    if(r&&r.ok&&r.suggested_month_sats&&!satsEdited)
+      document.getElementById('fund-sats').value=r.suggested_month_sats;
+    updateQuote();
+  }).catch(function(){});
   // No invoice generated yet this session — show balance, hide the pay link
   // until "Show invoice" creates a fresh bolt11.
   document.getElementById('fund-link').style.display='none';
@@ -987,6 +1013,54 @@ def _install_requirements():
                 "pip install -r requirements.txt")
 
 
+# Live BTC/USD for the funding box (5-min cache; two independent public
+# sources, fail-soft). Sats are meaningless to most users — the wizard shows
+# "≈ $X · covers ~N day-passes" next to the amount instead.
+_btc_usd_cache = {"t": 0.0, "usd": 0.0}
+_DAY_PASS_USD = 10.0        # feed day-pass ballpark, floats with BTC
+_MARKET_DAYS_PER_MONTH = 21
+
+
+def _btc_usd():
+    import time
+    if time.time() - _btc_usd_cache["t"] < 300 and _btc_usd_cache["usd"] > 0:
+        return _btc_usd_cache["usd"]
+    import requests
+    for fetch in (
+        lambda: float(requests.get(
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+            timeout=5).json()["data"]["amount"]),
+        lambda: float(requests.get(
+            "https://blockchain.info/ticker",
+            timeout=5).json()["USD"]["last"]),
+    ):
+        try:
+            usd = fetch()
+            if usd > 0:
+                _btc_usd_cache.update(t=time.time(), usd=usd)
+                return usd
+        except Exception:
+            continue
+    return 0.0
+
+
+def _fund_quote(sats):
+    """USD context for a sats amount: value, ~day-passes covered, and a
+    suggested one-month top-up at the current BTC price. {ok: False} when no
+    live price is available (the funding box just omits the hint)."""
+    usd_per_btc = _btc_usd()
+    if usd_per_btc <= 0:
+        return {"ok": False, "error": "no live BTC price"}
+    usd = sats * usd_per_btc / 1e8
+    month_sats = int(round(
+        _MARKET_DAYS_PER_MONTH * _DAY_PASS_USD / usd_per_btc * 1e8 / 1000.0
+    )) * 1000
+    return {"ok": True, "btc_usd": round(usd_per_btc, 2),
+            "usd": round(usd, 2),
+            "day_passes": int(usd // _DAY_PASS_USD),
+            "suggested_month_sats": month_sats}
+
+
 # One-shot guard: attempt the missing-dependency bootstrap at most once per
 # process so a broken pip can't stall every invoice render.
 _qr_bootstrap_attempted = False
@@ -1318,6 +1392,15 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         except (WalletError, ValueError) as exc:
             return {"ok": False, "error": str(exc)[:200]}
 
+    def wallet_quote(h):
+        from urllib.parse import parse_qs, urlparse
+        try:
+            sats = int((parse_qs(urlparse(h.path).query).get("sats")
+                        or ["0"])[0])
+        except ValueError:
+            sats = 0
+        return _fund_quote(max(0, sats))
+
     def wallet_balance(_h):
         w = _wallet()
         if w is None:
@@ -1484,6 +1567,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/deploy/status": deploy_status,
                     "/api/brokers": brokers_list,
                     "/api/update/check": update_check,
+                    "/api/wallet/quote": wallet_quote,
                     "/api/status": d_status, "/api/trades": d_trades,
                     "/api/proposal": proposal_get}
     def ask(_h, data):
