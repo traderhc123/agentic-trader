@@ -757,25 +757,36 @@ _DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <style>
  body{max-width:1180px}
  header{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:.4rem 0 1rem}
- header h1{margin:0;font-size:1.25rem}
  header .sp{flex:1}
- .qbtn{background:#232936;color:#e6e6e6;border:1px solid #2a2f3a;font-size:.85rem}
- .qbtn:hover{background:#2a3242}
+ .hero-mini{display:flex;align-items:center;gap:.7rem;min-width:0}
+ .hero-mini .tag{font-size:.66rem;letter-spacing:.18em;text-transform:uppercase;color:var(--muted)}
+ .hero-mini h1{margin:0;font-size:1.25rem;letter-spacing:-.02em}
+ .logo{width:38px;height:38px;flex:none;border-radius:11px;position:relative;overflow:hidden;
+   background:radial-gradient(125% 125% at 30% 18%,#6ea0ff,#2f6bff 52%,#1c3d97);
+   box-shadow:0 6px 20px rgba(58,110,255,.45),inset 0 1px 0 rgba(255,255,255,.4)}
+ .logo::after{content:"";position:absolute;inset:0;
+   background:conic-gradient(from 200deg,transparent,rgba(255,255,255,.4),transparent 42%)}
+ .qbtn{background:var(--sink);color:var(--fg);border:1px solid var(--line-2);font-size:.85rem}
+ .qbtn:hover{background:#1a2233;border-color:var(--accent);filter:none}
  .grid{display:grid;grid-template-columns:2fr 1fr;gap:1rem;align-items:start}
  @media(max-width:900px){.grid{grid-template-columns:1fr}}
  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
         gap:.8rem;margin-bottom:1rem}
- .tile{border:1px solid #2a2f3a;border-radius:10px;background:#161a22;
-       padding:.7rem .9rem}
- .tile .k{font-size:.72rem;color:#9aa3b2;text-transform:uppercase;
+ .tile{border:1px solid var(--line);border-radius:12px;
+       background:linear-gradient(180deg,var(--panel),var(--panel-2));
+       box-shadow:var(--shadow);padding:.7rem .9rem;position:relative;overflow:hidden}
+ .tile::before{content:"";position:absolute;inset:0 auto 0 0;width:3px;
+       background:linear-gradient(180deg,var(--accent),transparent)}
+ .tile .k{font-size:.72rem;color:var(--muted);text-transform:uppercase;
           letter-spacing:.04em}
- .tile .v{font-size:1.35rem;font-weight:600;margin-top:.15rem}
- .tile .s{font-size:.75rem;color:#9aa3b2}
- .panel{border:1px solid #2a2f3a;border-radius:10px;background:#161a22;
-        display:flex;flex-direction:column;min-height:0}
- .panel h2{margin:0;padding:.6rem .9rem;border-bottom:1px solid #232936;
+ .tile .v{font-size:1.35rem;font-weight:600;margin-top:.15rem;color:var(--accent-2)}
+ .tile .s{font-size:.75rem;color:var(--muted)}
+ .panel{border:1px solid var(--line);border-radius:12px;
+        background:linear-gradient(180deg,var(--panel),var(--panel-2));
+        box-shadow:var(--shadow);display:flex;flex-direction:column;min-height:0}
+ .panel h2{margin:0;padding:.6rem .9rem;border-bottom:1px solid var(--line);
            font-size:.85rem;text-transform:uppercase;letter-spacing:.04em;
-           color:#9aa3b2}
+           color:var(--accent-2)}
  .panel .body{padding:.4rem .9rem .7rem;overflow-y:auto}
  #p-activity .body{max-height:320px}
  #p-positions .body{max-height:160px}
@@ -786,13 +797,16 @@ _DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
  .chatrow{display:flex;gap:.4rem}
  .chatrow input{margin:0;flex:1}
  .pill{display:inline-block;font-size:.72rem;padding:.05rem .5rem;
-       border-radius:99px;border:1px solid #2a2f3a;color:#9aa3b2}
- .pill.live{border-color:#7f1d1d;color:#fca5a5}
- .pill.dry{border-color:#1e3a8a;color:#93c5fd}
- .pill.paused{border-color:#78350f;color:#fbbf24}
+       border-radius:99px;border:1px solid var(--line-2);color:var(--muted)}
+ .pill.live{border-color:#14532d;color:var(--ok);background:rgba(74,222,128,.08)}
+ .pill.dry{border-color:#1e3a8a;color:#93c5fd;background:rgba(76,141,255,.08)}
+ .pill.paused{border-color:#78350f;color:#fbbf24;background:rgba(251,191,36,.07)}
+ td.act-in{color:var(--ok);font-weight:600} td.act-out{color:#fbbf24;font-weight:600}
+ td.act-skip{color:var(--muted)}
 </style></head><body>
 <header>
- <h1>agentic-trader</h1>
+ <div class="hero-mini"><div class="logo" aria-hidden="true"></div>
+  <div><div class="tag">Agentic Trader</div><h1>Dashboard</h1></div></div>
  <span class="pill" id="b-mode">…</span>
  <span class="pill" id="b-market"></span>
  <span class="pill paused" id="b-paused" style="display:none">⏸ PAUSED</span>
@@ -907,9 +921,13 @@ async function refresh(){
     const t=await api('/api/trades');
     document.getElementById('trades').innerHTML = t.trades.length ?
       '<table><tr><th>time (UTC)</th><th>action</th><th>contract</th><th>note</th></tr>'+
-      t.trades.map(x=>'<tr><td>'+esc((x.ts||'').replace('T',' ').slice(5,16))+
-        '</td><td>'+esc(x.action||'')+'</td><td>'+esc(x.contract||'')+
-        '</td><td>'+esc((x.reason||'').slice(0,80))+'</td></tr>').join('')+'</table>'
+      t.trades.map(x=>{
+        const a=(x.action||'').toUpperCase();
+        const cls=a.indexOf('ENTER')>=0||a.indexOf('BUY')>=0?'act-in'
+          :a.indexOf('EXIT')>=0||a.indexOf('SELL')>=0?'act-out':'act-skip';
+        return '<tr><td>'+esc((x.ts||'').replace('T',' ').slice(5,16))+
+        '</td><td class="'+cls+'">'+esc(x.action||'')+'</td><td>'+esc(x.contract||'')+
+        '</td><td>'+esc((x.reason||'').slice(0,80))+'</td></tr>';}).join('')+'</table>'
       : '<span class="muted">nothing yet</span>';
   }catch(e){document.getElementById('status')&&(document.getElementById('status').textContent='agent unreachable');}
 }
