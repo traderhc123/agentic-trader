@@ -52,3 +52,24 @@ def test_create_wallet_no_adminkey_raises():
     with patch.object(lw.requests, "post", return_value=_resp({"id": "x"})):
         with pytest.raises(lw.WalletError):
             lw.create_wallet("https://demo.lnbits.com")
+
+
+def test_qr_matrix_shape_and_failsoft():
+    import webui
+    m = webui._qr_matrix("LNBC500N1TESTINVOICE")
+    if m is not None:  # qrcode installed
+        assert len(m) >= 21 and len(m) == len(m[0])
+        assert all(cell in (0, 1) for row in m for cell in row)
+    # fail-soft: qrcode import breaking must yield None, not raise
+    import builtins
+    real_import = builtins.__import__
+
+    def _no_qrcode(name, *a, **k):
+        if name == "qrcode":
+            raise ImportError("nope")
+        return real_import(name, *a, **k)
+    builtins.__import__ = _no_qrcode
+    try:
+        assert webui._qr_matrix("X") is None
+    finally:
+        builtins.__import__ = real_import

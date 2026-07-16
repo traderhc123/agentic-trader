@@ -1,2 +1,5 @@
 requests>=2.31
 anthropic>=0.40
+# QR rendering for Lightning funding invoices in the wizard (fail-soft:
+# the wizard still works without it — copy button + lightning: link remain).
+qrcode>=7.4
