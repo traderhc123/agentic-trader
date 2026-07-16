@@ -73,3 +73,45 @@ def test_qr_matrix_shape_and_failsoft():
         assert webui._qr_matrix("X") is None
     finally:
         builtins.__import__ = real_import
+
+
+def test_qr_matrix_bootstraps_missing_dep_once(monkeypatch):
+    """qrcode missing -> install requirements once, retry; never twice."""
+    import builtins
+    import webui
+    monkeypatch.setattr(webui, "_qr_bootstrap_attempted", False)
+    installs = []
+    monkeypatch.setattr(webui, "_install_requirements",
+                        lambda: installs.append(1) or "")
+    real_import = builtins.__import__
+
+    def _no_qrcode(name, *a, **k):
+        if name == "qrcode":
+            raise ImportError("missing")
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", _no_qrcode)
+
+    assert webui._qr_matrix("X") is None
+    assert installs == [1]          # bootstrap attempted
+    assert webui._qr_matrix("X") is None
+    assert installs == [1]          # but only once per process
+
+
+def test_qr_matrix_recovers_after_bootstrap(monkeypatch):
+    """Import fails once, install 'fixes' it -> matrix returned same call."""
+    import builtins
+    import webui
+    monkeypatch.setattr(webui, "_qr_bootstrap_attempted", False)
+    state = {"fixed": False}
+    monkeypatch.setattr(webui, "_install_requirements",
+                        lambda: state.update(fixed=True) or "")
+    real_import = builtins.__import__
+
+    def _flaky(name, *a, **k):
+        if name == "qrcode" and not state["fixed"]:
+            raise ImportError("missing")
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", _flaky)
+
+    m = webui._qr_matrix("LNBC1SELFHEAL")
+    assert m is not None and len(m) == len(m[0])

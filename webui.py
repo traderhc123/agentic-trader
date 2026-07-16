@@ -987,13 +987,34 @@ def _install_requirements():
                 "pip install -r requirements.txt")
 
 
+# One-shot guard: attempt the missing-dependency bootstrap at most once per
+# process so a broken pip can't stall every invoice render.
+_qr_bootstrap_attempted = False
+
+
 def _qr_matrix(data):
     """QR module matrix (list of 0/1 rows) for `data`, or None when the
-    qrcode package isn't installed (fail-soft — the wizard still offers the
-    copy button and lightning: link). Rendered client-side as an SVG path so
-    no image bytes or external assets are involved."""
+    qrcode package is unavailable (fail-soft — the wizard still offers the
+    copy button and lightning: link). Self-healing: installs on existing
+    setups that predate the qrcode dependency (their update pull ran the
+    old handler that didn't install requirements), then retries the import
+    once. Rendered client-side as an SVG path — no image bytes or external
+    assets."""
+    global _qr_bootstrap_attempted
     try:
         import qrcode
+    except ImportError:
+        if _qr_bootstrap_attempted:
+            return None
+        _qr_bootstrap_attempted = True
+        _install_requirements()
+        import importlib
+        importlib.invalidate_caches()
+        try:
+            import qrcode
+        except ImportError:
+            return None
+    try:
         q = qrcode.QRCode(border=2)
         q.add_data(data)
         q.make(fit=True)
