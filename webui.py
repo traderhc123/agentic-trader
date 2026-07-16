@@ -346,6 +346,17 @@ function render(){
   });
   STEPS.forEach((s,i)=>{document.getElementById(s[0]).className=(i===cur)?'active':'';});
 }
+function restoredNote(sec,txt){
+  // '✓ already configured' line at the top of a completed tab, so returning
+  // users see WHAT is set up, not just a checked chip. textContent = no
+  // injection surface.
+  if(!txt)return;
+  const el=document.getElementById(sec);if(!el)return;
+  let p=document.getElementById(sec+'-restored');
+  if(!p){p=document.createElement('p');p.id=sec+'-restored';p.className='ok';
+    el.insertBefore(p,el.children[1]||null);}
+  p.textContent='✓ '+txt;
+}
 function done(id){
   // auto-advance only the FIRST time a step completes — re-saving an
   // already-done step must not yank the user off the tab they chose
@@ -393,15 +404,17 @@ function srcChanged(){
 async function boot(){
   const st=await api('/api/state');
   document.getElementById('disclaimer').textContent=st.disclaimer;
-  if(st.consent)done('s-consent');
-  if(st.llm)done('s-llm');
-  if(st.source)done('s-source');
+  const notes=st.notes||{};
+  if(st.consent){done('s-consent');restoredNote('s-consent',notes.consent||'Agreement signed — on file');}
+  if(st.llm){done('s-llm');restoredNote('s-llm',notes.llm||'AI connected');}
+  if(st.source){done('s-source');restoredNote('s-source',notes.source||('Source saved: '+st.source));}
   if(st.broker){done('s-broker');
     // numeric = Robinhood account last4; otherwise a key-based broker id
     const t=/^\\d+$/.test(st.broker)?'account ····'+st.broker:st.broker;
-    document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ '+esc(t)+'</span>';}
-  if(st.sizing)done('s-sizing');
-  if(st.safety)done('s-safety');
+    document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ '+esc(t)+'</span>';
+    restoredNote('s-broker','Broker connected: '+t);}
+  if(st.sizing){done('s-sizing');restoredNote('s-sizing',notes.sizing||'Sizing saved');}
+  if(st.safety){done('s-safety');restoredNote('s-safety',notes.safety||'Safety saved');}
   cur=Math.min(maxUnlocked,STEPS.length-1);render();
   loadBrokers();
 }
@@ -901,6 +914,45 @@ class _Handler(BaseHTTPRequestHandler):
 
 # ── the setup wizard ─────────────────────────────────────────────────────────
 
+def _restore_notes(cfg, acceptance=None):
+    """Per-tab 'already configured' summaries for the wizard restore path.
+    Non-secret only — these render as plain text at the top of each completed
+    tab so a returning user can see WHAT is configured, not just a checkmark."""
+    notes = {}
+    if acceptance and acceptance.get("accepted"):
+        when = str(acceptance.get("accepted_at", ""))[:10]
+        notes["consent"] = ("Agreement signed"
+                            + (f" on {when}" if when else "") + " — on file")
+    if cfg.get("anthropic_api_key"):
+        notes["llm"] = ("AI connected — Anthropic key on file"
+                        + (f" · model {cfg['llm_model']}"
+                           if cfg.get("llm_model") else ""))
+    src = cfg.get("source")
+    if src:
+        detail = ""
+        if src == "agenthc":
+            if cfg.get("agenthc_api_key"):
+                detail = " · API key on file"
+            elif cfg.get("lnbits_url"):
+                detail = " · Lightning wallet connected"
+            if cfg.get("include_other_trades"):
+                detail += " · main + other trades"
+        elif src == "url" and cfg.get("source_url"):
+            detail = f" · {cfg['source_url']}"
+        notes["source"] = f"Source saved: {src}{detail}"
+    if cfg.get("sizing_mode") == "budget":
+        notes["sizing"] = (f"Sizing saved: up to "
+                           f"${cfg.get('budget_per_trade_usd', 0):g} per trade")
+    elif cfg.get("sizing_mode"):
+        n = cfg.get("contracts_per_trade", 1)
+        notes["sizing"] = f"Sizing saved: {n} contract{'s' if n != 1 else ''} per trade"
+    if cfg.get("max_entries_per_day") is not None:
+        notes["safety"] = (
+            f"Safety saved: {'DRY-RUN' if cfg.get('dry_run', True) else 'LIVE'}"
+            f" · max {cfg.get('max_entries_per_day')} entries/day")
+    return notes
+
+
 def _broker_display(cfg, last4=""):
     """What the wizard's broker step shows as connected: the in-session hint,
     else the Robinhood account last4, else the persisted key-based broker id
@@ -943,6 +995,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "llm": bool(cfg.get("anthropic_api_key")),
             "sizing": bool(cfg.get("sizing_mode")),
             "safety": cfg.get("max_entries_per_day") is not None,
+            "notes": _restore_notes(cfg, A._load(A.ACCEPTANCE_PATH, {})),
         }
 
     def consent(_h, data):
