@@ -79,7 +79,37 @@ def create_wallet(instance_url=None, name="agentic-trader"):
     key = _find_key(resp.json())
     if not key:
         raise WalletError(f"no adminkey in response: {resp.text[:150]}")
-    return url, key
+
+    # Best-effort wallet-page URL so the user can OPEN the wallet in a
+    # browser later (LNbits response shapes vary by version: `user`/`id`
+    # at the account level, or nested wallet objects).
+    def _find_str(obj, names):
+        if isinstance(obj, dict):
+            for k in names:
+                v = obj.get(k)
+                if isinstance(v, str) and v:
+                    return v
+            for v in obj.values():
+                found = _find_str(v, names)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for v in obj:
+                found = _find_str(v, names)
+                if found:
+                    return found
+        return ""
+
+    data = resp.json()
+    usr = _find_str(data, ("user", "user_id", "usr"))
+    wal = _find_str(data, ("id", "wallet_id"))
+    if usr:
+        page = f"{url}/wallet?usr={usr}" + (f"&wal={wal}" if wal else "")
+    elif wal:
+        page = f"{url}/wallet?wal={wal}"
+    else:
+        page = ""
+    return url, key, page
 
 
 def wallet_setup(cfg):
@@ -90,15 +120,19 @@ def wallet_setup(cfg):
     choice = input("Choose [1/2, default 1]: ").strip() or "1"
     if choice == "1":
         try:
-            url, key = create_wallet()
+            url, key, page = create_wallet()
         except WalletError as exc:
             print(f"Automatic wallet creation failed: {exc}")
             return cfg
         cfg["lnbits_url"] = url
         cfg["lnbits_admin_key"] = key
+        if page:
+            cfg["lnbits_wallet_page"] = page
         cfg.setdefault("max_autopay_sats", 30_000)
         print(f"Wallet created on {url} ✓ (custodial hosted wallet — the agent "
               "keeps only spending money here)")
+        if page:
+            print(f"Wallet page (view balance / receive): {page}")
         raw = input("Fund it now — amount in sats (e.g. 50000; blank to skip): ").strip()
         if raw.isdigit() and int(raw) > 0:
             print_funding_invoice(LNbitsWallet(url, key), int(raw))
