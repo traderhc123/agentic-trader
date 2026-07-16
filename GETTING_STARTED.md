@@ -40,36 +40,32 @@ catches up when it wakes (and refuses to act on entries older than 5
 minutes — a safety feature), but exits can be delayed. Fine for dry-run
 trials; not ideal for live money.
 
-**How much terminal is involved, really?** Three pasted lines, once — the
-install, `setup --web`, and `run`. Every decision and all day-to-day use
-happens in your browser (the setup wizard, then the dashboard). If you'd
-rather touch a terminal zero times, use the AI-assistant path above: Claude
-pastes the lines, you use the browser.
+**How much terminal is involved, really?** ONE pasted line, once. The
+installer handles everything (it even installs Python itself if your
+computer doesn't have it — no git needed either), opens the setup wizard in
+your browser, and the wizard's last step has a **"Start my agent now"**
+button. Every decision and all day-to-day use happens in your browser.
 
 ### Option A — your computer (10 minutes, start here)
 
-1. Install Python 3.10+ (python.org, or it's already on Macs).
-2. Open Terminal (Mac: Cmd-Space, type "Terminal") and paste:
+1. Open Terminal (Mac: Cmd-Space, type "Terminal") and paste:
    ```bash
    curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | bash
    ```
-   On a Mac or Linux desktop that's the ONLY paste — the installer sets
-   everything up and **the setup wizard opens in your browser automatically**.
-   A setup page opens — read and accept the agreement, pick
-   your signal source, click **Connect Robinhood** (it bounces you to
-   Robinhood and straight back), choose a dollar budget per trade, and set
-   the safety rails. It defaults to **dry-run mode** — no real orders — so
-   you can watch it for a few days risk-free. That's the last of the
-   terminal apart from one more pasted line below.
-3. Start it:
-   ```bash
-   ./.venv/bin/python agent.py run
-   ```
-   Leave that window open, then open **http://127.0.0.1:8721** — your
-   agent's own dashboard: live status, every action it's taken, and a chat
+   That is the only command. The installer sets everything up (including a
+   private Python if needed) and **the setup wizard opens in your browser
+   automatically**.
+2. In the wizard: read and accept the agreement, pick your signal source,
+   connect your broker (Robinhood bounces you there and straight back;
+   Alpaca and moomoo both have zero-dollar paper modes), choose a dollar
+   budget per trade, and set the safety rails. It defaults to **dry-run
+   mode** — no real orders — so you can watch it for a few days risk-free.
+3. On the final step click **"Start my agent now"** — the same page becomes
+   your agent's live dashboard: status, every action it's taken, and a chat
    box where you can say `pause`, `resume`, `set budget 500`, `dry off`, or
-   just ask it questions about what it's been doing. On a remote server,
-   tunnel first: `ssh -L 8721:127.0.0.1:8721 user@yourserver`.
+   just ask what it's been doing. Bookmark **http://127.0.0.1:8721** — it's
+   your agent's home from now on. On a remote server, tunnel first:
+   `ssh -L 8721:127.0.0.1:8721 user@yourserver`.
 
 ### Option B — a $5 VPS (always-on, ~30 minutes)
 
