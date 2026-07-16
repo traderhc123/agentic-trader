@@ -115,3 +115,35 @@ def test_qr_matrix_recovers_after_bootstrap(monkeypatch):
 
     m = webui._qr_matrix("LNBC1SELFHEAL")
     assert m is not None and len(m) == len(m[0])
+
+
+def test_fund_quote_math(monkeypatch):
+    import webui
+    monkeypatch.setattr(webui, "_btc_usd", lambda: 64000.0)
+    q = webui._fund_quote(50_000)
+    assert q["ok"] and q["usd"] == 32.0 and q["day_passes"] == 3
+    # month suggestion: 21 passes x $10 = $210 -> sats, rounded to 1k
+    assert q["suggested_month_sats"] == 328_000
+    assert webui._fund_quote(0)["usd"] == 0
+
+
+def test_fund_quote_failsoft_without_price(monkeypatch):
+    import webui
+    monkeypatch.setattr(webui, "_btc_usd", lambda: 0.0)
+    assert webui._fund_quote(50_000)["ok"] is False
+
+
+def test_btc_usd_cache(monkeypatch):
+    import webui
+    webui._btc_usd_cache.update(t=0.0, usd=0.0)
+    calls = []
+
+    class _R:
+        def json(self):
+            calls.append(1)
+            return {"data": {"amount": "64000"}}
+    import requests
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _R())
+    assert webui._btc_usd() == 64000.0
+    assert webui._btc_usd() == 64000.0  # cached — no second fetch
+    assert len(calls) == 1
