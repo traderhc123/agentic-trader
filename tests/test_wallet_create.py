@@ -122,9 +122,27 @@ def test_fund_quote_math(monkeypatch):
     monkeypatch.setattr(webui, "_btc_usd", lambda: 64000.0)
     q = webui._fund_quote(50_000)
     assert q["ok"] and q["usd"] == 32.0 and q["day_passes"] == 3
-    # month suggestion: 21 passes x $10 = $210 -> sats, rounded to 1k
-    assert q["suggested_month_sats"] == 328_000
+    # one $10 day pass at $64k/BTC = 15,625 sats, ceil to 100 -> 15,700
+    assert q["day_pass_sats"] == 15_700
+    assert q["suggested_sats"] == 15_700       # no cap known
     assert webui._fund_quote(0)["usd"] == 0
+
+
+def test_fund_quote_clamps_to_invoice_cap(monkeypatch):
+    import webui
+    monkeypatch.setattr(webui, "_btc_usd", lambda: 5000.0)  # cheap BTC: pass=200k sats
+    q = webui._fund_quote(0, invoice_cap=100_000)
+    assert q["day_pass_sats"] == 200_000
+    assert q["suggested_sats"] == 100_000
+    assert q["invoice_cap"] == 100_000
+
+
+def test_invoice_cap_from_error():
+    import webui
+    msg = ('invoice creation failed HTTP 520: {"detail":"Invoice amount '
+           '328000 sats is too high. Max allowed: 100000 sats."}')
+    assert webui._invoice_cap_from_error(msg) == 100_000
+    assert webui._invoice_cap_from_error("some other error") == 0
 
 
 def test_fund_quote_failsoft_without_price(monkeypatch):

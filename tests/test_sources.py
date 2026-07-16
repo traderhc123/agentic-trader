@@ -208,7 +208,8 @@ def test_agenthc_402_buys_day_pass_and_retries(monkeypatch):
 
     monkeypatch.setattr(agenthc.requests, "get", fake_get)
     state = {}
-    events = agenthc.poll({}, state, save_state=lambda s: None)
+    events = agenthc.poll({"day_pass_recurring": True}, state,
+                          save_state=lambda s: None)
     assert wallet.paid == ["lnbc1..."]
     assert state["l402"]["token"] == "L402 MAC:preimage-abc"
     assert calls[1]["Authorization"] == "L402 MAC:preimage-abc"
@@ -222,7 +223,8 @@ def test_agenthc_402_respects_autopay_cap(monkeypatch):
                                  "amount_sats": 999_999}}, status=402)
     monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
     with pytest.raises(RuntimeError, match="auto-pay cap"):
-        agenthc.poll({"max_autopay_sats": 30_000}, {}, lambda s: None)
+        agenthc.poll({"max_autopay_sats": 30_000,
+                      "day_pass_recurring": True}, {}, lambda s: None)
 
 
 def test_agenthc_402_without_wallet_is_actionable(monkeypatch):
@@ -230,4 +232,41 @@ def test_agenthc_402_without_wallet_is_actionable(monkeypatch):
     resp = FakeResp({"payment": {}}, status=402)
     monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
     with pytest.raises(RuntimeError, match="wallet"):
-        agenthc.poll({}, {}, lambda s: None)
+        agenthc.poll({"day_pass_recurring": True}, {}, lambda s: None)
+
+
+def test_agenthc_402_recurring_off_does_not_pay(monkeypatch):
+    """Default (recurring OFF): the agent must never auto-spend — no pay,
+    empty events, once-per-day notify flag persisted."""
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    resp = FakeResp({"payment": {"payment_request": "lnbc1...",
+                                 "macaroon": "MAC",
+                                 "amount_sats": 9500}}, status=402)
+    monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
+    saved = []
+    state = {}
+    events = agenthc.poll({}, state, save_state=saved.append)
+    assert events == []
+    assert wallet.paid == []
+    assert state.get("pass_needed_notified")
+    assert saved  # notify flag persisted
+
+
+def test_agenthc_402_recurring_on_pays(monkeypatch):
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    calls = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls.append(1)
+        if len(calls) == 1:
+            return FakeResp({"payment": {"payment_request": "lnbc1...",
+                                         "macaroon": "MAC",
+                                         "amount_sats": 9500}}, status=402)
+        return FakeResp({"events": [_feed_event()]})
+
+    monkeypatch.setattr(agenthc.requests, "get", fake_get)
+    events = agenthc.poll({"day_pass_recurring": True}, {}, lambda s: None)
+    assert wallet.paid == ["lnbc1..."]
+    assert len(events) == 1

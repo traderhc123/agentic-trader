@@ -217,10 +217,17 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div id="fund-box" style="display:none">
    <p>Wallet ready ✓ — now give your agent some sats. Pay this invoice from any
    Lightning app (Strike, Cash App, Phoenix, Alby…):</p>
-   <label>Amount (sats)</label>
-   <input type="number" id="fund-sats" value="50000" min="1000" oninput="satsChanged()">
+   <label>Amount (sats) — a day pass is ~$10 of bitcoin</label>
+   <input type="number" id="fund-sats" value="16000" min="1000" oninput="satsChanged()">
    <button onclick="fundInvoice()">Show invoice</button>
    <p id="fund-quote" class="muted" style="display:none"></p>
+   <p id="fund-note" class="ok" style="display:none"></p>
+   <div class="navrow">
+    <button id="recur-btn" onclick="toggleRecurring()">Recurring day-pass: OFF</button>
+    <span class="muted">ON = the agent buys each day's ~$10 pass from its
+    wallet automatically (never above your auto-pay cap). OFF = it never
+    spends without you.</span>
+   </div>
    <div id="fund-qr" style="display:none;margin:.6rem 0"></div>
    <pre id="bolt11" style="display:none"></pre>
    <p id="fund-open" style="display:none">
@@ -412,13 +419,25 @@ async function updateQuote(){
     if(!r.ok){el.style.display='none';return;}
     let t=sats.toLocaleString()+' sats ≈ $'+r.usd.toFixed(2)
       +' (BTC $'+Math.round(r.btc_usd).toLocaleString()+')'
-      +' · covers ~'+r.day_passes+' day-pass'+(r.day_passes===1?'':'es')+' at ~$10';
-    if(r.suggested_month_sats)
-      t+=' — a month of market days ≈ '+r.suggested_month_sats.toLocaleString()+' sats';
+      +' · covers ~'+r.day_passes+' day-pass'+(r.day_passes===1?'':'es')+' at ~$10/day';
+    if(r.day_pass_sats)
+      t+=' — one day pass ≈ '+r.day_pass_sats.toLocaleString()+' sats';
+    if(r.invoice_cap)
+      t+=' · instance max '+r.invoice_cap.toLocaleString()+' sats/invoice';
     el.textContent=t;el.style.display='';
   }catch(e){el.style.display='none';}
 }
 function satsChanged(){satsEdited=true;clearTimeout(quoteTimer);quoteTimer=setTimeout(updateQuote,400);}
+function setRecurBtn(on){
+  const b=document.getElementById('recur-btn');
+  b.textContent='Recurring day-pass: '+(on?'ON':'OFF');
+  b.dataset.on=on?'1':'';
+}
+async function toggleRecurring(){
+  const on=!document.getElementById('recur-btn').dataset.on;
+  const r=await api('/api/wallet/recurring',{on:on});
+  if(r.ok)setRecurBtn(r.on);
+}
 function renderQr(m){
   // Server sends the QR as a 0/1 module matrix; draw it as one SVG path.
   // No image bytes, no external assets — and the lightning: link stays as a
@@ -452,6 +471,7 @@ async function boot(){
   if(st.source){done('s-source');restoredNote('s-source',notes.source||('Source saved: '+st.source));
     const sel=document.getElementById('src');sel.value=st.source;srcChanged();}
   if(st.wallet&&st.wallet.connected)showWallet(st.wallet.page,'wallet connected ✓');
+  setRecurBtn(!!st.recurring);
   if(st.broker){done('s-broker');
     // numeric = Robinhood account last4; otherwise a key-based broker id
     const t=/^\\d+$/.test(st.broker)?'account ····'+st.broker:st.broker;
@@ -489,12 +509,12 @@ function showWallet(page,label){
     mw.appendChild(a);
   }
   document.getElementById('fund-box').style.display='';
-  // Price-aware default: sats for ~a month of day-passes at the CURRENT BTC
-  // price (the old fixed 50,000 drifted to ~3 days) — unless the user
-  // already typed an amount.
+  // Price-aware default: ONE ~$10 day pass at the CURRENT BTC price
+  // (clamped to the instance's per-invoice cap when known) — unless the
+  // user already typed an amount.
   api('/api/wallet/quote?sats=0').then(function(r){
-    if(r&&r.ok&&r.suggested_month_sats&&!satsEdited)
-      document.getElementById('fund-sats').value=r.suggested_month_sats;
+    if(r&&r.ok&&r.suggested_sats&&!satsEdited)
+      document.getElementById('fund-sats').value=r.suggested_sats;
     updateQuote();
   }).catch(function(){});
   // No invoice generated yet this session — show balance, hide the pay link
@@ -519,6 +539,9 @@ async function fundInvoice(){
   if(!r.ok){document.getElementById('mw-msg').innerHTML=' <span class="err">'+r.error+'</span>';return;}
   const pre=document.getElementById('bolt11');pre.style.display='';pre.textContent=r.bolt11;
   renderQr(r.qr);
+  const fn=document.getElementById('fund-note');
+  if(r.note){fn.textContent=r.note;fn.style.display='';}
+  else fn.style.display='none';
   document.getElementById('copy-msg').textContent='';
   document.getElementById('fund-open').style.display='';
   const fl=document.getElementById('fund-link');
@@ -1018,7 +1041,15 @@ def _install_requirements():
 # "≈ $X · covers ~N day-passes" next to the amount instead.
 _btc_usd_cache = {"t": 0.0, "usd": 0.0}
 _DAY_PASS_USD = 10.0        # feed day-pass ballpark, floats with BTC
-_MARKET_DAYS_PER_MONTH = 21
+
+
+def _invoice_cap_from_error(msg):
+    """Per-invoice cap (sats) parsed from an LNbits 'amount too high' error,
+    or 0. E.g. demo.lnbits.com: 'Invoice amount 328000 sats is too high.
+    Max allowed: 100000 sats.'"""
+    import re
+    m = re.search(r"[Mm]ax allowed:\s*([0-9][0-9,]*)", str(msg))
+    return int(m.group(1).replace(",", "")) if m else 0
 
 
 def _btc_usd():
@@ -1044,21 +1075,25 @@ def _btc_usd():
     return 0.0
 
 
-def _fund_quote(sats):
-    """USD context for a sats amount: value, ~day-passes covered, and a
-    suggested one-month top-up at the current BTC price. {ok: False} when no
-    live price is available (the funding box just omits the hint)."""
+def _fund_quote(sats, invoice_cap=0):
+    """USD context for a sats amount: value, ~day-passes covered, and the
+    sats price of ONE ~$10 day pass at the current BTC price (the funding
+    default — this is a day-pass product). suggested_sats is the day pass
+    clamped to the instance's per-invoice cap when one is known.
+    {ok: False} when no live price is available (the funding box just omits
+    the hint)."""
     usd_per_btc = _btc_usd()
     if usd_per_btc <= 0:
         return {"ok": False, "error": "no live BTC price"}
     usd = sats * usd_per_btc / 1e8
-    month_sats = int(round(
-        _MARKET_DAYS_PER_MONTH * _DAY_PASS_USD / usd_per_btc * 1e8 / 1000.0
-    )) * 1000
+    day_sats = int(-(-_DAY_PASS_USD / usd_per_btc * 1e8 // 100) * 100)  # ceil→100
+    suggested = min(day_sats, invoice_cap) if invoice_cap else day_sats
     return {"ok": True, "btc_usd": round(usd_per_btc, 2),
             "usd": round(usd, 2),
             "day_passes": int(usd // _DAY_PASS_USD),
-            "suggested_month_sats": month_sats}
+            "day_pass_sats": day_sats,
+            "suggested_sats": suggested,
+            "invoice_cap": invoice_cap or None}
 
 
 # One-shot guard: attempt the missing-dependency bootstrap at most once per
@@ -1184,6 +1219,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                   and cfg.get("lnbits_admin_key")),
                 "page": cfg.get("lnbits_wallet_page", ""),
             },
+            "recurring": bool(cfg.get("day_pass_recurring")),
         }
 
     def consent(_h, data):
@@ -1384,13 +1420,36 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"ok": False, "error": "no wallet yet"}
         try:
             sats = max(1000, int(data.get("sats") or 50000))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "enter a sats amount"}
+        note = ""
+        cap = int(cfg.get("lnbits_max_invoice_sats") or 0)
+        if cap and sats > cap:
+            note = (f"this wallet instance caps invoices at {cap:,} sats — "
+                    f"generated {cap:,}; pay it and repeat to reach {sats:,}")
+            sats = cap
+        try:
             bolt11 = w.create_invoice(sats, memo="fund agentic-trader")
-            # Uppercase bolt11 in the QR = alphanumeric mode = denser, easier
-            # scan (bech32 is case-insensitive; wallet scanners expect this).
-            return {"ok": True, "bolt11": bolt11,
-                    "qr": _qr_matrix(bolt11.upper())}
         except (WalletError, ValueError) as exc:
-            return {"ok": False, "error": str(exc)[:200]}
+            # Learn the instance's per-invoice cap from the error, remember
+            # it (clamps future suggestions too), and retry once at the cap.
+            new_cap = _invoice_cap_from_error(exc)
+            if not new_cap or new_cap >= sats:
+                return {"ok": False, "error": str(exc)[:200]}
+            cfg["lnbits_max_invoice_sats"] = new_cap
+            save()
+            try:
+                bolt11 = w.create_invoice(new_cap, memo="fund agentic-trader")
+            except (WalletError, ValueError) as exc2:
+                return {"ok": False, "error": str(exc2)[:200]}
+            note = (f"this wallet instance caps invoices at {new_cap:,} sats "
+                    f"— generated {new_cap:,}; pay it and repeat to reach "
+                    f"{sats:,}")
+            sats = new_cap
+        # Uppercase bolt11 in the QR = alphanumeric mode = denser, easier
+        # scan (bech32 is case-insensitive; wallet scanners expect this).
+        return {"ok": True, "bolt11": bolt11, "sats": sats, "note": note,
+                "qr": _qr_matrix(bolt11.upper())}
 
     def wallet_quote(h):
         from urllib.parse import parse_qs, urlparse
@@ -1399,7 +1458,17 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                         or ["0"])[0])
         except ValueError:
             sats = 0
-        return _fund_quote(max(0, sats))
+        return _fund_quote(max(0, sats),
+                           int(cfg.get("lnbits_max_invoice_sats") or 0))
+
+    def wallet_recurring(_h, data):
+        # Recurring day-pass consent: ON = the agent may auto-pay each day's
+        # ~$10 pass from its wallet (still capped by max_autopay_sats);
+        # OFF = it never spends without the operator. The run loop re-reads
+        # config every poll, so this applies live without a restart.
+        cfg["day_pass_recurring"] = bool(data.get("on"))
+        save()
+        return {"ok": True, "on": cfg["day_pass_recurring"]}
 
     def wallet_balance(_h):
         w = _wallet()
@@ -1591,6 +1660,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/wallet/fund": wallet_fund,
                      "/api/llm": llm, "/api/deploy": deploy,
                      "/api/update/pull": update_pull,
+                     "/api/wallet/recurring": wallet_recurring,
                      "/api/broker/connect": broker_connect,
                      "/api/proposal/apply": proposal_apply,
                      "/api/proposal/reject": proposal_reject,
