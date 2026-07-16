@@ -60,6 +60,23 @@ def accept_terms(cfg):
     return body.get("terms_version")
 
 
+def _pass_purchase_allowed(cfg, state, save_state):
+    """Recurring-day-pass gate: the agent only auto-pays the ~$10 pass when
+    the operator turned 'Recurring day-pass' ON (wizard Source tab / config
+    day_pass_recurring). OFF (the default) = the agent never spends without
+    approval — it notifies once per day and returns no events instead."""
+    if cfg.get("day_pass_recurring"):
+        return True
+    day = time.strftime("%Y-%m-%d")
+    if state.get("pass_needed_notified") != day:
+        state["pass_needed_notified"] = day
+        save_state(state)
+        print("Day-pass required (~$10 in sats) but recurring payments are "
+              "OFF — turn ON 'Recurring day-pass' in the wizard Source tab "
+              "to let the agent buy it each day.")
+    return False
+
+
 def _buy_day_pass(cfg, state, body, save_state):
     """Pay the 402 Lightning invoice; cache the 24h L402 token in state."""
     wallet = wallet_from_cfg(cfg)
@@ -100,6 +117,8 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
                         params={"limit": 20, "track": track},
                         headers=_headers(cfg, state), timeout=15)
     if resp.status_code == 402 and not _retried:
+        if not _pass_purchase_allowed(cfg, state, save_state):
+            return []
         _buy_day_pass(cfg, state, resp.json(), save_state)
         return poll(cfg, state, save_state, _retried=True)
     if resp.status_code == 401 and not _retried and not cfg.get("agenthc_api_key"):
