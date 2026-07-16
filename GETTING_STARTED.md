@@ -102,6 +102,11 @@ docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trad
   `"dry_run": false` in `~/.agentic-trader/config.json` to go live.
 - **Daily entry cap** (default 5) and **1-contract default sizing** bound the
   worst day.
+- **Main pick only by default**: the AgentHC feed follows the single daily
+  high-conviction pick unless you opt into "other trades" (the wider journal,
+  several entries a day) during setup — or later via
+  `"include_other_trades": true` in `~/.agentic-trader/config.json`. The daily
+  cap and per-trade budget apply either way.
 - **Notifications**: set up Discord/ntfy/Telegram during setup — you get a
   message on every action, veto, and error, plus a daily digest after the
   close. Never run it silently.
