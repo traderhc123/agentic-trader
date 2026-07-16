@@ -77,3 +77,32 @@ def test_post_rejects_foreign_host_even_with_ok_origin():
     s = _Stub({"Host": "evil.example.com", "Origin": _allowed_origin()})
     assert s._guard(check_origin=True) is False
     assert s.sent[1] == 403
+
+
+# ── wizard finish-line wiring (regression: the s-done step used to fire
+#    /api/finish on arrival, shutting the server down BEFORE Option A/B) ─────
+
+def _webui_source():
+    import inspect
+    return inspect.getsource(webui)
+
+
+def test_safety_step_does_not_kill_the_wizard_server():
+    src = _webui_source()
+    safety_js = src.split("async function doSafety")[1].split("async function")[0]
+    assert "/api/finish" not in safety_js, (
+        "doSafety must NOT call /api/finish — it shuts the wizard server down "
+        "before the user can click Start/Deploy on the final step")
+
+
+def test_start_local_button_and_route_wired():
+    src = _webui_source()
+    assert "startLocal()" in src            # Option A button
+    assert '"/api/start-local": start_local' in src  # route registered
+    assert "connect_ex" in src              # child waits for the port to free
+
+
+def test_deploy_success_finishes_wizard():
+    src = _webui_source()
+    deploy_js = src.split("async function deploy")[1].split("async function")[0]
+    assert "/api/finish" in deploy_js

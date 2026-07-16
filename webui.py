@@ -295,8 +295,11 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <section id="s-done"><h2>Done — where should your agent live?</h2>
  <div id="done-body"></div>
  <div id="deploy-box">
-  <p><b>Option A — this computer:</b> run the command above; keep it awake
-  during market hours.</p>
+  <p><b>Option A — this computer:</b>
+   <button onclick="startLocal()">Start my agent now</button>
+   <span id="start-msg"></span></p>
+  <p class="muted">One click — the agent starts here and this page becomes its
+  dashboard. Keep this computer awake during market hours.</p>
   <p><b>Option B — let your agent create its own cloud server</b> (~$6/mo on
   YOUR DigitalOcean account): it provisions the server, moves its completed
   setup there, and starts itself. Your token is used once and not stored.</p>
@@ -473,11 +476,27 @@ async function doSafety(){
     anthropic_key:document.getElementById('pol-key').value});
   if(r.ok){done('s-safety');
     document.getElementById('done-body').innerHTML=
-     '<p class="ok">Setup complete.</p><pre>'+r.next+'</pre>'+
-     '<p class="muted">The dashboard lives at http://127.0.0.1:8721 once the '+
-     'agent is running.</p>';
-    api('/api/finish',{});}
+     '<p class="ok">Setup complete — pick where your agent should live.</p>'+
+     '<details><summary class="muted">…or start it from a terminal instead</summary>'+
+     '<pre>'+esc(r.next)+'</pre></details>';}
   else document.getElementById('sf-msg').innerHTML='<span class="err">'+r.error+'</span>';
+}
+async function startLocal(){
+  const el=document.getElementById('start-msg');
+  el.textContent=' starting…';
+  let r;
+  try{r=await api('/api/start-local',{});}
+  catch(e){el.innerHTML=' <span class="err">could not reach setup server</span>';return;}
+  if(!r.ok){el.innerHTML=' <span class="err">'+esc(r.error)+'</span>';return;}
+  el.textContent=' starting… (the agent takes over this address in a few seconds)';
+  // The wizard hands its port to the running agent; poll until the agent's
+  // dashboard answers with a real mode, then hop over to it.
+  const hop=setInterval(async()=>{
+    try{const s=await fetch('/api/status');
+      if(s.ok){const j=await s.json();
+        if(j.mode&&j.mode!=='OFFLINE'){clearInterval(hop);location='/dash';}}}
+    catch(e){}
+  },1500);
 }
 async function deploy(){
   const el=document.getElementById('deploy-msg');
@@ -490,8 +509,10 @@ async function deploy(){
     if(s.ip){el.innerHTML='<span class="ok">Your agent is live on its own server at '
       +s.ip+' ✓</span><br><span class="muted">It started automatically and will send '
       +'your startup notification shortly. This computer no longer needs to run '
-      +'anything. Dashboard from here: ssh -L 8721:127.0.0.1:8721 trader@'+s.ip
-      +' then open http://127.0.0.1:8721/dash</span>';}
+      +'anything — you can close this window. Dashboard from here: '
+      +'ssh -L 8721:127.0.0.1:8721 trader@'+s.ip
+      +' then open http://127.0.0.1:8721/dash</span>';
+      api('/api/finish',{});}
     else{el.textContent='server status: '+s.status+' — waiting…';setTimeout(poll2,5000);}
   };
   poll2();
@@ -1138,6 +1159,41 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         pending["finished"].set()
         return {"ok": True}
 
+    def start_local(_h, _data):
+        """Option A as one click: spawn the agent detached, then hand it this
+        port. The child waits until the wizard's socket is actually free
+        before exec'ing `agent.py run`, so the dashboard (same port) can't
+        lose the bind race and fall back to headless."""
+        if not A.consent_ok():
+            return {"ok": False, "error": "accept the agreement first"}
+        from brokers import broker_ready
+        if not (cfg.get("source") and broker_ready(cfg)):
+            return {"ok": False,
+                    "error": "finish the source and broker steps first"}
+        save()
+        import os
+        import subprocess
+        import sys
+        py = sys.executable
+        script = os.path.join(_repo_dir(), "agent.py")
+        log_path = os.path.join(os.path.dirname(A.CONFIG_PATH), "agent-run.log")
+        wait_free = (
+            f'for i in $(seq 1 40); do "{py}" -c \'import socket,sys; '
+            f's=socket.socket(); sys.exit(0 if s.connect_ex(("127.0.0.1", '
+            f'{APP_PORT})) else 1)\' && break; sleep 0.5; done; ')
+        cmd = wait_free + f'exec "{py}" "{script}" run >> "{log_path}" 2>&1'
+        try:
+            subprocess.Popen(["/bin/sh", "-c", cmd], cwd=_repo_dir(),
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except Exception as exc:
+            return {"ok": False, "error": f"could not start the agent: {exc}"}
+        # release the port AFTER this response has flushed
+        threading.Timer(0.5, pending["finished"].set).start()
+        return {"ok": True}
+
     def d_status(_h):
         if get_status is None:
             return {"mode": "OFFLINE", "paused": False, "fields": {}}
@@ -1181,6 +1237,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     W.routes_post = {"/api/consent": consent, "/api/source": source,
                      "/api/sizing": sizing, "/api/safety": safety,
                      "/api/finish": finish, "/api/ask": ask,
+                     "/api/start-local": start_local,
                      "/api/wallet/create": wallet_create,
                      "/api/wallet/fund": wallet_fund,
                      "/api/llm": llm, "/api/deploy": deploy,
@@ -1228,8 +1285,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             pass
         try:
             pending["finished"].wait()
-            print("Setup complete — start the agent with: agent.py run "
-                  "(the same URL then serves the dashboard).")
+            print("Setup complete. If you clicked \"Start my agent now\", it "
+                  "is taking over this address — the browser page becomes the "
+                  "dashboard. Otherwise start it any time with: agent.py run")
         except KeyboardInterrupt:
             print("\nWizard aborted.")
         server.shutdown()

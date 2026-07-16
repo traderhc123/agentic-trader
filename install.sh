@@ -14,7 +14,6 @@ REPO="https://github.com/traderhc123/agentic-trader"
 DIR="${AGENTIC_TRADER_DIR:-$HOME/agentic-trader}"
 
 echo "== agentic-trader installer =="
-command -v git >/dev/null 2>&1 || { echo "ERROR: git is required (macOS: run 'xcode-select --install')"; exit 1; }
 
 py_ok() { "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; }
 
@@ -33,11 +32,31 @@ if [ -z "$PYTHON" ]; then
   echo "Using $PYTHON"
 fi
 
-if [ -d "$DIR/.git" ]; then
-  echo "Existing install found at $DIR — updating…"
-  git -C "$DIR" pull --ff-only
+# git is preferred but NOT required — a stock Mac has no git until the Xcode
+# CLT dialog is answered, which is exactly the wall a first-time user hits.
+# Without git we download a snapshot tarball instead (curl+tar are always
+# present on macOS/Linux). `.venv` and any local edits are left in place.
+fetch_snapshot() {
+  echo "git not found — downloading a snapshot of the code instead…"
+  TMP="$(mktemp -d)"
+  curl -fsSL "https://codeload.github.com/traderhc123/agentic-trader/tar.gz/refs/heads/main" \
+    | tar -xz -C "$TMP"
+  mkdir -p "$DIR"
+  cp -R "$TMP"/agentic-trader-*/. "$DIR"/
+  rm -rf "$TMP"
+}
+
+if command -v git >/dev/null 2>&1; then
+  if [ -d "$DIR/.git" ]; then
+    echo "Existing install found at $DIR — updating…"
+    git -C "$DIR" pull --ff-only
+  elif [ -f "$DIR/agent.py" ]; then
+    fetch_snapshot   # tarball install being re-run on a box that now has git
+  else
+    git clone --depth 1 "$REPO" "$DIR"
+  fi
 else
-  git clone --depth 1 "$REPO" "$DIR"
+  fetch_snapshot
 fi
 
 cd "$DIR"
