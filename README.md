@@ -4,7 +4,7 @@
 
 A consent-gated, open-source **autonomous trading agent** for Robinhood's new
 [agentic trading](https://robinhood.com/us/en/agentic-trading/) platform.
-Pick a **signal source**, connect **your own brokerage** (Robinhood Agentic or Alpaca — including Alpaca's zero-dollar paper mode), set
+Pick a **signal source**, connect **your own brokerage** (Robinhood Agentic, Alpaca, or moomoo — Alpaca and moomoo both include zero-dollar paper modes), set
 your own position size, and the agent executes long-options orders on a
 heartbeat — entirely under your configuration and responsibility.
 
@@ -149,7 +149,7 @@ spend in this wallet. The Admin key is stored locally with `0600` perms.
 |---|---|
 | `agent.py` | Orchestrator: consent gate, setup wizard, heartbeat |
 | `sources/` | Signal source adapters (`manual`, `url`, `agenthc`) — PRs welcome |
-| `brokers/` | Broker adapters: Robinhood agentic MCP, **Alpaca (paper/live)**; moomoo = adapter template, PRs welcome |
+| `brokers/` | Broker adapters: Robinhood agentic MCP, **Alpaca (paper/live)**, **moomoo (paper/live, via OpenD)** — more PRs welcome |
 | `lightning_wallet.py` | Built-in Lightning wallet (LNbits) for sats-priced sources |
 | `install.sh` | One-line installer (clone + venv + deps; never auto-consents) |
 | `GETTING_STARTED.md` | Plain-English setup guide (local / home server / VPS / Docker) |

@@ -75,6 +75,7 @@ else
   echo
   echo "  cd $DIR"
   echo "  ./.venv/bin/python agent.py setup --web   # browser wizard"
+  echo "  ./.venv/bin/python agent.py doctor        # verify everything is ready"
   echo "  ./.venv/bin/python agent.py run           # heartbeat + dashboard"
   echo
   echo "On a remote server, tunnel first, then open http://127.0.0.1:8721 :"
