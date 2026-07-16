@@ -327,7 +327,7 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
 // run during boot(), before any local definition would exist).
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
 const STEPS=[["s-consent","Agreement"],["s-llm","Your AI"],["s-source","Source"],
- ["s-broker","Robinhood"],["s-sizing","Sizing"],["s-safety","Safety"],["s-done","Launch"]];
+ ["s-broker","Broker"],["s-sizing","Sizing"],["s-safety","Safety"],["s-done","Launch"]];
 let doneSet=new Set(), cur=0, maxUnlocked=0;
 function idx(id){return STEPS.findIndex(s=>s[0]===id);}
 function render(){
@@ -341,9 +341,14 @@ function render(){
   });
   STEPS.forEach((s,i)=>{document.getElementById(s[0]).className=(i===cur)?'active':'';});
 }
-function done(id){doneSet.add(id);
+function done(id){
+  // auto-advance only the FIRST time a step completes — re-saving an
+  // already-done step must not yank the user off the tab they chose
+  const first=!doneSet.has(id);
+  doneSet.add(id);
   maxUnlocked=Math.max(maxUnlocked,Math.min(idx(id)+1,STEPS.length-1));
-  cur=Math.min(idx(id)+1,STEPS.length-1);render();}
+  if(first)cur=Math.min(idx(id)+1,STEPS.length-1);
+  render();}
 function unlock(id){maxUnlocked=Math.max(maxUnlocked,idx(id));render();}
 async function api(p, body){
   const r = await fetch(p, body?{method:'POST',headers:{'Content-Type':'application/json'},
@@ -362,7 +367,11 @@ async function boot(){
   if(st.llm)done('s-llm');
   if(st.source)done('s-source');
   if(st.broker){done('s-broker');
-    document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ account ····'+st.broker+'</span>';}
+    // numeric = Robinhood account last4; otherwise a key-based broker id
+    const t=/^\d+$/.test(st.broker)?'account ····'+st.broker:st.broker;
+    document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ '+esc(t)+'</span>';}
+  if(st.sizing)done('s-sizing');
+  if(st.safety)done('s-safety');
   cur=Math.min(maxUnlocked,STEPS.length-1);render();
   loadBrokers();
 }
@@ -862,6 +871,19 @@ class _Handler(BaseHTTPRequestHandler):
 
 # ── the setup wizard ─────────────────────────────────────────────────────────
 
+def _broker_display(cfg, last4=""):
+    """What the wizard's broker step shows as connected: the in-session hint,
+    else the Robinhood account last4, else the persisted key-based broker id
+    (alpaca/moomoo/… write cfg["broker"] on connect). Without that last
+    fallback, a saved key-based connection looked unconfigured on every new
+    wizard session and re-locked the steps after it."""
+    if last4:
+        return last4
+    if cfg.get("robinhood_account"):
+        return cfg["robinhood_account"][-4:]
+    return cfg.get("broker", "")
+
+
 def start_app(get_status=None, get_trades=None, apply_command=None,
               cfg_getter=None, wait_finish=False):
     """One server, one port: /setup (wizard) + /dash (dashboard) + all APIs."""
@@ -886,11 +908,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "disclaimer": A._disclaimer_text(),
             "consent": A.consent_ok(),
             "source": cfg.get("source"),
-            "broker": pending["broker_last4"] or
-                      (cfg.get("robinhood_account", "")[-4:]
-                       if cfg.get("robinhood_account") else ""),
+            "broker": _broker_display(cfg, pending["broker_last4"]),
             "rh_warning": pending["rh_warning"],
             "llm": bool(cfg.get("anthropic_api_key")),
+            "sizing": bool(cfg.get("sizing_mode")),
+            "safety": cfg.get("max_entries_per_day") is not None,
         }
 
     def consent(_h, data):
