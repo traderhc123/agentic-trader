@@ -367,7 +367,7 @@ async function checkUpdates(){
   if(!r.ok){msg.innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}
   if(!r.behind){msg.innerHTML='<span class="ok">up to date ✓</span>';return;}
   msg.innerHTML='<span class="ok">'+r.behind+' update'+(r.behind>1?'s':'')+
-    ' available</span>'+(r.summary?' — latest: '+esc(r.summary.split('\n')[0]):'');
+    ' available</span>'+(r.summary?' — latest: '+esc(r.summary.split('\\n')[0]):'');
   document.getElementById('upd-pull').style.display='';
 }
 async function pullUpdates(){
@@ -390,7 +390,7 @@ async function boot(){
   if(st.source)done('s-source');
   if(st.broker){done('s-broker');
     // numeric = Robinhood account last4; otherwise a key-based broker id
-    const t=/^\d+$/.test(st.broker)?'account ····'+st.broker:st.broker;
+    const t=/^\\d+$/.test(st.broker)?'account ····'+st.broker:st.broker;
     document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ '+esc(t)+'</span>';}
   if(st.sizing)done('s-sizing');
   if(st.safety)done('s-safety');
