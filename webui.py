@@ -407,7 +407,9 @@ async function boot(){
   const notes=st.notes||{};
   if(st.consent){done('s-consent');restoredNote('s-consent',notes.consent||'Agreement signed — on file');}
   if(st.llm){done('s-llm');restoredNote('s-llm',notes.llm||'AI connected');}
-  if(st.source){done('s-source');restoredNote('s-source',notes.source||('Source saved: '+st.source));}
+  if(st.source){done('s-source');restoredNote('s-source',notes.source||('Source saved: '+st.source));
+    const sel=document.getElementById('src');sel.value=st.source;srcChanged();}
+  if(st.wallet&&st.wallet.connected)showWallet(st.wallet.page,'wallet connected ✓');
   if(st.broker){done('s-broker');
     // numeric = Robinhood account last4; otherwise a key-based broker id
     const t=/^\\d+$/.test(st.broker)?'account ····'+st.broker:st.broker;
@@ -434,12 +436,31 @@ async function doLLM(){
 }
 async function skipLLM(){done('s-llm');}
 let walletMade=false, balTimer=null;
+function showWallet(page,label){
+  walletMade=true;
+  const mw=document.getElementById('mw-msg');
+  mw.innerHTML=' <span class="ok">'+label+'</span>';
+  if(page){
+    const a=document.createElement('a');
+    a.href=page;a.target='_blank';a.rel='noopener';
+    a.textContent=' open wallet page ↗';
+    mw.appendChild(a);
+  }
+  document.getElementById('fund-box').style.display='';
+  // No invoice generated yet this session — show balance, hide the pay link
+  // until "Show invoice" creates a fresh bolt11.
+  document.getElementById('fund-link').style.display='none';
+  api('/api/wallet/balance').then(function(b){
+    if(b&&b.ok){
+      document.getElementById('fund-bal').textContent=b.sats.toLocaleString();
+      document.getElementById('fund-open').style.display='';
+    }
+  }).catch(function(){});
+}
 async function makeWallet(){
   document.getElementById('mw-msg').textContent=' creating…';
   const r=await api('/api/wallet/create',{});
-  if(r.ok){walletMade=true;
-    document.getElementById('mw-msg').innerHTML=' <span class="ok">created ✓</span>';
-    document.getElementById('fund-box').style.display='';}
+  if(r.ok)showWallet(r.page,'created ✓');
   else document.getElementById('mw-msg').innerHTML=' <span class="err">'+r.error+'</span>';
 }
 async function fundInvoice(){
@@ -448,7 +469,8 @@ async function fundInvoice(){
   if(!r.ok){document.getElementById('mw-msg').innerHTML=' <span class="err">'+r.error+'</span>';return;}
   const pre=document.getElementById('bolt11');pre.style.display='';pre.textContent=r.bolt11;
   document.getElementById('fund-open').style.display='';
-  document.getElementById('fund-link').href='lightning:'+r.bolt11;
+  const fl=document.getElementById('fund-link');
+  fl.href='lightning:'+r.bolt11;fl.style.display='';
   if(balTimer)clearInterval(balTimer);
   balTimer=setInterval(async()=>{const b=await api('/api/wallet/balance');
     if(b.ok)document.getElementById('fund-bal').textContent=b.sats.toLocaleString();},4000);
@@ -996,6 +1018,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "sizing": bool(cfg.get("sizing_mode")),
             "safety": cfg.get("max_entries_per_day") is not None,
             "notes": _restore_notes(cfg, A._load(A.ACCEPTANCE_PATH, {})),
+            "wallet": {
+                "connected": bool(cfg.get("lnbits_url")
+                                  and cfg.get("lnbits_admin_key")),
+                "page": cfg.get("lnbits_wallet_page", ""),
+            },
         }
 
     def consent(_h, data):
@@ -1174,15 +1201,17 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"ok": False, "error": "accept the agreement first"}
         from lightning_wallet import create_wallet
         try:
-            url, key = create_wallet()
+            url, key, page = create_wallet()
         except WalletError as exc:
             return {"ok": False, "error": str(exc)[:200]}
         cfg["source"] = "agenthc"
         cfg["lnbits_url"] = url
         cfg["lnbits_admin_key"] = key
+        if page:
+            cfg["lnbits_wallet_page"] = page
         cfg.setdefault("max_autopay_sats", 30_000)
         save()
-        return {"ok": True}
+        return {"ok": True, "page": page}
 
     def wallet_fund(_h, data):
         w = _wallet()
