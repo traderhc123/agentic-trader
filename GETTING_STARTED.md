@@ -116,6 +116,22 @@ docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trad
 
 Full details: [SECURITY.md](SECURITY.md).
 
+## Something not working?
+
+```bash
+./.venv/bin/python agent.py doctor
+```
+
+checks everything (consent, source, wallet + balance, feed reachability,
+broker connection, notifications) and prints the exact command that fixes
+each ✗. Run it any time the agent isn't doing what you expect.
+
+**moomoo users**: the adapter talks to moomoo's local **OpenD** gateway —
+download it from moomoo.com → API, log in once, keep it running, and
+`.venv/bin/pip install moomoo-api`. `doctor` will tell you if either piece
+is missing. Paper (SIMULATE) is the default; live orders additionally need
+your trade password and options approval.
+
 ## Checklist before going live (turning dry-run off)
 
 - [ ] You read DISCLAIMER.md and accepted it yourself

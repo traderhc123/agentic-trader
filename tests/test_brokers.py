@@ -4,14 +4,14 @@ import json
 
 import pytest
 
-from brokers import BROKERS, alpaca, key_brokers, robinhood
+from brokers import BROKERS, alpaca, broker_ready, key_brokers, moomoo, robinhood
 from conftest import make_event
 
 
 # ── registry ─────────────────────────────────────────────────────────────────
 
-def test_registry_contains_both():
-    assert set(BROKERS) == {"robinhood", "alpaca"}
+def test_registry_contains_all():
+    assert set(BROKERS) == {"robinhood", "alpaca", "moomoo"}
     for mod in BROKERS.values():
         assert callable(mod.setup) and callable(mod.client) and callable(mod.execute)
 
@@ -19,8 +19,16 @@ def test_registry_contains_both():
 def test_key_brokers_descriptor():
     descs = key_brokers()
     assert any(d["id"] == "alpaca" for d in descs)
+    assert any(d["id"] == "moomoo" for d in descs)
     alp = next(d for d in descs if d["id"] == "alpaca")
     assert {f["id"] for f in alp["fields"]} >= {"alpaca_key_id", "alpaca_secret"}
+
+
+def test_broker_ready_is_registry_driven(home):
+    assert broker_ready({}) is False
+    assert broker_ready({"broker": "moomoo"}) is True          # chosen adapter owns readiness
+    assert broker_ready({"alpaca_key_id": "k", "alpaca_secret": "s"}) is True  # pre-`broker`-key config
+    assert broker_ready({"broker": "nope"}) is False
 
 
 # ── alpaca: OCC symbol builder ───────────────────────────────────────────────
@@ -247,3 +255,184 @@ def test_robinhood_failed_place_keeps_position(monkeypatch):
                            {"option_id": "opt-123", "qty": 2}}}
     assert not robinhood.execute(None, {}, make_event(event="EXITED"), state)
     assert "SPY|2026-07-10|752.0|C" in state["positions"]
+
+
+# ── moomoo: option code builder ──────────────────────────────────────────────
+
+@pytest.mark.parametrize("ev,expected", [
+    (dict(ticker="SPY", expiry="2026-07-10", strike=752, type="C"),
+     "US.SPY260710C752000"),
+    (dict(ticker="SPY", expiry="2026-07-10", strike=752.5, type="P"),
+     "US.SPY260710P752500"),
+    (dict(ticker="A", expiry="2026-12-19", strike=0.5, type="C"),
+     "US.A261219C500"),
+])
+def test_moomoo_code(ev, expected):
+    assert moomoo._moomoo_code(make_event(**ev)) == expected
+
+
+def test_moomoo_size_budget():
+    cfg = {"sizing_mode": "budget", "budget_per_trade_usd": 500,
+           "contracts_per_trade": 1, "max_contracts_per_trade": 25}
+    assert moomoo._size(cfg, 2.50)[0] == 2
+    assert moomoo._size(cfg, 6.00)[0] == 0          # 1 contract > budget
+    assert moomoo._size(cfg, 0.0)[0] == 1           # no quote -> fixed fallback
+    assert moomoo._size({"contracts_per_trade": 3}, 2.5)[0] == 3
+
+
+def test_moomoo_connect_applies_defaults():
+    cfg = {}
+    # verify() will fail (no SDK/OpenD in CI) — connect must still normalize
+    ok, note = moomoo.connect(cfg, {"moomoo_host": "", "moomoo_port": "",
+                                    "moomoo_paper": True})
+    assert cfg["moomoo_host"] == "127.0.0.1"
+    assert cfg["moomoo_port"] == 11111
+    assert cfg["broker"] == "moomoo"
+    assert cfg["moomoo_paper"] is True
+    assert isinstance(ok, bool) and note
+
+
+class _FakeDF:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __len__(self):
+        return len(self._rows)
+
+    @property
+    def iloc(self):
+        return self._rows
+
+
+class _FakeTradeCtx:
+    def __init__(self, sdk):
+        self.sdk = sdk
+
+    def unlock_trade(self, pwd):
+        self.sdk.unlocked.append(pwd)
+        return (self.sdk.RET_OK if pwd == "good" else -1), "unlock"
+
+    def place_order(self, **kw):
+        self.sdk.orders.append(kw)
+        return self.sdk.RET_OK, _FakeDF([{"order_id": "mm-1"}])
+
+    def get_acc_list(self):
+        return self.sdk.RET_OK, _FakeDF([{"acc_id": 1}])
+
+    def close(self):
+        pass
+
+
+class _FakeSDK:
+    """Duck-typed stand-in for the moomoo-api package."""
+    RET_OK = 0
+
+    class TrdEnv:
+        SIMULATE, REAL = "SIM", "REAL"
+
+    class TrdSide:
+        BUY, SELL = "BUY", "SELL"
+
+    class OrderType:
+        NORMAL = "NORMAL"
+
+    class TrdMarket:
+        US = "US"
+
+    class SecurityFirm:
+        FUTUINC = "FUTUINC"
+
+    def __init__(self, ask=1.5):
+        self.orders = []
+        self.unlocked = []
+        self._ask = ask
+
+    def OpenSecTradeContext(self, **kw):
+        return _FakeTradeCtx(self)
+
+    def OpenQuoteContext(self, **kw):
+        sdk = self
+
+        class _Q:
+            def get_market_snapshot(self, codes):
+                if sdk._ask <= 0:
+                    return -1, None
+                return sdk.RET_OK, _FakeDF([{"ask_price": sdk._ask,
+                                             "last_price": sdk._ask}])
+
+            def close(self):
+                pass
+        return _Q()
+
+
+def _moomoo_cfg(**over):
+    cfg = {"broker": "moomoo", "moomoo_paper": True, "contracts_per_trade": 1}
+    cfg.update(over)
+    return cfg
+
+
+def test_moomoo_execute_entry_places_and_records(monkeypatch):
+    sdk = _FakeSDK(ask=1.5)
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    state = {"positions": {}}
+    assert moomoo.execute(None, _moomoo_cfg(), make_event(), state)
+    assert len(sdk.orders) == 1
+    order = sdk.orders[0]
+    assert order["code"] == "US.SPY260710C752000"
+    assert order["trd_side"] == "BUY" and order["price"] == 1.5
+    assert state["positions"]["SPY|2026-07-10|752.0|C"]["qty"] == 1
+    assert sdk.unlocked == []  # SIMULATE never needs the trade password
+
+
+def test_moomoo_execute_entry_no_quote_skips(monkeypatch):
+    sdk = _FakeSDK(ask=0.0)
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    state = {"positions": {}}
+    assert not moomoo.execute(None, _moomoo_cfg(), make_event(), state)
+    assert sdk.orders == [] and state["positions"] == {}
+
+
+def test_moomoo_execute_entry_dedupes(monkeypatch):
+    sdk = _FakeSDK()
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    state = {"positions": {"SPY|2026-07-10|752.0|C": {"qty": 1}}}
+    assert not moomoo.execute(None, _moomoo_cfg(), make_event(), state)
+    assert sdk.orders == []
+
+
+def test_moomoo_execute_exit_closes_what_it_opened(monkeypatch):
+    sdk = _FakeSDK(ask=2.0)
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    state = {"positions": {"SPY|2026-07-10|752.0|C":
+                           {"option_id": "US.SPY260710C752000", "qty": 2}}}
+    assert moomoo.execute(None, _moomoo_cfg(), make_event(event="EXITED"), state)
+    assert sdk.orders[0]["trd_side"] == "SELL" and sdk.orders[0]["qty"] == 2
+    assert state["positions"] == {}
+
+
+def test_moomoo_live_without_trade_password_blocks(monkeypatch, capsys):
+    sdk = _FakeSDK(ask=1.5)
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    state = {"positions": {}}
+    cfg = _moomoo_cfg(moomoo_paper=False)  # LIVE, no moomoo_trade_pwd
+    assert not moomoo.execute(None, cfg, make_event(), state)
+    assert sdk.orders == [] and state["positions"] == {}
+    assert "trade password" in capsys.readouterr().out
+
+
+def test_moomoo_live_unlocks_before_order(monkeypatch):
+    sdk = _FakeSDK(ask=1.5)
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    state = {"positions": {}}
+    cfg = _moomoo_cfg(moomoo_paper=False, moomoo_trade_pwd="good")
+    assert moomoo.execute(None, cfg, make_event(), state)
+    assert sdk.unlocked == ["good"]
+    assert sdk.orders[0]["trd_env"] == "REAL"
+
+
+def test_moomoo_sdk_missing_is_actionable(monkeypatch, capsys):
+    def boom():
+        raise RuntimeError("moomoo SDK not installed — run:  pip install moomoo-api")
+    monkeypatch.setattr(moomoo, "_sdk", boom)
+    assert not moomoo.execute(None, _moomoo_cfg(), make_event(), {"positions": {}})
+    assert "moomoo-api" in capsys.readouterr().out

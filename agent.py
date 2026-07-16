@@ -14,6 +14,8 @@ Robinhood's trading MCP).
     python agent.py app      # same as run, but opens the dashboard as a desktop
                              # app window (chromeless browser; --app on run too)
     python agent.py status   # config, wallet balance, open positions
+    python agent.py doctor   # check EVERYTHING (config, wallet, feed, broker)
+                             # and print the exact command to fix each problem
     python agent.py fund N   # print a Lightning invoice to add N sats
 
 HARD CONSENT GATE: this program will not perform ANY setup or trading action
@@ -361,8 +363,9 @@ def cmd_setup():
     print("\n== Step 2/4: Broker ==")
     print("  1) Robinhood Agentic account (OAuth)")
     print("  2) Alpaca — paper or live (API keys; paper = zero real dollars)")
-    bc = input("Choose [1/2, default 1]: ").strip() or "1"
-    cfg["broker"] = "alpaca" if bc == "2" else "robinhood"
+    print("  3) moomoo — paper or live (needs their OpenD gateway running)")
+    bc = input("Choose [1-3, default 1]: ").strip() or "1"
+    cfg["broker"] = {"2": "alpaca", "3": "moomoo"}.get(bc, "robinhood")
     cfg = BROKERS[cfg["broker"]].setup(cfg)
 
     print("\n== Step 3/4: Position sizing ==")
@@ -505,9 +508,8 @@ def _apply_command(text):
 def cmd_run(app_window=False):
     require_consent_or_exit()
     cfg = _load(CONFIG_PATH)
-    broker_ready = bool(cfg and (cfg.get("robinhood_account")
-                                 or cfg.get("alpaca_key_id")))
-    if not cfg or not cfg.get("source") or not broker_ready:
+    from brokers import broker_ready as _broker_ready
+    if not cfg or not cfg.get("source") or not _broker_ready(cfg):
         print("Not configured — run: python agent.py setup   (or setup --web)")
         sys.exit(1)
     source = SOURCES.get(cfg["source"])
@@ -633,14 +635,111 @@ def cmd_status():
         print(f"day-pass         : active, ~{mins} min remaining")
     else:
         print("day-pass         : none (bought automatically on next 402)")
+    broker_name = cfg.get("broker", "robinhood")
     acct = cfg.get("robinhood_account", "")
-    print(f"robinhood account: {'••••' + acct[-4:] if acct else 'MISSING'}")
+    detail = f" (account ••••{acct[-4:]})" if broker_name == "robinhood" and acct else ""
+    from brokers import broker_ready
+    print(f"broker           : {broker_name}{detail}"
+          f"{'' if broker_ready(cfg) else ' — NOT CONFIGURED'}")
     print(f"contracts/trade  : {cfg.get('contracts_per_trade', 'unset')}")
     print(f"mode             : {'DRY-RUN' if cfg.get('dry_run') else 'LIVE'}")
     print(f"policy brain     : {'ON (' + llm_policy.policy_path() + ')' if llm_policy.enabled(cfg) else 'off'}")
     print(f"daily entry cap  : {cfg.get('max_entries_per_day', 5)}")
     print(f"entries today    : {_entries_today()}")
     print(f"open positions   : {list(state.get('positions', {})) or 'none'}")
+
+
+def cmd_doctor():
+    """Check every dependency of a working agent; print the exact fix for
+    each failure. Exit 0 = ready to run, 1 = something needs attention."""
+    problems = []
+
+    def check(ok, label, detail="", fix=""):
+        mark = "✓" if ok else "✗"
+        line = f" {mark} {label}"
+        if detail:
+            line += f" — {detail}"
+        print(line)
+        if not ok:
+            if fix:
+                print(f"      fix: {fix}")
+            problems.append(label)
+
+    print("agentic-trader doctor\n")
+    check(sys.version_info >= (3, 10), "Python 3.10+",
+          f"running {sys.version.split()[0]}",
+          "re-run install.sh (it installs a private Python 3.12 via uv)")
+    check(consent_ok(), "Consent accepted (DISCLAIMER.md)",
+          "" if consent_ok() else "nothing can run or trade without it",
+          "python agent.py setup   (or setup --web)")
+
+    cfg = _load(CONFIG_PATH, {}) or {}
+    src = cfg.get("source", "")
+    check(bool(src and src in SOURCES), "Signal source configured",
+          src or "unset", "python agent.py setup")
+
+    if src == "agenthc":
+        try:
+            import requests as _rq
+            api = os.getenv("AGENTHC_API", "https://api.traderhc.com")
+            r = _rq.get(f"{api}/api/v1/trading/day-trade-ideas/track-record",
+                        timeout=10)
+            check(r.status_code == 200, "AgentHC API reachable",
+                  f"HTTP {r.status_code}",
+                  "check your internet connection / firewall")
+        except Exception as exc:
+            check(False, "AgentHC API reachable", str(exc)[:80],
+                  "check your internet connection / firewall")
+        wallet = wallet_from_cfg(cfg)
+        if cfg.get("agenthc_api_key"):
+            check(True, "Feed access", "Premium API key set")
+        elif wallet:
+            try:
+                bal = wallet.balance_sats()
+                check(bal >= 10_000, "Wallet funded",
+                      f"{bal:,} sats ({'~' + str(bal // 12_000) + ' more market day(s)' if bal >= 10_000 else 'below one ~$10 day-pass'})",
+                      "python agent.py fund 50000   (then pay the invoice)")
+            except WalletError as exc:
+                check(False, "Lightning wallet", str(exc)[:80],
+                      "python agent.py setup   (source step → recreate wallet)")
+        else:
+            check(False, "Feed access",
+                  "no wallet and no Premium key — the feed cannot be paid for",
+                  "python agent.py setup   (source step)")
+
+    broker_name = cfg.get("broker", "")
+    mod = BROKERS.get(broker_name)
+    if mod is None:
+        check(False, "Broker configured", broker_name or "unset",
+              "python agent.py setup")
+    elif hasattr(mod, "verify"):
+        ok, msg = mod.verify(cfg)
+        check(ok, f"Broker: {broker_name}", msg,
+              "python agent.py setup   (broker step)")
+    else:
+        ok = mod.client(cfg) is not None
+        check(ok, f"Broker: {broker_name}",
+              "authenticated" if ok else "not authenticated",
+              "python agent.py setup   (broker step)")
+
+    notif = bool(cfg.get("discord_webhook_url") or cfg.get("ntfy_topic")
+                 or cfg.get("telegram_bot_token"))
+    check(notif, "Notifications",
+          "configured" if notif
+          else "none set — you won't hear about trades or errors",
+          "python agent.py setup   (notifications step)")
+
+    if "dry_run" not in cfg:
+        mode = "not set — setup defaults to DRY-RUN"
+    elif cfg["dry_run"]:
+        mode = "DRY-RUN (safe — logs what it WOULD do)"
+    else:
+        mode = "LIVE ORDERS"
+    print(f"\nmode: {mode} | daily entry cap: {cfg.get('max_entries_per_day', 5)}")
+    if problems:
+        print(f"\n{len(problems)} problem(s): {', '.join(problems)}")
+        sys.exit(1)
+    print("\nAll checks passed — python agent.py run")
 
 
 def cmd_fund(sats):
@@ -657,8 +756,8 @@ def _is_ready():
     if not consent_ok():
         return False
     cfg = _load(CONFIG_PATH) or {}
-    return bool(cfg.get("source") and (cfg.get("robinhood_account")
-                                       or cfg.get("alpaca_key_id")))
+    from brokers import broker_ready
+    return bool(cfg.get("source") and broker_ready(cfg))
 
 
 def main():
@@ -686,6 +785,8 @@ def main():
         cmd_run(app_window=(cmd == "app" or "--app" in sys.argv))
     elif cmd == "status":
         cmd_status()
+    elif cmd == "doctor":
+        cmd_doctor()
     elif cmd == "fund":
         amount = sys.argv[2] if len(sys.argv) > 2 else "20000"
         if not amount.isdigit():
