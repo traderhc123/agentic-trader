@@ -75,10 +75,12 @@ def test_alpaca_size_respects_max_contracts(monkeypatch):
     assert qty == 25  # 2000 fit, capped
 
 
-def test_alpaca_size_no_quote_falls_back_to_fixed(monkeypatch):
+def test_alpaca_size_no_quote_skips(monkeypatch):
+    # No quote = no way to honor the budget — skip, never guess (parity with
+    # the robinhood adapter).
     monkeypatch.setattr(alpaca, "_quote_price", lambda cfg, occ: 0.0)
     qty, note = alpaca._size(_budget_cfg(contracts_per_trade=3), "OCC")
-    assert qty == 3
+    assert qty == 0
     assert "no quote" in note
 
 
@@ -89,6 +91,12 @@ def test_alpaca_size_contracts_mode():
 
 
 # ── alpaca: execute ──────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def instant_fills(monkeypatch):
+    """Fill-confirmation polls assume full immediate fills in unit tests."""
+    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty: qty)
+
 
 def test_alpaca_execute_entry_places_buy(monkeypatch):
     orders = []
@@ -214,20 +222,36 @@ def test_robinhood_resolve_instrument_empty_payload():
     assert robinhood.resolve_instrument(FakeRH(), make_event()) == ""
 
 
+def _fake_place(placed, oid="order-1", was_limit=False):
+    def _p(rh, cfg, opt, side, effect, qty):
+        placed.append((opt, side, effect, qty))
+        return {"order_id": oid, "was_limit": was_limit}
+    return _p
+
+
+def _instant_fill(monkeypatch):
+    """_settle_fast resolves the pending order as fully filled at once."""
+    monkeypatch.setattr(
+        robinhood, "_settle_fast",
+        lambda rh, cfg, state, pk: robinhood._finalize_pending(
+            state, pk, state["positions"][pk]["pending"]["requested"]))
+
+
 def test_robinhood_execute_entry(monkeypatch):
     placed = []
     monkeypatch.setattr(robinhood, "resolve_instrument",
                         lambda rh, ev: "opt-123")
     monkeypatch.setattr(robinhood, "size_contracts",
                         lambda rh, cfg, oid: (2, "test"))
-    monkeypatch.setattr(robinhood, "place",
-                        lambda rh, cfg, oid, side, effect, qty:
-                        placed.append((oid, side, effect, qty)) or "order-1")
+    monkeypatch.setattr(robinhood, "place", _fake_place(placed))
+    _instant_fill(monkeypatch)
     state = {"positions": {}}
     assert robinhood.execute(None, {"robinhood_account": "123"},
                              make_event(), state)
     assert placed == [("opt-123", "buy", "open", 2)]
-    assert state["positions"]["SPY|2026-07-10|752.0|C"]["option_id"] == "opt-123"
+    pos = state["positions"]["SPY|2026-07-10|752.0|C"]
+    assert pos["option_id"] == "opt-123"
+    assert pos["qty"] == 2 and "pending" not in pos
 
 
 def test_robinhood_execute_entry_unresolvable_skips(monkeypatch):
@@ -239,9 +263,8 @@ def test_robinhood_execute_entry_unresolvable_skips(monkeypatch):
 
 def test_robinhood_execute_exit_closes_what_it_opened(monkeypatch):
     placed = []
-    monkeypatch.setattr(robinhood, "place",
-                        lambda rh, cfg, oid, side, effect, qty:
-                        placed.append((oid, side, effect, qty)) or "order-2")
+    monkeypatch.setattr(robinhood, "place", _fake_place(placed, oid="order-2"))
+    _instant_fill(monkeypatch)
     state = {"positions": {"SPY|2026-07-10|752.0|C":
                            {"option_id": "opt-123", "qty": 2}}}
     assert robinhood.execute(None, {}, make_event(event="EXITED"), state)
@@ -255,6 +278,114 @@ def test_robinhood_failed_place_keeps_position(monkeypatch):
                            {"option_id": "opt-123", "qty": 2}}}
     assert not robinhood.execute(None, {}, make_event(event="EXITED"), state)
     assert "SPY|2026-07-10|752.0|C" in state["positions"]
+
+
+# ── robinhood: fill verification + reconcile ────────────────────────────────
+
+def _orders_result(order_id, state_str, processed="0"):
+    return _mcp_result({"data": {"results": [
+        {"id": order_id, "state": state_str, "processed_quantity": processed}]}})
+
+
+@pytest.fixture(autouse=True)
+def no_settle_waits(monkeypatch):
+    monkeypatch.setattr(robinhood, "_SETTLE_WAIT_S", 0)
+    monkeypatch.setattr(robinhood.time, "sleep", lambda s: None)
+
+
+def _entry_pending(qty=2, was_limit=False, oid="o-1", filled=0):
+    return {"positions": {"SPY|2026-07-10|752.0|C": {
+        "option_id": "opt-123", "qty": 0,
+        "pending": {"order_id": oid, "side": "buy", "requested": qty,
+                    "filled": filled, "was_limit": was_limit,
+                    "placed_at": robinhood.time.time()}}}}
+
+
+def test_rejected_entry_records_no_position():
+    """The phantom-position class of bug: an order that dies unfilled must
+    remove the ledger entry, not leave a position the account doesn't have."""
+    rh = FakeRH({"get_option_orders": _orders_result("o-1", "rejected")})
+    state = _entry_pending()
+    robinhood.reconcile(rh, {"robinhood_account": "1"}, state, lambda s: None)
+    assert state["positions"] == {}
+
+
+def test_filled_entry_verifies_qty():
+    rh = FakeRH({"get_option_orders": _orders_result("o-1", "filled", "2")})
+    state = _entry_pending()
+    robinhood.reconcile(rh, {"robinhood_account": "1"}, state, lambda s: None)
+    pos = state["positions"]["SPY|2026-07-10|752.0|C"]
+    assert pos["qty"] == 2 and "pending" not in pos
+
+
+def test_working_order_stays_pending():
+    rh = FakeRH({"get_option_orders": _orders_result("o-1", "confirmed")})
+    state = _entry_pending()
+    robinhood.reconcile(rh, {"robinhood_account": "1"}, state, lambda s: None)
+    assert "pending" in state["positions"]["SPY|2026-07-10|752.0|C"]
+
+
+def test_blackout_limit_converts_to_market_after_window(monkeypatch):
+    """Unfilled marketable limit + blackout over -> cancel, re-place MARKET
+    for the remainder (the mirror's verified conversion semantics)."""
+    monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: False)
+    rh = FakeRH({
+        "get_option_orders": _orders_result("o-1", "confirmed", "1"),
+        "cancel_option_order": _mcp_result({"ok": True}),
+        "place_option_order": _mcp_result({"data": {"id": "o-2"}}),
+    })
+    state = _entry_pending(qty=3, was_limit=True)
+    robinhood.reconcile(rh, {"robinhood_account": "1"}, state, lambda s: None)
+    pos = state["positions"]["SPY|2026-07-10|752.0|C"]
+    assert pos["qty"] == 1                       # partial banked at conversion
+    assert pos["pending"]["order_id"] == "o-2"   # remainder re-placed...
+    assert pos["pending"]["requested"] == 2      # ...for what's left
+    replaced = [args for name, args in rh.calls if name == "place_option_order"]
+    assert replaced and replaced[-1]["type"] == "market"
+
+
+def test_partial_exit_keeps_remainder():
+    rh = FakeRH({"get_option_orders": _orders_result("o-9", "cancelled", "1")})
+    state = {"positions": {"SPY|2026-07-10|752.0|C": {
+        "option_id": "opt-123", "qty": 3,
+        "pending": {"order_id": "o-9", "side": "sell", "requested": 3,
+                    "filled": 0, "was_limit": False,
+                    "placed_at": robinhood.time.time()}}}}
+    robinhood.reconcile(rh, {"robinhood_account": "1"}, state, lambda s: None)
+    assert state["positions"]["SPY|2026-07-10|752.0|C"]["qty"] == 2
+
+
+def test_exit_while_entry_pending_cancels_buy_first(monkeypatch):
+    """A fast EXITED on a still-working entry cancels the buy; if nothing
+    filled there is nothing to sell and the position vanishes."""
+    cancels = []
+    monkeypatch.setattr(robinhood, "_cancel_order",
+                        lambda rh, a, oid: cancels.append(oid) or True)
+    monkeypatch.setattr(robinhood, "_order_status",
+                        lambda rh, a, oid: ("cancelled", 0))
+    monkeypatch.setattr(robinhood, "place",
+                        lambda *a: pytest.fail("nothing filled — must not sell"))
+    state = _entry_pending()
+    assert robinhood.execute(None, {"robinhood_account": "1"},
+                             make_event(event="EXITED"), state)
+    assert cancels == ["o-1"] and state["positions"] == {}
+
+
+def test_order_id_extraction_shapes():
+    r1 = _mcp_result({"data": {"order_id": "abc"}})
+    r2 = _mcp_result({"data": {"results": [{"id": "def", "state": "queued"}]}})
+    assert robinhood._extract_order_id(r1) == "abc"
+    assert robinhood._extract_order_id(r2) == "def"
+
+
+def test_resolve_sends_no_tradability_filter():
+    """Server-side tradability filter returns zero rows since ~2026-07-17
+    (killed every entry in the production mirror) — must not be sent."""
+    rh = FakeRH({"get_option_instruments": _mcp_result(
+        {"data": {"results": [{"id": "opt-123", "chain_symbol": "SPY"}]}})})
+    robinhood.resolve_instrument(rh, make_event())
+    _, args = rh.calls[-1]
+    assert "tradability" not in args
 
 
 # ── robinhood: opening blackout (market orders rejected 9:30-9:35 ET) ───────

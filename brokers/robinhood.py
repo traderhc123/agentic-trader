@@ -9,6 +9,7 @@ options-approved, and funded — the setup wizard checks and explains each.
 
 import os
 import sys
+import time
 import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -16,6 +17,14 @@ from zoneinfo import ZoneInfo
 from .robinhood_mcp import RobinhoodMCP, content_json, tool_ok
 
 MARKET_TZ = ZoneInfo("America/New_York")
+
+# Order-state vocabulary + fill fields verified live against the agentic
+# account 2026-07-17 (same MCP schema the AgentHC production mirror uses).
+_FILLED = ("filled",)
+_DEAD = ("cancelled", "canceled", "rejected", "failed", "expired", "voided")
+_SETTLE_TRIES = 3           # quick inline polls right after placing
+_SETTLE_WAIT_S = 5.0
+_PENDING_GIVEUP_S = 30 * 60  # cancel + settle any order still working after this
 
 # Robinhood rejects market option orders outside 9:35 AM-4:00 PM ET. Feed
 # events consumed just after the open can land inside the 9:30-9:35 window,
@@ -75,13 +84,16 @@ def setup(cfg):
 
 
 def resolve_instrument(rh, event):
+    # NO tradability filter: since ~2026-07-17 the server returns ZERO rows
+    # when tradability is passed (even though every row IS tradable) — it
+    # silently killed every entry in AgentHC's production mirror until the
+    # filter was dropped there. Keep parity with that verified behavior.
     result = rh.call_tool("get_option_instruments", {
         "chain_symbol": event["ticker"],
         "expiration_dates": event["expiry"],
         "strike_price": f"{float(event['strike']):.4f}",
         "type": "call" if event["type"] == "C" else "put",
         "state": "active",
-        "tradability": "tradable",
     })
     payload = content_json(result)
 
@@ -184,7 +196,76 @@ def size_contracts(rh, cfg, option_id):
     return max(1, int(cfg.get("contracts_per_trade", 1))), "fixed contract count"
 
 
+def _extract_order_id(result):
+    """Walk the tool payload for an order id (`order_id` or `id`) — the
+    wrapper shape varies, and without a real id fills can't be verified."""
+    body = content_json(result)
+
+    def _find(obj):
+        if isinstance(obj, dict):
+            oid = obj.get("order_id") or obj.get("id")
+            if oid:
+                return str(oid)
+            for v in obj.values():
+                f = _find(v)
+                if f:
+                    return f
+        elif isinstance(obj, list):
+            for v in obj:
+                f = _find(v)
+                if f:
+                    return f
+        return ""
+
+    return _find(body) if body else ""
+
+
+def _order_status(rh, account, order_id):
+    """(state, filled_qty) for order_id via get_option_orders; (None, 0) when
+    it can't be found / the call fails — caller keeps polling. Orders carry
+    `state` + string-decimal `processed_quantity`."""
+    try:
+        body = content_json(rh.call_tool("get_option_orders",
+                                         {"account_number": account})) or {}
+
+        def _find(obj):
+            if isinstance(obj, dict):
+                if str(obj.get("id")) == str(order_id):
+                    return obj
+                for v in obj.values():
+                    hit = _find(v)
+                    if hit is not None:
+                        return hit
+            elif isinstance(obj, list):
+                for v in obj:
+                    hit = _find(v)
+                    if hit is not None:
+                        return hit
+            return None
+
+        order = _find(body)
+        if not order:
+            return None, 0
+        st = str(order.get("state") or order.get("status") or "").lower()
+        try:
+            filled = int(float(order.get("processed_quantity") or 0))
+        except (TypeError, ValueError):
+            filled = 0
+        return st, filled
+    except Exception:
+        return None, 0
+
+
+def _cancel_order(rh, account, order_id):
+    try:
+        return tool_ok(rh.call_tool("cancel_option_order", {
+            "account_number": account, "order_id": str(order_id)}))
+    except Exception:
+        return False
+
+
 def place(rh, cfg, option_id, side, effect, qty):
+    """Submit the order. Returns {"order_id": ..., "was_limit": bool} or None."""
     limit_price = _blackout_limit_price(rh, option_id, side)
     args = {
         "account_number": cfg["robinhood_account"],
@@ -203,10 +284,141 @@ def place(rh, cfg, option_id, side, effect, qty):
     if not tool_ok(result):
         print(f"  ORDER FAILED: {str(result)[:300]}")
         return None
-    body = content_json(result) or {}
-    oid = str((body.get("data") or body).get("id", "")) or "submitted"
-    print(f"  order {side}/{effect} x{qty} -> {oid}")
-    return oid
+    oid = _extract_order_id(result)
+    print(f"  order {side}/{effect} x{qty} -> {oid or 'submitted (no id)'}")
+    return {"order_id": oid, "was_limit": limit_price is not None}
+
+
+def _finalize_pending(state, pos_key, filled_total):
+    """Terminal order state reached: reconcile the ledger with what actually
+    filled, so an unfilled buy never leaves a phantom position and a partial
+    exit keeps the remainder."""
+    pos = state["positions"].get(pos_key)
+    if not pos:
+        return
+    pend = pos.pop("pending", None)
+    if not pend:
+        return
+    filled_total = int(filled_total)
+    if pend["side"] == "buy":
+        # ADD to qty: a blackout-limit partial banked into qty at conversion
+        # must not be overwritten by the follow-up market order's own fill.
+        total = int(pos.get("qty", 0)) + filled_total
+        if total > 0:
+            pos["qty"] = total
+            print(f"  fill verified: bought {total}x ({pos_key})")
+        else:
+            del state["positions"][pos_key]
+            print(f"  entry never filled — no position recorded ({pos_key})")
+    else:
+        remaining = int(pos.get("qty", 0)) - filled_total
+        if remaining <= 0:
+            del state["positions"][pos_key]
+            print(f"  fill verified: sold {filled_total}x ({pos_key})")
+        else:
+            pos["qty"] = remaining
+            print(f"  ⚠️ exit only filled {filled_total}/{pend['requested']} — "
+                  f"{remaining}x still held ({pos_key}); reconcile keeps working "
+                  "it, or close manually in the app")
+
+
+def _record_pending(state, pos_key, placed, side, qty):
+    state["positions"][pos_key]["pending"] = {
+        "order_id": placed["order_id"], "side": side, "requested": int(qty),
+        "filled": 0, "was_limit": bool(placed["was_limit"]),
+        "placed_at": time.time(),
+    }
+
+
+def _settle_fast(rh, cfg, state, pos_key):
+    """Quick inline polls right after placing — market orders usually fill in
+    seconds. Anything still working is left pending for reconcile()."""
+    pos = state["positions"].get(pos_key)
+    pend = (pos or {}).get("pending")
+    if not pend or not pend["order_id"]:
+        return
+    for _ in range(_SETTLE_TRIES):
+        time.sleep(_SETTLE_WAIT_S)
+        st, filled = _order_status(rh, cfg.get("robinhood_account", ""),
+                                   pend["order_id"])
+        pend["filled"] = max(pend["filled"], filled)
+        if st in _FILLED:
+            _finalize_pending(state, pos_key,
+                             pend["filled"] or pend["requested"])
+            return
+        if st in _DEAD:
+            _finalize_pending(state, pos_key, pend["filled"])
+            return
+
+
+def reconcile(rh, cfg, state, save_state):
+    """Progress pending (unverified) orders — called once per poll cycle by
+    the agent loop. A recorded position is not trusted until its order reaches
+    a terminal state: blackout limits convert to market once the window ends,
+    and orders that die unfilled remove/adjust the position instead of leaving
+    a phantom (a position the ledger has but the account doesn't)."""
+    account = cfg.get("robinhood_account", "")
+    changed = False
+    for pos_key, pos in list(state.get("positions", {}).items()):
+        pend = pos.get("pending")
+        if not pend:
+            continue
+        if not pend.get("order_id"):
+            # can't ever verify — assume the request as placed (legacy behavior)
+            _finalize_pending(state, pos_key, pend["requested"])
+            changed = True
+            continue
+        st, filled = _order_status(rh, account, pend["order_id"])
+        pend["filled"] = max(pend.get("filled", 0), filled)
+        expired = time.time() - pend.get("placed_at", 0) > _PENDING_GIVEUP_S
+        if st in _FILLED:
+            _finalize_pending(state, pos_key, pend["filled"] or pend["requested"])
+            changed = True
+        elif st in _DEAD:
+            _finalize_pending(state, pos_key, pend["filled"])
+            changed = True
+        elif st is None:
+            if expired:  # unfindable for 30 min — settle with what we saw fill
+                _finalize_pending(state, pos_key, pend["filled"])
+                changed = True
+        else:  # order is working
+            convert = pend.get("was_limit") and not _in_opening_blackout()
+            if not (convert or expired):
+                continue
+            if not _cancel_order(rh, account, pend["order_id"]):
+                continue  # cancel refused (may be mid-fill) — re-poll next cycle
+            time.sleep(2)  # let the cancel settle; catch a fill-vs-cancel race
+            st2, filled2 = _order_status(rh, account, pend["order_id"])
+            pend["filled"] = max(pend["filled"], filled2)
+            remaining = pend["requested"] - pend["filled"]
+            if st2 in _FILLED or remaining <= 0 or expired:
+                _finalize_pending(state, pos_key,
+                                  pend["filled"] or (pend["requested"]
+                                                     if st2 in _FILLED else 0))
+                changed = True
+                continue
+            # Bank what the dying order already filled BEFORE re-pending, so
+            # the follow-up order's finalize only accounts for its own fills.
+            already = pend["filled"]
+            if already:
+                if pend["side"] == "buy":
+                    pos["qty"] = int(pos.get("qty", 0)) + already
+                else:
+                    pos["qty"] = max(0, int(pos.get("qty", 0)) - already)
+                pend["filled"] = 0
+            # blackout over: re-place the remainder as MARKET (guaranteed fill)
+            replaced = place(rh, cfg, pos["option_id"], pend["side"],
+                             "open" if pend["side"] == "buy" else "close",
+                             remaining)
+            if replaced:
+                _record_pending(state, pos_key, replaced, pend["side"], remaining)
+                print(f"  blackout limit converted to market x{remaining} "
+                      f"({pos_key})")
+            else:
+                _finalize_pending(state, pos_key, 0)
+            changed = True
+    if changed:
+        save_state(state)
 
 
 def execute(rh, cfg, event, state):
@@ -226,16 +438,36 @@ def execute(rh, cfg, event, state):
             print(f"SKIPPED {contract}: {note}")
             return False
         print(f"ENTERED event -> buying {qty}x {contract} ({note} — your configuration)")
-        if place(rh, cfg, option_id, "buy", "open", qty):
-            state["positions"][pos_key] = {"option_id": option_id, "qty": qty,
+        placed = place(rh, cfg, option_id, "buy", "open", qty)
+        if placed:
+            state["positions"][pos_key] = {"option_id": option_id, "qty": 0,
                                            "opened_event": event.get("event_id")}
+            _record_pending(state, pos_key, placed, "buy", qty)
+            _settle_fast(rh, cfg, state, pos_key)
             return True
     elif event["event"] == "EXITED":
         pos = state["positions"].get(pos_key)
         if not pos:
             return False  # we never opened this one
+        pend = pos.get("pending")
+        if pend and pend["side"] == "buy":
+            # Fast exit while the entry is still working: cancel the buy
+            # first so a late fill can never leave an orphaned long.
+            _cancel_order(rh, cfg.get("robinhood_account", ""),
+                          pend["order_id"])
+            time.sleep(2)
+            _, filled = _order_status(rh, cfg.get("robinhood_account", ""),
+                                      pend["order_id"])
+            _finalize_pending(state, pos_key,
+                              max(filled, pend.get("filled", 0)))
+            pos = state["positions"].get(pos_key)
+            if not pos:
+                print(f"  entry never filled — nothing to sell ({contract})")
+                return True
         print(f"EXITED event -> selling {pos['qty']}x {contract}")
-        if place(rh, cfg, pos["option_id"], "sell", "close", pos["qty"]):
-            del state["positions"][pos_key]
+        placed = place(rh, cfg, pos["option_id"], "sell", "close", pos["qty"])
+        if placed:
+            _record_pending(state, pos_key, placed, "sell", pos["qty"])
+            _settle_fast(rh, cfg, state, pos_key)
             return True
     return False

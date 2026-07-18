@@ -652,6 +652,13 @@ def cmd_run(app_window=False):
             return
         try:
             if not webui.CONTROLS["paused"]:
+                if client is not None and hasattr(broker, "reconcile"):
+                    try:
+                        # progress any unverified orders (fill verification,
+                        # blackout-limit conversion) before new events
+                        broker.reconcile(client, cfg, state, save_state)
+                    except Exception as exc:
+                        print(f"order reconcile error (non-fatal): {str(exc)[:150]}")
                 events = source.poll(cfg, state, save_state)
                 for ev in events:
                     if ev.get("event_id") in seen:
