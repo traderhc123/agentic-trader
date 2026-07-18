@@ -123,9 +123,14 @@ def _size(cfg, occ):
             return (min(qty, int(cfg.get("max_contracts_per_trade", 25))),
                     f"${budget:,.0f} budget @ ~${price:.2f} → {qty}x")
         if budget > 0:
-            return (max(1, int(cfg.get("contracts_per_trade", 1))),
-                    "no quote — fell back to fixed contracts")
+            # No quote = no way to honor the budget; skipping beats silently
+            # buying an unknown-priced contract (matches the robinhood adapter).
+            return 0, "no quote available for budget sizing — skipped"
     return max(1, int(cfg.get("contracts_per_trade", 1))), "fixed contract count"
+
+
+_CONFIRM_TRIES = 3
+_CONFIRM_WAIT_S = 5.0
 
 
 def _order(cfg, occ, side, qty):
@@ -142,9 +147,41 @@ def _order(cfg, occ, side, qty):
     return oid
 
 
+def _confirm_fill(cfg, oid, qty):
+    """Poll the order briefly; returns the filled quantity.
+
+    Market DAY orders on options nearly always fill in seconds (paper mode
+    instantly). A rejected/cancelled order returns 0 so no phantom position
+    is recorded; if it's still working after the polls, assume the requested
+    qty (legacy behavior) and say so."""
+    import time
+    if oid == "submitted":
+        return qty
+    for _ in range(_CONFIRM_TRIES):
+        time.sleep(_CONFIRM_WAIT_S)
+        try:
+            resp = requests.get(f"{_base(cfg)}/v2/orders/{oid}",
+                                headers=_headers(cfg), timeout=_TIMEOUT)
+            o = resp.json() if resp.status_code == 200 else {}
+        except Exception:
+            o = {}
+        status = str(o.get("status", "")).lower()
+        if status == "filled":
+            return int(float(o.get("filled_qty") or qty))
+        if status in ("rejected", "canceled", "cancelled", "expired"):
+            filled = int(float(o.get("filled_qty") or 0))
+            print(f"  order {status} — filled {filled}/{qty}")
+            return filled
+    print(f"  order still working after {_CONFIRM_TRIES * _CONFIRM_WAIT_S:.0f}s"
+          f" — assuming {qty}x (check your Alpaca dashboard)")
+    return qty
+
+
 def execute(cl, cfg, event, state):
     """Act on one normalized event. Returns True if state changed."""
-    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    # Prefer the cfg the caller passed (it may carry per-track sizing
+    # overrides); the client's stored copy is only a fallback.
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
     contract = f"{event['ticker']} {event['expiry']} ${event['strike']:g} " \
                f"{'CALL' if event['type'] == 'C' else 'PUT'}"
     pos_key = f"{event['ticker']}|{event['expiry']}|{event['strike']}|{event['type']}"
@@ -157,8 +194,13 @@ def execute(cl, cfg, event, state):
             print(f"SKIPPED {contract}: {note}")
             return False
         print(f"ENTERED event -> buying {qty}x {contract} ({note})")
-        if _order(cfg, occ, "buy", qty):
-            state["positions"][pos_key] = {"option_id": occ, "qty": qty,
+        oid = _order(cfg, occ, "buy", qty)
+        if oid:
+            filled = _confirm_fill(cfg, oid, qty)
+            if filled < 1:
+                print(f"  entry never filled — no position recorded ({contract})")
+                return False
+            state["positions"][pos_key] = {"option_id": occ, "qty": filled,
                                            "opened_event": event.get("event_id")}
             return True
     elif event["event"] == "EXITED":
@@ -166,7 +208,15 @@ def execute(cl, cfg, event, state):
         if not pos:
             return False
         print(f"EXITED event -> selling {pos['qty']}x {contract}")
-        if _order(cfg, pos.get("option_id", occ), "sell", pos["qty"]):
-            del state["positions"][pos_key]
+        oid = _order(cfg, pos.get("option_id", occ), "sell", pos["qty"])
+        if oid:
+            sold = _confirm_fill(cfg, oid, pos["qty"])
+            remaining = int(pos["qty"]) - sold
+            if remaining > 0:
+                pos["qty"] = remaining
+                print(f"  ⚠️ exit only filled {sold}/{pos['qty'] + sold} — "
+                      f"{remaining}x still held; close manually if needed")
+            else:
+                del state["positions"][pos_key]
             return True
     return False
