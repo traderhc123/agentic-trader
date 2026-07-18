@@ -637,3 +637,42 @@ def test_moomoo_sdk_missing_is_actionable(monkeypatch, capsys):
     monkeypatch.setattr(moomoo, "_sdk", boom)
     assert not moomoo.execute(None, _moomoo_cfg(), make_event(), {"positions": {}})
     assert "moomoo-api" in capsys.readouterr().out
+
+
+# ── alpaca: fill confirmation (prod day_trade_broker semantics) ─────────────
+
+# The autouse instant_fills fixture patches alpaca._confirm_fill for the
+# execute() tests above; grab the real function at import time to test it.
+_REAL_CONFIRM_FILL = alpaca._confirm_fill
+
+
+def _no_waits(monkeypatch):
+    import time as _t
+    monkeypatch.setattr(alpaca, "_CONFIRM_WAIT_S", 0)
+    monkeypatch.setattr(_t, "sleep", lambda s: None)
+
+
+def test_alpaca_confirm_filled(monkeypatch):
+    _no_waits(monkeypatch)
+    monkeypatch.setattr(alpaca, "_order_state", lambda cfg, oid: ("filled", 2))
+    assert _REAL_CONFIRM_FILL({}, "o1", 2) == 2
+
+
+def test_alpaca_confirm_rejected_returns_partial(monkeypatch):
+    _no_waits(monkeypatch)
+    monkeypatch.setattr(alpaca, "_order_state", lambda cfg, oid: ("rejected", 1))
+    assert _REAL_CONFIRM_FILL({}, "o1", 3) == 1
+
+
+def test_alpaca_confirm_timeout_cancels_and_settles(monkeypatch):
+    """Prod semantics: an order still working after the polls is cancelled
+    and settled with the actual fill — never assumed fully filled."""
+    _no_waits(monkeypatch)
+    cancels = []
+    monkeypatch.setattr(alpaca, "_order_state",
+                        lambda cfg, oid: ("accepted", 1))
+    monkeypatch.setattr(alpaca.requests, "delete",
+                        lambda url, **kw: cancels.append(url) or
+                        type("R", (), {"status_code": 200})())
+    assert _REAL_CONFIRM_FILL({}, "o1", 3) == 1
+    assert cancels and cancels[0].endswith("/v2/orders/o1")

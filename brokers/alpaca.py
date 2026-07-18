@@ -147,34 +147,54 @@ def _order(cfg, occ, side, qty):
     return oid
 
 
+def _order_state(cfg, oid):
+    """(status, filled_qty) from GET /v2/orders/{id}; ("", 0) on failure."""
+    try:
+        resp = requests.get(f"{_base(cfg)}/v2/orders/{oid}",
+                            headers=_headers(cfg), timeout=_TIMEOUT)
+        o = resp.json() if resp.status_code == 200 else {}
+    except Exception:
+        o = {}
+    return (str(o.get("status", "")).lower(),
+            int(float(o.get("filled_qty") or 0)))
+
+
 def _confirm_fill(cfg, oid, qty):
     """Poll the order briefly; returns the filled quantity.
 
     Market DAY orders on options nearly always fill in seconds (paper mode
-    instantly). A rejected/cancelled order returns 0 so no phantom position
-    is recorded; if it's still working after the polls, assume the requested
-    qty (legacy behavior) and say so."""
+    instantly). A rejected/cancelled order returns its partial fill (0 = no
+    phantom position recorded). An order still working after the polls is
+    CANCELLED and settled with what actually filled — assuming the requested
+    qty is how ledger/broker divergence starts (with a post-cancel recheck
+    for the fill-vs-cancel race)."""
     import time
     if oid == "submitted":
         return qty
     for _ in range(_CONFIRM_TRIES):
         time.sleep(_CONFIRM_WAIT_S)
-        try:
-            resp = requests.get(f"{_base(cfg)}/v2/orders/{oid}",
-                                headers=_headers(cfg), timeout=_TIMEOUT)
-            o = resp.json() if resp.status_code == 200 else {}
-        except Exception:
-            o = {}
-        status = str(o.get("status", "")).lower()
+        status, filled = _order_state(cfg, oid)
         if status == "filled":
-            return int(float(o.get("filled_qty") or qty))
+            return filled or qty
         if status in ("rejected", "canceled", "cancelled", "expired"):
-            filled = int(float(o.get("filled_qty") or 0))
             print(f"  order {status} — filled {filled}/{qty}")
             return filled
-    print(f"  order still working after {_CONFIRM_TRIES * _CONFIRM_WAIT_S:.0f}s"
-          f" — assuming {qty}x (check your Alpaca dashboard)")
-    return qty
+    try:
+        requests.delete(f"{_base(cfg)}/v2/orders/{oid}",
+                        headers=_headers(cfg), timeout=_TIMEOUT)
+        time.sleep(2)  # let the cancel settle; catch a fill-vs-cancel race
+        status, filled = _order_state(cfg, oid)
+        if status == "filled":
+            return filled or qty
+        print(f"  order didn't fill in "
+              f"{_CONFIRM_TRIES * _CONFIRM_WAIT_S:.0f}s — cancelled; "
+              f"filled {filled}/{qty}")
+        return filled
+    except Exception:
+        # cancel path itself failed — fall back to the optimistic assumption
+        print(f"  order still working and cancel failed — assuming {qty}x "
+              "(check your Alpaca dashboard)")
+        return qty
 
 
 def execute(cl, cfg, event, state):
