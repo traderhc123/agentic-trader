@@ -248,6 +248,22 @@ def require_consent_or_exit():
 
 # ── event pipeline: validate -> staleness -> caps -> policy -> execute ───────
 
+_TRACK_SIZING_KEYS = ("sizing_mode", "budget_per_trade_usd",
+                      "contracts_per_trade", "max_contracts_per_trade")
+
+
+def _sizing_cfg(cfg, event):
+    """Effective config for one event. Feed events carry track="main" (the
+    daily pick) or track="other" (the wider journal); other-track events use
+    the other_* sizing overrides when set, so the two can be allocated
+    differently (e.g. $500 main / $100 other). No overrides = same sizing."""
+    if str(event.get("track", "main")) == "main":
+        return cfg
+    overrides = {k: cfg[f"other_{k}"] for k in _TRACK_SIZING_KEYS
+                 if cfg.get(f"other_{k}") not in (None, "")}
+    return {**cfg, **overrides} if overrides else cfg
+
+
 def _execute_dry(cfg, event, state, broker=None, client=None):
     """Dry-run bookkeeping: identical position tracking, zero orders."""
     contract = f"{event['ticker']} {event['expiry']} ${event['strike']:g} " \
@@ -326,11 +342,12 @@ def handle_event(ev, cfg, state, broker, client, save_state):
     existing = state["positions"].get(pos_key)
     dry = bool(cfg.get("dry_run")) or bool(existing and existing.get("dry"))
 
+    ecfg = _sizing_cfg(cfg, ev)  # per-track sizing (main vs "other trades")
     if dry:
-        action = _execute_dry(cfg, ev, state, broker, client)
+        action = _execute_dry(ecfg, ev, state, broker, client)
         prefix = "[DRY-RUN] "
     else:
-        changed = broker.execute(client, cfg, ev, state)
+        changed = broker.execute(client, ecfg, ev, state)
         action = ("entry" if ev["event"] == "ENTERED" else "exit") if changed else None
         prefix = ""
 
@@ -401,6 +418,27 @@ def cmd_setup():
         cfg.setdefault("contracts_per_trade", 1)  # dry-run fallback estimate
     cfg.setdefault("max_contracts_per_trade", 25)
 
+    if cfg.get("include_other_trades"):
+        print("\nYour source includes the \"other trades\" journal. Size those")
+        print("separately from the main pick? (blank = same sizing as above)")
+        raw = input("Other-trades " +
+                    ("budget in USD" if cfg["sizing_mode"] == "budget"
+                     else "contracts per trade") + " [same]: ").strip()
+        if raw:
+            try:
+                if cfg["sizing_mode"] == "budget":
+                    val = float(raw)
+                    assert val > 0
+                    cfg["other_sizing_mode"] = "budget"
+                    cfg["other_budget_per_trade_usd"] = val
+                else:
+                    val = int(raw)
+                    assert val >= 1
+                    cfg["other_sizing_mode"] = "contracts"
+                    cfg["other_contracts_per_trade"] = val
+            except (ValueError, AssertionError):
+                print("Not a valid number — other trades will use the main sizing.")
+
     print("\n== Step 4/4: Safety rails & extras ==")
     dry = input("Start in DRY-RUN mode (log actions, place NO orders — "
                 "recommended for the first days)? [Y/n]: ").strip().lower()
@@ -422,8 +460,17 @@ def cmd_setup():
 
 def _sizing_desc(cfg):
     if str(cfg.get("sizing_mode", "contracts")) == "budget":
-        return f"${float(cfg.get('budget_per_trade_usd', 0) or 0):,.0f}/trade budget"
-    return f"{int(cfg.get('contracts_per_trade', 1))} contract(s)/trade"
+        desc = f"${float(cfg.get('budget_per_trade_usd', 0) or 0):,.0f}/trade budget"
+    else:
+        desc = f"{int(cfg.get('contracts_per_trade', 1))} contract(s)/trade"
+    other = str(cfg.get("other_sizing_mode") or "")
+    if other == "budget":
+        desc += (f" (other trades: "
+                 f"${float(cfg.get('other_budget_per_trade_usd', 0) or 0):,.0f}/trade)")
+    elif other == "contracts":
+        desc += (f" (other trades: "
+                 f"{int(cfg.get('other_contracts_per_trade', 1))} contract(s))")
+    return desc
 
 
 def _apply_command(text):
@@ -464,6 +511,34 @@ def _apply_command(text):
         cfg["budget_per_trade_usd"] = val
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Per-trade budget set to ${val:,.0f} (your decision — see DISCLAIMER.md)."
+    if t.startswith("set other budget"):
+        try:
+            val = float(t.split()[-1].lstrip("$").replace(",", ""))
+            assert val > 0
+        except (ValueError, AssertionError, IndexError):
+            return True, "Usage: set other budget 100"
+        cfg["other_sizing_mode"] = "budget"
+        cfg["other_budget_per_trade_usd"] = val
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, (f"'Other trades' budget set to ${val:,.0f}/trade — main "
+                      "pick keeps its own sizing (your decision — see DISCLAIMER.md).")
+    if t.startswith("set other contracts"):
+        try:
+            val = int(t.split()[-1])
+            assert val >= 1
+        except (ValueError, AssertionError, IndexError):
+            return True, "Usage: set other contracts 1"
+        cfg["other_sizing_mode"] = "contracts"
+        cfg["other_contracts_per_trade"] = val
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, (f"'Other trades' sizing set to {val} contract(s)/trade — "
+                      "main pick keeps its own sizing.")
+    if t in ("other sizing same", "clear other sizing"):
+        for k in ("other_sizing_mode", "other_budget_per_trade_usd",
+                  "other_contracts_per_trade", "other_max_contracts_per_trade"):
+            cfg.pop(k, None)
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, "'Other trades' now size the same as the main pick."
     if t.startswith("set cap"):
         try:
             val = int(t.split()[-1])

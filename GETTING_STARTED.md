@@ -103,6 +103,15 @@ docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trad
   several entries a day) during setup — or later via
   `"include_other_trades": true` in `~/.agentic-trader/config.json`. The daily
   cap and per-trade budget apply either way.
+- **Per-track sizing**: every feed event is flagged `track: "main"` or
+  `track: "other"`, and "other trades" can be sized separately from the main
+  pick — set it in the wizard's Sizing step, or via
+  `"other_budget_per_trade_usd": 100` (with `"other_sizing_mode": "budget"`)
+  / `"other_contracts_per_trade": 1` (with `"other_sizing_mode":
+  "contracts"`) in config.json. Unset = same sizing as the main pick.
+- **No weekend spend**: the recurring day-pass never auto-buys on Saturday or
+  Sunday — the feed only publishes on market days, so a weekend pass would be
+  wasted sats.
 - **Notifications**: set up Discord/ntfy/Telegram during setup — you get a
   message on every action, veto, and error, plus a daily digest after the
   close. Never run it silently.

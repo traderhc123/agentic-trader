@@ -2,11 +2,21 @@
 
 import json
 import time
+from datetime import datetime
 
 import pytest
 
 from sources import SOURCES, agenthc_day_trade_ideas as agenthc
 from sources import generic_json_url, manual_file
+
+
+@pytest.fixture(autouse=True)
+def market_weekday(monkeypatch):
+    """Pin 'now' to a Wednesday so the weekend day-pass gate never makes
+    these tests pass/fail depending on which day CI happens to run."""
+    monkeypatch.setattr(agenthc, "_now_et",
+                        lambda: datetime(2026, 7, 15, 10, 30,
+                                         tzinfo=agenthc.MARKET_TZ))
 
 
 @pytest.fixture
