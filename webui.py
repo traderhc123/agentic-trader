@@ -287,6 +287,11 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
  <label><input type="radio" name="szmode" value="contracts"> Fixed contracts
  per trade</label>
  <input type="number" id="sz-val" placeholder="e.g. 500" min="1" step="any">
+ <label class="muted">"Other trades" size — only used if your source includes
+ the wider other-trades journal; sized separately from the main pick
+ (blank = same as main)</label>
+ <input type="number" id="sz-other-val" placeholder="blank = same as main"
+ min="1" step="any">
  <div class="navrow"><button onclick="doSizing()">Save & continue</button>
  <span id="sz-msg"></span></div>
 </section>
@@ -609,7 +614,8 @@ async function poll(){
 }
 async function doSizing(){
   const mode=document.querySelector('input[name=szmode]:checked').value;
-  const r=await api('/api/sizing',{mode:mode,value:document.getElementById('sz-val').value});
+  const r=await api('/api/sizing',{mode:mode,value:document.getElementById('sz-val').value,
+    other:document.getElementById('sz-other-val').value});
   document.getElementById('sz-msg').innerHTML=r.ok?'<span class="ok">saved ✓</span>'
     :'<span class="err">'+r.error+'</span>';
   if(r.ok)done('s-sizing');
@@ -1182,6 +1188,13 @@ def _restore_notes(cfg, acceptance=None):
     elif cfg.get("sizing_mode"):
         n = cfg.get("contracts_per_trade", 1)
         notes["sizing"] = f"Sizing saved: {n} contract{'s' if n != 1 else ''} per trade"
+    if notes.get("sizing") and cfg.get("other_sizing_mode"):
+        if cfg["other_sizing_mode"] == "budget":
+            notes["sizing"] += (" · other trades "
+                                f"${cfg.get('other_budget_per_trade_usd', 0):g}/trade")
+        else:
+            notes["sizing"] += (" · other trades "
+                                f"{cfg.get('other_contracts_per_trade', 1)} contract(s)")
     if cfg.get("max_entries_per_day") is not None:
         notes["safety"] = (
             f"Safety saved: {'DRY-RUN' if cfg.get('dry_run', True) else 'LIVE'}"
@@ -1551,6 +1564,29 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             cfg["sizing_mode"] = "contracts"
             cfg["contracts_per_trade"] = max(1, int(val))
         cfg.setdefault("max_contracts_per_trade", 25)
+        # Optional per-track override: "other trades" journal events sized
+        # separately from the main pick (same mode); blank clears it.
+        other_raw = str(data.get("other") or "").strip()
+        if other_raw:
+            try:
+                oval = float(other_raw)
+            except (TypeError, ValueError):
+                oval = 0
+            if oval <= 0:
+                return {"ok": False,
+                        "error": "other-trades size must be a positive number"}
+            if mode == "budget":
+                cfg["other_sizing_mode"] = "budget"
+                cfg["other_budget_per_trade_usd"] = oval
+                cfg.pop("other_contracts_per_trade", None)
+            else:
+                cfg["other_sizing_mode"] = "contracts"
+                cfg["other_contracts_per_trade"] = max(1, int(oval))
+                cfg.pop("other_budget_per_trade_usd", None)
+        else:
+            for k in ("other_sizing_mode", "other_budget_per_trade_usd",
+                      "other_contracts_per_trade"):
+                cfg.pop(k, None)
         save()
         return {"ok": True}
 

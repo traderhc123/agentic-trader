@@ -15,10 +15,19 @@ GET https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record
 
 import os
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
 from lightning_wallet import wallet_from_cfg, wallet_setup
+
+MARKET_TZ = ZoneInfo("America/New_York")
+
+
+def _now_et():
+    return datetime.now(MARKET_TZ)
+
 
 NAME = "agenthc"
 DESCRIPTION = ("AgentHC Agentic Day Trade Ideas — journal events from a "
@@ -60,11 +69,26 @@ def accept_terms(cfg):
     return body.get("terms_version")
 
 
-def _pass_purchase_allowed(cfg, state, save_state):
+def _pass_purchase_allowed(cfg, state, save_state, now=None):
     """Recurring-day-pass gate: the agent only auto-pays the ~$10 pass when
     the operator turned 'Recurring day-pass' ON (wizard Source tab / config
     day_pass_recurring). OFF (the default) = the agent never spends without
-    approval — it notifies once per day and returns no events instead."""
+    approval — it notifies once per day and returns no events instead.
+
+    Never buys on weekends regardless of the recurring flag: the feed only
+    publishes on market days, so a Saturday/Sunday pass is pure wasted sats
+    (the 24h token expires before Monday's first event). The API also stops
+    selling passes on non-trading days server-side; this check keeps every
+    consumer safe even against an older server."""
+    now = now or _now_et()
+    if now.weekday() >= 5:
+        day = now.strftime("%Y-%m-%d")
+        if state.get("weekend_skip_notified") != day:
+            state["weekend_skip_notified"] = day
+            save_state(state)
+            print("Day-pass purchase skipped: market closed (weekend), no "
+                  "events publish today — auto-buy resumes next market day.")
+        return False
     if cfg.get("day_pass_recurring"):
         return True
     day = time.strftime("%Y-%m-%d")
