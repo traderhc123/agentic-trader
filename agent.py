@@ -759,9 +759,13 @@ def cmd_doctor():
             api = os.getenv("AGENTHC_API", "https://api.traderhc.com")
             r = _rq.get(f"{api}/api/v1/trading/day-trade-ideas/track-record",
                         timeout=10)
-            check(r.status_code == 200, "AgentHC API reachable",
-                  f"HTTP {r.status_code}",
-                  "check your internet connection / firewall")
+            # Any HTTP answer proves reachability — 402 just means the free
+            # daily teaser hit was already used (e.g. doctor ran twice today).
+            detail = f"HTTP {r.status_code}"
+            if r.status_code == 402:
+                detail += " (free daily teaser already used — API is up)"
+            check(r.status_code in (200, 402), "AgentHC API reachable",
+                  detail, "check your internet connection / firewall")
         except Exception as exc:
             check(False, "AgentHC API reachable", str(exc)[:80],
                   "check your internet connection / firewall")
