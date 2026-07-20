@@ -120,7 +120,7 @@ def _size(cfg, occ):
             if qty < 1:
                 return 0, (f"1 contract ≈ ${price * 100:,.0f} exceeds your "
                            f"${budget:,.0f} budget — skipped")
-            return (min(qty, int(cfg.get("max_contracts_per_trade", 25))),
+            return (min(qty, int(cfg.get("max_contracts_per_trade", 100))),
                     f"${budget:,.0f} budget @ ~${price:.2f} → {qty}x")
         if budget > 0:
             # No quote = no way to honor the budget; skipping beats silently

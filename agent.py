@@ -174,6 +174,33 @@ def _market_open_now():
     return (9 * 60 + 25) <= minutes <= (16 * 60 + 15)
 
 
+def _prune_expired_positions(cfg, state, save_state):
+    """Drop ledger positions whose contract expiry has passed (ET).
+
+    A position leaves the ledger only via an EXITED event; miss that event
+    (agent offline, feed gap) and the row lingers forever, silently eating a
+    max_open_positions slot until entries are blocked. Past expiry the
+    contract can't be exited anymore, so the row is pure staleness.
+    Bookkeeping only — places no orders. The notify matters: expiry without
+    an exit usually means the premium was lost, so check the account.
+    """
+    today = datetime.now(MARKET_TZ).date().isoformat()
+    dropped = []
+    for key in list(state.get("positions", {})):
+        parts = key.split("|")
+        if len(parts) == 4 and _EXPIRY_RE.match(parts[1]) and parts[1] < today:
+            state["positions"].pop(key)
+            dropped.append(key)
+    if dropped:
+        save_state(state)
+        for key in dropped:
+            msg = (f"pruned expired position {key} — expired without an exit "
+                   f"event; check your broker account")
+            print(msg)
+            notify(cfg, f"agentic-trader: {msg}")
+    return dropped
+
+
 def _maybe_daily_digest(cfg, state, save_state):
     """After the close, send a one-message summary of today's activity."""
     now = datetime.now(MARKET_TZ)
@@ -416,7 +443,10 @@ def cmd_setup():
             print("Enter a positive dollar amount.")
         cfg["budget_per_trade_usd"] = b
         cfg.setdefault("contracts_per_trade", 1)  # dry-run fallback estimate
-    cfg.setdefault("max_contracts_per_trade", 25)
+    # 100 (was 25 through v2026-07): still a guard against a penny option
+    # ballooning one budget-mode trade into a lot too large to exit into thin
+    # quotes, without capping cheap contracts to a fraction of the budget.
+    cfg.setdefault("max_contracts_per_trade", 100)
 
     if cfg.get("include_other_trades"):
         print("\nYour source includes the \"other trades\" journal. Size those")
@@ -652,6 +682,10 @@ def cmd_run(app_window=False):
             return
         try:
             if not webui.CONTROLS["paused"]:
+                try:
+                    _prune_expired_positions(cfg, state, save_state)
+                except Exception as exc:
+                    print(f"expiry prune error (non-fatal): {str(exc)[:150]}")
                 if client is not None and hasattr(broker, "reconcile"):
                     try:
                         # progress any unverified orders (fill verification,

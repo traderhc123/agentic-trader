@@ -191,7 +191,7 @@ def size_contracts(rh, cfg, option_id):
         if qty < 1:
             return 0, (f"1 contract ≈ ${price * 100:,.0f} exceeds your "
                        f"${budget:,.0f} per-trade budget — skipped")
-        qty = min(qty, int(cfg.get("max_contracts_per_trade", 25)))
+        qty = min(qty, int(cfg.get("max_contracts_per_trade", 100)))
         return qty, f"${budget:,.0f} budget @ ~${price:.2f} → {qty} contract(s)"
     return max(1, int(cfg.get("contracts_per_trade", 1))), "fixed contract count"
 

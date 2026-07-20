@@ -1563,7 +1563,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         else:
             cfg["sizing_mode"] = "contracts"
             cfg["contracts_per_trade"] = max(1, int(val))
-        cfg.setdefault("max_contracts_per_trade", 25)
+        cfg.setdefault("max_contracts_per_trade", 100)
         # Optional per-track override: "other trades" journal events sized
         # separately from the main pick (same mode); blank clears it.
         other_raw = str(data.get("other") or "").strip()
