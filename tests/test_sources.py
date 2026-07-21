@@ -280,3 +280,50 @@ def test_agenthc_402_recurring_on_pays(monkeypatch):
     events = agenthc.poll({"day_pass_recurring": True}, {}, lambda s: None)
     assert wallet.paid == ["lnbc1..."]
     assert len(events) == 1
+
+
+def test_agenthc_recurring_off_skips_network_entirely(monkeypatch):
+    """When access is impossible (no key, no token, recurring OFF) the agent
+    must not even make the request — each such GET makes the server mint a
+    Lightning invoice that is guaranteed to expire unpaid."""
+    def exploding_get(*a, **kw):
+        raise AssertionError("poll() must not hit the network when it "
+                             "cannot obtain access")
+    monkeypatch.setattr(agenthc.requests, "get", exploding_get)
+    saved = []
+    state = {}
+    events = agenthc.poll({}, state, save_state=saved.append)
+    assert events == []
+    assert state.get("pass_needed_notified")  # once-per-day notify still fires
+    assert saved
+
+
+def test_agenthc_weekend_skips_network_entirely(monkeypatch):
+    """Weekend + no credentials: no request, no invoice churn."""
+    monkeypatch.setattr(agenthc, "_now_et",
+                        lambda: datetime(2026, 7, 18, 12, 0,
+                                         tzinfo=agenthc.MARKET_TZ))  # Saturday
+    monkeypatch.setattr(agenthc.requests, "get",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            AssertionError("no network on weekend skip")))
+    state = {}
+    assert agenthc.poll({"day_pass_recurring": True}, state, lambda s: None) == []
+    assert state.get("weekend_skip_notified")
+
+
+def test_agenthc_live_token_still_polls(monkeypatch):
+    """A cached unexpired day-pass token must keep polling normally even with
+    recurring OFF — the guard only blocks access-impossible states."""
+    monkeypatch.setattr(agenthc.requests, "get",
+                        lambda *a, **kw: FakeResp({"events": [_feed_event()]}))
+    state = {"l402": {"token": "L402 m:p", "expires_at": time.time() + 3600}}
+    events = agenthc.poll({}, state, save_state=lambda s: None)
+    assert len(events) == 1
+
+
+def test_agenthc_api_key_still_polls(monkeypatch):
+    """An API-key consumer is unaffected by the day-pass purchase gate."""
+    monkeypatch.setattr(agenthc.requests, "get",
+                        lambda *a, **kw: FakeResp({"events": [_feed_event()]}))
+    events = agenthc.poll({"agenthc_api_key": "k"}, {}, save_state=lambda s: None)
+    assert len(events) == 1

@@ -136,6 +136,14 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     shadow book — several entries a day; your daily entry cap and budget
     still apply per trade).
     """
+    # Skip the request entirely when access is impossible: no API key, no
+    # live day-pass token, and buying one isn't allowed right now (recurring
+    # OFF, or weekend). Every such GET makes the server mint a Lightning
+    # invoice that is guaranteed to expire unpaid — at market-hours poll
+    # cadence that's ~1,000 doomed invoices a day against the publisher's
+    # node. The once-per-day notify inside _pass_purchase_allowed still fires.
+    if not _headers(cfg, state) and not _pass_purchase_allowed(cfg, state, save_state):
+        return []
     track = "all" if cfg.get("include_other_trades") else "main"
     resp = requests.get(f"{AGENTHC_API}{FEED_PATH}",
                         params={"limit": 20, "track": track},
