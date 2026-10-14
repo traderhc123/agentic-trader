@@ -264,12 +264,23 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
 </section>
 
 <section id="s-llm"><h2>Connect your AI (recommended)</h2>
- <p class="muted">Your agent becomes a real AI agent with an Anthropic API key
- (pay-per-use, separate from a Claude subscription — console.anthropic.com).
- It powers the help chat, your plain-English trading policy, and the dashboard
- Q&A. Skippable; add it later any time.</p>
- <input type="password" id="llm-key" placeholder="sk-ant-…">
- <div class="navrow"><button onclick="doLLM()">Connect & continue</button>
+ <p class="muted">Connecting Claude powers the help chat, your plain-English
+ trading policy and the dashboard Q&amp;A. It never places trades. You can
+ skip this and add it any time.</p>
+ <ol class="muted" style="padding-left:1.2rem;margin:.4rem 0">
+  <li><b>Claude Max or Team plan?</b> Your plan includes monthly API credits —
+   link them to a Claude Console organization once (claude.ai → your plan's
+   API credits). Otherwise a pay-as-you-go Console account works.</li>
+  <li><a href="https://console.anthropic.com/settings/keys" target="_blank"
+   rel="noopener">Open the Claude Console → API keys ↗</a> and create a key.</li>
+  <li>Paste it here — it connects automatically.</li>
+ </ol>
+ <input type="password" id="llm-key" placeholder="sk-ant-…" autocomplete="off"
+  oninput="llmKeyTyped()" onkeydown="if(event.key==='Enter')doLLM()">
+ <p class="muted" style="margin-top:.3rem">Signing in with claude.ai doesn't
+ connect here — the API key is how your plan's credits (or pay-as-you-go
+ billing) reach the agent. The key stays on this computer.</p>
+ <div class="navrow"><button onclick="doLLM()">Connect &amp; continue</button>
  <button class="back" onclick="skipLLM()">Skip for now</button>
  <span id="llm-msg"></span></div>
 </section>
@@ -581,11 +592,21 @@ async function doConsent(){
     :'<span class="err">'+r.error+'</span>';
   if(r.ok)done('s-consent');
 }
+let llmBusy=false;
+function llmKeyTyped(){
+  // A pasted key arrives whole — connect without another click.
+  const v=document.getElementById('llm-key').value.trim();
+  if(!llmBusy&&v.startsWith('sk-ant-')&&v.length>=40)doLLM();
+}
 async function doLLM(){
-  const r=await api('/api/llm',{key:document.getElementById('llm-key').value});
-  document.getElementById('llm-msg').innerHTML=r.ok?' <span class="ok">connected ✓</span>'
-    :' <span class="err">'+r.error+'</span>';
-  if(r.ok)done('s-llm');
+  if(llmBusy)return;llmBusy=true;
+  const msg=document.getElementById('llm-msg');msg.textContent=' checking key…';
+  try{
+    const r=await api('/api/llm',{key:document.getElementById('llm-key').value});
+    msg.innerHTML=r.ok?' <span class="ok">connected ✓</span>'
+      :' <span class="err">'+esc(r.error)+'</span>';
+    if(r.ok){document.getElementById('llm-key').value='';done('s-llm');}
+  }finally{llmBusy=false;}
 }
 async function skipLLM(){done('s-llm');}
 let walletMade=false, balTimer=null;
@@ -1441,14 +1462,16 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     def llm(_h, data):
         key = str(data.get("key", "")).strip()
         if not key.startswith("sk-ant-"):
-            return {"ok": False, "error": "that doesn't look like an Anthropic key"}
+            return {"ok": False, "error": "that doesn't look like a Claude API key "
+                    "(they start with sk-ant-) — create one in the Claude Console"}
         try:
             import requests as _rq
             r = _rq.get("https://api.anthropic.com/v1/models",
                         headers={"x-api-key": key,
                                  "anthropic-version": "2023-06-01"}, timeout=10)
             if r.status_code == 401:
-                return {"ok": False, "error": "key rejected (401)"}
+                return {"ok": False, "error": "that key was rejected — it may be "
+                        "revoked or mistyped; create a new one in the Console"}
             if r.status_code != 200:
                 return {"ok": False, "error": f"validation failed HTTP {r.status_code}"}
         except Exception as exc:
