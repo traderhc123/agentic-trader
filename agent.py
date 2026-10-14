@@ -17,6 +17,7 @@ Robinhood's trading MCP).
     python agent.py doctor   # check EVERYTHING (config, wallet, feed, broker)
                              # and print the exact command to fix each problem
     python agent.py fund N   # print a Lightning invoice to add N sats
+    python agent.py link     # print the dashboard login link
 
 HARD CONSENT GATE: this program will not perform ANY setup or trading action
 until you have accepted DISCLAIMER.md (all liability is yours; no party here
@@ -71,16 +72,26 @@ def _load(path, default=None):
 
 
 def _save(path, payload, private=False):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    try:
-        os.chmod(os.path.dirname(path), 0o700)  # keys/tokens live here
-    except OSError:
-        pass
+    import platform_compat
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    # keys/tokens live here. POSIX chmod is cheap, so re-apply every save;
+    # Windows icacls is a subprocess, so lock once (marker file) — this also
+    # locks homes created by older versions on their first save.
+    if not platform_compat.IS_WINDOWS:
+        platform_compat.make_private(d, is_dir=True)
+    else:
+        marker = os.path.join(d, ".acl-locked")
+        if not os.path.exists(marker) and platform_compat.make_private(d, is_dir=True):
+            try:
+                open(marker, "w", encoding="utf-8").close()
+            except OSError:
+                pass
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
-    if private:
-        os.chmod(tmp, 0o600)
+    if private and not platform_compat.IS_WINDOWS:
+        os.chmod(tmp, 0o600)  # Windows: inherits the locked directory's ACL
     os.replace(tmp, path)
 
 
@@ -163,6 +174,60 @@ def _entries_today():
     except OSError:
         pass
     return count
+
+
+def _est_pnl_today():
+    """Today's estimated realized P&L (USD) from the trade log's exit records.
+
+    An ESTIMATE: brokers don't report fill prices back to the agent, so each
+    exit's P&L is (exit quote - entry quote) x qty x 100, or the feed's own
+    paper P&L %% applied to the entry estimate when an exit quote is missing.
+    Exits with no estimate at all count as 0 (see `unmeasured`). Full-log
+    scan for the same reason as _entries_today."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    total, unmeasured = 0.0, 0
+    try:
+        with open(TRADES_PATH, encoding="utf-8") as f:
+            for line in f:
+                if today not in line:
+                    continue
+                try:
+                    t = json.loads(line)
+                except ValueError:
+                    continue
+                if t.get("action") != "exit" or not str(t.get("ts", "")).startswith(today):
+                    continue
+                if isinstance(t.get("est_pnl_usd"), (int, float)):
+                    total += float(t["est_pnl_usd"])
+                else:
+                    unmeasured += 1
+    except OSError:
+        pass
+    return total, unmeasured
+
+
+def _mark(broker, client, cfg, event, side):
+    """Best-effort per-share quote for P&L estimates; 0.0 when unavailable."""
+    fn = getattr(broker, "mark_price", None) if broker is not None else None
+    if fn is None or client is None:
+        return 0.0
+    try:
+        return float(fn(client, cfg, event, side) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _est_exit_pnl(pos, exit_mark, event):
+    qty = int((pos or {}).get("qty") or 0)
+    entry = float((pos or {}).get("entry_mark") or 0)
+    if qty < 1 or entry <= 0:
+        return None
+    if exit_mark > 0:
+        return round((exit_mark - entry) * qty * 100, 2)
+    pct = event.get("paper_pnl_pct")
+    if isinstance(pct, (int, float)):
+        return round(entry * qty * 100 * float(pct) / 100.0, 2)
+    return None
 
 
 def _market_open_now():
@@ -297,7 +362,9 @@ def _execute_dry(cfg, event, state, broker=None, client=None):
                f"{'CALL' if event['type'] == 'C' else 'PUT'}"
     pos_key = f"{event['ticker']}|{event['expiry']}|{event['strike']}|{event['type']}"
     if event["event"] == "ENTERED" and pos_key not in state["positions"]:
-        qty, note = int(cfg.get("contracts_per_trade", 1)), "fixed contract count"
+        qty = min(max(1, int(cfg.get("contracts_per_trade", 1))),
+                  int(cfg.get("max_contracts_per_trade", 100)))
+        note = "fixed contract count"
         if broker is not None and client is not None:
             try:  # read-only: resolve + quote so budget sizing previews accurately
                 option_id = broker.resolve_instrument(client, event)
@@ -352,6 +419,19 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             _log_trade({"action": "skip_position_cap", "event_id": ev["event_id"],
                         "contract": contract})
             return msg
+        # Max daily loss (opt-in): once today's estimated realized loss reaches
+        # the limit, stop opening positions. Exits are never blocked.
+        loss_cap = float(cfg.get("max_daily_loss_usd") or 0)
+        if loss_cap > 0:
+            pnl, _unmeasured = _est_pnl_today()
+            if -pnl >= loss_cap:
+                msg = (f"SKIPPED {contract}: max daily loss reached "
+                       f"(est. ${-pnl:,.0f} of ${loss_cap:,.0f}) — no new "
+                       "entries until tomorrow")
+                print(msg)
+                _log_trade({"action": "skip_daily_loss", "event_id": ev["event_id"],
+                            "contract": contract})
+                return msg
         # The user's own policy, applied by the LLM policy brain (veto-only).
         verdict = llm_policy.evaluate(cfg, ev, _recent_trades(20))
         if not verdict["act"]:
@@ -370,6 +450,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
     dry = bool(cfg.get("dry_run")) or bool(existing and existing.get("dry"))
 
     ecfg = _sizing_cfg(cfg, ev)  # per-track sizing (main vs "other trades")
+    prior_pos = dict(existing) if existing else None  # qty/entry mark for P&L
     if dry:
         action = _execute_dry(ecfg, ev, state, broker, client)
         prefix = "[DRY-RUN] "
@@ -379,8 +460,17 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         prefix = ""
 
     if action:
-        _log_trade({"action": action, "event_id": ev["event_id"],
-                    "contract": contract, "dry": dry, "reason": policy_reason})
+        record = {"action": action, "event_id": ev["event_id"],
+                  "contract": contract, "dry": dry, "reason": policy_reason}
+        if action == "entry" and pos_key in state["positions"]:
+            mark = _mark(broker, client, ecfg, ev, "buy")
+            if mark > 0:
+                state["positions"][pos_key]["entry_mark"] = mark
+        elif action == "exit":
+            est = _est_exit_pnl(prior_pos, _mark(broker, client, ecfg, ev, "sell"), ev)
+            if est is not None:
+                record["est_pnl_usd"] = est
+        _log_trade(record)
         save_state(state)
         return f"{prefix}{action.upper()}: {contract}"
     return None
@@ -587,6 +677,19 @@ def _apply_command(text):
         cfg["max_open_positions"] = val
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Max concurrent open positions set to {val}."
+    if t.startswith("set max loss"):
+        try:
+            val = float(t.split()[-1].lstrip("$").replace(",", ""))
+            assert val >= 0
+        except (ValueError, AssertionError, IndexError):
+            return True, "Usage: set max loss 300   (0 = off)"
+        cfg["max_daily_loss_usd"] = val
+        _save(CONFIG_PATH, cfg, private=True)
+        if val == 0:
+            return True, "Max daily loss OFF."
+        return True, (f"Max daily loss set to ${val:,.0f}: once today's estimated "
+                      "realized loss reaches it, no new entries until tomorrow "
+                      "(exits still run).")
     if t in ("self-edit on", "self edit on"):
         cfg["self_edit_enabled"] = True
         _save(CONFIG_PATH, cfg, private=True)
@@ -605,7 +708,11 @@ def _apply_command(text):
         st = _load(STATE_PATH, {"positions": {}})
         return True, (f"{'DRY-RUN' if cfg.get('dry_run') else 'LIVE'} · "
                       f"{_sizing_desc(cfg)} · entries today {_entries_today()}/"
-                      f"{cfg.get('max_entries_per_day', 5)} · open: "
+                      f"{cfg.get('max_entries_per_day', 5)} · "
+                      f"est. P&L today ${_est_pnl_today()[0]:,.0f}"
+                      + (f" (max loss ${float(cfg['max_daily_loss_usd']):,.0f})"
+                         if float(cfg.get('max_daily_loss_usd') or 0) > 0 else "")
+                      + " · open: "
                       f"{', '.join(st.get('positions', {})) or 'none'}")
     return False, ""
 
@@ -630,7 +737,7 @@ def cmd_run(app_window=False):
     seen = set(state["seen"])
 
     def save_state(st):
-        _save(STATE_PATH, st)
+        _save(STATE_PATH, st, private=True)  # holds the day-pass L402 token
 
     # The agent serves its OWN dashboard — status, trade log, and a command/
     # chat box — on localhost. No central server involved.
@@ -671,7 +778,8 @@ def cmd_run(app_window=False):
             webui.open_app_window(dash_url)
     print("Reminder: you are responsible for every order this agent places.")
     notify(cfg, f"agentic-trader heartbeat started [{mode}], source={cfg['source']}"
-                + (f" — dashboard {dash_url}" if dash_url else ""))
+                # never send the login token to a third-party notifier
+                + (f" — dashboard {dash_url.split('?')[0]}" if dash_url else ""))
     while True:
         cfg = _load(CONFIG_PATH, cfg) or cfg  # dashboard edits apply live
         poll = max(10, int(cfg.get("poll_seconds", 30)))
@@ -822,6 +930,10 @@ def cmd_doctor():
             except WalletError as exc:
                 check(False, "Lightning wallet", str(exc)[:80],
                       "python agent.py setup   (source step → recreate wallet)")
+            from lightning_wallet import demo_warning
+            warn = demo_warning(cfg.get("lnbits_url"))
+            if warn:
+                print(f"  ⚠️  Wallet host: {warn}")
         else:
             check(False, "Feed access",
                   "no wallet and no Premium key — the feed cannot be paid for",
@@ -907,6 +1019,10 @@ def main():
         cmd_status()
     elif cmd == "doctor":
         cmd_doctor()
+    elif cmd == "link":
+        import webui
+        print("Dashboard login link (keep it private — it unlocks the dashboard):")
+        print(f"  http://127.0.0.1:{webui.APP_PORT}/dash?k={webui.ui_token()}")
     elif cmd == "fund":
         amount = sys.argv[2] if len(sys.argv) > 2 else "20000"
         if not amount.isdigit():

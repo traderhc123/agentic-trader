@@ -182,6 +182,12 @@ def _ask_price(cfg, sdk, code):
                 pass
 
 
+def mark_price(cl, cfg, event, side="buy"):
+    """Per-share quote for the agent's P&L estimate (0.0 when unavailable)."""
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    return _ask_price(cfg, _sdk(), _moomoo_code(event))
+
+
 def _size(cfg, price):
     if str(cfg.get("sizing_mode", "contracts")) == "budget":
         budget = float(cfg.get("budget_per_trade_usd", 0) or 0)
@@ -193,9 +199,12 @@ def _size(cfg, price):
             return (min(qty, int(cfg.get("max_contracts_per_trade", 100))),
                     f"${budget:,.0f} budget @ ~${price:.2f} → {qty}x")
         if budget > 0:
-            return (max(1, int(cfg.get("contracts_per_trade", 1))),
-                    "no quote — fell back to fixed contracts")
-    return max(1, int(cfg.get("contracts_per_trade", 1))), "fixed contract count"
+            # Never guess a size without a price — a fixed-count fallback can
+            # spend far past the budget (same rule as robinhood/alpaca).
+            return 0, "no quote available for budget sizing — skipped"
+        return 0, "budget mode but budget_per_trade_usd unset — skipped"
+    return min(max(1, int(cfg.get("contracts_per_trade", 1))),
+               int(cfg.get("max_contracts_per_trade", 100))), "fixed contract count"
 
 
 def _order(cfg, sdk, code, side, qty, price):

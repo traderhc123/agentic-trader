@@ -72,8 +72,10 @@ button. Every decision and all day-to-day use happens in your browser.
    your agent's live dashboard: status, every action it's taken, and a chat
    box where you can say `pause`, `resume`, `set budget 500`, `dry off`, or
    just ask what it's been doing. Bookmark **http://127.0.0.1:8721** — it's
-   your agent's home from now on. On a remote server, tunnel first:
-   `ssh -L 8721:127.0.0.1:8721 user@yourserver`.
+   your agent's home from now on. The dashboard is login-protected: the
+   browser that opened it stays logged in; anywhere else (another browser, a
+   remote server), run `python agent.py link` and open the link it prints.
+   On a remote server, tunnel first: `ssh -L 8721:127.0.0.1:8721 user@yourserver`.
 
 ### Option B — a $5 VPS (always-on, ~30 minutes)
 
@@ -105,7 +107,13 @@ docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trad
   *would* do, places nothing. Watch it for a few days, then set
   `"dry_run": false` in `~/.agentic-trader/config.json` to go live.
 - **Daily entry cap** (default 5) and **1-contract default sizing** bound the
-  worst day.
+  worst day; no trade is ever larger than `max_contracts_per_trade` (100).
+- **Max daily loss** (optional): set it in the wizard's Safety step or say
+  `set max loss 300` in the dashboard — after an estimated $300 realized loss
+  in a day, no new entries until tomorrow (exits still run).
+- **Day-pass spend cap**: the agent auto-pays at most one day-pass's worth of
+  sats per day (`max_autopay_sats_per_day`) — a misbehaving paywall can't
+  drain the wallet.
 - **Main pick only by default**: the AgentHC feed follows the single daily
   high-conviction pick unless you opt into "other trades" (the wider journal,
   several entries a day) during setup — or later via

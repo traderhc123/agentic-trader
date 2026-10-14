@@ -85,6 +85,51 @@ def open_app_window(url):
     return False
 
 
+# ── dashboard login ──────────────────────────────────────────────────────────
+# The UI binds loopback only, but loopback is shared by every local process
+# and other OS users. Every page and API call requires a per-install secret,
+# delivered once via a `?k=<token>` link (printed in the terminal / opened in
+# the browser by the agent itself) and then kept in an HttpOnly cookie.
+_SESSION_COOKIE = "at_session"
+_LOCKED_PAGE = """<!doctype html><meta charset="utf-8"><title>Locked</title>
+<body style="font-family:system-ui;background:#0b0e14;color:#e8ebf2;padding:2rem">
+<h2>This dashboard is locked</h2>
+<p>Open the login link printed in the terminal where the agent is running,
+or print it again with:</p><pre>python agent.py link</pre></body>"""
+
+
+def _token_path():
+    home = os.path.expanduser(os.getenv("AGENT_HOME", "~/.agentic-trader"))
+    return os.path.join(home, "ui_token")
+
+
+def ui_token():
+    """This install's dashboard secret (created on first use, private)."""
+    import secrets
+    path = _token_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            tok = f.read().strip()
+        if len(tok) >= 32:
+            return tok
+    except OSError:
+        pass
+    import platform_compat
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tok = secrets.token_urlsafe(32)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(tok)
+    platform_compat.make_private(tmp)
+    os.replace(tmp, path)
+    return tok
+
+
+def _token_ok(candidate):
+    import hmac
+    return bool(candidate) and hmac.compare_digest(str(candidate), ui_token())
+
+
 class _AppServer(ThreadingHTTPServer):
     """On Windows, SO_REUSEADDR lets a SECOND process bind a port that is
     already in use (unlike POSIX), so a duplicate agent would silently share
@@ -334,6 +379,9 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
  <b>dry-run</b> mode (log actions, place no orders — recommended)</label></p>
  <label>Max new entries per day</label>
  <input type="number" id="sf-cap" value="5" min="1">
+ <label>Max daily loss in $ (optional, blank/0 = off) — once today's estimated
+  realized loss reaches this, no new entries until tomorrow; exits still run</label>
+ <input type="number" id="sf-maxloss" placeholder="e.g. 300" min="0">
  <label>Notifications (any/all, optional)</label>
  <input type="text" id="nt-discord" placeholder="Discord webhook URL">
  <input type="text" id="nt-ntfy" placeholder="ntfy.sh topic">
@@ -428,13 +476,18 @@ async function checkUpdates(){
   const r=await api('/api/update/check');
   if(!r.ok){msg.innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}
   if(!r.behind){msg.innerHTML='<span class="ok">up to date ✓</span>';return;}
+  updTarget=r.target||'';
   msg.innerHTML='<span class="ok">'+r.behind+' update'+(r.behind>1?'s':'')+
-    ' available</span>'+(r.summary?' — latest: '+esc(r.summary.split('\\n')[0]):'');
+    ' available</span> — review before pulling:<pre style="white-space:pre-wrap;'+
+    'max-height:12rem;overflow:auto">'+esc(r.summary||'')+'</pre>'+
+    '<span class="muted">installs exactly '+esc(updTarget.slice(0,12))+
+    ' from github.com/traderhc123/agentic-trader</span>';
   document.getElementById('upd-pull').style.display='';
 }
+let updTarget='';
 async function pullUpdates(){
   const msg=document.getElementById('upd-msg');msg.textContent='pulling…';
-  const r=await api('/api/update/pull',{});
+  const r=await api('/api/update/pull',{expect:updTarget});
   msg.innerHTML=r.ok?'<span class="ok">'+esc(r.note)+'</span>'
     :'<span class="err">'+esc(r.error)+'</span>';
   if(r.ok)document.getElementById('upd-pull').style.display='none';
@@ -568,7 +621,9 @@ function showWallet(page,label){
 async function makeWallet(){
   document.getElementById('mw-msg').textContent=' creating…';
   const r=await api('/api/wallet/create',{});
-  if(r.ok)showWallet(r.page,'created ✓');
+  if(r.ok){showWallet(r.page,'created ✓');
+    if(r.warning)document.getElementById('mw-msg').innerHTML+=
+      '<div class="err" style="margin-top:.5rem">⚠️ '+esc(r.warning)+'</div>';}
   else document.getElementById('mw-msg').innerHTML=' <span class="err">'+r.error+'</span>';
 }
 async function fundInvoice(){
@@ -656,6 +711,7 @@ async function doSizing(){
 async function doSafety(){
   const r=await api('/api/safety',{dry:document.getElementById('sf-dry').checked,
     cap:document.getElementById('sf-cap').value,
+    max_loss:document.getElementById('sf-maxloss').value,
     discord:document.getElementById('nt-discord').value,
     ntfy:document.getElementById('nt-ntfy').value,
     tg_token:document.getElementById('nt-tg-token').value,
@@ -1022,6 +1078,35 @@ class _Handler(BaseHTTPRequestHandler):
                 return False
         return True
 
+    def _authed(self):
+        from http.cookies import SimpleCookie
+        try:
+            c = SimpleCookie(self.headers.get("Cookie") or "")
+        except Exception:
+            return False
+        m = c.get(_SESSION_COOKIE)
+        return _token_ok(m.value if m else "")
+
+    def _login_from_query(self):
+        """`?k=<token>` → set the session cookie and redirect to the clean
+        path (keeps the secret out of the address bar). Returns True if it
+        handled the request."""
+        from urllib.parse import parse_qs, urlparse
+        u = urlparse(self.path)
+        k = (parse_qs(u.query).get("k") or [""])[0]
+        if not k:
+            return False
+        if not _token_ok(k):
+            self._send(None, 403, html=_LOCKED_PAGE)
+            return True
+        self.send_response(302)
+        self.send_header("Set-Cookie", f"{_SESSION_COOKIE}={k}; Path=/; HttpOnly; "
+                         "SameSite=Lax; Max-Age=31536000")
+        self.send_header("Location", u.path or "/")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        return True
+
     def _send(self, obj, status=200, html=None):
         body = html.encode() if html is not None else json.dumps(obj).encode()
         self.send_response(status)
@@ -1036,7 +1121,14 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._guard(check_origin=False):
             return
+        if self._login_from_query():
+            return
         path = self.path.split("?")[0]
+        if not self._authed():
+            if path.startswith("/api/"):
+                return self._send({"error": "locked — open the dashboard "
+                                   "login link (python agent.py link)"}, 401)
+            return self._send(None, 401, html=_LOCKED_PAGE)
         if path == "/":
             self.send_response(302)
             self.send_header("Location", self.landing)
@@ -1055,6 +1147,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._guard(check_origin=True):
             return
+        if not self._authed():
+            return self._send({"error": "locked — open the dashboard login "
+                               "link (python agent.py link)"}, 401)
         fn = self.routes_post.get(self.path.split("?")[0])
         if fn is None:
             return self._send({"error": "not found"}, 404)
@@ -1405,8 +1500,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     def update_check(_h):
         return check_code_updates()
 
-    def update_pull(_h, _data):
-        ok, note = pull_code_updates()
+    def update_pull(_h, data):
+        expect = str((data or {}).get("expect") or "").strip()
+        if not expect:
+            return {"ok": False, "error": "check for updates first, review the "
+                    "commit list, then pull"}
+        ok, note = pull_code_updates(expect=expect)
         if not ok:
             return {"ok": False, "error": note}
         import os
@@ -1477,7 +1576,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             cfg["lnbits_wallet_page"] = page
         cfg.setdefault("max_autopay_sats", 30_000)
         save()
-        return {"ok": True, "page": page}
+        from lightning_wallet import demo_warning
+        return {"ok": True, "page": page, "warning": demo_warning(url)}
 
     def wallet_fund(_h, data):
         w = _wallet()
@@ -1630,6 +1730,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             cfg["max_entries_per_day"] = max(1, int(data.get("cap") or 5))
         except (TypeError, ValueError):
             cfg["max_entries_per_day"] = 5
+        raw_loss = str(data.get("max_loss") or "").strip()
+        if raw_loss:  # blank keeps any existing limit (re-running the wizard)
+            try:
+                cfg["max_daily_loss_usd"] = max(
+                    0.0, float(raw_loss.lstrip("$").replace(",", "")))
+            except ValueError:
+                pass
         cfg.setdefault("max_event_age_s", 300)
         for src_key, cfg_key in (("discord", "discord_webhook_url"),
                                  ("ntfy", "ntfy_topic"),
@@ -1775,7 +1882,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     if wait_finish:
-        print(f"Setup running at {url}setup  (Ctrl-C to abort)")
+        login = f"{url}setup?k={ui_token()}"
+        print(f"Setup running at {login}  (Ctrl-C to abort)")
         print("On a remote server, tunnel first:  "
               f"ssh -L {APP_PORT}:127.0.0.1:{APP_PORT} user@host")
         try:
@@ -1783,7 +1891,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             # After an update-button re-exec the user's tab reloads itself —
             # opening a second tab would just duplicate the wizard.
             if not _os.environ.pop("AGENT_UPDATE_RESTARTED", None):
-                webbrowser.open(url + "setup")
+                webbrowser.open(login)
         except Exception:
             pass
         try:
@@ -1795,7 +1903,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             print("\nWizard aborted.")
         server.shutdown()
         return None
-    return url + "dash"
+    return f"{url}dash?k={ui_token()}"
 
 
 def run_wizard():
@@ -1825,13 +1933,44 @@ def _update_upstream():
     return candidate
 
 
+# Updates are only ever pulled from the official repository. A tampered
+# `origin` (another local program editing .git/config, a typo'd fork) would
+# otherwise let the Update button install and run arbitrary code. Forks set
+# AGENTIC_TRADER_UPDATE_REMOTE to their own URL explicitly.
+OFFICIAL_REMOTES = (
+    "https://github.com/traderhc123/agentic-trader",
+    "https://github.com/traderhc123/agentic-trader.git",
+    "git@github.com:traderhc123/agentic-trader.git",
+    "ssh://git@github.com/traderhc123/agentic-trader.git",
+)
+
+
+def _remote_problem():
+    """None if origin is the trusted update source, else an error string."""
+    import os
+    url = _git(["remote", "get-url", "origin"]).stdout.strip()
+    allowed = set(OFFICIAL_REMOTES)
+    if os.getenv("AGENTIC_TRADER_UPDATE_REMOTE"):
+        allowed.add(os.environ["AGENTIC_TRADER_UPDATE_REMOTE"].strip())
+    if url.rstrip("/") in allowed:
+        return None
+    return (f"refusing to update from an unrecognised remote ({url or 'none'}) — "
+            "updates only come from github.com/traderhc123/agentic-trader "
+            "(forks: set AGENTIC_TRADER_UPDATE_REMOTE to your repo URL)")
+
+
 def check_code_updates():
-    """Fetch origin and report how far behind HEAD is. Never raises."""
+    """Fetch origin and report how far behind HEAD is. Never raises.
+    Returns the exact commit (`target`) the user is shown, so the pull can
+    install THAT commit and nothing pushed after they looked."""
     import os
     if not os.path.isdir(os.path.join(_repo_dir(), ".git")):
         return {"ok": False, "error": "this install is not a git checkout — "
                 "update by re-running the installer"}
     try:
+        problem = _remote_problem()
+        if problem:
+            return {"ok": False, "error": problem}
         r = _git(["fetch", "--quiet", "origin"], timeout=120)
         if r.returncode != 0:
             return {"ok": False, "error": "fetch failed: "
@@ -1844,27 +1983,38 @@ def check_code_updates():
         n = int(behind.stdout.strip() or 0)
         summary = ""
         if n:
-            log = _git(["log", "--oneline", "--no-decorate", "-5",
+            log = _git(["log", "--oneline", "--no-decorate", "-20",
                         f"HEAD..{upstream}"])
             summary = log.stdout.strip()
+        target = _git(["rev-parse", upstream]).stdout.strip()
         return {"ok": True, "behind": n, "upstream": upstream,
-                "summary": summary}
+                "summary": summary, "target": target}
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:200]}
 
 
-def pull_code_updates():
+def pull_code_updates(expect=None):
     """Fetch origin and fast-forward to the upstream. Returns (ok, message).
     Fetches itself — never assume check_code_updates ran first (a stale
     origin/<branch> ref would merge cleanly and report success without
     actually updating). --ff-only so local commits/self-edits are never
-    merged over silently — a diverged tree is reported, not resolved."""
+    merged over silently — a diverged tree is reported, not resolved.
+    `expect` (the `target` from check_code_updates) pins the exact commit the
+    user reviewed: if the remote moved since, nothing is installed."""
     try:
+        problem = _remote_problem()
+        if problem:
+            return False, problem
         f = _git(["fetch", "--quiet", "origin"], timeout=120)
         if f.returncode != 0:
             return False, "fetch failed: " + (f.stderr or f.stdout).strip()[:200]
         upstream = _update_upstream()
-        r = _git(["merge", "--ff-only", upstream], timeout=120)
+        head = _git(["rev-parse", upstream]).stdout.strip()
+        if expect and head != expect:
+            return False, ("the remote changed since you checked — press "
+                           "'Check for code updates' again and review the "
+                           "new commit list")
+        r = _git(["merge", "--ff-only", head or upstream], timeout=120)
         if r.returncode != 0:
             err = (r.stderr or r.stdout).strip()[:200]
             return False, ("cannot fast-forward (local changes or diverged "

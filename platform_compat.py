@@ -33,6 +33,29 @@ runpy.run_path(script, run_name="__main__")
 """
 
 
+def make_private(path, is_dir=False):
+    """Restrict `path` to the current user. POSIX: chmod 600/700. Windows:
+    chmod is a no-op there, so strip inherited ACLs with icacls and grant only
+    this user (directories pass the grant on to files created inside them).
+    Never raises — a failure leaves the OS default (user-profile) ACL."""
+    try:
+        if not IS_WINDOWS:
+            os.chmod(path, 0o700 if is_dir else 0o600)
+            return True
+        user = os.environ.get("USERNAME")
+        if not user:
+            return False
+        domain = os.environ.get("USERDOMAIN")
+        who = f"{domain}\\{user}" if domain else user
+        grant = f"{who}:(OI)(CI)F" if is_dir else f"{who}:F"
+        r = subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", grant],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=15)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def venv_python(prefix="./.venv"):
     """The venv interpreter path a user should type on this OS."""
     if IS_WINDOWS:

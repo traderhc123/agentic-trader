@@ -268,3 +268,76 @@ def test_consent_false_when_disclaimer_text_changed(home):
 def test_consent_false_when_not_accepted(home):
     _accept(home, accepted=False)
     assert not agent.consent_ok()
+
+
+# ── max daily loss (opt-in) ──────────────────────────────────────────────────
+
+class _QuotedBroker(StubBroker):
+    """Stub broker with a scripted per-share quote for P&L estimates."""
+
+    def __init__(self, marks):
+        super().__init__()
+        self.marks = list(marks)
+
+    def mark_price(self, client, cfg, event, side="buy"):
+        return self.marks.pop(0) if self.marks else 0.0
+
+
+def _cfg(**kw):
+    return {"dry_run": False, "max_entries_per_day": 50, **kw}
+
+
+def test_exit_logs_quote_based_pnl_estimate(home, no_policy):
+    b = _QuotedBroker([2.00, 1.50])  # entry ask $2.00, exit bid $1.50
+    state = {"positions": {}}
+    agent.handle_event(make_event(event_id="e1"), _cfg(), state, b, object(),
+                       lambda s: None)
+    agent.handle_event(make_event(event="EXITED", event_id="x1"), _cfg(),
+                       state, b, object(), lambda s: None)
+    pnl, unmeasured = agent._est_pnl_today()
+    assert pnl == pytest.approx(-50.0)  # (1.50 - 2.00) x 1 x 100
+    assert unmeasured == 0
+
+
+def test_max_daily_loss_blocks_new_entries_but_not_exits(home, no_policy):
+    b = _QuotedBroker([5.00, 1.00])  # -$400 on the first round trip
+    cfg = _cfg(max_daily_loss_usd=300)
+    state = {"positions": {}}
+    agent.handle_event(make_event(event_id="e1"), cfg, state, b, object(),
+                       lambda s: None)
+    agent.handle_event(make_event(event="EXITED", event_id="x1"), cfg, state,
+                       b, object(), lambda s: None)
+    out = agent.handle_event(make_event(event_id="e2", strike=760.0), cfg,
+                             state, b, object(), lambda s: None)
+    assert out and "max daily loss" in out
+    assert len(b.calls) == 2  # the third (entry) never reached the broker
+
+
+def test_max_daily_loss_off_by_default(home, no_policy):
+    b = _QuotedBroker([5.00, 1.00])
+    state = {"positions": {}}
+    agent.handle_event(make_event(event_id="e1"), _cfg(), state, b, object(),
+                       lambda s: None)
+    agent.handle_event(make_event(event="EXITED", event_id="x1"), _cfg(),
+                       state, b, object(), lambda s: None)
+    out = agent.handle_event(make_event(event_id="e2", strike=760.0), _cfg(),
+                             state, b, object(), lambda s: None)
+    assert out and out.startswith("ENTRY")
+
+
+def test_exit_falls_back_to_feed_paper_pnl_pct(home, no_policy):
+    b = _QuotedBroker([2.00, 0.0])  # no exit quote
+    state = {"positions": {}}
+    agent.handle_event(make_event(event_id="e1"), _cfg(), state, b, object(),
+                       lambda s: None)
+    agent.handle_event(make_event(event="EXITED", event_id="x1",
+                                  paper_pnl_pct=-25.0), _cfg(), state, b,
+                       object(), lambda s: None)
+    assert agent._est_pnl_today()[0] == pytest.approx(-50.0)
+
+
+def test_set_max_loss_command(home):
+    agent._save(agent.CONFIG_PATH, {}, private=True)
+    ok, reply = agent._apply_command("set max loss 250")
+    assert ok and "$250" in reply
+    assert agent._load(agent.CONFIG_PATH)["max_daily_loss_usd"] == 250.0

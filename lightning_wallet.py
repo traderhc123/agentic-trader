@@ -28,6 +28,23 @@ _TIMEOUT = 20
 DEFAULT_LNBITS = os.getenv("AGENTIC_TRADER_LNBITS", "https://demo.lnbits.com")
 
 
+# Public TEST instances: anyone can register, the operators may wipe them, and
+# funds there are not protected. Fine for a few days of passes; never more.
+DEMO_HOSTS = ("demo.lnbits.com", "legend.lnbits.com")
+
+
+def demo_warning(url):
+    """A plain-English warning when `url` is a public demo/test instance."""
+    from urllib.parse import urlparse
+    host = (urlparse(str(url or "")).hostname or "").lower()
+    if host not in DEMO_HOSTS:
+        return ""
+    return (f"{host} is a PUBLIC TEST server — it can be reset or go offline "
+            "and anything on it can be lost. Keep only a few days of passes "
+            "there (e.g. 50,000 sats), or point the agent at your own LNbits "
+            "with AGENTIC_TRADER_LNBITS.")
+
+
 class WalletError(RuntimeError):
     pass
 
@@ -131,6 +148,9 @@ def wallet_setup(cfg):
         cfg.setdefault("max_autopay_sats", 30_000)
         print(f"Wallet created on {url} ✓ (custodial hosted wallet — the agent "
               "keeps only spending money here)")
+        warn = demo_warning(url)
+        if warn:
+            print(f"⚠️  {warn}")
         if page:
             print(f"Wallet page (view balance / receive): {page}")
         raw = input("Fund it now — amount in sats (e.g. 50000; blank to skip): ").strip()
