@@ -21,6 +21,7 @@ Stdlib only (http.server + threading) — no new dependencies.
 """
 
 import json
+import os
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,6 +49,22 @@ def open_app_window(url):
             ["open", "-na", "Microsoft Edge", "--args", f"--app={url}"],
             ["open", "-na", "Brave Browser", "--args", f"--app={url}"],
         ]
+    elif sys.platform == "win32":
+        import os
+        for exe in ("msedge", "chrome", "brave"):  # Edge ships with Windows
+            path = shutil.which(exe)
+            if not path:
+                for base in (os.environ.get("PROGRAMFILES(X86)"),
+                             os.environ.get("PROGRAMFILES"),
+                             os.environ.get("LOCALAPPDATA")):
+                    sub = {"msedge": r"Microsoft\Edge\Application\msedge.exe",
+                           "chrome": r"Google\Chrome\Application\chrome.exe",
+                           "brave": r"BraveSoftware\Brave-Browser\Application\brave.exe"}[exe]
+                    if base and os.path.isfile(os.path.join(base, sub)):
+                        path = os.path.join(base, sub)
+                        break
+            if path:
+                candidates.append([path, f"--app={url}"])
     else:
         for exe in ("google-chrome", "chromium", "chromium-browser",
                     "brave-browser", "microsoft-edge"):
@@ -66,6 +83,22 @@ def open_app_window(url):
     except Exception:
         pass
     return False
+
+
+class _AppServer(ThreadingHTTPServer):
+    """On Windows, SO_REUSEADDR lets a SECOND process bind a port that is
+    already in use (unlike POSIX), so a duplicate agent would silently share
+    the dashboard port instead of failing the bind. Use exclusive binding."""
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        import socket
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET,
+                                   socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 WIZARD_PORT = APP_PORT
 DASH_PORT = APP_PORT
 
@@ -1403,7 +1436,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         def _restart():
             _time.sleep(3.0)  # response flush + in-flight event grace
             os.environ["AGENT_UPDATE_RESTARTED"] = "1"  # skip browser popup
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            import platform_compat
+            platform_compat.restart_self(list(sys.argv), APP_PORT)
         threading.Thread(target=_restart, daemon=True).start()
         return {"ok": True, "restarting": True,
                 "note": note + " — restarting with the new code; this page "
@@ -1610,7 +1644,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             path = llm_policy.policy_path()
             import os as _os
             _os.makedirs(_os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(policy + "\n")
             key = str(data.get("anthropic_key", "")).strip()
             if key:
@@ -1619,8 +1653,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             cfg.setdefault("llm_fallback", "skip")
         cfg["poll_seconds"] = int(cfg.get("poll_seconds", 30))
         save()
+        import platform_compat
         nxt = ("cd " + _repo_dir() + "\n"
-               "./.venv/bin/python agent.py run\n\n"
+               + platform_compat.venv_python() + " agent.py run\n\n"
                "(or enable the systemd service / Docker container — see "
                "GETTING_STARTED.md)")
         return {"ok": True, "next": nxt}
@@ -1642,22 +1677,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "error": "finish the source and broker steps first"}
         save()
         import os
-        import subprocess
-        import sys
-        py = sys.executable
+        import platform_compat
         script = os.path.join(_repo_dir(), "agent.py")
         log_path = os.path.join(os.path.dirname(A.CONFIG_PATH), "agent-run.log")
-        wait_free = (
-            f'for i in $(seq 1 40); do "{py}" -c \'import socket,sys; '
-            f's=socket.socket(); sys.exit(0 if s.connect_ex(("127.0.0.1", '
-            f'{APP_PORT})) else 1)\' && break; sleep 0.5; done; ')
-        cmd = wait_free + f'exec "{py}" "{script}" run >> "{log_path}" 2>&1'
         try:
-            subprocess.Popen(["/bin/sh", "-c", cmd], cwd=_repo_dir(),
-                             stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL,
-                             start_new_session=True)
+            platform_compat.spawn_after_port_free(
+                script, ["run"], APP_PORT, log_path=log_path, cwd=_repo_dir())
         except Exception as exc:
             return {"ok": False, "error": f"could not start the agent: {exc}"}
         # release the port AFTER this response has flushed
@@ -1745,7 +1770,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
 
     W.do_GET = do_GET
 
-    server = ThreadingHTTPServer(("127.0.0.1", APP_PORT), W)
+    server = _AppServer(("127.0.0.1", APP_PORT), W)
     url = f"http://127.0.0.1:{APP_PORT}/"
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()

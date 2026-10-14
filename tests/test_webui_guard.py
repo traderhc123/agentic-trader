@@ -99,7 +99,11 @@ def test_start_local_button_and_route_wired():
     src = _webui_source()
     assert "startLocal()" in src            # Option A button
     assert '"/api/start-local": start_local' in src  # route registered
-    assert "connect_ex" in src              # child waits for the port to free
+    assert "spawn_after_port_free(" in src  # child waits for the port to free
+    import inspect
+
+    import platform_compat
+    assert "connect_ex" in inspect.getsource(platform_compat)
 
 
 def test_deploy_success_finishes_wizard():

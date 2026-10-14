@@ -34,6 +34,8 @@ on a heartbeat.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | bash
+# Windows (PowerShell): powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.ps1 | iex"
+#   then use .\.venv\Scripts\python.exe wherever ./.venv/bin/python appears
 cd ~/agentic-trader
 ./.venv/bin/python agent.py setup    # follow BOOT.md — written for you
 ./.venv/bin/python agent.py run

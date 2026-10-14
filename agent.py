@@ -64,7 +64,7 @@ SIZING_NOTICE = (
 
 def _load(path, default=None):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
@@ -77,7 +77,7 @@ def _save(path, payload, private=False):
     except OSError:
         pass
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     if private:
         os.chmod(tmp, 0o600)
@@ -125,7 +125,7 @@ def _log_trade(record):
     record["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
         os.makedirs(HOME, exist_ok=True)
-        with open(TRADES_PATH, "a") as f:
+        with open(TRADES_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
     except OSError:
         pass
@@ -133,7 +133,7 @@ def _log_trade(record):
 
 def _recent_trades(limit=50):
     try:
-        with open(TRADES_PATH) as f:
+        with open(TRADES_PATH, encoding="utf-8") as f:
             lines = f.readlines()[-limit:]
         return [json.loads(x) for x in lines if x.strip()]
     except (OSError, ValueError):
@@ -150,7 +150,7 @@ def _entries_today():
     today = datetime.now(timezone.utc).date().isoformat()
     count = 0
     try:
-        with open(TRADES_PATH) as f:
+        with open(TRADES_PATH, encoding="utf-8") as f:
             for line in f:
                 if today not in line:
                     continue
@@ -225,7 +225,7 @@ def _maybe_daily_digest(cfg, state, save_state):
 
 def _disclaimer_text():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DISCLAIMER.md")
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return f.read()
 
 

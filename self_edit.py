@@ -43,8 +43,29 @@ FOUNDATION = frozenset({
     "DISCLAIMER.md",     # the legal terms the human accepted
     "SECURITY.md",       # the promises this table makes
     "install.sh",        # what new users pipe into bash
+    "install.ps1",       # ...and the Windows twin piped into PowerShell
     "LICENSE",
 })
+
+
+def _is_foundation(rel):
+    """True if `rel` names a FOUNDATION file on THIS filesystem. Windows and
+    stock macOS are case-insensitive, and Windows also silently drops trailing
+    dots/spaces from names — so a plain `rel in FOUNDATION` would let
+    `Agent.py` or `agent.py.` overwrite the real consent gate."""
+    norm = os.path.normcase(rel.rstrip(". "))
+    return any(norm.casefold() == os.path.normcase(f).casefold()
+               for f in FOUNDATION)
+
+
+def _illegal_name(rel):
+    """Path parts Windows would reinterpret: NTFS alternate data streams
+    (`agent.py:x`), drive-relative paths (`C:foo`) and trailing dots/spaces."""
+    parts = rel.replace("\\", "/").split("/")
+    return any(":" in p or (p != p.rstrip(". ") and p not in (".", ".."))
+               for p in parts)
+
+
 # NOTE: brokers/ and sources/ are deliberately NOT locked — extending them is
 # a supported use of self-edit. Order-placement code changes are still gated
 # by human diff-review; the wallet spend path is not, hence its lock above.
@@ -77,7 +98,7 @@ def _repo_files():
             rel = os.path.relpath(path, _repo())
             try:
                 if os.path.getsize(path) <= MAX_FILE_BYTES:
-                    with open(path) as f:
+                    with open(path, encoding="utf-8") as f:
                         out[rel] = f.read()
             except (OSError, UnicodeDecodeError):
                 continue
@@ -90,7 +111,7 @@ def enabled(cfg):
 
 def current():
     try:
-        with open(_proposal_path()) as f:
+        with open(_proposal_path(), encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
@@ -148,7 +169,8 @@ def propose(cfg, request):
                 "code style; the owner will review your diff before it applies. "
                 "FOUNDATION FILES ARE READ-ONLY and any change to them will be "
                 "rejected by the apply layer: agent.py, self_edit.py, "
-                "llm_policy.py, DISCLAIMER.md, SECURITY.md, install.sh, LICENSE "
+                "llm_policy.py, lightning_wallet.py, DISCLAIMER.md, SECURITY.md, "
+                "install.sh, install.ps1, LICENSE "
                 "— treat them as fixed context and design around them. "
                 "If the request is unsafe or impossible, return zero files and "
                 "say why in the explanation."),
@@ -167,8 +189,9 @@ def propose(cfg, request):
 
     changes, warnings = [], []
     for f in result.get("files", []):
-        rel = os.path.normpath(str(f.get("path", "")))
-        if (rel.startswith("..") or os.path.isabs(rel)
+        raw = str(f.get("path", ""))
+        rel = os.path.normpath(raw)
+        if (rel.startswith("..") or os.path.isabs(rel) or _illegal_name(raw)
                 or rel.split(os.sep)[0] in (".git", ".venv")
                 or any(part.startswith(".") for part in rel.split(os.sep))):
             return False, f"proposal rejected: illegal path {rel!r}"
@@ -176,7 +199,7 @@ def propose(cfg, request):
         new = str(f.get("content", ""))
         if old == new:
             continue
-        if rel in FOUNDATION:
+        if _is_foundation(rel):
             return False, (f"proposal rejected: {rel} is a FOUNDATION file — "
                            "the agent cannot rewrite its own consent gate, "
                            "safety rails, terms, or this self-edit governor. "
@@ -200,12 +223,35 @@ def propose(cfg, request):
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     os.makedirs(_home(), exist_ok=True)
-    with open(_proposal_path(), "w") as f:
+    with open(_proposal_path(), "w", encoding="utf-8") as f:
         json.dump(proposal, f, indent=1)
     n = len(changes)
     return True, (f"Proposal ready: {n} file(s) changed. Review the diff in "
                   "the dashboard panel, then Apply or Reject."
                   + (" " + " ".join(warnings) if warnings else ""))
+
+
+def _same_as_foundation(dst_real, repo_real):
+    """Filesystem-level backstop for _is_foundation: does `dst_real` resolve
+    to the same file as any FOUNDATION file (hard links, 8.3 short names)?"""
+    if not os.path.exists(dst_real):
+        return False
+    for f in FOUNDATION:
+        fp = os.path.join(repo_real, f)
+        try:
+            if os.path.exists(fp) and os.path.samefile(dst_real, fp):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _app_port():
+    try:
+        import webui
+        return webui.APP_PORT
+    except Exception:
+        return 8721
 
 
 def apply_and_restart(restart=True):
@@ -218,14 +264,15 @@ def apply_and_restart(restart=True):
     # Re-validate paths at apply time — never trust the stored proposal file.
     repo_real = os.path.realpath(_repo())
     for ch in prop.get("changes", []):
-        rel = os.path.normpath(str(ch.get("path", "")))
+        raw = str(ch.get("path", ""))
+        rel = os.path.normpath(raw)
         dst_real = os.path.realpath(os.path.join(repo_real, rel))
-        if (rel.startswith("..") or os.path.isabs(rel)
+        if (rel.startswith("..") or os.path.isabs(rel) or _illegal_name(raw)
                 or not dst_real.startswith(repo_real + os.sep)
                 or any(part.startswith(".") for part in rel.split(os.sep))):
             reject()
             return False, f"apply refused: illegal path {rel!r} (proposal discarded)"
-        if rel in FOUNDATION:
+        if _is_foundation(rel) or _same_as_foundation(dst_real, repo_real):
             reject()
             return False, (f"apply refused: {rel} is a FOUNDATION file "
                            "(proposal discarded)")
@@ -242,7 +289,7 @@ def apply_and_restart(restart=True):
                 bak = os.path.join(backup_dir, ch["path"])
                 os.makedirs(os.path.dirname(bak), exist_ok=True)
                 shutil.copy2(dst, bak)
-            with open(dst, "w") as f:
+            with open(dst, "w", encoding="utf-8") as f:
                 f.write(ch["content"])
             written.append(ch["path"])
         # compile-check every changed python file
@@ -265,8 +312,9 @@ def apply_and_restart(restart=True):
     if restart:
         def _restart():
             time.sleep(1.5)  # let the HTTP response flush
-            os.execv(sys.executable, [sys.executable,
-                                      os.path.join(_repo(), "agent.py"), "run"])
+            import platform_compat
+            platform_compat.restart_self([os.path.join(_repo(), "agent.py"),
+                                          "run"], _app_port())
         threading.Thread(target=_restart, daemon=True).start()
         return True, (f"Applied {len(written)} file(s) (backup: {backup_dir}). "
                       "Restarting with the new code — this page will reconnect "

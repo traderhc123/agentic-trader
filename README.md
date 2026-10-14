@@ -60,12 +60,20 @@ Your human pointed you at this repository to set them up. Follow
 
 ## 🧑 Quickstart
 
-One-liner — on a Mac/Linux desktop this is the whole setup: it installs
-(bootstrapping Python if needed) and **opens the browser setup wizard
+One-liner — on a Mac, Linux or Windows desktop this is the whole setup: it
+installs (bootstrapping Python if needed) and **opens the browser setup wizard
 automatically**. You still read and accept the agreement yourself in the page.
+
+Mac / Linux (Terminal):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | bash
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.ps1 | iex"
 ```
 
 (Headless server? It prints the tunnel command instead. Opt out of auto-launch
@@ -151,7 +159,7 @@ spend in this wallet. The Admin key is stored locally with `0600` perms.
 | `sources/` | Signal source adapters (`manual`, `url`, `agenthc`) — PRs welcome |
 | `brokers/` | Broker adapters: Robinhood agentic MCP, **Alpaca (paper/live)**, **moomoo (paper/live, via OpenD)** — more PRs welcome |
 | `lightning_wallet.py` | Built-in Lightning wallet (LNbits) for sats-priced sources |
-| `install.sh` | One-line installer (clone + venv + deps; never auto-consents) |
+| `install.sh` / `install.ps1` | One-line installer for Mac/Linux / Windows (clone + venv + deps; never auto-consents) |
 | `GETTING_STARTED.md` | Plain-English setup guide (local / home server / VPS / Docker) |
 | `SECURITY.md` | Security model: built-in rails, blast radii, threat notes |
 | `llm_policy.py` | Optional LLM policy brain (your rules, your API key, veto-only) |

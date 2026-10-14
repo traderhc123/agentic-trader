@@ -36,8 +36,9 @@ _TIMEOUT_S = 15
 def _write_private(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".rh_")
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w") as f:
+    if hasattr(os, "fchmod"):  # POSIX only; Windows relies on the user-profile ACL
+        os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     os.replace(tmp, path)
 
@@ -57,7 +58,7 @@ class RobinhoodMCP:
 
     def _load_tokens(self):
         try:
-            with open(self.token_path) as f:
+            with open(self.token_path, encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return None

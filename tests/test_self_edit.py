@@ -138,3 +138,26 @@ def test_repo_files_skips_hidden_git_and_pycache(sandbox):
     files = self_edit._repo_files()
     assert "module.py" in files and "brokers/alpaca.py" in files
     assert not any(p.startswith(".") or "__pycache__" in p for p in files)
+
+
+# ── case-insensitive / Windows name aliasing (Windows + stock macOS) ────────
+
+@pytest.mark.parametrize("alias", ["Agent.py", "AGENT.PY", "agent.py.",
+                                   "agent.py ", "agent.py::$DATA",
+                                   "agent.py:evil", "Install.PS1"])
+def test_apply_refuses_foundation_aliases(sandbox, alias):
+    repo, home = sandbox
+    _stage_proposal(home, [{"path": alias, "content": "pwned = True\n"}])
+    ok, msg = self_edit.apply_and_restart(restart=False)
+    assert not ok
+    assert "pwned" not in (repo / "agent.py").read_text()
+
+
+def test_is_foundation_and_illegal_name_helpers():
+    assert self_edit._is_foundation("Agent.py")
+    assert self_edit._is_foundation("install.ps1")
+    assert not self_edit._is_foundation("module.py")
+    assert self_edit._illegal_name("brokers/x.py:stream")
+    assert self_edit._illegal_name("C:evil.py")
+    assert self_edit._illegal_name("brokers./x.py")
+    assert not self_edit._illegal_name("brokers/new_broker.py")
