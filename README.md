@@ -123,19 +123,26 @@ at http://127.0.0.1:8721). Prefer terminal prompts to the browser? Use
 **Prerequisites:** Python 3.10+; a Robinhood account with an **Agentic
 account** (created during setup), **options approval on the Agentic
 account**, and funds you can afford to lose entirely. The `agenthc` source
-additionally needs prepaid market days (below) or a Premium API key.
+additionally needs prepaid signal days (below) or a Premium API key.
 
 ## 💰 Paying for the AgentHC feed
 
-The AgentHC feed costs **~$10 per market day, paid in bitcoin sats** (the sats
+The AgentHC feed costs **~$10 per signal day, paid in bitcoin sats** (the sats
 amount floats with Bitcoin's price). Two ways to pay:
 
-**Prepaid market days (recommended).** In the setup wizard's *Signal source*
-step, pick **5, 20 or 60 market days**. You get one Lightning invoice (QR
+**Prepaid signal days (recommended).** In the setup wizard's *Signal source*
+step, pick **5, 20 or 60 signal days**. You get one Lightning invoice (QR
 code) — pay it from the wallet you already use (Cash App, Strike, Phoenix,
-Alby, …) and the page confirms by itself. Weekends and market holidays don't
-count. The agent never holds money. When 2 market days are left you get a
-notification; buying more adds days after the ones you have.
+Alby, …) and the page confirms by itself. The agent never holds money.
+
+A day is only used when your agent actually **receives a trade signal — an
+entry or an exit — that day**; quiet days (no picks, or your agent was off)
+are free, and several signals in one day count once. With "main pick only"
+only main-pick signals use days; adding "other trades" uses days on those
+too. When your days run out, exit signals keep coming for 3 more market days
+so open positions can close. You're notified when 2 days are left; buying
+more carries unused days over. A pass is valid for at most about twice its
+length in market days.
 
 **Advanced: daily auto-pay from a wallet the agent controls.** The agent
 keeps an LNbits wallet and buys a 24-hour pass each market day (only when you

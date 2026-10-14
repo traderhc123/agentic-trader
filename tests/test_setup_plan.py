@@ -105,7 +105,7 @@ def test_cli_setup_from_lists_owner_steps(home, monkeypatch, tmp_path, capsys):
     assert exc.value.code == 0
     rep = json.loads(capsys.readouterr().out)
     owner = " ".join(rep["owner_steps"])
-    assert "Connect Robinhood" in owner and "buys market days" in owner
+    assert "Connect Robinhood" in owner and "buys signal days" in owner
     assert agent._load(agent.CONFIG_PATH)["dry_run"] is True
 
 

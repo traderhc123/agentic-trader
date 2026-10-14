@@ -445,7 +445,7 @@ def test_low_days_left_notifies_once_per_day(monkeypatch):
     state = {}
     agenthc.poll(_pass_cfg(), state, lambda s: None)
     agenthc.poll(_pass_cfg(), state, lambda s: None)
-    assert len(sent) == 1 and "2 market day" in sent[0]
+    assert len(sent) == 1 and "2 signal day" in sent[0]
 
 
 def test_unpaid_invoice_stops_waiting_after_it_expires(monkeypatch):
@@ -495,6 +495,43 @@ def test_buy_pass_sends_extend_token(monkeypatch):
 def test_pass_summary_lines():
     tid = agenthc._token_id(PASS_TOK)
     st = {"pass_status": {tid: {"status": "active", "until_ts": 1e10, "days_left": 7}}}
-    assert agenthc.pass_summary(_pass_cfg(), st) == "prepaid pass · 7 market day(s) left"
+    assert agenthc.pass_summary(_pass_cfg(), st) == "prepaid pass · 7 signal day(s) left"
     assert "waiting" in agenthc.pass_summary(_pass_cfg(), {})
     assert agenthc.pass_summary({"agenthc_api_key": "k"}, {}) == "Premium API key"
+
+
+def test_exits_only_pass_keeps_reading_exits_and_warns(monkeypatch):
+    """Days used up -> server serves exits only; the agent must KEEP polling
+    (or an open position would never see its exit) and tell the owner."""
+    srv = _PassServer(status="exits_only", days_left=0)
+    orig = srv.get
+
+    def get(url, params=None, headers=None, timeout=None):
+        r = orig(url, params, headers, timeout)
+        if not url.endswith("/pass"):
+            r._payload = {"events": [{"event": "EXITED", "ticker": "SPY",
+                                      "expiry": "2026-07-17", "strike": 600,
+                                      "type": "C", "occurred_at": "x"}],
+                          "pass_days_left": 0, "pass_exits_only": True}
+        return r
+    monkeypatch.setattr(agenthc.requests, "get", get)
+    sent = []
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: sent.append(text))
+    state = {}
+    events = agenthc.poll(_pass_cfg(), state, lambda s: None)
+    assert [e["event"] for e in events] == ["EXITED"]
+    assert len(sent) == 1 and "EXIT signals" in sent[0]
+    assert "used up" in agenthc.pass_summary(_pass_cfg(), state)
+
+
+def test_active_pass_preferred_over_exits_only_one(monkeypatch):
+    srv = _PassServer()
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    cfg = {"source": "agenthc", "feed_pass": {"token": "L402 OLD:paid"},
+           "feed_pass_pending": {"token": PASS_TOK}}
+    state = {"pass_status": {
+        agenthc._token_id("L402 OLD:paid"): {"status": "exits_only", "until_ts": 1e10}}}
+    agenthc.poll(cfg, state, lambda s: None)
+    used = [h["Authorization"] for u, h in srv.calls if u.endswith("day-trade-ideas")]
+    assert used == [PASS_TOK]

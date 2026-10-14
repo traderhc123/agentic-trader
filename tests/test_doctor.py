@@ -70,7 +70,7 @@ def test_doctor_counts_an_active_prepaid_pass(home, monkeypatch, capsys):
     checks = []
     agent._feed_access_check(cfg, {}, lambda *a, **k: checks.append((a, k)))
     (cid, ok, label, detail), _ = checks[0]
-    assert ok and "12 market day" in detail
+    assert ok and "12 signal day" in detail
 
 
 def test_doctor_unpaid_pass_is_an_owner_step(home, monkeypatch):

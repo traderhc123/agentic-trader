@@ -38,7 +38,10 @@ FEED_PATH = "/api/v1/trading/day-trade-ideas"
 
 
 PASS_PATH = FEED_PATH + "/pass"
-PASS_LOW_DAYS = 2               # warn when this many market days (or fewer) remain
+PASS_LOW_DAYS = 2               # warn when this many signal days (or fewer) remain
+# Server statuses that still read the feed: "exits_only" = days used up, but
+# exit signals keep coming for a few market days so open positions can close.
+_USABLE = ("active", "exits_only")
 _PENDING_RECHECK_S = 60         # status poll cadence while an invoice is unpaid
 _INVOICE_LIFETIME_S = 3600      # server invoices expire after 1h
 
@@ -48,9 +51,10 @@ class PassUnavailable(RuntimeError):
 
 
 def buy_pass(days, extend_token=None):
-    """Ask AgentHC for an invoice covering `days` market days. Returns the
-    server body (payment_request, pass_token, amount_sats, access_until…).
-    `extend_token` (a still-active pass) makes the new days start after it."""
+    """Ask AgentHC for an invoice covering `days` SIGNAL days — a market day
+    is only used when the agent is served an entry/exit that day. Returns the
+    server body (payment_request, pass_token, amount_sats, signal_days…).
+    `extend_token` (the current pass) carries its unused days over."""
     payload = {"days": int(days)}
     if extend_token:
         payload["extend"] = extend_token
@@ -70,7 +74,8 @@ def buy_pass(days, extend_token=None):
 
 
 def pass_status(token):
-    """{'status': pending|active|expired|invalid, 'access_until', 'trading_days_left'}."""
+    """{'status': pending|active|exits_only|used_up|superseded|expired|invalid,
+    'days_left', 'valid_until', …}."""
     resp = requests.get(f"{AGENTHC_API}{PASS_PATH}",
                         headers={"Authorization": token}, timeout=15)
     if resp.status_code == 401:
@@ -112,7 +117,7 @@ def _refresh_pass(cfg, state, save_state, force=False):
         stale = (force or st is None
                  or (st == "pending" and now - rec.get("checked", 0) > _PENDING_RECHECK_S
                      and now - rec.get("first_seen", now) < _INVOICE_LIFETIME_S + 300)
-                 or (st == "active" and now > rec.get("until_ts", 0)))
+                 or (st in _USABLE and now > rec.get("until_ts", 0)))
         if stale:
             try:
                 fresh = pass_status(token)
@@ -121,12 +126,15 @@ def _refresh_pass(cfg, state, save_state, force=False):
             if fresh is not None:
                 until_ts = _iso_ts(fresh.get("access_until"))
                 rec = {"status": fresh.get("status"), "until_ts": until_ts,
-                       "days_left": fresh.get("trading_days_left"),
+                       "days_left": fresh.get("days_left", fresh.get("trading_days_left")),
                        "checked": now, "first_seen": rec.get("first_seen", now)}
                 cache[tid] = rec
                 save_state(state)
-        if rec.get("status") == "active" and rec.get("until_ts", 0) > best_until:
-            best, best_until = token, rec["until_ts"]
+        if rec.get("status") in _USABLE:
+            # prefer a pass with days left over one in its exits-only grace
+            rank = rec.get("until_ts", 0) + (1e12 if rec.get("status") == "active" else 0)
+            if rank > best_until:
+                best, best_until = token, rank
     return best
 
 
@@ -308,8 +316,8 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
                 return []  # invoice shown, not paid yet — nothing to read
             _pass_notice(cfg, state, save_state, "pass_expired_notified",
                          "Your AgentHC feed pass has run out — the agent gets no "
-                         "signals until you buy more days (dashboard → Settings → "
-                         "Signal source).")
+                         "signals until you buy more signal days (dashboard → "
+                         "Settings → Signal source).")
             return []
         # else: fall through to the wallet's daily auto-pay
     # Skip the request entirely when access is impossible: no API key, no
@@ -360,17 +368,26 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
         raise RuntimeError(f"403 from feed: {str(detail)[:200]}")
     resp.raise_for_status()
     body = resp.json()
-    left = body.get("pass_trading_days_left")
-    if isinstance(left, int):
-        rec = state.setdefault("pass_status", {}).get(_token_id(token))
-        if rec is not None and rec.get("days_left") != left:
+    left = body.get("pass_days_left", body.get("pass_trading_days_left"))
+    exits_only = bool(body.get("pass_exits_only"))
+    rec = state.setdefault("pass_status", {}).get(_token_id(token))
+    if rec is not None:
+        new_status = "exits_only" if exits_only else "active"
+        if rec.get("days_left") != left or rec.get("status") != new_status:
             rec["days_left"] = left
+            rec["status"] = new_status
             save_state(state)
-        if left <= PASS_LOW_DAYS:
-            _pass_notice(cfg, state, save_state, "pass_low_notified",
-                         f"Your AgentHC feed pass has {left} market day(s) left — "
-                         "buy more days in the dashboard (Settings → Signal "
-                         "source); new days start after the current ones.")
+    if exits_only:
+        _pass_notice(cfg, state, save_state, "pass_used_up_notified",
+                     "Your AgentHC feed pass is used up — for a few more days "
+                     "the agent still gets EXIT signals (so open positions can "
+                     "close), but no new entries. Buy more signal days in the "
+                     "dashboard (Settings → Signal source).")
+    elif isinstance(left, int) and left <= PASS_LOW_DAYS:
+        _pass_notice(cfg, state, save_state, "pass_low_notified",
+                     f"Your AgentHC feed pass has {left} signal day(s) left — "
+                     "buy more in the dashboard (Settings → Signal source); "
+                     "unused days carry over.")
     return _parse_events(body)
 
 
@@ -381,12 +398,15 @@ def pass_summary(cfg, state):
     best = None
     for token in _pass_tokens(cfg):
         rec = (state.get("pass_status") or {}).get(_token_id(token)) or {}
-        if rec.get("status") == "active" and (best is None
-                                              or rec.get("until_ts", 0) > best.get("until_ts", 0)):
+        if rec.get("status") in _USABLE and (
+                best is None or (rec.get("status") == "active"
+                                 and best.get("status") != "active")):
             best = rec
+    if best and best.get("status") == "exits_only":
+        return "prepaid pass used up — exit signals only for a few days; buy more"
     if best:
         left = best.get("days_left")
-        return (f"prepaid pass · {left} market day(s) left" if left is not None
+        return (f"prepaid pass · {left} signal day(s) left" if left is not None
                 else "prepaid pass · active")
     if _pass_tokens(cfg):
         return "prepaid pass · waiting for payment or expired"

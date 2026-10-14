@@ -975,18 +975,26 @@ def _feed_access_check(cfg, state, check):
                 st = hc.pass_status(token)
             except Exception:
                 continue
-            if st.get("status") == "active":
+            if st.get("status") == "active" or (st.get("status") == "exits_only"
+                                                and best is None):
                 best = st
             elif st.get("status") == "pending":
                 pending = True
         if best:
+            if best.get("status") == "exits_only":
+                check("feed_access", False, "Feed access",
+                      "signal days used up — exit signals only for a few days",
+                      "the OWNER buys more signal days in the wizard (Signal source)",
+                      who="owner")
+                return
+            left = best.get("days_left", best.get("trading_days_left", "?"))
             check("feed_access", True, "Feed access",
-                  f"prepaid pass · {best.get('trading_days_left', '?')} market day(s) left")
+                  f"prepaid pass · {left} signal day(s) left")
             return
         check("feed_access", False, "Feed access",
               "pass invoice not paid yet" if pending else "prepaid pass expired",
               "the OWNER pays the invoice shown in the wizard (Signal source), "
-              "or buys more market days there", who="owner")
+              "or buys more signal days there", who="owner")
         return
     wallet = wallet_from_cfg(cfg)
     if wallet:
@@ -1001,8 +1009,8 @@ def _feed_access_check(cfg, state, check):
                   "python agent.py setup   (source step → recreate wallet)")
         return
     check("feed_access", False, "Feed access",
-          "nothing paid yet — the feed needs prepaid market days",
-          "the OWNER buys market days in the wizard (Signal source) and pays "
+          "nothing paid yet — the feed needs prepaid signal days",
+          "the OWNER buys signal days in the wizard (Signal source) and pays "
           "from their own wallet", who="owner")
 
 
