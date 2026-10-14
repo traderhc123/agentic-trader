@@ -35,6 +35,10 @@ Mon–Fri). It sleeps itself outside those hours. Pick one:
 | **An old computer / Mac mini / Raspberry Pi at home** | Set-and-forget, no monthly fee | Free |
 | **A tiny cloud server (VPS)** | Most reliable — always on, survives power cuts | ~$5/month |
 
+**Windows PCs:** fully supported — use the PowerShell line below. Keep the
+PC from sleeping during market hours (Settings → System → Power → Sleep:
+Never while plugged in), same as the laptop caveat.
+
 **Laptop caveat:** if the lid closes or it sleeps, the agent pauses. It
 catches up when it wakes (and refuses to act on entries older than 5
 minutes — a safety feature), but exits can be delayed. Fine for dry-run
@@ -51,6 +55,10 @@ button. Every decision and all day-to-day use happens in your browser.
 1. Open Terminal (Mac: Cmd-Space, type "Terminal") and paste:
    ```bash
    curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | bash
+   ```
+   **Windows:** press the Windows key, type "PowerShell", open it, and paste:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.ps1 | iex"
    ```
    That is the only command. The installer sets everything up (including a
    private Python if needed) and **the setup wizard opens in your browser
@@ -127,13 +135,16 @@ Full details: [SECURITY.md](SECURITY.md).
 ./.venv/bin/python agent.py doctor
 ```
 
+(Windows: `.\.venv\Scripts\python.exe agent.py doctor` — in every command in
+this guide, `./.venv/bin/python` becomes `.\.venv\Scripts\python.exe`.)
+
 checks everything (consent, source, wallet + balance, feed reachability,
 broker connection, notifications) and prints the exact command that fixes
 each ✗. Run it any time the agent isn't doing what you expect.
 
 **moomoo users**: the adapter talks to moomoo's local **OpenD** gateway —
 download it from moomoo.com → API, log in once, keep it running, and
-`.venv/bin/pip install moomoo-api`. `doctor` will tell you if either piece
+`.venv/bin/pip install moomoo-api` (Windows: `.venv\Scripts\pip.exe install moomoo-api`). `doctor` will tell you if either piece
 is missing. Paper (SIMULATE) is the default; live orders additionally need
 your trade password and options approval.
 

@@ -5,7 +5,7 @@ moomoo's API is gateway-based: you run their **OpenD** desktop/CLI program
 talks to it locally. Two prerequisites beyond config:
 
     1. OpenD running (default 127.0.0.1:11111)
-    2. the SDK:  .venv/bin/pip install moomoo-api
+    2. the SDK:  .venv/bin/pip install moomoo-api   (Windows: .venv\\Scripts\\pip.exe)
 
 Native PAPER MODE (moomoo "SIMULATE") is the default — real options trading
 requires options approval on the account plus your trade password to unlock
@@ -16,6 +16,8 @@ Orders are placed as marketable LIMIT at the ask (market orders on options
 are not reliably accepted through OpenD), qty from the same budget sizing as
 the other brokers.
 """
+
+import platform_compat
 
 _TIMEOUT = 15
 _DEFAULT_HOST = "127.0.0.1"
@@ -46,7 +48,8 @@ def _sdk():
         return moomoo
     except ImportError:
         raise RuntimeError(
-            "moomoo SDK not installed — run:  .venv/bin/pip install moomoo-api"
+            "moomoo SDK not installed — run:  "
+            f"{platform_compat.venv_pip()} install moomoo-api"
             "  (then make sure the OpenD gateway from moomoo.com/download is "
             "running and logged in)")
 
@@ -131,7 +134,8 @@ def verify(cfg):
 def setup(cfg):
     print("\n-- moomoo --")
     print("Needs the OpenD gateway (moomoo.com → API → download OpenD, log in)")
-    print("running on this machine, plus:  .venv/bin/pip install moomoo-api")
+    print("running on this machine, plus:  "
+          f"{platform_compat.venv_pip()} install moomoo-api")
     host = input(f"OpenD host [{_DEFAULT_HOST}]: ").strip() or _DEFAULT_HOST
     port = input(f"OpenD port [{_DEFAULT_PORT}]: ").strip()
     cfg["moomoo_host"] = host

@@ -29,7 +29,7 @@ def poll(cfg, state, save_state=lambda s: None):
     if not os.path.exists(path):
         return []
     events = []
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:

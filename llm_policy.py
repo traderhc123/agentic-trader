@@ -71,7 +71,7 @@ def policy_path():
 
 def policy_text():
     try:
-        with open(policy_path()) as f:
+        with open(policy_path(), encoding="utf-8") as f:
             return f.read().strip()
     except OSError:
         return ""
@@ -166,7 +166,7 @@ def setup(cfg):
     path = policy_path()
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(POLICY_TEMPLATE)
         print(f"Created {path} — edit it with your rules.")
     else:

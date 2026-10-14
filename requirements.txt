@@ -3,3 +3,6 @@ anthropic>=0.40
 # QR rendering for Lightning funding invoices in the wizard (fail-soft:
 # the wizard still works without it — copy button + lightning: link remain).
 qrcode>=7.4
+# Windows has no system timezone database; zoneinfo (US market hours) needs
+# this package there. Linux/macOS use the OS tz database.
+tzdata>=2024.1; sys_platform == "win32"
