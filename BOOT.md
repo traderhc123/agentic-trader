@@ -22,7 +22,60 @@ software enforces it.
    agent places real orders in their Robinhood Agentic account and how to stop
    it (Ctrl-C) — and that stopping leaves any open positions in their account.
 
-## Boot sequence
+## ⚠️ Where to install — read this if your code runs in a sandbox or the cloud
+
+Assistants like **Claude Cowork** run their own code in an isolated VM or in
+the cloud. **Do not install the agent there.** The agent must keep running
+all market day, and the human's browser must reach its wizard at
+`http://127.0.0.1:8721` — neither works from inside your sandbox, and the
+agent stops when your session does.
+
+Install on the **human's own computer** instead: open their terminal
+(PowerShell on Windows, Terminal on Mac/Linux) with your computer-use /
+on-screen tools — or ask them to — and paste the one-line installer:
+
+```text
+Windows (PowerShell):
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.ps1 | iex"
+
+Mac / Linux (Terminal):
+curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | bash
+```
+
+Then drive the wizard in **their** browser (e.g. Claude in Chrome). If you
+run directly on their computer already (Claude Code, a local agent), just
+run the installer yourself.
+
+## Fast path — the setup plan (recommended for assistants)
+
+Instead of clicking through every wizard page, collect the human's choices
+and apply them in one step. Order:
+
+1. **Install** (above). The wizard opens in their browser.
+2. **The human accepts the agreement themselves** in the wizard (rule 1).
+   Plans refuse to run before this.
+3. **Ask the human** for their choices — signal source, broker (and its API
+   keys, if Alpaca/moomoo), an AI key + model (optional, any provider),
+   per-trade size (rule 2: *their* number), daily caps, a notification
+   channel, and any plain-English policy rules. Write them to a plan file;
+   `python agent.py setup --example-plan` prints the format.
+4. **Apply**: `python agent.py setup --from plan.json --json`.
+   All-or-nothing — nothing is saved unless every part passes, including a
+   real test call to the AI model and the broker's own key check. Then
+   **delete the plan file** (it holds keys).
+5. **Hand the `owner_steps` to the human.** Plans can never do these; the
+   human does them in the wizard: log in to Robinhood (if chosen), buy and
+   pay for AgentHC market days from their own wallet (if the AgentHC feed),
+   and anything else listed.
+6. **Verify**: `python agent.py doctor --json` until `"ready": true`. Each
+   failing check says `"who": "owner"` or `"who": "agent"` — fix yours,
+   hand theirs over. Don't report setup as done before `ready` is true.
+7. **Start** it (wizard "Start my agent now", or `python agent.py run`) and
+   offer to make it start with the computer. It stays in **dry-run**: plans
+   cannot turn dry-run off — the human says `dry off` in the dashboard when
+   they decide to go live (rule 3).
+
+## Boot sequence (manual / terminal)
 
 ### Step 0 — environment
 
@@ -48,16 +101,19 @@ This walks through, in order:
    `agenthc` (the optional Agentic Day Trade Ideas journal feed). Explain the
    options neutrally; the choice is theirs. The AgentHC-specific steps below
    apply only when they pick `agenthc`.
-2. **AgentHC feed access (sats-based)** — the wizard offers two paths:
-   - **Lightning day-pass (default, recommended)**: the agent gets its own
-     LNbits wallet and auto-buys a ~$10/day pass (price floats with Bitcoin's
-     USD price). Help the human create an LNbits wallet (any instance, e.g.
-     demo.lnbits.com — README "Give your agent sats" has the steps), paste the
-     instance URL + wallet **Admin key**, then fund it: `python agent.py fund
-     50000` prints a Lightning invoice payable from any wallet or exchange.
-     Note the safety cap: the agent refuses to auto-pay invoices above
-     `max_autopay_sats` (default 30,000). Paying a day-pass invoice
-     constitutes acceptance of the feed terms (stated in the 402 response).
+2. **AgentHC feed access (sats-based)** — in the wizard's Signal source
+   step:
+   - **Prepaid market days (recommended)**: the human picks 5 / 20 / 60
+     market days and pays ONE Lightning invoice (QR code) from the wallet
+     they already use (Cash App, Strike, Phoenix…). ~$10 per market day,
+     priced in sats. The agent holds no money. You never pay it for them.
+     Paying constitutes acceptance of the feed terms (stated with the
+     invoice).
+   - **Advanced — daily auto-pay from an agent wallet**: an LNbits wallet the
+     agent controls buys a ~$10 day-pass each market day (only with
+     "Recurring day-pass" ON). The one-click wallet is on demo.lnbits.com, a
+     public test server — keep only a few days of passes there. Safety caps:
+     `max_autopay_sats` per invoice and `max_autopay_sats_per_day`.
    - **Premium API key**: registers a free key
      (`POST https://api.traderhc.com/api/v1/agents/register`), then upgrade to
      Premium with sats (`https://api.traderhc.com/docs`,

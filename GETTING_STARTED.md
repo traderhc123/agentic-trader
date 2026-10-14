@@ -9,9 +9,15 @@ responsibility, not investment advice.
 If you use **Claude** (or ChatGPT or any AI assistant that can run commands
 on your computer — e.g. the Claude desktop app with Claude Code):
 
-> Paste this to your AI assistant:
+> Paste this to your AI assistant (Claude Cowork, the Claude desktop app,
+> Claude Code, …):
 > **"Set me up with https://github.com/traderhc123/agentic-trader — follow
 > its BOOT.md"**
+>
+> It installs the agent on your computer, fills in everything you tell it,
+> and checks the result. You do four things yourself: accept the agreement,
+> log in to your broker, pay for the feed from your own wallet, and choose
+> your trade size.
 
 The assistant will install everything and walk you through setup step by
 step. Two things it will (correctly) make YOU do yourself: read and accept

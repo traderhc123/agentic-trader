@@ -48,6 +48,7 @@ FOUNDATION = frozenset({
     "webui.py",          # dashboard: dry-run toggle, updates, consent page
     "platform_compat.py",  # process launch/restart plumbing
     "llm_client.py",     # carries the AI key; the policy brain's only door
+    "setup_plan.py",     # enforces what an assistant may never set (go live…)
     "requirements.txt",  # what the Update button pip-installs
 })
 
