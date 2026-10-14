@@ -47,6 +47,7 @@ FOUNDATION = frozenset({
     "LICENSE",
     "webui.py",          # dashboard: dry-run toggle, updates, consent page
     "platform_compat.py",  # process launch/restart plumbing
+    "llm_client.py",     # carries the AI key; the policy brain's only door
     "requirements.txt",  # what the Update button pip-installs
 })
 
@@ -163,12 +164,9 @@ def propose(cfg, request):
     if not enabled(cfg):
         return False, ("Self-edit is off. Say 'self-edit on' first (you'll "
                        "approve every change as a diff before it applies).")
-    if not (cfg.get("anthropic_api_key") or os.getenv("ANTHROPIC_API_KEY")):
-        return False, "Connect your Anthropic API key first (Setup tab)."
-    try:
-        import anthropic
-    except ImportError:
-        return False, "pip install anthropic to enable self-edit."
+    import llm_client
+    if not llm_client.configured(cfg):
+        return False, "Connect an AI model first (Setup → Connect your AI)."
 
     files = _repo_files()
     corpus = "\n\n".join(f"===== {p} =====\n{c}" for p, c in sorted(files.items()))
@@ -186,46 +184,42 @@ def propose(cfg, request):
         "required": ["explanation", "files"],
         "additionalProperties": False,
     }
+    system = (
+        "You are the self-modification engine of agentic-trader, an "
+        "open-source autonomous trading agent, editing YOUR OWN source "
+        "tree at the owner's request. Rules: return the COMPLETE new "
+        "content for every file you change or create (never fragments); "
+        "change as little as possible; keep the consent gate, safety "
+        "rails, and fail-soft error handling intact; never weaken "
+        "DISCLAIMER.md or SECURITY.md protections; match the existing "
+        "code style; the owner will review your diff before it applies. "
+        "FOUNDATION FILES ARE READ-ONLY and any change to them will be "
+        "rejected by the apply layer: agent.py, self_edit.py, "
+        "llm_policy.py, llm_client.py, lightning_wallet.py, webui.py, "
+        "platform_compat.py, requirements.txt, DISCLAIMER.md, "
+        "SECURITY.md, install.sh, install.ps1, LICENSE, and every "
+        "EXISTING file in brokers/ and sources/ (you may ADD new "
+        "adapter files there and register them in __init__.py) "
+        "— treat them as fixed context and design around them. "
+        "If the request is unsafe or impossible, return zero files and "
+        "say why in the explanation.")
     try:
-        client = anthropic.Anthropic(api_key=cfg.get("anthropic_api_key") or None)
-        with client.messages.stream(
-            model=cfg.get("llm_model", "claude-opus-4-8"),
-            max_tokens=64000,
-            thinking={"type": "adaptive"},
-            system=(
-                "You are the self-modification engine of agentic-trader, an "
-                "open-source autonomous trading agent, editing YOUR OWN source "
-                "tree at the owner's request. Rules: return the COMPLETE new "
-                "content for every file you change or create (never fragments); "
-                "change as little as possible; keep the consent gate, safety "
-                "rails, and fail-soft error handling intact; never weaken "
-                "DISCLAIMER.md or SECURITY.md protections; match the existing "
-                "code style; the owner will review your diff before it applies. "
-                "FOUNDATION FILES ARE READ-ONLY and any change to them will be "
-                "rejected by the apply layer: agent.py, self_edit.py, "
-                "llm_policy.py, lightning_wallet.py, webui.py, "
-                "platform_compat.py, requirements.txt, DISCLAIMER.md, "
-                "SECURITY.md, install.sh, install.ps1, LICENSE, and every "
-                "EXISTING file in brokers/ and sources/ (you may ADD new "
-                "adapter files there and register them in __init__.py) "
-                "— treat them as fixed context and design around them. "
-                "If the request is unsafe or impossible, return zero files and "
-                "say why in the explanation."),
-            output_config={"format": {"type": "json_schema", "schema": schema}},
-            messages=[{"role": "user", "content":
-                       f"OWNER'S REQUEST:\n{request}\n\nCURRENT SOURCE TREE:\n"
-                       f"{corpus}"}],
-        ) as stream:
-            response = stream.get_final_message()
-        if response.stop_reason == "refusal":
+        result = llm_client.complete_json(
+            cfg, system,
+            f"OWNER'S REQUEST:\n{request}\n\nCURRENT SOURCE TREE:\n{corpus}",
+            schema, max_tokens=64000, long=True, timeout=900)
+    except llm_client.LLMError as exc:
+        if exc.reason == "refused":
             return False, "The model declined that request."
-        text = next(b.text for b in response.content if b.type == "text")
-        result = json.loads(text)
+        return False, f"proposal failed: {str(exc)[:200]}"
     except Exception as exc:
         return False, f"proposal failed: {str(exc)[:200]}"
 
+    files_out = result.get("files", [])
+    if not isinstance(files_out, list) or not all(isinstance(f, dict) for f in files_out):
+        return False, "proposal failed: the model's reply had no usable file list"
     changes, warnings = [], []
-    for f in result.get("files", []):
+    for f in files_out:
         raw = str(f.get("path", ""))
         rel = os.path.normpath(raw)
         if (rel.startswith("..") or os.path.isabs(rel) or _illegal_name(raw)

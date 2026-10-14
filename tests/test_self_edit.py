@@ -123,7 +123,7 @@ def test_propose_requires_enable_flag(sandbox):
 def test_propose_requires_api_key(sandbox, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     ok, msg = self_edit.propose({"self_edit_enabled": True}, "do a thing")
-    assert not ok and "key" in msg.lower()
+    assert not ok and "connect an ai model" in msg.lower()
 
 
 # ── source-tree scan ─────────────────────────────────────────────────────────

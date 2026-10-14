@@ -89,8 +89,8 @@ Agentic account has options approval and cash in it.
 The wizard asks about dry-run (default ON — keep it on for new users and say
 why), a daily entry cap, notifications (strongly encourage configuring at
 least one channel), and the optional LLM policy brain (plain-English rules in
-`~/.agentic-trader/policy.md`, checked with the human's own Anthropic API
-key; veto-only). Help the human write their policy rules if they enable it —
+`~/.agentic-trader/policy.md`, checked with the human's own AI API key — any
+provider, picked in the wizard's "Connect your AI" step; veto-only). Help the human write their policy rules if they enable it —
 the rules are theirs; you may translate their intent into clear bullet
 points but never invent rules they didn't express.
 

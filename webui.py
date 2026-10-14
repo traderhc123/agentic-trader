@@ -264,12 +264,37 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
 </section>
 
 <section id="s-llm"><h2>Connect your AI (recommended)</h2>
- <p class="muted">Your agent becomes a real AI agent with an Anthropic API key
- (pay-per-use, separate from a Claude subscription — console.anthropic.com).
- It powers the help chat, your plain-English trading policy, and the dashboard
- Q&A. Skippable; add it later any time.</p>
- <input type="password" id="llm-key" placeholder="sk-ant-…">
- <div class="navrow"><button onclick="doLLM()">Connect & continue</button>
+ <p class="muted">Any model works — Claude, ChatGPT/OpenAI, Grok, Gemini,
+ OpenRouter (hundreds of models with one key), DeepSeek, Mistral, Groq, or a
+ model running on this computer. It powers the help chat, your plain-English
+ trading policy and the dashboard Q&amp;A. It never places trades. Skippable.</p>
+ <label>1. Paste an API key</label>
+ <input type="password" id="llm-key" placeholder="sk-ant-…, sk-…, xai-…, AIza…, sk-or-…"
+  autocomplete="off" oninput="llmKeyTyped()" onkeydown="if(event.key==='Enter')llmFind()">
+ <p class="muted" style="margin:.3rem 0">The provider is detected from the key.
+ Need one? <a id="llm-keys-link" href="https://console.anthropic.com/settings/keys"
+ target="_blank" rel="noopener">Get a key ↗</a> · <b>Claude Max or Team plan?</b>
+ It includes monthly API credits — link them to a Claude Console organization
+ (claude.ai → your plan's API credits), then create a key there. Signing in
+ with a chat account (claude.ai, chatgpt.com) doesn't connect here; the API
+ key does. Keys stay on this computer.</p>
+ <details id="llm-adv"><summary class="muted">Provider / local model / custom endpoint</summary>
+  <select id="llm-provider" onchange="llmProviderChanged()"></select>
+  <input type="text" id="llm-base" placeholder="Endpoint URL (custom / local only)">
+  <p class="muted">Local models (Ollama, LM Studio) need no key — pick
+  "Local model", check the URL, then press Find models.</p>
+ </details>
+ <div class="navrow"><button onclick="llmFind()">Find models</button>
+ <span id="llm-find-msg"></span></div>
+ <div id="llm-pick" style="display:none">
+  <label>2. Pick a model</label>
+  <input type="text" id="llm-model" list="llm-models" autocomplete="off"
+   placeholder="start typing to filter">
+  <datalist id="llm-models"></datalist>
+  <p class="muted">Bigger models follow your trading policy more reliably;
+  any error or unclear answer from the model means the trade is skipped.</p>
+ </div>
+ <div class="navrow"><button id="llm-connect" onclick="doLLM()" style="display:none">Connect &amp; continue</button>
  <button class="back" onclick="skipLLM()">Skip for now</button>
  <span id="llm-msg"></span></div>
 </section>
@@ -391,7 +416,7 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
  checks before every entry; veto-only; uses YOUR Anthropic API key)</label>
  <textarea id="pol-text" rows="5"
   placeholder="- Never trade more than 2 new entries per day.&#10;- Skip puts.&#10;- Only tickers: SPY, QQQ, NVDA."></textarea>
- <input type="password" id="pol-key" placeholder="Anthropic API key (if not connected earlier)">
+ <input type="password" id="pol-key" placeholder="Claude API key (if you skipped Connect your AI — any other provider: use that step)">
  <div class="navrow"><button onclick="doSafety()">Finish setup</button>
  <span id="sf-msg"></span></div>
 </section>
@@ -581,11 +606,53 @@ async function doConsent(){
     :'<span class="err">'+r.error+'</span>';
   if(r.ok)done('s-consent');
 }
+let llmBusy=false, LLMP={};
+async function llmLoadProviders(){
+  const r=await api('/api/llm/providers');LLMP=r.providers||{};
+  const sel=document.getElementById('llm-provider');
+  sel.innerHTML='<option value="">— detect from key —</option>'+
+    Object.entries(LLMP).map(([id,p])=>'<option value="'+id+'">'+esc(p.name)+'</option>').join('');
+}
+function llmProviderChanged(){
+  const id=document.getElementById('llm-provider').value,p=LLMP[id];
+  if(p){document.getElementById('llm-base').value=(id==='custom'||id==='ollama')?p.base_url:'';
+    if(p.keys_url)document.getElementById('llm-keys-link').href=p.keys_url;}
+}
+function llmKeyTyped(){
+  // A pasted key arrives whole — look up its models without another click.
+  const v=document.getElementById('llm-key').value.trim();
+  if(!llmBusy&&v.length>=30)llmFind();
+}
+async function llmFind(){
+  if(llmBusy)return;llmBusy=true;
+  const msg=document.getElementById('llm-find-msg');msg.textContent=' checking key…';
+  try{
+    const r=await api('/api/llm/models',{key:document.getElementById('llm-key').value,
+      provider:document.getElementById('llm-provider').value,
+      base_url:document.getElementById('llm-base').value});
+    if(!r.ok){msg.innerHTML=' <span class="err">'+esc(r.error)+'</span>';
+      if(r.need_provider)document.getElementById('llm-adv').open=true;return;}
+    document.getElementById('llm-provider').value=r.provider;
+    msg.innerHTML=' <span class="ok">'+esc(LLMP[r.provider]?LLMP[r.provider].name:r.provider)+
+      ' ✓ — '+r.models.length+' models</span>';
+    document.getElementById('llm-models').innerHTML=r.models.map(m=>'<option value="'+esc(m)+'">').join('');
+    document.getElementById('llm-model').value=r.suggested||'';
+    document.getElementById('llm-pick').style.display='';
+    document.getElementById('llm-connect').style.display='';
+  }finally{llmBusy=false;}
+}
 async function doLLM(){
-  const r=await api('/api/llm',{key:document.getElementById('llm-key').value});
-  document.getElementById('llm-msg').innerHTML=r.ok?' <span class="ok">connected ✓</span>'
-    :' <span class="err">'+r.error+'</span>';
-  if(r.ok)done('s-llm');
+  if(llmBusy)return;llmBusy=true;
+  const msg=document.getElementById('llm-msg');msg.textContent=' testing the model…';
+  try{
+    const r=await api('/api/llm',{key:document.getElementById('llm-key').value,
+      provider:document.getElementById('llm-provider').value,
+      base_url:document.getElementById('llm-base').value,
+      model:document.getElementById('llm-model').value});
+    msg.innerHTML=r.ok?' <span class="ok">connected ✓ '+esc(r.describe||'')+'</span>'
+      :' <span class="err">'+esc(r.error)+'</span>';
+    if(r.ok){document.getElementById('llm-key').value='';done('s-llm');}
+  }finally{llmBusy=false;}
 }
 async function skipLLM(){done('s-llm');}
 let walletMade=false, balTimer=null;
@@ -655,6 +722,7 @@ async function doSource(){
     :'<span class="err">'+r.error+'</span>';
   if(r.ok)done('s-source');
 }
+llmLoadProviders();
 let BRK=[];
 async function loadBrokers(){
   const r=await api('/api/brokers');BRK=r.brokers||[];
@@ -1293,10 +1361,9 @@ def _restore_notes(cfg, acceptance=None):
         when = str(acceptance.get("accepted_at", ""))[:10]
         notes["consent"] = ("Agreement signed"
                             + (f" on {when}" if when else "") + " — on file")
-    if cfg.get("anthropic_api_key"):
-        notes["llm"] = ("AI connected — Anthropic key on file"
-                        + (f" · model {cfg['llm_model']}"
-                           if cfg.get("llm_model") else ""))
+    import llm_client
+    if llm_client.configured(cfg):
+        notes["llm"] = "AI connected — " + llm_client.describe(cfg)
     src = cfg.get("source")
     if src:
         detail = ""
@@ -1369,7 +1436,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "source": cfg.get("source"),
             "broker": _broker_display(cfg, pending["broker_last4"]),
             "rh_warning": pending["rh_warning"],
-            "llm": bool(cfg.get("anthropic_api_key")),
+            "llm": __import__("llm_client").configured(cfg),
             "sizing": bool(cfg.get("sizing_mode")),
             "safety": cfg.get("max_entries_per_day") is not None,
             "notes": _restore_notes(cfg, A._load(A.ACCEPTANCE_PATH, {})),
@@ -1438,26 +1505,72 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         save()
         return {"ok": True, "note": note}
 
-    def llm(_h, data):
+    def llm_providers(_h):
+        import llm_client
+        return {"providers": {pid: {"name": p["name"], "base_url": p["base_url"],
+                                    "keys_url": p["keys_url"]}
+                              for pid, p in llm_client.PROVIDERS.items()}}
+
+    def _llm_target(data):
+        import llm_client
         key = str(data.get("key", "")).strip()
-        if not key.startswith("sk-ant-"):
-            return {"ok": False, "error": "that doesn't look like an Anthropic key"}
+        pid = str(data.get("provider", "")).strip() or llm_client.detect_provider(key)
+        base = str(data.get("base_url", "")).strip()
+        if not pid:
+            return None, key, base, ("couldn't tell which provider that key is "
+                                     "for — pick it under Provider")
+        if pid not in llm_client.PROVIDERS:
+            return None, key, base, "unknown provider"
+        if not key and not llm_client.PROVIDERS[pid].get("no_key"):
+            return None, key, base, "paste an API key first"
+        if base and not llm_client.safe_base_url(base):
+            return None, key, base, ("the endpoint must be https:// (or this "
+                                     "computer: http://localhost)")
+        if pid == "custom" and not base:
+            return None, key, base, "enter the endpoint URL for a custom provider"
+        return pid, key, base, None
+
+    def llm_models(_h, data):
+        import llm_client
+        pid, key, base, err = _llm_target(data)
+        if err:
+            return {"ok": False, "error": err, "need_provider": pid is None}
         try:
-            import requests as _rq
-            r = _rq.get("https://api.anthropic.com/v1/models",
-                        headers={"x-api-key": key,
-                                 "anthropic-version": "2023-06-01"}, timeout=10)
-            if r.status_code == 401:
-                return {"ok": False, "error": "key rejected (401)"}
-            if r.status_code != 200:
-                return {"ok": False, "error": f"validation failed HTTP {r.status_code}"}
-        except Exception as exc:
-            return {"ok": False, "error": f"could not validate: {str(exc)[:100]}"}
-        cfg["anthropic_api_key"] = key
-        cfg.setdefault("llm_model", "claude-opus-4-8")
+            models = llm_client.list_models(pid, key, base or None)
+        except llm_client.LLMError as exc:
+            msg = {"auth": "the provider rejected that key — check it, or pick "
+                           "the right provider under Provider",
+                   "network": "couldn't reach the provider (check the URL / your "
+                              "connection)"}.get(exc.reason, str(exc)[:160])
+            return {"ok": False, "error": msg, "need_provider": exc.reason == "auth"}
+        if not models:
+            return {"ok": False, "error": "the provider listed no models for this key"}
+        return {"ok": True, "provider": pid, "models": models,
+                "suggested": llm_client.suggest_model(pid, models)}
+
+    def llm(_h, data):
+        import llm_client
+        pid, key, base, err = _llm_target(data)
+        if err:
+            return {"ok": False, "error": err}
+        model = str(data.get("model", "")).strip()
+        if not model:
+            return {"ok": False, "error": "pick a model"}
+        trial = {"llm_provider": pid, "llm_api_key": key, "llm_model": model}
+        if base:
+            trial["llm_base_url"] = base
+        try:  # one tiny real call: catches a typo'd model or a key without access
+            llm_client.complete(trial, "Reply with the word OK.", "ping",
+                                max_tokens=256, timeout=45)
+        except llm_client.LLMError as exc:
+            return {"ok": False, "error": f"that model didn't answer ({str(exc)[:140]})"}
+        for k in ("llm_provider", "llm_api_key", "llm_model", "llm_base_url",
+                  "anthropic_api_key"):
+            cfg.pop(k, None)
+        cfg.update(trial)
         cfg.setdefault("llm_fallback", "skip")
         save()
-        return {"ok": True}
+        return {"ok": True, "describe": llm_client.describe(cfg)}
 
     def deploy(_h, data):
         import provision
@@ -1754,9 +1867,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             with open(path, "w", encoding="utf-8") as f:
                 f.write(policy + "\n")
             key = str(data.get("anthropic_key", "")).strip()
-            if key:
-                cfg["anthropic_api_key"] = key
-            cfg.setdefault("llm_model", "claude-opus-4-8")
+            import llm_client
+            if key and not llm_client.configured(cfg):
+                pid = llm_client.detect_provider(key)
+                if pid == "anthropic":  # other providers need a model pick:
+                    cfg["llm_provider"] = pid          # use Connect your AI
+                    cfg["llm_api_key"] = key
             cfg.setdefault("llm_fallback", "skip")
         cfg["poll_seconds"] = int(cfg.get("poll_seconds", 30))
         save()
@@ -1823,6 +1939,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/brokers": brokers_list,
                     "/api/update/check": update_check,
                     "/api/wallet/quote": wallet_quote,
+                    "/api/llm/providers": llm_providers,
                     "/api/status": d_status, "/api/trades": d_trades,
                     "/api/proposal": proposal_get}
     def ask(_h, data):
@@ -1844,7 +1961,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/start-local": start_local,
                      "/api/wallet/create": wallet_create,
                      "/api/wallet/fund": wallet_fund,
-                     "/api/llm": llm, "/api/deploy": deploy,
+                     "/api/llm": llm, "/api/llm/models": llm_models,
+                     "/api/deploy": deploy,
                      "/api/update/pull": update_pull,
                      "/api/wallet/recurring": wallet_recurring,
                      "/api/broker/connect": broker_connect,
@@ -2028,20 +2146,14 @@ def pull_code_updates(expect=None):
 
 def _ask_llm(cfg, question, status_fields, trades, system=None):
     """Free-text Q&A about the agent's own state. Answer-only, never trades."""
+    import llm_client
+    if not llm_client.configured(cfg):
+        return ("Connect an AI model (Setup → Connect your AI) to enable Q&A — "
+                "Claude, OpenAI, Grok, Gemini, OpenRouter or a local model.")
     try:
-        import anthropic
-    except ImportError:
-        return ("I can answer questions if you add your Anthropic API key "
-                "(anthropic_api_key in config.json) and `pip install anthropic`.")
-    if not (cfg.get("anthropic_api_key") or __import__("os").getenv("ANTHROPIC_API_KEY")):
-        return ("Add your Anthropic API key (anthropic_api_key in config.json "
-                "or ANTHROPIC_API_KEY) to enable Q&A.")
-    try:
-        client = anthropic.Anthropic(api_key=cfg.get("anthropic_api_key") or None)
-        response = client.messages.create(
-            model=cfg.get("llm_model", "claude-opus-4-8"),
-            max_tokens=1024,
-            system=system or (
+        return llm_client.complete(
+            cfg,
+            system or (
                 "You are the status assistant embedded in the user's own "
                 "agentic-trader instance. Answer questions using ONLY the "
                 "status and trade-log data provided. You cannot place, "
@@ -2051,16 +2163,14 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "set cap N, stop). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
-            output_config={"effort": "low"},
-            messages=[{"role": "user", "content":
-                       f"STATUS:\n{json.dumps(status_fields, indent=1)}\n\n"
-                       f"RECENT TRADE LOG:\n{json.dumps(trades, indent=1)}\n\n"
-                       f"QUESTION: {question}"}],
-        )
-        if response.stop_reason == "refusal":
+            f"STATUS:\n{json.dumps(status_fields, indent=1)}\n\n"
+            f"RECENT TRADE LOG:\n{json.dumps(trades, indent=1)}\n\n"
+            f"QUESTION: {question}",
+            max_tokens=1024, effort="low")
+    except llm_client.LLMError as exc:
+        if exc.reason == "refused":
             return "I can't help with that one."
-        return next((b.text for b in response.content if b.type == "text"),
-                    "(no answer)")
+        return f"Q&A failed: {str(exc)[:150]}"
     except Exception as exc:
         return f"Q&A failed: {str(exc)[:150]}"
 
