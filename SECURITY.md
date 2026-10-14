@@ -22,7 +22,7 @@ you control, and what to check before running it.
 | **File permissions** | `~/.agentic-trader/` is `0700`; config (wallet admin key, API keys), `state.json` (day-pass token), the dashboard token and broker tokens are `0600`. On Windows the folder's inherited ACL is replaced with one granting only your user (via `icacls`). |
 | **Web UI localhost-only + login** | The combined setup wizard + dashboard (127.0.0.1:8721) binds localhost exclusively — nothing is exposed to the network; remote access requires an SSH tunnel. Every page and API call also requires a per-install secret (`~/.agentic-trader/ui_token`), handed to your browser once via the login link the agent prints/opens (`python agent.py link` prints it again) and kept in an HttpOnly cookie — other OS users and web pages can't drive it. (A program running as *your* user can read the token file, as it can any of your files.) The dashboard chat is a fixed command allowlist plus answer-only LLM Q&A; it cannot place trades. |
 | **Verified-source updates** | The Update button only pulls from github.com/traderhc123/agentic-trader (forks: set `AGENTIC_TRADER_UPDATE_REMOTE`), shows the incoming commit list first, and installs exactly the commit you reviewed — if anything new lands in between, nothing is installed. Fast-forward only, so local edits are never overwritten. |
-| **Self-edit — human merge gate** | Off by default (`self-edit on` to enable). The agent's LLM can WRITE changes to its own code, but nothing applies until the owner reviews the unified diff in the dashboard and clicks Apply; applies are backed up, compile-checked, and auto-rolled-back on failure; and a **FOUNDATION layer is immutable to the agent**: agent.py (consent gate + safety pipeline), self_edit.py (the governor itself), llm_policy.py, lightning_wallet.py, webui.py, platform_compat.py, requirements.txt, DISCLAIMER.md, SECURITY.md, install.sh, install.ps1, LICENSE, and every **existing** module in `brokers/` and `sources/` (the order and signal paths) can never be self-rewritten — the agent may only ADD new adapters there (registry edits are flagged in the review) — — enforced at both propose and apply time, case-insensitively and against Windows name aliasing (`Agent.py`, `agent.py.`, `agent.py:stream`). A prompt-injected proposal can only sit unapplied in a diff view, and can never target the foundation at all. |
+| **Self-edit — human merge gate** | Off by default (`self-edit on` to enable). The agent's LLM can WRITE changes to its own code, but nothing applies until the owner reviews the unified diff in the dashboard and clicks Apply; applies are backed up, compile-checked, and auto-rolled-back on failure; and a **FOUNDATION layer is immutable to the agent**: agent.py (consent gate + safety pipeline), self_edit.py (the governor itself), llm_policy.py, llm_client.py, lightning_wallet.py, webui.py, platform_compat.py, requirements.txt, DISCLAIMER.md, SECURITY.md, install.sh, install.ps1, LICENSE, and every **existing** module in `brokers/` and `sources/` (the order and signal paths) can never be self-rewritten — the agent may only ADD new adapters there (registry edits are flagged in the review) — — enforced at both propose and apply time, case-insensitively and against Windows name aliasing (`Agent.py`, `agent.py.`, `agent.py:stream`). A prompt-injected proposal can only sit unapplied in a diff view, and can never target the foundation at all. |
 | **HTTPS enforcement** | Custom feed URLs and wallet URLs must be HTTPS (or localhost) — signals and spend keys never travel cleartext. |
 
 ## What YOU control (read before going live)
@@ -37,8 +37,13 @@ you control, and what to check before running it.
   reset or go offline and its balance lost; the wizard, setup and `doctor`
   warn whenever you're on it. On a demo instance keep only a few days of
   passes; on your own/paid instance, ~a month of feed fees, nothing more.
-- **API keys**: the Anthropic key (policy brain) should be a dedicated key
-  with a spend limit set in the Anthropic console.
+- **API keys**: the AI key (policy brain / Q&A — any provider) should be a
+  dedicated key with a spend limit set in that provider's console. Keys are
+  only ever sent over HTTPS, or to a model on this computer (localhost).
+- **Model choice**: the policy brain is veto-only, and any error, refusal or
+  reply that isn't a clear JSON yes/no skips the trade. A weaker model can
+  still misread your policy or be swayed by text inside an event — the worst
+  case is the same as having no policy at all. Prefer a capable model.
 - **Machine hygiene**: anyone with access to `~/.agentic-trader/` has your
   wallet key and broker session. Run on a machine you control; full-disk
   encryption recommended; don't run on shared hosts.

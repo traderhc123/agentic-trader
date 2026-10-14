@@ -2,8 +2,9 @@
 
 The user writes plain-English rules in ~/.agentic-trader/policy.md ("skip
 puts", "stop after two losses in a day", "only tickers I've listed"). Before
-acting on an ENTERED event, the agent asks Claude (the USER'S own Anthropic
-API key) whether the event passes THE USER'S policy.
+acting on an ENTERED event, the agent asks the AI model the user connected
+(any provider — see llm_client.py; the USER'S own key) whether the event
+passes THE USER'S policy.
 
 Deliberate constraints:
   - VETO-ONLY. The LLM never picks trades, never sizes, never overrides the
@@ -16,9 +17,10 @@ Deliberate constraints:
     "skip" | "act"). No policy file configured -> pure mechanical mode,
     exactly as before.
 
-Uses the official Anthropic SDK. Model defaults to claude-opus-4-8 (a policy
-check is one small request per journal event — a few per day); set
-`llm_model` in config.json (e.g. "claude-haiku-4-5") to change it.
+Model: whatever the owner picked in "Connect your AI" (`llm_provider` +
+`llm_model` in config.json); Claude defaults to claude-opus-4-8. A policy
+check is one small request per journal event — a few per day. Any model
+error, refusal or unparseable verdict takes the fail-safe path.
 """
 
 import json
@@ -93,50 +95,38 @@ def evaluate(cfg, event, recent_trades):
         return {"act": True, "reason": "no policy configured (mechanical mode)"}
 
     fallback_act = str(cfg.get("llm_fallback", "skip")).lower() == "act"
+    tail = "acting per llm_fallback" if fallback_act else "skipping (fail-safe)"
 
-    try:
-        import anthropic
-    except ImportError:
+    import llm_client
+    if not llm_client.configured(cfg):
         return {"act": fallback_act,
-                "reason": "anthropic SDK not installed (pip install anthropic) — "
-                          + ("acting per llm_fallback" if fallback_act else "skipping fail-safe")}
-
+                "reason": "no AI model connected (Setup → Connect your AI) — " + tail}
+    user_msg = (
+        f"OWNER'S POLICY:\n{policy}\n\n"
+        f"CANDIDATE EVENT:\n{json.dumps(event, indent=1)}\n\n"
+        f"RECENT TRADE LOG (newest last):\n"
+        f"{json.dumps(recent_trades[-20:], indent=1)}"
+    )
     try:
-        client = anthropic.Anthropic(
-            api_key=cfg.get("anthropic_api_key") or None)  # None -> env/profile
-        user_msg = (
-            f"OWNER'S POLICY:\n{policy}\n\n"
-            f"CANDIDATE EVENT:\n{json.dumps(event, indent=1)}\n\n"
-            f"RECENT TRADE LOG (newest last):\n"
-            f"{json.dumps(recent_trades[-20:], indent=1)}"
-        )
-        response = client.messages.create(
-            model=cfg.get("llm_model", DEFAULT_MODEL),
-            max_tokens=1024,
-            system=_SYSTEM,
-            output_config={
-                "effort": "low",
-                "format": {"type": "json_schema", "schema": _VERDICT_SCHEMA},
-            },
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        if response.stop_reason == "refusal":
-            return {"act": fallback_act, "reason": "policy check refused — fail-safe"}
-        text = next(b.text for b in response.content if b.type == "text")
-        verdict = json.loads(text)
-        return {"act": bool(verdict["act"]), "reason": str(verdict["reason"])[:300]}
-    except anthropic.AuthenticationError:
-        return {"act": fallback_act,
-                "reason": "Anthropic API key invalid/missing — set anthropic_api_key "
-                          "in config.json or ANTHROPIC_API_KEY"}
-    except anthropic.RateLimitError:
-        return {"act": fallback_act, "reason": "policy check rate-limited — fail-safe"}
-    except anthropic.APIStatusError as exc:
-        return {"act": fallback_act, "reason": f"policy check API error {exc.status_code} — fail-safe"}
-    except anthropic.APIConnectionError:
-        return {"act": fallback_act, "reason": "policy check network error — fail-safe"}
+        verdict = llm_client.complete_json(cfg, _SYSTEM, user_msg, _VERDICT_SCHEMA,
+                                           max_tokens=1024, effort="low")
+    except llm_client.LLMError as exc:
+        what = {"auth": "AI key invalid/missing (Setup → Connect your AI)",
+                "rate_limited": "policy check rate-limited",
+                "network": "policy check network error",
+                "refused": "policy check refused",
+                "bad_output": "policy check gave an unreadable verdict"}.get(
+                    exc.reason, f"policy check failed ({str(exc)[:120]})")
+        return {"act": fallback_act, "reason": f"{what} — {tail}"}
     except Exception as exc:  # never let the brain crash the heartbeat
-        return {"act": fallback_act, "reason": f"policy check failed ({str(exc)[:120]}) — fail-safe"}
+        return {"act": fallback_act,
+                "reason": f"policy check failed ({str(exc)[:120]}) — {tail}"}
+    # Strict: only a real JSON boolean approves. Weaker models sometimes
+    # answer "true"/"yes" strings or omit the field — treat that as an error.
+    if not isinstance(verdict.get("act"), bool):
+        return {"act": fallback_act,
+                "reason": f"policy check gave no clear yes/no — {tail}"}
+    return {"act": verdict["act"], "reason": str(verdict.get("reason", ""))[:300]}
 
 
 POLICY_TEMPLATE = """\
@@ -158,7 +148,7 @@ POLICY_TEMPLATE = """\
 def setup(cfg):
     """Interactive wizard step for the policy brain."""
     print("\n-- Optional: LLM policy brain --")
-    print("Write plain-English rules the agent must check (with YOUR Anthropic")
+    print("Write plain-English rules the agent must check (with YOUR AI model's")
     print("API key) before acting on any entry event. Veto-only; your rules.")
     want = input("Enable the policy brain? [y/N]: ").strip().lower()
     if want != "y":
@@ -171,12 +161,43 @@ def setup(cfg):
         print(f"Created {path} — edit it with your rules.")
     else:
         print(f"Using existing {path}.")
-    if not (cfg.get("anthropic_api_key") or os.getenv("ANTHROPIC_API_KEY")):
-        key = input("Anthropic API key (blank to use ANTHROPIC_API_KEY env later): ").strip()
-        if key:
-            cfg["anthropic_api_key"] = key
-    cfg.setdefault("llm_model", DEFAULT_MODEL)
+    import llm_client
+    if not llm_client.configured(cfg):
+        cfg = connect_cli(cfg)
     cfg.setdefault("llm_fallback", "skip")
-    print(f"Policy brain on: model={cfg['llm_model']}, on error -> "
+    print(f"Policy brain on: {llm_client.describe(cfg)}, on error -> "
           f"{cfg['llm_fallback']} (fail-safe).")
+    return cfg
+
+
+def connect_cli(cfg):
+    """Terminal version of the wizard's "Connect your AI" step."""
+    import llm_client
+    key = input("AI API key (Claude, OpenAI, Grok, Gemini, OpenRouter, … — "
+                "blank for a local Ollama model): ").strip()
+    guess = llm_client.detect_provider(key) or ("ollama" if not key else "custom")
+    ids = list(llm_client.PROVIDERS)
+    print("Providers: " + ", ".join(ids))
+    pid = input(f"Provider [{guess}]: ").strip() or guess
+    if pid not in llm_client.PROVIDERS:
+        print("Unknown provider — skipped.")
+        return cfg
+    base = ""
+    if pid in ("custom", "ollama"):
+        base = input(f"Endpoint URL [{llm_client.PROVIDERS[pid]['base_url']}]: ").strip()
+    try:
+        models = llm_client.list_models(pid, key, base or None)
+    except llm_client.LLMError as exc:
+        print(f"Could not list models ({exc}) — type the model id yourself.")
+        models = []
+    default = llm_client.suggest_model(pid, models)
+    if models:
+        print(f"{len(models)} models available, e.g. " + ", ".join(models[:8]))
+    model = input(f"Model [{default}]: ").strip() or default
+    if not model:
+        print("No model chosen — skipped.")
+        return cfg
+    cfg.update({"llm_provider": pid, "llm_api_key": key, "llm_model": model})
+    if base:
+        cfg["llm_base_url"] = base
     return cfg

@@ -44,13 +44,17 @@ def test_enabled_iff_policy_file_nonempty(home):
 
 def test_sdk_missing_default_skips(policy, no_anthropic):
     """Error + policy configured -> the safe direction is NOT trading."""
-    v = llm_policy.evaluate({}, make_event(), [])
+    v = llm_policy.evaluate({"anthropic_api_key": "sk-ant-test"}, make_event(), [])
     assert v["act"] is False
 
 
 def test_sdk_missing_explicit_fallback_act(policy, no_anthropic):
-    v = llm_policy.evaluate({"llm_fallback": "act"}, make_event(), [])
+    v = llm_policy.evaluate({"llm_fallback": "act", "anthropic_api_key": "sk-ant-test"},
+                            make_event(), [])
     assert v["act"] is True
+
+
+CLAUDE = {"anthropic_api_key": "sk-ant-test"}   # pre-multi-provider config
 
 
 def _fake_anthropic(raises):
@@ -76,7 +80,7 @@ def test_evaluate_never_raises(policy, monkeypatch):
     """Whatever explodes inside, the heartbeat must survive."""
     monkeypatch.setitem(sys.modules, "anthropic",
                         _fake_anthropic(RuntimeError("kaboom")))
-    v = llm_policy.evaluate({}, make_event(), [])
+    v = llm_policy.evaluate(CLAUDE, make_event(), [])
     assert v["act"] is False  # skip fail-safe
     assert "kaboom" in v["reason"]
 
@@ -86,7 +90,7 @@ def test_evaluate_auth_error_reports_key_problem(policy, monkeypatch):
     fake.Anthropic = lambda **kw: (_ for _ in ()).throw(
         fake.AuthenticationError("bad key"))
     monkeypatch.setitem(sys.modules, "anthropic", fake)
-    v = llm_policy.evaluate({}, make_event(), [])
+    v = llm_policy.evaluate(CLAUDE, make_event(), [])
     assert v["act"] is False
     assert "key" in v["reason"].lower()
 

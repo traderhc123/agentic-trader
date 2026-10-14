@@ -21,10 +21,11 @@ the agreement, and log into Robinhood in your own browser. That's by design.
 > it up and can start it for you, but the agent itself is a small program
 > that runs on a computer you choose (below). It keeps running after you
 > close Claude, and it doesn't consume your Claude subscription. (The
-> optional "policy brain" feature uses a Claude **API key**. Claude Max and
+> optional "policy brain" feature uses an **AI API key** from any provider —
+> Claude, OpenAI, Grok, Gemini, OpenRouter, or a local model. Claude Max and
 > Team plans include monthly API credits you can link to a Claude Console
-> organization; otherwise the key is billed pay-as-you-go. Signing in with
-> claude.ai doesn't connect it — create a key in the Console.)
+> organization; otherwise keys are billed pay-as-you-go by the provider.
+> Signing in with a chat account doesn't connect it — create an API key.)
 
 ## Where should it run?
 

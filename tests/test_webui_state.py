@@ -35,7 +35,7 @@ def test_restore_notes_full_config():
     acc = {"accepted": True, "accepted_at": "2026-07-16T20:00:00+00:00"}
     n = webui._restore_notes(cfg, acc)
     assert n["consent"] == "Agreement signed on 2026-07-16 — on file"
-    assert "Anthropic key on file" in n["llm"] and "claude-opus-4-8" in n["llm"]
+    assert n["llm"] == "AI connected — Claude (Anthropic) · claude-opus-4-8"
     assert "Lightning wallet connected" in n["source"]
     assert "main + other trades" in n["source"]
     assert n["sizing"] == "Sizing saved: up to $500 per trade"
