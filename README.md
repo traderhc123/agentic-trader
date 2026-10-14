@@ -113,29 +113,32 @@ at http://127.0.0.1:8721). Prefer terminal prompts to the browser? Use
 **Prerequisites:** Python 3.10+; a Robinhood account with an **Agentic
 account** (created during setup), **options approval on the Agentic
 account**, and funds you can afford to lose entirely. The `agenthc` source
-additionally needs sats (below) or a Premium API key.
+additionally needs prepaid market days (below) or a Premium API key.
 
-## 💰 Give your agent sats (for sats-priced sources)
+## 💰 Paying for the AgentHC feed
 
-The AgentHC feed costs **~$10/day, paid in bitcoin sats** — the sats amount
-floats with Bitcoin's price. The agent pays this itself from a built-in
-Lightning wallet and receives a 24-hour access token; it re-buys
-automatically when the pass expires. Setup takes ~2 minutes:
+The AgentHC feed costs **~$10 per market day, paid in bitcoin sats** (the sats
+amount floats with Bitcoin's price). Two ways to pay:
 
-1. **Create an LNbits wallet** — on any LNbits instance (e.g.
-   <https://demo.lnbits.com>, another hosted instance, or your own server).
-2. **Get the Admin key** — wallet UI → *API info* → **Admin key** (it can
-   spend, which is what lets the agent pay invoices).
-3. **Tell the agent** — `python agent.py setup` asks for the instance URL and
-   Admin key, verifies the connection, and shows the balance.
-4. **Fund it** — `python agent.py fund 50000` prints a Lightning invoice for
-   50,000 sats; pay it from any Lightning wallet or exchange (Strike, Cash
-   App, Coinbase, Phoenix, Alby, Wallet of Satoshi, …). ~50k sats ≈ a month
-   of market days at $100k/BTC.
+**Prepaid market days (recommended).** In the setup wizard's *Signal source*
+step, pick **5, 20 or 60 market days**. You get one Lightning invoice (QR
+code) — pay it from the wallet you already use (Cash App, Strike, Phoenix,
+Alby, …) and the page confirms by itself. Weekends and market holidays don't
+count. The agent never holds money. When 2 market days are left you get a
+notification; buying more adds days after the ones you have.
 
-Safety rails: the agent never auto-pays an invoice above `max_autopay_sats`
-(default 30,000 — edit in `config.json`); keep only what you're willing to
-spend in this wallet. The Admin key is stored locally with `0600` perms.
+**Advanced: daily auto-pay from a wallet the agent controls.** The agent
+keeps an LNbits wallet and buys a 24-hour pass each market day (only when you
+turn *Recurring day-pass* ON). Set it up under *Advanced* in the wizard, or
+with `python agent.py setup` (instance URL + Admin key), then fund it with
+`python agent.py fund 50000`. ⚠️ The one-click wallet lives on
+demo.lnbits.com, a public test server that can be reset — keep only a few
+days of passes there, or use your own LNbits instance. Safety rails: never
+pays an invoice above `max_autopay_sats` (30,000) or more than
+`max_autopay_sats_per_day` in a day; the Admin key is stored with `0600`
+perms.
+
+A Premium AgentHC API key also works (*Advanced* in the wizard).
 
 ## How it works
 

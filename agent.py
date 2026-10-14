@@ -578,6 +578,16 @@ def cmd_setup():
     print("Start the heartbeat with: python agent.py run")
 
 
+def _feed_access(cfg, state):
+    try:
+        from sources import agenthc_day_trade_ideas as hc
+        line = hc.pass_summary(cfg, state)
+        notice = state.get("pass_notice")
+        return f"{line} — {notice}" if notice and "left" not in line else line
+    except Exception:
+        return "unknown"
+
+
 def _sizing_desc(cfg):
     if str(cfg.get("sizing_mode", "contracts")) == "budget":
         desc = f"${float(cfg.get('budget_per_trade_usd', 0) or 0):,.0f}/trade budget"
@@ -751,6 +761,8 @@ def cmd_run(app_window=False):
             "paused": webui.CONTROLS["paused"],
             "fields": {
                 "source": c.get("source"),
+                **({"feed access": _feed_access(c, st)}
+                   if c.get("source") == "agenthc" else {}),
                 "sizing": _sizing_desc(c),
                 "entries today": f"{_entries_today()} / cap {c.get('max_entries_per_day', 5)}",
                 "policy brain": "on" if llm_policy.enabled(c) else "off",

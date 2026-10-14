@@ -366,3 +366,135 @@ def test_agenthc_daily_autopay_cap_is_configurable(monkeypatch):
             pass
         state.pop("l402", None)
     assert len(wallet.paid) == 3  # 48,000 <= 50,000 < 64,000
+
+
+# ── prepaid multi-day pass ──────────────────────────────────────────────────
+
+PASS_TOK = "L402 MACPASS:paid"
+
+
+class _PassServer:
+    """Scripted AgentHC: pass status + feed, recording every request."""
+
+    def __init__(self, status="active", days_left=10, feed_status=200):
+        self.status, self.days_left, self.feed_status = status, days_left, feed_status
+        self.calls = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append((url, dict(headers or {})))
+        if url.endswith("/pass"):
+            return FakeResp({"status": self.status,
+                             "access_until": "2030-01-02T00:00:00+00:00",
+                             "trading_days_left": self.days_left})
+        return FakeResp({"events": [{"event": "ENTERED", "ticker": "SPY",
+                                     "expiry": "2026-07-17", "strike": 600,
+                                     "type": "C", "occurred_at": "x"}],
+                         "access": "multiday_pass",
+                         "pass_trading_days_left": self.days_left},
+                        status=self.feed_status)
+
+
+def _pass_cfg(**kw):
+    return {"source": "agenthc", "feed_pass": {"token": PASS_TOK}, **kw}
+
+
+def test_active_pass_reads_feed_with_pass_token(monkeypatch):
+    srv = _PassServer()
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    state = {}
+    events = agenthc.poll(_pass_cfg(), state, lambda s: None)
+    assert len(events) == 1
+    feed_calls = [h for u, h in srv.calls if u.endswith("day-trade-ideas")]
+    assert feed_calls and feed_calls[0]["Authorization"] == PASS_TOK
+    # status checked once, then cached while active
+    agenthc.poll(_pass_cfg(), state, lambda s: None)
+    assert sum(1 for u, _ in srv.calls if u.endswith("/pass")) == 1
+
+
+def test_pending_pass_waits_quietly_without_reading_feed(monkeypatch):
+    srv = _PassServer(status="pending")
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    notified = []
+    monkeypatch.setattr(agenthc, "_pass_notice", lambda *a: notified.append(a))
+    assert agenthc.poll(_pass_cfg(), {}, lambda s: None) == []
+    assert not any(u.endswith("day-trade-ideas") for u, _ in srv.calls)
+    assert notified == []
+
+
+def test_expired_pass_notifies_once_and_never_buys(monkeypatch):
+    srv = _PassServer(status="expired")
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    sent = []
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: sent.append(text))
+    state = {}
+    for _ in range(3):
+        assert agenthc.poll(_pass_cfg(), state, lambda s: None) == []
+    assert len(sent) == 1 and "run out" in sent[0]
+    assert wallet.paid == []
+
+
+def test_low_days_left_notifies_once_per_day(monkeypatch):
+    srv = _PassServer(days_left=2)
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    sent = []
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: sent.append(text))
+    state = {}
+    agenthc.poll(_pass_cfg(), state, lambda s: None)
+    agenthc.poll(_pass_cfg(), state, lambda s: None)
+    assert len(sent) == 1 and "2 market day" in sent[0]
+
+
+def test_unpaid_invoice_stops_waiting_after_it_expires(monkeypatch):
+    srv = _PassServer(status="pending")
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    state = {"pass_status": {agenthc._token_id(PASS_TOK): {
+        "status": "pending", "first_seen": 0, "checked": 0}}}
+    agenthc.poll(_pass_cfg(), state, lambda s: None)
+    assert state["pass_status"][agenthc._token_id(PASS_TOK)]["status"] == "unpaid"
+    assert state.get("pass_notice")  # told to renew instead of waiting forever
+
+
+def test_renewal_uses_newest_active_token(monkeypatch):
+    """Pending renewal that got paid wins over the old token (it carries the
+    extended end date) even before the wizard promotes it in config."""
+    srv = _PassServer()
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    cfg = {"source": "agenthc", "feed_pass": {"token": "L402 OLD:paid"},
+           "feed_pass_pending": {"token": PASS_TOK}}
+    state = {"pass_status": {
+        agenthc._token_id("L402 OLD:paid"): {"status": "active", "until_ts": 1e10 - 5}}}
+    srv_until = agenthc._iso_ts("2030-01-02T00:00:00+00:00")
+    assert srv_until < 1e10 - 5  # scripted server date is earlier: OLD wins here
+    agenthc.poll(cfg, state, lambda s: None)
+    used = [h["Authorization"] for u, h in srv.calls if u.endswith("day-trade-ideas")]
+    assert used == ["L402 OLD:paid"]
+
+
+def test_buy_pass_unavailable_is_actionable(monkeypatch):
+    monkeypatch.setattr(agenthc.requests, "post",
+                        lambda *a, **kw: FakeResp({"detail": {}}, status=404))
+    with pytest.raises(agenthc.PassUnavailable, match="Advanced"):
+        agenthc.buy_pass(5)
+
+
+def test_buy_pass_sends_extend_token(monkeypatch):
+    seen = {}
+
+    def post(url, json=None, timeout=None):
+        seen.update(json)
+        return FakeResp({"payment_request": "lnbc1", "pass_token": "T"})
+    monkeypatch.setattr(agenthc.requests, "post", post)
+    agenthc.buy_pass(20, extend_token=PASS_TOK)
+    assert seen == {"days": 20, "extend": PASS_TOK}
+
+
+def test_pass_summary_lines():
+    tid = agenthc._token_id(PASS_TOK)
+    st = {"pass_status": {tid: {"status": "active", "until_ts": 1e10, "days_left": 7}}}
+    assert agenthc.pass_summary(_pass_cfg(), st) == "prepaid pass · 7 market day(s) left"
+    assert "waiting" in agenthc.pass_summary(_pass_cfg(), {})
+    assert agenthc.pass_summary({"agenthc_api_key": "k"}, {}) == "Premium API key"

@@ -37,6 +37,122 @@ AGENTHC_API = os.getenv("AGENTHC_API", "https://api.traderhc.com")
 FEED_PATH = "/api/v1/trading/day-trade-ideas"
 
 
+PASS_PATH = FEED_PATH + "/pass"
+PASS_LOW_DAYS = 2               # warn when this many market days (or fewer) remain
+_PENDING_RECHECK_S = 60         # status poll cadence while an invoice is unpaid
+_INVOICE_LIFETIME_S = 3600      # server invoices expire after 1h
+
+
+class PassUnavailable(RuntimeError):
+    """The feed server isn't selling prepaid passes (yet)."""
+
+
+def buy_pass(days, extend_token=None):
+    """Ask AgentHC for an invoice covering `days` market days. Returns the
+    server body (payment_request, pass_token, amount_sats, access_until…).
+    `extend_token` (a still-active pass) makes the new days start after it."""
+    payload = {"days": int(days)}
+    if extend_token:
+        payload["extend"] = extend_token
+    resp = requests.post(f"{AGENTHC_API}{PASS_PATH}", json=payload, timeout=20)
+    if resp.status_code == 404:
+        raise PassUnavailable("Prepaid passes aren't on sale yet — use a "
+                              "Lightning wallet (Advanced) for now.")
+    if resp.status_code != 200:
+        try:
+            detail = resp.json().get("detail")
+        except ValueError:
+            detail = resp.text
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("error") or detail
+        raise RuntimeError(f"pass purchase failed ({resp.status_code}): {str(detail)[:160]}")
+    return resp.json()
+
+
+def pass_status(token):
+    """{'status': pending|active|expired|invalid, 'access_until', 'trading_days_left'}."""
+    resp = requests.get(f"{AGENTHC_API}{PASS_PATH}",
+                        headers={"Authorization": token}, timeout=15)
+    if resp.status_code == 401:
+        return {"status": "invalid"}
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _pass_tokens(cfg):
+    """Prepaid pass tokens from config, newest purchase first."""
+    out = []
+    for key in ("feed_pass_pending", "feed_pass"):
+        tok = (cfg.get(key) or {}).get("token")
+        if tok and tok not in out:
+            out.append(tok)
+    return out
+
+
+def _token_id(token):
+    import hashlib
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def _refresh_pass(cfg, state, save_state, force=False):
+    """Return the usable (active) pass token, checking the server only when
+    needed: pending invoices at most once a minute until they expire, active
+    passes only after their end time or when the feed refused them."""
+    cache = state.setdefault("pass_status", {})
+    now = time.time()
+    best, best_until = None, 0.0
+    for token in _pass_tokens(cfg):
+        tid = _token_id(token)
+        rec = cache.get(tid) or {}
+        st = rec.get("status")
+        if st == "pending" and now - rec.get("first_seen", now) > _INVOICE_LIFETIME_S + 300:
+            rec["status"] = st = "unpaid"   # invoice expired without payment
+            cache[tid] = rec
+            save_state(state)
+        stale = (force or st is None
+                 or (st == "pending" and now - rec.get("checked", 0) > _PENDING_RECHECK_S
+                     and now - rec.get("first_seen", now) < _INVOICE_LIFETIME_S + 300)
+                 or (st == "active" and now > rec.get("until_ts", 0)))
+        if stale:
+            try:
+                fresh = pass_status(token)
+            except Exception:
+                fresh = None
+            if fresh is not None:
+                until_ts = _iso_ts(fresh.get("access_until"))
+                rec = {"status": fresh.get("status"), "until_ts": until_ts,
+                       "days_left": fresh.get("trading_days_left"),
+                       "checked": now, "first_seen": rec.get("first_seen", now)}
+                cache[tid] = rec
+                save_state(state)
+        if rec.get("status") == "active" and rec.get("until_ts", 0) > best_until:
+            best, best_until = token, rec["until_ts"]
+    return best
+
+
+def _iso_ts(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pass_notice(cfg, state, save_state, key, text):
+    """Once-per-day notification (dashboard + Discord/ntfy/Telegram)."""
+    day = time.strftime("%Y-%m-%d")
+    if state.get(key) == day:
+        return
+    state[key] = day
+    state["pass_notice"] = text
+    save_state(state)
+    print(text)
+    try:
+        from notifications import notify
+        notify(cfg, text)
+    except Exception:
+        pass
+
+
 def _headers(cfg, state):
     if cfg.get("agenthc_api_key"):
         return {"X-API-Key": cfg["agenthc_api_key"]}
@@ -180,6 +296,22 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     shadow book — several entries a day; your daily entry cap and budget
     still apply per trade).
     """
+    # Prepaid multi-day pass (bought in the dashboard, paid from any wallet):
+    # takes precedence over the per-day wallet auto-pay.
+    if not cfg.get("agenthc_api_key") and _pass_tokens(cfg):
+        token = _refresh_pass(cfg, state, save_state)
+        if token:
+            return _poll_with_pass(cfg, state, save_state, token, _retried)
+        if not (cfg.get("lnbits_url") and cfg.get("day_pass_recurring")):
+            statuses = {r.get("status") for r in state.get("pass_status", {}).values()}
+            if "pending" in statuses:
+                return []  # invoice shown, not paid yet — nothing to read
+            _pass_notice(cfg, state, save_state, "pass_expired_notified",
+                         "Your AgentHC feed pass has run out — the agent gets no "
+                         "signals until you buy more days (dashboard → Settings → "
+                         "Signal source).")
+            return []
+        # else: fall through to the wallet's daily auto-pay
     # Skip the request entirely when access is impossible: no API key, no
     # live day-pass token, and buying one isn't allowed right now (recurring
     # OFF, or weekend). Every such GET makes the server mint a Lightning
@@ -210,8 +342,63 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             return []  # feed exists but isn't publishing yet — keep polling
         raise RuntimeError(f"403 from feed: {str(detail)[:200]}")
     resp.raise_for_status()
+    return _parse_events(resp.json())
+
+
+def _poll_with_pass(cfg, state, save_state, token, _retried):
+    track = "all" if cfg.get("include_other_trades") else "main"
+    resp = requests.get(f"{AGENTHC_API}{FEED_PATH}",
+                        params={"limit": 20, "track": track},
+                        headers={"Authorization": token}, timeout=15)
+    if resp.status_code in (401, 402) and not _retried:
+        _refresh_pass(cfg, state, save_state, force=True)  # ended/refused: recheck
+        return poll(cfg, state, save_state, _retried=True)
+    if resp.status_code == 403:
+        detail = resp.json().get("detail", {})
+        if isinstance(detail, dict) and detail.get("error") == "feed_not_live":
+            return []
+        raise RuntimeError(f"403 from feed: {str(detail)[:200]}")
+    resp.raise_for_status()
+    body = resp.json()
+    left = body.get("pass_trading_days_left")
+    if isinstance(left, int):
+        rec = state.setdefault("pass_status", {}).get(_token_id(token))
+        if rec is not None and rec.get("days_left") != left:
+            rec["days_left"] = left
+            save_state(state)
+        if left <= PASS_LOW_DAYS:
+            _pass_notice(cfg, state, save_state, "pass_low_notified",
+                         f"Your AgentHC feed pass has {left} market day(s) left — "
+                         "buy more days in the dashboard (Settings → Signal "
+                         "source); new days start after the current ones.")
+    return _parse_events(body)
+
+
+def pass_summary(cfg, state):
+    """One line for the dashboard: what feed access the agent has right now."""
+    if cfg.get("agenthc_api_key"):
+        return "Premium API key"
+    best = None
+    for token in _pass_tokens(cfg):
+        rec = (state.get("pass_status") or {}).get(_token_id(token)) or {}
+        if rec.get("status") == "active" and (best is None
+                                              or rec.get("until_ts", 0) > best.get("until_ts", 0)):
+            best = rec
+    if best:
+        left = best.get("days_left")
+        return (f"prepaid pass · {left} market day(s) left" if left is not None
+                else "prepaid pass · active")
+    if _pass_tokens(cfg):
+        return "prepaid pass · waiting for payment or expired"
+    if cfg.get("lnbits_url"):
+        return ("wallet auto-pay (recurring ON)" if cfg.get("day_pass_recurring")
+                else "wallet — recurring day-pass OFF")
+    return "no access configured"
+
+
+def _parse_events(body):
     events = []
-    for ev in resp.json().get("events", []):
+    for ev in body.get("events", []):
         if ev.get("event") not in ("ENTERED", "EXITED"):
             continue
         try:
