@@ -313,15 +313,18 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
   </select>
   <p class="muted">"Other trades" follows AgentHC's broader shadow journal; your
   daily entry cap and per-trade budget still apply to every signal.</p>
-  <label>Access — prepay market days</label>
+  <label>Access — prepay signal days</label>
   <p class="muted">One Lightning payment from the wallet you already use (Cash
-  App, Strike, Phoenix, Alby…) — ~$10 per market day, priced in sats.
-  Weekends and holidays don't count. Nothing to set up, and the agent never
-  holds money. Buying more later adds days after the ones you have.</p>
+  App, Strike, Phoenix, Alby…) — ~$10 per signal day, priced in sats. A day
+  is only used when your agent actually receives a trade signal (an entry or
+  an exit) that day; quiet days are free. "Main pick only" uses a day only
+  for main-pick signals; adding "other trades" (above) uses days on those
+  too. Unused days carry over when you buy more. The agent never holds
+  money.</p>
   <div class="navrow">
-   <button onclick="buyPass(5)">5 market days</button>
-   <button onclick="buyPass(20)">20 market days</button>
-   <button onclick="buyPass(60)">60 market days</button>
+   <button onclick="buyPass(5)">5 signal days</button>
+   <button onclick="buyPass(20)">20 signal days</button>
+   <button onclick="buyPass(60)">60 signal days</button>
   </div>
   <p id="pass-status" class="muted"></p>
   <div id="pass-box" style="display:none">
@@ -611,9 +614,9 @@ async function buyPass(days){
   if(!r.ok){st.innerHTML='<span class="err">'+esc(r.error)+'</span>';
     if(r.unavailable)document.getElementById('adv-wallet').open=true;return;}
   document.getElementById('pass-box').style.display='';
-  document.getElementById('pass-quote').textContent=days+' market days — '+
+  document.getElementById('pass-quote').textContent=days+' signal days — '+
     r.amount_sats.toLocaleString()+' sats'+(r.amount_usd?' (~$'+r.amount_usd+')':'')+
-    (r.extends?' · added after the days you already have':'');
+    (r.carried?' · plus '+r.carried+' unused day(s) carried over':'');
   renderQr(r.qr,'pass-qr');
   document.getElementById('pass-bolt11').textContent=r.bolt11;
   document.getElementById('pass-link').href='lightning:'+r.bolt11;
@@ -629,13 +632,14 @@ async function checkPass(){
     if(passTimer){clearInterval(passTimer);passTimer=null;}
     document.getElementById('pass-box').style.display='none';
     st.innerHTML='<span class="ok">Access active ✓ — '+(r.days_left??'?')+
-      ' market day(s) left</span>';
+      ' signal day(s) left</span>';
   }else if(r.status==='pending'){st.textContent='waiting for payment…';}
   else if(r.status==='unpaid'){
     if(passTimer){clearInterval(passTimer);passTimer=null;}
     document.getElementById('pass-box').style.display='none';
     st.innerHTML='<span class="err">That invoice expired unpaid — pick a pass again.</span>';
-  }else if(r.status==='expired'){st.innerHTML='<span class="err">Your pass has run out — buy more days above.</span>';}
+  }else if(r.status==='exits_only'){st.innerHTML='<span class="err">Your signal days are used up — exits still come through for a few days. Buy more above.</span>';}
+  else if(r.status==='expired'||r.status==='used_up'){st.innerHTML='<span class="err">Your pass has run out — buy more days above.</span>';}
 }
 function srcChanged(){
   const v=document.getElementById('src').value;
@@ -1748,7 +1752,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         return {"ok": True, "reply": "proposal rejected"}
 
     def pass_buy(_h, data):
-        """Invoice for N prepaid market days; the user pays from any wallet."""
+        """Invoice for N prepaid signal days; the user pays from any wallet."""
         if not A.consent_ok():
             return {"ok": False, "error": "accept the agreement first"}
         from sources import agenthc_day_trade_ideas as hc
@@ -1774,6 +1778,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "amount_sats": body.get("amount_sats"),
                 "amount_usd": body.get("amount_usd_approx"),
                 "extends": bool(body.get("extends_current_pass")),
+                "carried": body.get("carried_over_days") or 0,
                 "access_until": body.get("access_until")}
 
     def pass_status_route(_h):
@@ -1784,12 +1789,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         try:
             if pend:
                 st = hc.pass_status(pend["token"])
-                if st.get("status") == "active":
+                if st.get("status") in ("active", "exits_only"):
                     cfg["feed_pass"] = {**pend, "access_until": st.get("access_until")}
                     cfg.pop("feed_pass_pending", None)
                     save()
                     return {"ok": True, "status": "active",
-                            "days_left": st.get("trading_days_left"),
+                            "days_left": st.get("days_left", st.get("trading_days_left")),
                             "access_until": st.get("access_until")}
                 if st.get("status") == "pending":
                     if _t.time() - float(pend.get("bought_at") or 0) < 3600 + 300:
@@ -1803,7 +1808,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 return {"ok": True, "status": "none"}
             st = hc.pass_status(cur["token"])
             return {"ok": True, "status": st.get("status"),
-                    "days_left": st.get("trading_days_left"),
+                    "days_left": st.get("days_left", st.get("trading_days_left")),
                     "access_until": st.get("access_until")}
         except Exception as exc:
             return {"ok": False, "status": "error", "error": str(exc)[:160]}

@@ -65,7 +65,7 @@ and apply them in one step. Order:
    **delete the plan file** (it holds keys).
 5. **Hand the `owner_steps` to the human.** Plans can never do these; the
    human does them in the wizard: log in to Robinhood (if chosen), buy and
-   pay for AgentHC market days from their own wallet (if the AgentHC feed),
+   pay for AgentHC signal days from their own wallet (if the AgentHC feed),
    and anything else listed.
 6. **Verify**: `python agent.py doctor --json` until `"ready": true`. Each
    failing check says `"who": "owner"` or `"who": "agent"` — fix yours,
@@ -103,10 +103,13 @@ This walks through, in order:
    apply only when they pick `agenthc`.
 2. **AgentHC feed access (sats-based)** — in the wizard's Signal source
    step:
-   - **Prepaid market days (recommended)**: the human picks 5 / 20 / 60
-     market days and pays ONE Lightning invoice (QR code) from the wallet
-     they already use (Cash App, Strike, Phoenix…). ~$10 per market day,
-     priced in sats. The agent holds no money. You never pay it for them.
+   - **Prepaid signal days (recommended)**: the human picks 5 / 20 / 60
+     signal days and pays ONE Lightning invoice (QR code) from the wallet
+     they already use (Cash App, Strike, Phoenix…). ~$10 per signal day,
+     priced in sats; a day is only used when the agent receives an entry or
+     exit that day (quiet days free; "other trades" signals count only if
+     they chose main + other). The agent holds no money. You never pay it
+     for them.
      Paying constitutes acceptance of the feed terms (stated with the
      invoice).
    - **Advanced — daily auto-pay from an agent wallet**: an LNbits wallet the
