@@ -38,6 +38,8 @@ def repos(tmp_path, monkeypatch):
     _run(install, "config", "user.email", "t@t")
     _run(install, "config", "user.name", "t")
     monkeypatch.setattr(webui, "_repo_dir", lambda: str(install))
+    # the throwaway bare repo stands in for the official remote
+    monkeypatch.setenv("AGENTIC_TRADER_UPDATE_REMOTE", str(origin))
     return author, install
 
 
@@ -112,3 +114,38 @@ def test_install_requirements_failure_is_failsoft(tmp_path, monkeypatch):
     monkeypatch.setattr(webui, "_repo_dir", lambda: str(tmp_path))
     note = webui._install_requirements()
     assert "FAILED" in note and "pip install -r requirements.txt" in note
+
+
+def test_update_refuses_unrecognised_remote(repos, monkeypatch):
+    monkeypatch.delenv("AGENTIC_TRADER_UPDATE_REMOTE")
+    r = webui.check_code_updates()
+    assert not r["ok"] and "unrecognised remote" in r["error"]
+    ok, note = webui.pull_code_updates()
+    assert not ok and "unrecognised remote" in note
+
+
+def test_pull_installs_only_the_reviewed_commit(repos):
+    author, install = repos
+    (author / "f.txt").write_text("v2\n")
+    _run(author, "commit", "-am", "v2")
+    _run(author, "push", "origin", "main")
+    reviewed = webui.check_code_updates()["target"]
+    # something new lands on the remote after the user looked
+    (author / "f.txt").write_text("v3-unreviewed\n")
+    _run(author, "commit", "-am", "v3")
+    _run(author, "push", "origin", "main")
+    ok, note = webui.pull_code_updates(expect=reviewed)
+    assert not ok and "changed since you checked" in note
+    assert (install / "f.txt").read_text() == "v1\n"
+    fresh = webui.check_code_updates()["target"]
+    ok, _ = webui.pull_code_updates(expect=fresh)
+    assert ok and (install / "f.txt").read_text() == "v3-unreviewed\n"
+
+
+def test_remote_problem_accepts_official_urls(monkeypatch):
+    class R:
+        def __init__(self, out):
+            self.stdout = out
+    for url in webui.OFFICIAL_REMOTES:
+        monkeypatch.setattr(webui, "_git", lambda args, timeout=60, u=url: R(u + "\n"))
+        assert webui._remote_problem() is None

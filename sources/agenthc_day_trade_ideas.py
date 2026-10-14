@@ -90,6 +90,19 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
                   "events publish today — auto-buy resumes next market day.")
         return False
     if cfg.get("day_pass_recurring"):
+        spent = _autopay_spent_today(state, now)
+        cap = _daily_autopay_cap(cfg)
+        if spent["sats"] >= cap:
+            day = now.strftime("%Y-%m-%d")
+            if state.get("autopay_cap_notified") != day:
+                state["autopay_cap_notified"] = day
+                save_state(state)
+                print(f"Day-pass auto-pay STOPPED for today: already paid "
+                      f"{spent['sats']:,} sats ({spent['count']} pass(es)), "
+                      f"daily cap {cap:,} (max_autopay_sats_per_day). If a "
+                      "pass you paid for was rejected, contact the feed "
+                      "operator before raising the cap. Resumes tomorrow.")
+            return False
         return True
     day = time.strftime("%Y-%m-%d")
     if state.get("pass_needed_notified") != day:
@@ -99,6 +112,24 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
               "OFF — turn ON 'Recurring day-pass' in the wizard Source tab "
               "to let the agent buy it each day.")
     return False
+
+
+def _daily_autopay_cap(cfg):
+    """Total sats the agent may auto-pay per market day. Defaults to ONE
+    invoice's worth (max_autopay_sats): a healthy feed never needs a second
+    pass the same day, so a second purchase means something is wrong (e.g.
+    the server keeps rejecting a valid pass) — without this cap the agent
+    would re-buy on every poll and drain the wallet."""
+    per_invoice = int(cfg.get("max_autopay_sats", 30_000))
+    return int(cfg.get("max_autopay_sats_per_day", per_invoice))
+
+
+def _autopay_spent_today(state, now=None):
+    day = (now or _now_et()).strftime("%Y-%m-%d")
+    spent = state.get("autopay_spent") or {}
+    if spent.get("day") != day:
+        spent = {"day": day, "sats": 0, "count": 0}
+    return spent
 
 
 def _buy_day_pass(cfg, state, body, save_state):
@@ -119,6 +150,19 @@ def _buy_day_pass(cfg, state, body, save_state):
         raise RuntimeError(
             f"Day-pass costs {amount:,} sats which exceeds your auto-pay cap "
             f"({cap:,}). Raise max_autopay_sats in config.json if intended.")
+    spent = _autopay_spent_today(state)
+    daily_cap = _daily_autopay_cap(cfg)
+    if spent["sats"] + amount > daily_cap:
+        raise RuntimeError(
+            f"Day-pass ({amount:,} sats) would exceed today's auto-pay cap: "
+            f"{spent['sats']:,} of {daily_cap:,} sats already spent "
+            "(max_autopay_sats_per_day in config.json).")
+    # Count BEFORE paying: a payment that errors after the wallet already
+    # sent the sats must still consume the daily budget.
+    spent["sats"] += amount
+    spent["count"] += 1
+    state["autopay_spent"] = spent
+    save_state(state)
     print(f"Buying 24h day-pass: paying {amount:,} sats "
           "(terms accepted by payment — see `disclosure` in the 402 body) …")
     preimage = wallet.pay_invoice(invoice)

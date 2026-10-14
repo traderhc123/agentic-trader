@@ -111,6 +111,12 @@ def _quote_price(cfg, occ):
         return 0.0
 
 
+def mark_price(cl, cfg, event, side="buy"):
+    """Per-share quote for the agent's P&L estimate (0.0 when unavailable)."""
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    return _quote_price(cfg, _occ_symbol(event))
+
+
 def _size(cfg, occ):
     if str(cfg.get("sizing_mode", "contracts")) == "budget":
         budget = float(cfg.get("budget_per_trade_usd", 0) or 0)
@@ -126,7 +132,8 @@ def _size(cfg, occ):
             # No quote = no way to honor the budget; skipping beats silently
             # buying an unknown-priced contract (matches the robinhood adapter).
             return 0, "no quote available for budget sizing — skipped"
-    return max(1, int(cfg.get("contracts_per_trade", 1))), "fixed contract count"
+    return min(max(1, int(cfg.get("contracts_per_trade", 1))),
+               int(cfg.get("max_contracts_per_trade", 100))), "fixed contract count"
 
 
 _CONFIRM_TRIES = 3

@@ -150,6 +150,12 @@ def quote_price(rh, option_id, side="buy"):
     return _find_number(payload, keys)
 
 
+def mark_price(rh, cfg, event, side="buy"):
+    """Per-share quote for the agent's P&L estimate (0.0 when unavailable)."""
+    option_id = resolve_instrument(rh, event)
+    return quote_price(rh, option_id, side) if option_id else 0.0
+
+
 def _blackout_limit_price(rh, option_id, side):
     """Marketable-limit price (per share) during the opening blackout; None
     once market orders are allowed. Buys pay up to ask+5% (rounded up to a
@@ -193,7 +199,8 @@ def size_contracts(rh, cfg, option_id):
                        f"${budget:,.0f} per-trade budget — skipped")
         qty = min(qty, int(cfg.get("max_contracts_per_trade", 100)))
         return qty, f"${budget:,.0f} budget @ ~${price:.2f} → {qty} contract(s)"
-    return max(1, int(cfg.get("contracts_per_trade", 1))), "fixed contract count"
+    return min(max(1, int(cfg.get("contracts_per_trade", 1))),
+               int(cfg.get("max_contracts_per_trade", 100))), "fixed contract count"
 
 
 def _extract_order_id(result):

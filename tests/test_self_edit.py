@@ -81,12 +81,12 @@ def test_apply_rolls_back_on_syntax_error(sandbox):
     repo, home = sandbox
     _stage_proposal(home, [
         {"path": "module.py", "content": "VALUE = 2\n"},
-        {"path": "brokers/alpaca.py", "content": "def broken(:\n"},
+        {"path": "brokers/new_adapter.py", "content": "def broken(:\n"},
     ])
     ok, msg = self_edit.apply_and_restart(restart=False)
     assert not ok and "rolled back" in msg
     assert (repo / "module.py").read_text() == "VALUE = 1\n"
-    assert (repo / "brokers" / "alpaca.py").read_text() == "ORIGINAL = True\n"
+    assert not (repo / "brokers" / "new_adapter.py").exists()
 
 
 def test_apply_success_writes_backs_up_and_consumes(sandbox):
@@ -161,3 +161,30 @@ def test_is_foundation_and_illegal_name_helpers():
     assert self_edit._illegal_name("C:evil.py")
     assert self_edit._illegal_name("brokers./x.py")
     assert not self_edit._illegal_name("brokers/new_broker.py")
+
+
+# ── order/signal code lock ──────────────────────────────────────────────────
+
+@pytest.mark.parametrize("path", ["brokers/alpaca.py", "Brokers/Alpaca.py",
+                                  "webui.py", "requirements.txt"])
+def test_apply_refuses_existing_order_path_files(sandbox, path):
+    repo, home = sandbox
+    (repo / "webui.py").write_text("UI = 1\n")
+    (repo / "requirements.txt").write_text("requests\n")
+    _stage_proposal(home, [{"path": path, "content": "pwned = True\n"}])
+    ok, _msg = self_edit.apply_and_restart(restart=False)
+    assert not ok
+    assert (repo / "brokers" / "alpaca.py").read_text() == "ORIGINAL = True\n"
+    assert (repo / "webui.py").read_text() == "UI = 1\n"
+
+
+def test_apply_allows_new_broker_adapter_and_registry(sandbox):
+    repo, home = sandbox
+    (repo / "brokers" / "__init__.py").write_text("BROKERS = {}\n")
+    _stage_proposal(home, [
+        {"path": "brokers/tasty.py", "content": "NAME = 'tasty'\n"},
+        {"path": "brokers/__init__.py", "content": "BROKERS = {'tasty': 1}\n"},
+    ])
+    ok, _ = self_edit.apply_and_restart(restart=False)
+    assert ok
+    assert (repo / "brokers" / "tasty.py").exists()

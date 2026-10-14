@@ -327,3 +327,42 @@ def test_agenthc_api_key_still_polls(monkeypatch):
                         lambda *a, **kw: FakeResp({"events": [_feed_event()]}))
     events = agenthc.poll({"agenthc_api_key": "k"}, {}, save_state=lambda s: None)
     assert len(events) == 1
+
+
+def test_agenthc_daily_autopay_cap_stops_rebuy_loop(monkeypatch):
+    """A server that keeps rejecting a valid pass must not drain the wallet:
+    one pass per day by default, then polls go quiet until tomorrow."""
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    resp = FakeResp({"payment": {"payment_request": "lnbc1...",
+                                 "macaroon": "MAC",
+                                 "amount_sats": 16_000}}, status=402)
+    monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
+    cfg = {"day_pass_recurring": True, "max_autopay_sats": 30_000}
+    state = {}
+    for _ in range(20):  # 20 polls against a server that never honours the pass
+        try:
+            agenthc.poll(cfg, state, save_state=lambda s: None)
+        except Exception:
+            pass
+        state.pop("l402", None)  # as if the token were rejected/expired
+    assert wallet.paid == ["lnbc1..."]
+    assert state["autopay_spent"]["sats"] == 16_000
+
+
+def test_agenthc_daily_autopay_cap_is_configurable(monkeypatch):
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    resp = FakeResp({"payment": {"payment_request": "lnbc1...",
+                                 "macaroon": "MAC",
+                                 "amount_sats": 16_000}}, status=402)
+    monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
+    cfg = {"day_pass_recurring": True, "max_autopay_sats_per_day": 50_000}
+    state = {}
+    for _ in range(10):
+        try:
+            agenthc.poll(cfg, state, save_state=lambda s: None)
+        except Exception:
+            pass
+        state.pop("l402", None)
+    assert len(wallet.paid) == 3  # 48,000 <= 50,000 < 64,000

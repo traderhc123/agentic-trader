@@ -477,7 +477,7 @@ def test_moomoo_size_budget():
            "contracts_per_trade": 1, "max_contracts_per_trade": 25}
     assert moomoo._size(cfg, 2.50)[0] == 2
     assert moomoo._size(cfg, 6.00)[0] == 0          # 1 contract > budget
-    assert moomoo._size(cfg, 0.0)[0] == 1           # no quote -> fixed fallback
+    assert moomoo._size(cfg, 0.0)[0] == 0           # no quote -> skip, never guess
     assert moomoo._size({"contracts_per_trade": 3}, 2.5)[0] == 3
 
 
@@ -676,3 +676,21 @@ def test_alpaca_confirm_timeout_cancels_and_settles(monkeypatch):
                         type("R", (), {"status_code": 200})())
     assert _REAL_CONFIRM_FILL({}, "o1", 3) == 1
     assert cancels and cancels[0].endswith("/v2/orders/o1")
+
+
+@pytest.mark.parametrize("mod", ["alpaca", "moomoo"])
+def test_fixed_contract_sizing_is_capped(mod):
+    """Fixed-count mode honours max_contracts_per_trade like budget mode —
+    a typo like contracts_per_trade=1000 must not place 1000 contracts."""
+    import brokers
+    m = getattr(brokers, mod)
+    cfg = {"sizing_mode": "contracts", "contracts_per_trade": 1000}
+    arg = "OCC" if mod == "alpaca" else 2.5
+    assert m._size(cfg, arg)[0] == 100
+    assert m._size({**cfg, "max_contracts_per_trade": 5}, arg)[0] == 5
+
+
+def test_robinhood_fixed_contract_sizing_is_capped():
+    from brokers import robinhood
+    cfg = {"sizing_mode": "contracts", "contracts_per_trade": 1000}
+    assert robinhood.size_contracts(None, cfg, "opt")[0] == 100

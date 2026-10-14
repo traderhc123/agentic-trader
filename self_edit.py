@@ -45,7 +45,18 @@ FOUNDATION = frozenset({
     "install.sh",        # what new users pipe into bash
     "install.ps1",       # ...and the Windows twin piped into PowerShell
     "LICENSE",
+    "webui.py",          # dashboard: dry-run toggle, updates, consent page
+    "platform_compat.py",  # process launch/restart plumbing
+    "requirements.txt",  # what the Update button pip-installs
 })
+
+# Order-placement and signal code: EXISTING modules here are locked (a
+# proposal could otherwise change how orders are placed or strip the auto-pay
+# cap), but the agent may still ADD new adapters — a new file can't alter an
+# existing order path. The registries (__init__.py) stay editable so a new
+# adapter can be wired in; changes to them are flagged in the review panel.
+LOCKED_DIRS = ("brokers", "sources")
+_REGISTRY = "__init__.py"
 
 
 def _is_foundation(rel):
@@ -56,6 +67,29 @@ def _is_foundation(rel):
     norm = os.path.normcase(rel.rstrip(". "))
     return any(norm.casefold() == os.path.normcase(f).casefold()
                for f in FOUNDATION)
+
+
+def _locked_module(rel, repo):
+    """True for an EXISTING file under brokers/ or sources/ (except the
+    registries). Matches case-insensitively for Windows/macOS."""
+    parts = rel.replace("\\", "/").split("/")
+    if len(parts) < 2 or parts[0].casefold() not in LOCKED_DIRS:
+        return False
+    if parts[-1].casefold() == _REGISTRY:
+        return False
+    # Walk the tree case-insensitively: `Brokers/Alpaca.py` IS brokers/alpaca.py
+    # on Windows/macOS, so test against the real names, not os.path.exists.
+    cur = repo
+    for part in parts:
+        try:
+            match = next((e for e in os.listdir(cur)
+                          if e.casefold() == part.casefold()), None)
+        except OSError:
+            return False
+        if match is None:
+            return False
+        cur = os.path.join(cur, match)
+    return True
 
 
 def _illegal_name(rel):
@@ -169,8 +203,11 @@ def propose(cfg, request):
                 "code style; the owner will review your diff before it applies. "
                 "FOUNDATION FILES ARE READ-ONLY and any change to them will be "
                 "rejected by the apply layer: agent.py, self_edit.py, "
-                "llm_policy.py, lightning_wallet.py, DISCLAIMER.md, SECURITY.md, "
-                "install.sh, install.ps1, LICENSE "
+                "llm_policy.py, lightning_wallet.py, webui.py, "
+                "platform_compat.py, requirements.txt, DISCLAIMER.md, "
+                "SECURITY.md, install.sh, install.ps1, LICENSE, and every "
+                "EXISTING file in brokers/ and sources/ (you may ADD new "
+                "adapter files there and register them in __init__.py) "
                 "— treat them as fixed context and design around them. "
                 "If the request is unsafe or impossible, return zero files and "
                 "say why in the explanation."),
@@ -276,6 +313,10 @@ def apply_and_restart(restart=True):
             reject()
             return False, (f"apply refused: {rel} is a FOUNDATION file "
                            "(proposal discarded)")
+        if _locked_module(rel, repo_real):
+            reject()
+            return False, (f"apply refused: {rel} is an existing broker/source "
+                           "module (proposal discarded)")
 
     backup_dir = os.path.join(_home(), "backups",
                               time.strftime("%Y%m%d-%H%M%S", time.gmtime()))
