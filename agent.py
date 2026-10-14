@@ -16,6 +16,9 @@ Robinhood's trading MCP).
     python agent.py status   # config, wallet balance, open positions
     python agent.py doctor   # check EVERYTHING (config, wallet, feed, broker)
                              # and print the exact command to fix each problem
+                             # (--json: machine-readable, for AI assistants)
+    python agent.py setup --from plan.json   # apply an assistant-written plan
+                             # (everything except the owner's own steps)
     python agent.py fund N   # print a Lightning invoice to add N sats
     python agent.py link     # print the dashboard login link
 
@@ -885,34 +888,29 @@ def cmd_status():
     print(f"open positions   : {list(state.get('positions', {})) or 'none'}")
 
 
-def cmd_doctor():
-    """Check every dependency of a working agent; print the exact fix for
-    each failure. Exit 0 = ready to run, 1 = something needs attention."""
-    problems = []
+def doctor_checks():
+    """Every readiness check as data: [{id, label, ok, detail, fix, who}].
+    who = "owner" for steps only the human can do (agreement, Robinhood
+    login, paying, choosing size) — an assistant hands those to them."""
+    checks = []
 
-    def check(ok, label, detail="", fix=""):
-        mark = "✓" if ok else "✗"
-        line = f" {mark} {label}"
-        if detail:
-            line += f" — {detail}"
-        print(line)
-        if not ok:
-            if fix:
-                print(f"      fix: {fix}")
-            problems.append(label)
+    def check(cid, ok, label, detail="", fix="", who="agent"):
+        checks.append({"id": cid, "label": label, "ok": bool(ok), "detail": detail,
+                       "fix": "" if ok else fix, "who": who})
 
-    print("agentic-trader doctor\n")
-    check(sys.version_info >= (3, 10), "Python 3.10+",
+    check("python", sys.version_info >= (3, 10), "Python 3.10+",
           f"running {sys.version.split()[0]}",
-          "re-run install.sh (it installs a private Python 3.12 via uv)")
-    check(consent_ok(), "Consent accepted (DISCLAIMER.md)",
+          "re-run the installer (it installs a private Python 3.12 via uv)")
+    check("consent", consent_ok(), "Consent accepted (DISCLAIMER.md)",
           "" if consent_ok() else "nothing can run or trade without it",
-          "python agent.py setup   (or setup --web)")
+          "the OWNER reads and accepts it in the wizard: python agent.py setup --web",
+          who="owner")
 
     cfg = _load(CONFIG_PATH, {}) or {}
+    state = _load(STATE_PATH, {}) or {}
     src = cfg.get("source", "")
-    check(bool(src and src in SOURCES), "Signal source configured",
-          src or "unset", "python agent.py setup")
+    check("source", bool(src and src in SOURCES), "Signal source configured",
+          src or "unset", "python agent.py setup --from plan.json  (or the wizard)")
 
     if src == "agenthc":
         try:
@@ -925,65 +923,167 @@ def cmd_doctor():
             detail = f"HTTP {r.status_code}"
             if r.status_code == 402:
                 detail += " (free daily teaser already used — API is up)"
-            check(r.status_code in (200, 402), "AgentHC API reachable",
+            check("agenthc_api", r.status_code in (200, 402), "AgentHC API reachable",
                   detail, "check your internet connection / firewall")
         except Exception as exc:
-            check(False, "AgentHC API reachable", str(exc)[:80],
+            check("agenthc_api", False, "AgentHC API reachable", str(exc)[:80],
                   "check your internet connection / firewall")
-        wallet = wallet_from_cfg(cfg)
-        if cfg.get("agenthc_api_key"):
-            check(True, "Feed access", "Premium API key set")
-        elif wallet:
-            try:
-                bal = wallet.balance_sats()
-                check(bal >= 10_000, "Wallet funded",
-                      f"{bal:,} sats ({'~' + str(bal // 12_000) + ' more market day(s)' if bal >= 10_000 else 'below one ~$10 day-pass'})",
-                      "python agent.py fund 50000   (then pay the invoice)")
-            except WalletError as exc:
-                check(False, "Lightning wallet", str(exc)[:80],
-                      "python agent.py setup   (source step → recreate wallet)")
-            from lightning_wallet import demo_warning
-            warn = demo_warning(cfg.get("lnbits_url"))
-            if warn:
-                print(f"  ⚠️  Wallet host: {warn}")
-        else:
-            check(False, "Feed access",
-                  "no wallet and no Premium key — the feed cannot be paid for",
-                  "python agent.py setup   (source step)")
+        _feed_access_check(cfg, state, check)
 
     broker_name = cfg.get("broker", "")
     mod = BROKERS.get(broker_name)
     if mod is None:
-        check(False, "Broker configured", broker_name or "unset",
-              "python agent.py setup")
+        check("broker", False, "Broker configured", broker_name or "unset",
+              "python agent.py setup --from plan.json  (or the wizard)")
     elif hasattr(mod, "verify"):
         ok, msg = mod.verify(cfg)
-        check(ok, f"Broker: {broker_name}", msg,
-              "python agent.py setup   (broker step)")
+        check("broker", ok, f"Broker: {broker_name}", msg,
+              "fix the keys in the plan / wizard broker step")
     else:
         ok = mod.client(cfg) is not None
-        check(ok, f"Broker: {broker_name}",
+        check("broker", ok, f"Broker: {broker_name}",
               "authenticated" if ok else "not authenticated",
-              "python agent.py setup   (broker step)")
+              "the OWNER logs in: wizard → Broker → Connect Robinhood",
+              who="owner" if broker_name == "robinhood" else "agent")
+
+    # Informational, never a failure: unset sizing means 1 contract per
+    # trade — the conservative default. Only the owner changes it.
+    sized = bool(cfg.get("sizing_mode") or cfg.get("contracts_per_trade"))
+    check("sizing", True, "Position sizing",
+          _sizing_desc(cfg) + ("" if sized else " (default — only the owner changes it)"),
+          who="owner")
 
     notif = bool(cfg.get("discord_webhook_url") or cfg.get("ntfy_topic")
                  or cfg.get("telegram_bot_token"))
-    check(notif, "Notifications",
+    check("notifications", notif, "Notifications",
           "configured" if notif
           else "none set — you won't hear about trades or errors",
-          "python agent.py setup   (notifications step)")
+          "add one in the plan (notifications) or the wizard")
+    return checks, cfg
 
+
+def _feed_access_check(cfg, state, check):
+    if cfg.get("agenthc_api_key"):
+        check("feed_access", True, "Feed access", "Premium API key set")
+        return
+    from sources import agenthc_day_trade_ideas as hc
+    tokens = hc._pass_tokens(cfg)
+    if tokens:
+        best, pending = None, False
+        for token in tokens:
+            try:
+                st = hc.pass_status(token)
+            except Exception:
+                continue
+            if st.get("status") == "active":
+                best = st
+            elif st.get("status") == "pending":
+                pending = True
+        if best:
+            check("feed_access", True, "Feed access",
+                  f"prepaid pass · {best.get('trading_days_left', '?')} market day(s) left")
+            return
+        check("feed_access", False, "Feed access",
+              "pass invoice not paid yet" if pending else "prepaid pass expired",
+              "the OWNER pays the invoice shown in the wizard (Signal source), "
+              "or buys more market days there", who="owner")
+        return
+    wallet = wallet_from_cfg(cfg)
+    if wallet:
+        try:
+            bal = wallet.balance_sats()
+            check("feed_access", bal >= 10_000, "Wallet funded",
+                  f"{bal:,} sats ({'~' + str(bal // 12_000) + ' more market day(s)' if bal >= 10_000 else 'below one ~$10 day-pass'})",
+                  "python agent.py fund 50000   (the OWNER pays the invoice)",
+                  who="owner")
+        except WalletError as exc:
+            check("feed_access", False, "Lightning wallet", str(exc)[:80],
+                  "python agent.py setup   (source step → recreate wallet)")
+        return
+    check("feed_access", False, "Feed access",
+          "nothing paid yet — the feed needs prepaid market days",
+          "the OWNER buys market days in the wizard (Signal source) and pays "
+          "from their own wallet", who="owner")
+
+
+def cmd_doctor(as_json=False):
+    """Check every dependency of a working agent; print the exact fix for
+    each failure. Exit 0 = ready to run, 1 = something needs attention.
+    --json: machine-readable, for an assistant deciding whether setup is done."""
+    checks, cfg = doctor_checks()
+    failed = [c for c in checks if not c["ok"]]
+    mode = ("DRY-RUN" if cfg.get("dry_run", True) else "LIVE")
+    if as_json:
+        print(json.dumps({
+            "ready": not failed,
+            "mode": mode,
+            "checks": checks,
+            "owner_steps": [c["fix"] for c in failed if c["who"] == "owner"],
+            "agent_steps": [c["fix"] for c in failed if c["who"] == "agent"],
+        }, indent=2))
+        sys.exit(1 if failed else 0)
+    print("agentic-trader doctor\n")
+    for c in checks:
+        line = f" {'✓' if c['ok'] else '✗'} {c['label']}"
+        if c["detail"]:
+            line += f" — {c['detail']}"
+        print(line)
+        if not c["ok"] and c["fix"]:
+            print(f"      fix: {c['fix']}")
+    if cfg.get("source") == "agenthc" and cfg.get("lnbits_url"):
+        from lightning_wallet import demo_warning
+        warn = demo_warning(cfg.get("lnbits_url"))
+        if warn:
+            print(f"  ⚠️  Wallet host: {warn}")
     if "dry_run" not in cfg:
-        mode = "not set — setup defaults to DRY-RUN"
+        desc = "not set — setup defaults to DRY-RUN"
     elif cfg["dry_run"]:
-        mode = "DRY-RUN (safe — logs what it WOULD do)"
+        desc = "DRY-RUN (safe — logs what it WOULD do)"
     else:
-        mode = "LIVE ORDERS"
-    print(f"\nmode: {mode} | daily entry cap: {cfg.get('max_entries_per_day', 5)}")
-    if problems:
-        print(f"\n{len(problems)} problem(s): {', '.join(problems)}")
+        desc = "LIVE ORDERS"
+    print(f"\nmode: {desc} | daily entry cap: {cfg.get('max_entries_per_day', 5)}")
+    if failed:
+        print(f"\n{len(failed)} problem(s): {', '.join(c['label'] for c in failed)}")
         sys.exit(1)
     print("\nAll checks passed — python agent.py run")
+
+
+def cmd_setup_from(path, as_json=False):
+    """Apply an assistant-written plan (see setup_plan.py). All-or-nothing."""
+    import setup_plan
+    try:
+        plan = setup_plan.load_plan(path)
+    except (OSError, ValueError) as exc:
+        report = {"ok": False, "applied": [], "errors": [f"can't read plan: {exc}"],
+                  "owner_steps": []}
+        new = None
+    else:
+        cfg = _load(CONFIG_PATH, {}) or {}
+        new, report = setup_plan.apply(plan, cfg, consent_ok(), HOME)
+    if new is not None:
+        _save(CONFIG_PATH, new, private=True)
+        checks, _ = doctor_checks()
+        report["owner_steps"] = [c["fix"] for c in checks
+                                 if not c["ok"] and c["who"] == "owner"]
+        report["remaining_agent_steps"] = [c["fix"] for c in checks
+                                           if not c["ok"] and c["who"] == "agent"]
+    if as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        if report["ok"]:
+            print("Plan applied (dry-run stays ON):")
+            for a in report["applied"]:
+                print(f"  ✓ {a}")
+            if report["owner_steps"]:
+                print("\nStill needs the OWNER:")
+                for s_ in report["owner_steps"]:
+                    print(f"  → {s_}")
+            print("\nThe plan file holds keys — delete it now.")
+        else:
+            print("Plan NOT applied (nothing was changed):")
+            for e in report["errors"]:
+                print(f"  ✗ {e}")
+    sys.exit(0 if report["ok"] else 1)
 
 
 def cmd_fund(sats):
@@ -1023,6 +1123,15 @@ def main():
         if "--web" in sys.argv:
             import webui
             webui.run_wizard()
+        elif "--from" in sys.argv:
+            i = sys.argv.index("--from")
+            if i + 1 >= len(sys.argv):
+                print("Usage: python agent.py setup --from plan.json [--json]")
+                sys.exit(1)
+            cmd_setup_from(sys.argv[i + 1], as_json="--json" in sys.argv)
+        elif "--example-plan" in sys.argv:
+            import setup_plan
+            print(json.dumps(setup_plan.EXAMPLE_PLAN, indent=2))
         else:
             cmd_setup()
     elif cmd in ("run", "app"):
@@ -1030,7 +1139,7 @@ def main():
     elif cmd == "status":
         cmd_status()
     elif cmd == "doctor":
-        cmd_doctor()
+        cmd_doctor(as_json="--json" in sys.argv)
     elif cmd == "link":
         import webui
         print("Dashboard login link (keep it private — it unlocks the dashboard):")

@@ -33,14 +33,24 @@ heartbeat — entirely under your configuration and responsibility.
 Your human pointed you at this repository to set them up. Follow
 [BOOT.md](BOOT.md) exactly. The short version:
 
-1. Never skip or paraphrase the consent gate. Run `python agent.py setup` and
-   let the human read DISCLAIMER.md and type the acceptance phrase
-   themselves. Do not type it for them, ever.
-2. Help them pick a signal source and walk through broker auth (Robinhood
-   OAuth). When asked about position sizing, state that no party here is an
-   investment advisor and cannot advise sizing — the number is their decision.
-3. Start the heartbeat with `python agent.py run` and explain how to stop it
-   (Ctrl-C) and that open positions remain in their account afterwards.
+0. **Install on the human's own computer** — not inside your sandbox / VM /
+   cloud workspace (e.g. Claude Cowork): the agent must keep running and the
+   human's browser must reach its wizard. Open their terminal and paste the
+   one-line installer below.
+1. Never skip or paraphrase the consent gate. The human reads DISCLAIMER.md
+   and types the acceptance phrase themselves in the wizard. Do not type it
+   for them, ever.
+2. Collect their choices and apply them in one step:
+   `python agent.py setup --from plan.json --json` (format:
+   `python agent.py setup --example-plan`). All-or-nothing; it can never go
+   live, accept the agreement, log in to Robinhood or pay for them — it lists
+   those as `owner_steps` for the human. When asked about position sizing,
+   state that no party here is an investment advisor and cannot advise
+   sizing — the number is their decision.
+3. `python agent.py doctor --json` until `"ready": true`, then start it
+   (`python agent.py run`) and explain how to stop it (Ctrl-C) and that open
+   positions remain in their account afterwards. It stays in dry-run until
+   the human says `dry off`.
 
 **New to this / not technical? Start with [GETTING_STARTED.md](GETTING_STARTED.md)** — plain-English instructions for running it on your computer, a home machine, or a $5 cloud server, including how to have Claude set it all up for you.
 
