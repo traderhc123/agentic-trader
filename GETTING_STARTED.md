@@ -114,9 +114,13 @@ docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trad
 - **Max daily loss** (optional): set it in the wizard's Safety step or say
   `set max loss 300` in the dashboard — after an estimated $300 realized loss
   in a day, no new entries until tomorrow (exits still run).
-- **Day-pass spend cap**: the agent auto-pays at most one day-pass's worth of
-  sats per day (`max_autopay_sats_per_day`) — a misbehaving paywall can't
-  drain the wallet.
+- **Prepaid feed access**: for the AgentHC feed, buy 5/20/60 market days in
+  the wizard with one Lightning payment from the wallet you already use —
+  the agent holds no money. You're notified when 2 days are left; buying more
+  adds days after the current ones.
+- **Day-pass spend cap** (only if you chose the Advanced wallet auto-pay): at
+  most one day-pass's worth of sats per day (`max_autopay_sats_per_day`) — a
+  misbehaving paywall can't drain the wallet.
 - **Main pick only by default**: the AgentHC feed follows the single daily
   high-conviction pick unless you opt into "other trades" (the wider journal,
   several entries a day) during setup — or later via

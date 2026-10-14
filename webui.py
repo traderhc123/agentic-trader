@@ -313,8 +313,32 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
   </select>
   <p class="muted">"Other trades" follows AgentHC's broader shadow journal; your
   daily entry cap and per-trade budget still apply to every signal.</p>
-  <p class="muted">Pay-as-you-go: ~$10/day in sats, paid automatically from the
-  agent's own Lightning wallet.</p>
+  <label>Access — prepay market days</label>
+  <p class="muted">One Lightning payment from the wallet you already use (Cash
+  App, Strike, Phoenix, Alby…) — ~$10 per market day, priced in sats.
+  Weekends and holidays don't count. Nothing to set up, and the agent never
+  holds money. Buying more later adds days after the ones you have.</p>
+  <div class="navrow">
+   <button onclick="buyPass(5)">5 market days</button>
+   <button onclick="buyPass(20)">20 market days</button>
+   <button onclick="buyPass(60)">60 market days</button>
+  </div>
+  <p id="pass-status" class="muted"></p>
+  <div id="pass-box" style="display:none">
+   <p id="pass-quote"></p>
+   <div id="pass-qr" style="display:none;margin:.6rem 0"></div>
+   <pre id="pass-bolt11"></pre>
+   <p><button onclick="copyText('pass-bolt11','pass-copy-msg')">Copy invoice</button>
+   <span id="pass-copy-msg"></span>
+   <a id="pass-link" href="#">Open in my Lightning wallet app</a></p>
+   <p class="muted">Scan the QR with your phone's wallet, or copy the invoice
+   into any Lightning app. This page updates by itself once you pay (the
+   invoice is good for 1 hour).</p>
+  </div>
+  <details id="adv-wallet"><summary class="muted">Advanced: auto-pay each day
+  from a Lightning wallet the agent controls, or use an API key</summary>
+  <p class="muted">The agent pays ~$10 each market day from a wallet it holds
+  the keys to. Only for people who want hands-off daily payments.</p>
   <button onclick="makeWallet()">Create my agent's wallet for me</button>
   <span id="mw-msg"></span>
   <div id="fund-box" style="display:none">
@@ -340,10 +364,11 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
    <span class="muted">(scan the QR with your phone's wallet, or copy the
    invoice and paste it in any Lightning app — updates automatically after
    you pay)</span></p>
-   <p class="muted">Hosted wallet on demo.lnbits.com (custodial) — the agent
-   keeps only spending money here. Advanced: use your own instance below.</p>
+   <p class="muted">Hosted wallet on demo.lnbits.com — a public TEST server
+   (custodial; it can be reset). Keep only a few days of passes there, or use
+   your own instance below.</p>
   </div>
-  <details><summary class="muted">Advanced: my own wallet or API key</summary>
+   <p class="muted">Your own LNbits wallet:</p>
    <input type="text" id="ln-url" placeholder="LNbits instance URL (https://…)">
    <input type="password" id="ln-key" placeholder="LNbits wallet ADMIN key">
    <p class="muted">— or —</p>
@@ -554,11 +579,11 @@ async function toggleRecurring(){
   const r=await api('/api/wallet/recurring',{on:on});
   if(r.ok)setRecurBtn(r.on);
 }
-function renderQr(m){
+function renderQr(m,target){
   // Server sends the QR as a 0/1 module matrix; draw it as one SVG path.
   // No image bytes, no external assets — and the lightning: link stays as a
   // fallback for desktops that DO have a handler registered.
-  const box=document.getElementById('fund-qr');
+  const box=document.getElementById(target||'fund-qr');
   if(!m||!m.length){box.style.display='none';return;}
   const n=m.length;let d='';
   for(let y=0;y<n;y++)for(let x=0;x<m[y].length;x++)if(m[y][x])d+='M'+x+' '+y+'h1v1h-1z';
@@ -573,6 +598,45 @@ async function copyInvoice(){
   try{await navigator.clipboard.writeText(t);msg.textContent='copied ✓';}
   catch(e){msg.textContent='clipboard blocked — select the invoice text above and copy it';}
 }
+async function copyText(srcId,msgId){
+  const t=document.getElementById(srcId).textContent;
+  const msg=document.getElementById(msgId);
+  try{await navigator.clipboard.writeText(t);msg.textContent='copied ✓';}
+  catch(e){msg.textContent='clipboard blocked — select the invoice text above and copy it';}
+}
+let passTimer=null;
+async function buyPass(days){
+  const st=document.getElementById('pass-status');st.textContent='creating invoice…';
+  const r=await api('/api/pass/buy',{days:days});
+  if(!r.ok){st.innerHTML='<span class="err">'+esc(r.error)+'</span>';
+    if(r.unavailable)document.getElementById('adv-wallet').open=true;return;}
+  document.getElementById('pass-box').style.display='';
+  document.getElementById('pass-quote').textContent=days+' market days — '+
+    r.amount_sats.toLocaleString()+' sats'+(r.amount_usd?' (~$'+r.amount_usd+')':'')+
+    (r.extends?' · added after the days you already have':'');
+  renderQr(r.qr,'pass-qr');
+  document.getElementById('pass-bolt11').textContent=r.bolt11;
+  document.getElementById('pass-link').href='lightning:'+r.bolt11;
+  document.getElementById('pass-copy-msg').textContent='';
+  st.textContent='waiting for payment…';
+  if(passTimer)clearInterval(passTimer);
+  passTimer=setInterval(checkPass,3000);
+}
+async function checkPass(){
+  const r=await api('/api/pass/status');
+  const st=document.getElementById('pass-status');
+  if(r.status==='active'){
+    if(passTimer){clearInterval(passTimer);passTimer=null;}
+    document.getElementById('pass-box').style.display='none';
+    st.innerHTML='<span class="ok">Access active ✓ — '+(r.days_left??'?')+
+      ' market day(s) left</span>';
+  }else if(r.status==='pending'){st.textContent='waiting for payment…';}
+  else if(r.status==='unpaid'){
+    if(passTimer){clearInterval(passTimer);passTimer=null;}
+    document.getElementById('pass-box').style.display='none';
+    st.innerHTML='<span class="err">That invoice expired unpaid — pick a pass again.</span>';
+  }else if(r.status==='expired'){st.innerHTML='<span class="err">Your pass has run out — buy more days above.</span>';}
+}
 function srcChanged(){
   const v=document.getElementById('src').value;
   for(const k of ['agenthc','url','manual'])
@@ -586,7 +650,9 @@ async function boot(){
   if(st.llm){done('s-llm');restoredNote('s-llm',notes.llm||'AI connected');}
   if(st.source){done('s-source');restoredNote('s-source',notes.source||('Source saved: '+st.source));
     const sel=document.getElementById('src');sel.value=st.source;srcChanged();}
-  if(st.wallet&&st.wallet.connected)showWallet(st.wallet.page,'wallet connected ✓');
+  if(st.wallet&&st.wallet.connected){showWallet(st.wallet.page,'wallet connected ✓');
+    document.getElementById('adv-wallet').open=true;}
+  if(st.pass)checkPass();
   setRecurBtn(!!st.recurring);
   if(st.broker){done('s-broker');
     // numeric = Robinhood account last4; otherwise a key-based broker id
@@ -1446,6 +1512,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "page": cfg.get("lnbits_wallet_page", ""),
             },
             "recurring": bool(cfg.get("day_pass_recurring")),
+            "pass": bool(cfg.get("feed_pass") or cfg.get("feed_pass_pending")),
         }
 
     def consent(_h, data):
@@ -1497,11 +1564,17 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 cfg["lnbits_admin_key"] = str(data["lnbits_key"]).strip()
                 cfg.setdefault("max_autopay_sats", 30_000)
                 note = f"wallet connected ✓ balance {bal:,} sats"
+            elif cfg.get("feed_pass"):
+                note = "prepaid pass ✓"
+            elif cfg.get("feed_pass_pending"):
+                note = ("saved ✓ — the agent starts reading signals once your "
+                        "pass invoice is paid")
             elif cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"):
                 note = "using the wallet created above ✓"
             else:
                 return {"ok": False,
-                        "error": "create a wallet above, or provide your own / an API key"}
+                        "error": "buy a pass above (or, under Advanced, set up a "
+                                 "wallet or API key)"}
         save()
         return {"ok": True, "note": note}
 
@@ -1673,6 +1746,67 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         import self_edit
         self_edit.reject()
         return {"ok": True, "reply": "proposal rejected"}
+
+    def pass_buy(_h, data):
+        """Invoice for N prepaid market days; the user pays from any wallet."""
+        if not A.consent_ok():
+            return {"ok": False, "error": "accept the agreement first"}
+        from sources import agenthc_day_trade_ideas as hc
+        try:
+            days = int(data.get("days") or 0)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "pick 5, 20 or 60 days"}
+        current = (cfg.get("feed_pass") or {}).get("token")
+        try:
+            body = hc.buy_pass(days, extend_token=current)
+        except hc.PassUnavailable as exc:
+            return {"ok": False, "error": str(exc), "unavailable": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:200]}
+        import time as _t
+        cfg["source"] = "agenthc"
+        cfg["feed_pass_pending"] = {
+            "token": body["pass_token"], "days": days, "bought_at": _t.time(),
+            "access_until": body.get("access_until")}
+        save()
+        bolt11 = body["payment_request"]
+        return {"ok": True, "bolt11": bolt11, "qr": _qr_matrix(bolt11.upper()),
+                "amount_sats": body.get("amount_sats"),
+                "amount_usd": body.get("amount_usd_approx"),
+                "extends": bool(body.get("extends_current_pass")),
+                "access_until": body.get("access_until")}
+
+    def pass_status_route(_h):
+        """Pending purchase first (promote it once paid), else the current pass."""
+        from sources import agenthc_day_trade_ideas as hc
+        import time as _t
+        pend = cfg.get("feed_pass_pending")
+        try:
+            if pend:
+                st = hc.pass_status(pend["token"])
+                if st.get("status") == "active":
+                    cfg["feed_pass"] = {**pend, "access_until": st.get("access_until")}
+                    cfg.pop("feed_pass_pending", None)
+                    save()
+                    return {"ok": True, "status": "active",
+                            "days_left": st.get("trading_days_left"),
+                            "access_until": st.get("access_until")}
+                if st.get("status") == "pending":
+                    if _t.time() - float(pend.get("bought_at") or 0) < 3600 + 300:
+                        return {"ok": True, "status": "pending"}
+                cfg.pop("feed_pass_pending", None)  # expired unpaid / invalid
+                save()
+                if not cfg.get("feed_pass"):
+                    return {"ok": True, "status": "unpaid"}
+            cur = cfg.get("feed_pass")
+            if not cur:
+                return {"ok": True, "status": "none"}
+            st = hc.pass_status(cur["token"])
+            return {"ok": True, "status": st.get("status"),
+                    "days_left": st.get("trading_days_left"),
+                    "access_until": st.get("access_until")}
+        except Exception as exc:
+            return {"ok": False, "status": "error", "error": str(exc)[:160]}
 
     def wallet_create(_h, _data):
         if not A.consent_ok():
@@ -1940,6 +2074,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/update/check": update_check,
                     "/api/wallet/quote": wallet_quote,
                     "/api/llm/providers": llm_providers,
+                    "/api/pass/status": pass_status_route,
                     "/api/status": d_status, "/api/trades": d_trades,
                     "/api/proposal": proposal_get}
     def ask(_h, data):
@@ -1960,6 +2095,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/finish": finish, "/api/ask": ask,
                      "/api/start-local": start_local,
                      "/api/wallet/create": wallet_create,
+                     "/api/pass/buy": pass_buy,
                      "/api/wallet/fund": wallet_fund,
                      "/api/llm": llm, "/api/llm/models": llm_models,
                      "/api/deploy": deploy,
