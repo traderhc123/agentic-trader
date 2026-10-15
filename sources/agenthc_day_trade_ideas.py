@@ -18,9 +18,10 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import requests
+import requests  # noqa: F401  (tests stub requests.get/post; _http calls them)
 
 from lightning_wallet import wallet_from_cfg, wallet_setup
+from net_check import http as _http  # steps around a broken proxy setting
 
 MARKET_TZ = ZoneInfo("America/New_York")
 
@@ -50,6 +51,11 @@ class PassUnavailable(RuntimeError):
     """The feed server isn't selling prepaid passes (yet)."""
 
 
+class PassSizeUnavailable(RuntimeError):
+    """Passes are on sale, just not this many days (e.g. 1-day before the
+    server offers it)."""
+
+
 def buy_pass(days, extend_token=None):
     """Ask AgentHC for an invoice covering `days` SIGNAL days — a market day
     is only used when the agent is served an entry/exit that day. Returns the
@@ -58,10 +64,19 @@ def buy_pass(days, extend_token=None):
     payload = {"days": int(days)}
     if extend_token:
         payload["extend"] = extend_token
-    resp = requests.post(f"{AGENTHC_API}{PASS_PATH}", json=payload, timeout=20)
+    resp = _http.post(f"{AGENTHC_API}{PASS_PATH}", json=payload, timeout=20)
     if resp.status_code == 404:
         raise PassUnavailable("Prepaid passes aren't on sale yet — use a "
                               "Lightning wallet (Advanced) for now.")
+    if resp.status_code == 400:
+        try:
+            d = resp.json().get("detail") or {}
+        except ValueError:
+            d = {}
+        if isinstance(d, dict) and d.get("error") == "invalid_days":
+            sizes = ", ".join(str(n) for n in d.get("options") or [])
+            raise PassSizeUnavailable(f"{days}-day passes aren't on sale right now"
+                                  + (f" — pick {sizes} signal days." if sizes else "."))
     if resp.status_code != 200:
         try:
             detail = resp.json().get("detail")
@@ -76,7 +91,7 @@ def buy_pass(days, extend_token=None):
 def pass_status(token):
     """{'status': pending|active|exits_only|used_up|superseded|expired|invalid,
     'days_left', 'valid_until', …}."""
-    resp = requests.get(f"{AGENTHC_API}{PASS_PATH}",
+    resp = _http.get(f"{AGENTHC_API}{PASS_PATH}",
                         headers={"Authorization": token}, timeout=15)
     if resp.status_code == 401:
         return {"status": "invalid"}
@@ -173,7 +188,7 @@ def _headers(cfg, state):
 def register_key():
     name = input("Name for your agent on AgentHC (e.g. my-trade-agent): ").strip() \
         or "agentic-trader"
-    resp = requests.post(f"{AGENTHC_API}/api/v1/agents/register",
+    resp = _http.post(f"{AGENTHC_API}/api/v1/agents/register",
                          json={"name": name}, timeout=15)
     resp.raise_for_status()
     body = resp.json()
@@ -185,7 +200,7 @@ def register_key():
 
 
 def accept_terms(cfg):
-    resp = requests.post(f"{AGENTHC_API}{FEED_PATH}/accept-terms",
+    resp = _http.post(f"{AGENTHC_API}{FEED_PATH}/accept-terms",
                          headers={"X-API-Key": cfg["agenthc_api_key"]}, timeout=15)
     resp.raise_for_status()
     body = resp.json()
@@ -329,7 +344,7 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     if not _headers(cfg, state) and not _pass_purchase_allowed(cfg, state, save_state):
         return []
     track = "all" if cfg.get("include_other_trades") else "main"
-    resp = requests.get(f"{AGENTHC_API}{FEED_PATH}",
+    resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
                         params={"limit": 20, "track": track},
                         headers=_headers(cfg, state), timeout=15)
     if resp.status_code == 402 and not _retried:
@@ -355,7 +370,7 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
 
 def _poll_with_pass(cfg, state, save_state, token, _retried):
     track = "all" if cfg.get("include_other_trades") else "main"
-    resp = requests.get(f"{AGENTHC_API}{FEED_PATH}",
+    resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
                         params={"limit": 20, "track": track},
                         headers={"Authorization": token}, timeout=15)
     if resp.status_code in (401, 402) and not _retried:

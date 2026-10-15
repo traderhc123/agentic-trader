@@ -103,7 +103,7 @@ This walks through, in order:
    apply only when they pick `agenthc`.
 2. **AgentHC feed access (sats-based)** — in the wizard's Signal source
    step:
-   - **Prepaid signal days (recommended)**: the human picks 5 / 20 / 60
+   - **Prepaid signal days (recommended)**: the human picks 1 / 5 / 20 / 60
      signal days and pays ONE Lightning invoice (QR code) from the wallet
      they already use (Cash App, Strike, Phoenix…). ~$10 per signal day,
      priced in sats; a day is only used when the agent receives an entry or

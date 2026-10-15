@@ -192,11 +192,11 @@ def diagnose(host=HOST, timeout=8):
     try:
         ips = _resolve(host)
     except OSError as exc:
-        return _result(False, "dns_failed",
+        return _with_proxy_note(_result(False, "dns_failed",
                        f"this computer can't look up {host} ({exc})",
                        "Check the internet connection. If other websites work, "
                        "a DNS filter is blocking this address — set your DNS to "
-                       "1.1.1.1 or try a phone hotspot.")
+                       "1.1.1.1 or try a phone hotspot."), host)
     bad = [ip for ip in ips if _suspicious_ip(ip)]
     if bad:
         return _result(False, "dns_blocked",
@@ -219,7 +219,21 @@ def diagnose(host=HOST, timeout=8):
     ip = ips[0]
     diag = _connect(host, ip, timeout)
     if not diag["ok"] and redirected:
-        return redirected
+        diag = redirected
+    return _with_proxy_note(diag, host)
+
+
+def _with_proxy_note(diag, host):
+    """A failed diagnosis on a computer with a proxy setting names it — a
+    wrong proxy entry is the most common cause of WRONG_VERSION_NUMBER."""
+    proxy = proxy_for(f"https://{host}")
+    diag["proxy"] = proxy
+    if proxy and not diag["ok"]:
+        diag["fix"] = (f"This computer is set to use a proxy ({proxy}) — if you "
+                       "don't use one on purpose, remove it (Windows: Settings → "
+                       "Network & Internet → Proxy, and the HTTPS_PROXY / "
+                       "HTTP_PROXY environment variables), then restart the "
+                       "agent. " + diag["fix"])
     return diag
 
 
@@ -307,3 +321,72 @@ def summary(diag, name="AgentHC"):
     if diag["ok"]:
         return f"Connection OK — {diag['detail']}"
     return f"Can't reach {name}: {diag['detail']}.\nFix: {diag['fix']}"
+
+
+# ── proxy settings that break HTTPS ─────────────────────────────────────────
+# Python obeys HTTPS_PROXY / HTTP_PROXY and (on Windows) the system proxy
+# setting. A stale or wrong entry — very often "https://…" for a proxy that
+# only speaks plain HTTP — makes every request fail with
+# "SSL: WRONG_VERSION_NUMBER" while nothing is wrong with the network.
+
+def proxy_for(url):
+    """The proxy Python would use for `url`, or '' (credentials stripped)."""
+    try:
+        import requests
+        from urllib.parse import urlsplit
+        proxy = requests.utils.get_environ_proxies(url).get(urlsplit(url).scheme, "")
+    except Exception:
+        return ""
+    if "@" in proxy:  # never show proxy credentials
+        scheme, _, rest = proxy.partition("://")
+        proxy = f"{scheme}://{rest.split('@', 1)[1]}"
+    return proxy
+
+
+class _Http:
+    """requests.get/post that steps around a broken proxy setting by itself:
+    when a request through a configured proxy fails at the connection/TLS
+    level, it is retried once WITHOUT proxies; if that works, the rest of the
+    session goes direct and `bypassed` names the proxy (shown by netcheck and
+    the support report)."""
+
+    def __init__(self):
+        self.bypassed = ""
+        self._direct = None
+
+    def _direct_session(self):
+        if self._direct is None:
+            import requests
+            self._direct = requests.Session()
+            self._direct.trust_env = False  # ignore env + system proxies
+        return self._direct
+
+    def _call(self, method, url, **kw):
+        import requests
+        if self.bypassed:
+            return getattr(self._direct_session(), method)(url, **kw)
+        try:
+            return getattr(requests, method)(url, **kw)
+        except (requests.exceptions.SSLError, requests.exceptions.ProxyError,
+                requests.exceptions.ConnectionError) as exc:
+            proxy = proxy_for(url)
+            if not proxy:
+                raise
+            try:
+                resp = getattr(self._direct_session(), method)(url, **kw)
+            except Exception:
+                raise exc
+            self.bypassed = proxy
+            print(f"Network note: the proxy setting on this computer ({proxy}) "
+                  "breaks secure connections — the agent now connects directly. "
+                  "Remove the proxy setting if you don't use one on purpose.")
+            return resp
+
+    def get(self, url, **kw):
+        return self._call("get", url, **kw)
+
+    def post(self, url, **kw):
+        return self._call("post", url, **kw)
+
+
+http = _Http()
