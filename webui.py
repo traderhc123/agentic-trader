@@ -91,11 +91,19 @@ def open_app_window(url):
 # delivered once via a `?k=<token>` link (printed in the terminal / opened in
 # the browser by the agent itself) and then kept in an HttpOnly cookie.
 _SESSION_COOKIE = "at_session"
-_LOCKED_PAGE = """<!doctype html><meta charset="utf-8"><title>Locked</title>
-<body style="font-family:system-ui;background:#0b0e14;color:#e8ebf2;padding:2rem">
+_LOCKED_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Locked</title>
+<style>:root{color-scheme:dark}*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px 16px;background:#090b0f;color:#e7eaf0;
+font:13px/1.5 "Inter var",Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,Arial,sans-serif}
+.card{max-width:440px;width:100%;background:#0e1117;border:1px solid #1c222d;border-radius:8px;padding:24px}
+h2{margin:0 0 8px;font-size:18px;font-weight:600;letter-spacing:-.01em}p{margin:0 0 12px;color:#b4bccb}
+pre{margin:0;background:#07090c;border:1px solid #1c222d;border-radius:6px;padding:10px 12px;
+font:12px/1.6 ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:#b4bccb;overflow:auto}</style></head>
+<body><div class="card">
 <h2>This dashboard is locked</h2>
 <p>Open the login link printed in the terminal where the agent is running,
-or print it again with:</p><pre>python agent.py link</pre></body>"""
+or print it again with:</p><pre>python agent.py link</pre></div></body></html>"""
 
 
 def _token_path():
@@ -153,350 +161,797 @@ CONTROLS = {"paused": False, "stop": False}
 _STYLE = """
 <style>
  :root{
-   --bg:#0b0e14; --panel:#141925; --panel-2:#161b28; --sink:#0a0c11;
-   --fg:#e8ebf2; --muted:#9aa4b6; --line:#232a38; --line-2:#2c3446;
-   --accent:#4c8dff; --accent-2:#82b0ff; --ok:#4ade80; --err:#f87171;
-   --shadow:0 1px 2px rgba(0,0,0,.45),0 10px 34px rgba(0,0,0,.30);
+   color-scheme:dark;
+   --bg:#090b0f; --surface:#0e1117; --surface-2:#12161e; --raise:#171c26; --sink:#07090c;
+   --line:#1c222d; --line-2:#272f3d; --line-3:#343e50;
+   --fg:#e7eaf0; --fg-2:#b4bccb; --muted:#8b95a8; --faint:#808a9d;
+   /* --faint-deco: decoration only (rules, disabled/locked chrome) — never body text */
+   --faint-deco:#566074; --field-line:#5a657a;
+   --accent:#5b9dff; --accent-hi:#74adff; --accent-ink:#0a1830;
+   --accent-soft:rgba(91,157,255,.12); --accent-line:rgba(91,157,255,.42);
+   --up:#33c17d; --up-soft:rgba(51,193,125,.12); --up-line:rgba(51,193,125,.45);
+   --down:#f0605d; --down-soft:rgba(240,96,93,.12);
+   --warn:#e9a640; --warn-soft:rgba(233,166,64,.11); --warn-line:rgba(233,166,64,.45);
+   --live:#ff4d5e; --live-soft:rgba(255,77,94,.12); --live-line:rgba(255,77,94,.50);
+   --ok:var(--up); --err:var(--down);
+   --r-sm:4px; --r:6px; --r-lg:8px;
+   --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:20px; --s6:24px; --s8:32px;
+   --font:"Inter var",Inter,-apple-system,BlinkMacSystemFont,"Segoe UI Variable Text","Segoe UI",system-ui,Roboto,"Helvetica Neue",Arial,sans-serif;
+   --mono:ui-monospace,"SF Mono",SFMono-Regular,"JetBrains Mono","Cascadia Mono","Roboto Mono",Menlo,Consolas,monospace;
+   --fs-xs:11px; --fs-sm:12px; --fs:13px; --fs-md:14px; --fs-lg:16px; --fs-xl:22px;
  }
  *{box-sizing:border-box}
- body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,system-ui,sans-serif;
-      max-width:760px;margin:2rem auto;padding:0 1.15rem;background:var(--bg);color:var(--fg);
-      line-height:1.55;-webkit-font-smoothing:antialiased;letter-spacing:.1px}
- h1{font-size:1.5rem;font-weight:650;letter-spacing:-.02em}
- h2{font-size:1.06rem;font-weight:600;margin:1.6rem 0 .5rem;letter-spacing:-.01em}
- a{color:var(--accent-2);text-decoration:none} a:hover{text-decoration:underline}
- section{border:1px solid var(--line);border-radius:12px;padding:1.15rem 1.2rem;margin:1rem 0;
-         background:linear-gradient(180deg,var(--panel),var(--panel-2));box-shadow:var(--shadow)}
- section.done{border-color:#2f6f43} section.locked{opacity:.45;pointer-events:none}
- label{display:block;font-size:.9rem;margin-top:.15rem}
- input[type=text],input[type=password],input[type=number],textarea,select{
-   width:100%;padding:.6rem .7rem;margin:.3rem 0 .7rem;background:var(--sink);color:var(--fg);
-   border:1px solid var(--line-2);border-radius:8px;font-size:.95rem;
-   transition:border-color .15s,box-shadow .15s}
- input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent);
-   box-shadow:0 0 0 3px rgba(76,141,255,.18)}
- button{padding:.55rem 1.1rem;border:0;border-radius:8px;color:#fff;cursor:pointer;
-        font-size:.95rem;font-weight:550;background:linear-gradient(180deg,var(--accent),#3a7bef);
-        box-shadow:0 1px 2px rgba(0,0,0,.35);transition:transform .08s,filter .15s}
- button:hover{filter:brightness(1.08)} button:active{transform:translateY(1px)}
- button:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(76,141,255,.38)}
- button:disabled{background:#2a303c;color:#6b7280;cursor:not-allowed;box-shadow:none;filter:none}
- .muted{color:var(--muted);font-size:.86rem} .ok{color:var(--ok)} .err{color:var(--err);white-space:pre-line}
- pre{background:var(--sink);padding:.75rem;border-radius:8px;overflow-x:auto;border:1px solid var(--line);
-     white-space:pre-wrap;word-break:break-word;font-size:.8rem}
- .disc h3,.disc h4,.disc h5,.disc h6{margin:.9rem 0 .35rem;font-size:.92rem;color:var(--fg)}
-  .disc h3{font-size:1rem} .disc p{margin:.45rem 0} .disc ul{margin:.3rem 0 .5rem 1.1rem;padding:0}
-  .disc blockquote{margin:.5rem 0;padding:.4rem .7rem;border-left:3px solid var(--accent);color:var(--muted)}
-  .disc code{font-size:.78rem;background:var(--line);padding:.05rem .3rem;border-radius:4px}
- .disc{max-height:280px;overflow-y:auto;border:1px solid var(--line-2);padding:.85rem;
-       border-radius:8px;font-size:.82rem;background:var(--sink)}
- .badge{font-size:.72rem;padding:.12rem .55rem;border-radius:99px;
-        background:var(--line-2);margin-left:.5rem}
- .badge.on{background:#14532d;color:var(--ok)}
- #chatlog{height:300px;overflow-y:auto;background:var(--sink);border-radius:8px;
-          padding:.75rem;font-size:.85rem;border:1px solid var(--line)}
- .me{color:var(--accent-2)} .agent{color:var(--fg);margin-bottom:.6rem;white-space:pre-wrap}
- table{width:100%;border-collapse:collapse;font-size:.82rem}
- td,th{padding:.35rem .55rem;border-bottom:1px solid var(--line);text-align:left}
- @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+ html{background:var(--bg)}
+ body{margin:0;background:var(--bg);color:var(--fg);font:var(--fs)/1.5 var(--font);
+   -webkit-font-smoothing:antialiased;font-feature-settings:"cv11","ss01"}
+ /* tabular numerals only where digits must line up — "tnum" on prose also
+    fixes the width of hyphens (Inter), which spaces out "dry-run" */
+ body :is(.num,.kpi .v,.t td,.feed .pnl,.feed .when,.chart-head,.chart-head *,.chart-axis,.pass .q,.pass .p,.inv-quote){
+   font-variant-numeric:tabular-nums}
+ a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+ code,.mono{font-family:var(--mono);font-size:.92em}
+ code{background:var(--raise);border:1px solid var(--line);padding:0 4px;border-radius:3px;color:var(--fg-2)}
+ svg.i{width:14px;height:14px;flex:none;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+
+ /* buttons: bare = neutral; main actions add .btn-primary */
+ button,.btn{font:500 var(--fs)/1 var(--font);height:30px;padding:0 12px;border-radius:var(--r);cursor:pointer;
+   display:inline-flex;align-items:center;gap:6px;white-space:nowrap;border:1px solid var(--line-2);
+   background:var(--surface-2);color:var(--fg);text-decoration:none;transition:background .12s,border-color .12s,color .12s}
+ button:hover,.btn:hover{background:var(--raise);border-color:var(--line-3);text-decoration:none}
+ button:focus-visible,.btn:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+ button:disabled,.btn:disabled{opacity:.45;cursor:not-allowed}
+ .btn-primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+ .btn-primary:hover{background:var(--accent-hi);border-color:var(--accent-hi)}
+ .btn-warn{color:var(--warn);border-color:var(--warn-line);background:var(--warn-soft)}
+ .btn-warn:hover{background:rgba(233,166,64,.18);border-color:var(--warn)}
+ .btn-live{color:var(--live);border-color:var(--live-line);background:var(--live-soft)}
+ .btn-live:hover{background:rgba(255,77,94,.18);border-color:var(--live)}
+ .btn-ghost{background:transparent;border-color:transparent;color:var(--fg-2)}
+ .btn-ghost:hover{background:var(--surface-2);border-color:var(--line)}
+ .btn-sm{height:24px;padding:0 8px;font-size:var(--fs-sm)}
+
+ /* inputs */
+ input[type=text],input[type=password],input[type=number],select,textarea{
+   width:100%;height:34px;padding:0 10px;background:var(--sink);color:var(--fg);border:1px solid var(--field-line);
+   border-radius:var(--r);font:var(--fs-md) var(--font);transition:border-color .12s,box-shadow .12s}
+ textarea{height:auto;padding:8px 10px;line-height:1.5}
+ select{appearance:none;-webkit-appearance:none;padding-right:30px;
+   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%237c8597' stroke-width='1.5' fill='none'/%3E%3C/svg%3E");
+   background-repeat:no-repeat;background-position:right 11px center}
+ input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+ :is(.disc,pre,#chatlog):focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+ input[type=checkbox],input[type=radio]{accent-color:var(--accent);width:16px;height:16px;margin:0;flex:none}
+ ::placeholder{color:var(--faint)}
+
+ /* pills + tags */
+ .pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border-radius:var(--r-sm);
+   font:600 var(--fs-xs)/1 var(--font);letter-spacing:.04em;text-transform:uppercase;border:1px solid var(--line-2);color:var(--fg-2);white-space:nowrap}
+ .pill .dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
+ .pill.dry{color:var(--accent);border-color:var(--accent-line);background:var(--accent-soft)}
+ .pill.live{color:var(--live);border-color:var(--live-line);background:var(--live-soft)}
+ .pill.paused{color:var(--warn);border-color:var(--warn-line);background:var(--warn-soft)}
+ .pill.bad{color:var(--down);border-color:rgba(240,96,93,.45);background:var(--down-soft)}
+ .pill.open .dot{background:var(--up);box-shadow:0 0 0 3px rgba(51,193,125,.18)}
+ .tag{display:inline-block;font:600 10px/16px var(--mono);letter-spacing:.04em;padding:0 5px;border-radius:3px;vertical-align:1px}
+ .tag.call{color:var(--up);background:var(--up-soft)} .tag.put{color:var(--down);background:var(--down-soft)}
+ .tag.dry{color:var(--accent);background:var(--accent-soft)}
+ .tag.live{color:var(--live);background:var(--live-soft)}
+ .up{color:var(--up)} .down{color:var(--down)} .muted{color:var(--muted)} .faint{color:var(--faint)}
+ .num{font-family:var(--mono)}
+ .ok{color:var(--ok)} .err{color:var(--err);white-space:pre-line}
+
+ /* panels */
+ .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);min-width:0}
+ .ph{display:flex;align-items:center;gap:var(--s2);min-height:38px;padding:8px var(--s4);border-bottom:1px solid var(--line)}
+ .ph h2[tabindex]:focus{outline:none}
+ .ph h2{margin:0;font:600 var(--fs-xs)/1.4 var(--font);letter-spacing:.08em;text-transform:uppercase;color:var(--fg-2)}
+ .ph .count{font:500 var(--fs-xs)/1 var(--mono);color:var(--muted);background:var(--raise);border-radius:3px;padding:3px 5px}
+ .ph .sp{flex:1}
+ .pb{padding:var(--s3) var(--s4)}
+
+ /* long text + code */
+ pre{background:var(--sink);border:1px solid var(--line);border-radius:var(--r);padding:var(--s3);
+   font:12px/1.6 var(--mono);color:var(--fg-2);white-space:pre-wrap;word-break:break-word;overflow:auto;max-width:100%}
+ .disc{background:var(--sink);border:1px solid var(--line-2);border-radius:var(--r);padding:12px 14px;
+   font-size:13px;color:var(--fg-2);max-height:320px;overflow:auto;line-height:1.55}
+ .disc h3,.disc h4,.disc h5,.disc h6{margin:.9rem 0 .35rem;font-size:13px;font-weight:600;color:var(--fg)}
+ .disc h3{font-size:14px} .disc p{margin:.45rem 0} .disc ul{margin:.3rem 0 .5rem 1.1rem;padding:0}
+ .disc blockquote{margin:.5rem 0;padding:.4rem .7rem;border-left:2px solid var(--accent);color:var(--muted)}
+ .disc code{font-size:12px}
+ #pass-help.disc{max-height:none;border-left:2px solid var(--warn);background:var(--surface)}
+
+ /* app bar (both pages) */
+ .appbar{position:sticky;top:0;z-index:5;background:rgba(9,11,15,.88);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+   border-bottom:1px solid var(--line)}
+ .appbar-in{max-width:1360px;margin:0 auto;min-height:52px;padding:0 24px;display:flex;align-items:center;gap:var(--s3);
+   flex-wrap:wrap;row-gap:8px}
+ @media (max-width:1100px){
+   .appbar .lbl-sm,.brand .crumb,.brand .page{display:none}
+   .acts-a .btn-ghost{width:30px;padding:0;justify-content:center}
+   .acts-a #upd-badge{width:auto;padding:0 8px}
+ }
+ @media (max-width:900px) and (min-width:641px){.appbar-in{padding-top:8px;padding-bottom:8px}}
+ .brand{display:flex;align-items:center;gap:10px;min-width:0;color:var(--fg)}
+ a.brand:hover{text-decoration:none}
+ .mark{width:24px;height:24px;flex:none}
+ .brand .name{font:600 var(--fs-md)/1 var(--font);letter-spacing:-.01em;white-space:nowrap}
+ .brand .crumb{color:var(--faint);font-size:var(--fs-md)}
+ .brand .page{color:var(--fg-2);font-size:var(--fs-md);white-space:nowrap}
+ .appbar .sp{flex:1}
+ .vsep{width:1px;height:20px;background:var(--line-2);flex:none}
+ .actions{display:flex;gap:6px;align-items:center}
+
+ /* chat bubbles (dashboard + wizard) */
+ #chatlog{display:flex;flex-direction:column;gap:10px;height:300px;overflow-y:auto;background:var(--sink);
+   border:1px solid var(--line);border-radius:var(--r);padding:var(--s3);font-size:var(--fs)}
+ .msg{max-width:88%;align-self:flex-start;min-width:0}
+ .msg .who{font:600 10px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+ .msg .body{padding:8px 11px;border-radius:10px;white-space:pre-wrap;overflow-wrap:anywhere}
+ .msg.me{align-self:flex-end}
+ .msg.me .who{color:var(--accent);text-align:right}
+ .msg.me .body{background:var(--accent-soft);border:1px solid var(--accent-line);color:var(--fg);border-bottom-right-radius:3px}
+ .msg.agent .body{background:var(--surface-2);border:1px solid var(--line);color:var(--fg-2);border-bottom-left-radius:3px}
+ .chatrow{display:flex;gap:6px}
+ .chatrow input{flex:1;min-width:0;height:32px}
+ .chatrow button{height:32px}
+ .hint{font-size:var(--fs-sm);color:var(--muted);line-height:1.45}
+
+ @media (max-width:640px){
+   /* the wrapped phone header is ~140px: pinned, it would cover focused
+      controls (WCAG 2.4.11) and eat reading space — let it scroll away */
+   .appbar{position:static}
+   .appbar-in{padding-left:16px;padding-right:16px;height:auto;min-height:52px;flex-wrap:wrap;
+     padding-top:10px;padding-bottom:10px;row-gap:10px}
+   .brand .crumb,.brand .page,.vsep.hide-sm,.lbl-sm{display:none}
+   .brand{order:1} .acts-a{order:2;margin-left:auto} .appbar .sp{display:none}
+   .appbar .pill{order:3}
+   .acts-b{order:5;width:100%} .acts-b button{flex:1;justify-content:center}
+   .acts-b{gap:8px}
+   .acts-a .btn-ghost{width:44px;height:44px;padding:0;justify-content:center}
+   .acts-a #upd-badge{width:auto;padding:0 8px}
+   .hide-sm{display:none}
+   #chatlog{height:220px}
+   /* touch: >=44px targets; 16px fields so iOS Safari does not zoom on focus */
+   button,.btn{height:auto;min-height:44px}
+   .btn-sm{min-height:40px}
+   input[type=text],input[type=password],input[type=number],select{font-size:16px;height:44px}
+   textarea{font-size:16px}
+   .chatrow input,.chatrow button{height:44px}
+ }
+ @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>"""
 
-_WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
+_WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agentic-trader setup</title>""" + _STYLE + """
 <style>
- html{background:
-   radial-gradient(1100px 720px at 82% -10%,rgba(76,141,255,.12),transparent 58%),
-   radial-gradient(900px 620px at 4% 2%,rgba(76,141,255,.07),transparent 55%),
-   var(--bg);background-repeat:no-repeat;background-attachment:fixed;min-height:100%}
- body{max-width:880px;background:transparent}
- #bg{position:fixed;inset:0;width:100%;height:100%;z-index:-1;display:block}
- .hero{display:flex;align-items:center;gap:.85rem;margin:.5rem 0 .1rem}
- .hero>div.txt{min-width:0}
- .hero .tag{font-size:.7rem;letter-spacing:.18em;text-transform:uppercase;color:var(--muted)}
- .hero h1{margin:.05rem 0 0}
- .logo{width:42px;height:42px;flex:none;border-radius:12px;position:relative;overflow:hidden;
-   background:radial-gradient(125% 125% at 30% 18%,#6ea0ff,#2f6bff 52%,#1c3d97);
-   box-shadow:0 6px 20px rgba(58,110,255,.45),inset 0 1px 0 rgba(255,255,255,.4)}
- .logo::after{content:"";position:absolute;inset:0;
-   background:conic-gradient(from 200deg,transparent,rgba(255,255,255,.4),transparent 42%)}
- .grow{flex:1}
- .lead{color:var(--muted);font-size:.9rem;margin:.55rem 0 .1rem;max-width:64ch}
- .stepbar{display:flex;gap:.4rem;flex-wrap:wrap;margin:1.25rem 0 1.35rem}
- .chip{font-size:.75rem;padding:.32rem .78rem;border-radius:99px;border:1px solid var(--line-2);
-   color:var(--muted);cursor:default;user-select:none;background:rgba(20,25,37,.55);transition:.15s}
- .chip.done{border-color:#2f7d46;color:var(--ok);cursor:pointer}
- .chip.done:hover{background:rgba(47,125,70,.14)}
- .chip.cur{border-color:var(--accent);color:#bcd4ff;background:rgba(37,60,120,.4);
-   box-shadow:0 0 0 3px rgba(76,141,255,.12)}
- section{display:none;background:linear-gradient(180deg,rgba(20,25,37,.82),rgba(22,27,40,.88));
-   backdrop-filter:blur(9px);-webkit-backdrop-filter:blur(9px)}
- section.active{display:block;animation:rise .28s ease both}
- @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
- .navrow{display:flex;gap:.6rem;margin-top:.9rem;align-items:center;flex-wrap:wrap}
- .navrow .back{background:linear-gradient(180deg,#28303f,#222a38);border:1px solid var(--line-2)}
- #help{margin-top:1.5rem;border-top:1px solid var(--line);padding-top:.9rem}
- #chatlog{height:170px}
- .chatrow{display:flex;gap:.4rem}.chatrow input{margin:0;flex:1}
+ #bg{display:none}
+ .wz{max-width:1120px;margin:0 auto;padding:var(--s6) 24px var(--s8)}
+ .wz-bar .appbar-in{max-width:1120px}
+ .eyebrow{font:600 var(--fs-xs)/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+ .wz-head{margin-bottom:var(--s5)}
+ .wz-head .eyebrow{margin-bottom:8px}
+ .wz-head h1{margin:0;font:600 24px/1.2 var(--font);letter-spacing:-.02em}
+ .wz-head p{margin:8px 0 0;color:var(--fg-2);max-width:66ch;font-size:var(--fs-md)}
+ .wz-body{display:grid;grid-template-columns:220px minmax(0,1fr);gap:var(--s6);align-items:start}
+ .wz-body>*,.wz-main>*{min-width:0}
+ .wz-side{position:sticky;top:72px}
+
+ /* stepper (render() builds span.chip > span.n + span.lbl) */
+ #stepbar{display:flex;flex-direction:column;gap:2px}
+ #stepbar .chip{display:flex;align-items:center;gap:10px;height:36px;padding:0 10px;border-radius:var(--r);
+   color:var(--muted);font:400 var(--fs)/1.5 var(--font);cursor:pointer;user-select:none;position:relative;
+   width:100%;border:0;background:none;text-align:left;white-space:nowrap}
+ #stepbar .chip:hover{background:var(--surface-2)}
+ /* locked steps are disabled buttons: dim decoration tone is exempt from text contrast */
+ #stepbar .chip.lock{color:var(--faint-deco);cursor:default;opacity:1}
+ #stepbar .chip.lock:hover{background:none}
+ #stepbar .chip.done{color:var(--fg-2)}
+ #stepbar .chip.cur{background:var(--surface-2);color:var(--fg);box-shadow:inset 2px 0 0 var(--accent);font-weight:500}
+ #stepbar .n{width:20px;height:20px;border-radius:50%;display:grid;place-items:center;font:600 10px/1 var(--mono);
+   border:1px solid var(--line-3);color:var(--muted);flex:none}
+ #stepbar .chip.lock .n{border-color:var(--line-2);color:var(--faint-deco)}
+ #stepbar .chip.done .n{background:var(--up-soft);border-color:transparent;color:var(--up);font-size:11px}
+ #stepbar .chip.cur .n{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+ #stepbar .meta{margin-left:auto;font:500 10px/1 var(--mono);color:var(--faint)}
+ .stepnow,.stepseg{display:none}
+ .stepnow{align-items:center;gap:var(--s3);font:600 var(--fs-md)/1.3 var(--font);color:var(--fg)}
+ .stepnow .nx{margin-left:auto;font:500 var(--fs-sm)/1.3 var(--font);color:var(--muted);white-space:nowrap}
+ .stepnow button.nx{height:auto;min-height:32px;padding:0 6px;margin-right:-6px}
+ .stepnow .nx.go{color:var(--accent);cursor:pointer}
+ /* headings take programmatic focus on step change (screen readers announce
+    the new step); no ring — it is not an interactive control */
+ .wz-main section>h2[tabindex]:focus,.wz-main section>h2[tabindex]:focus-visible{outline:none}
+ .stepseg{grid-template-columns:repeat(7,minmax(0,1fr));gap:4px;margin-top:10px}
+ .stepseg button{display:block;width:100%;height:40px;min-height:40px;padding:0;margin:0;border:0;border-radius:2px;cursor:default;
+   background:linear-gradient(var(--line-2),var(--line-2)) center/100% 4px no-repeat}
+ .stepseg button:disabled{opacity:1}
+ .stepseg button.on{cursor:pointer}
+ .stepseg button.on:hover{background-size:100% 6px}
+ .stepseg button.done{background-image:linear-gradient(var(--up),var(--up))}
+ .stepseg button.cur{background-image:linear-gradient(var(--accent),var(--accent))}
+ .stepseg button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+ .upd{margin-top:var(--s4);padding:var(--s3);border:1px solid var(--line);border-radius:var(--r-lg);font-size:var(--fs-sm);color:var(--muted)}
+ .upd{display:flex;flex-direction:column;gap:8px}
+ .upd button{width:100%;justify-content:center}
+ #upd-msg:empty{display:none}
+ .upd pre{max-height:12rem;margin:8px 0}
+ #upd-msg{display:block;overflow-wrap:anywhere}
+
+ /* step cards — render() sets className to 'active' or '' only */
+ .wz-main section{display:none;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);min-width:0}
+ .wz-main section.active{display:block}
+ .wz-main section>h2:first-child{margin:0;padding:var(--s5) var(--s6) var(--s4);border-bottom:1px solid var(--line);
+   font:600 18px/1.3 var(--font);letter-spacing:-.01em;color:var(--fg)}
+ .wz-main section>h2 .eyebrow{display:block;margin-bottom:7px}
+ .wz-main section>p.ok{margin:0;padding:10px var(--s6);background:var(--up-soft);color:var(--up);border-bottom:1px solid var(--line);font-size:var(--fs)}
+ .sec-b{padding:var(--s5) var(--s6)}
+ .sec-b+.sec-b{border-top:1px solid var(--line)}
+ :where(.sec-b,.stack,.opt,.adv-b,#fund-box,#help .pb) p{margin:0}
+ .sec-b>*+*,.stack>*+*{margin-top:var(--s3)}
+ .copy{font-size:var(--fs);color:var(--fg-2);line-height:1.6;max-width:72ch}
+ .copy b{color:var(--fg);font-weight:600}
+ .fs-grid{display:grid;grid-template-columns:200px minmax(0,1fr);gap:var(--s6)}
+ .fs-grid>*{min-width:0}
+ .fs-lbl{font:600 var(--fs)/1.4 var(--font);color:var(--fg)}
+ .fs-lbl p{font-weight:400;color:var(--muted);font-size:var(--fs-sm);margin:4px 0 0;line-height:1.5}
+ .field>label{display:block;font:500 var(--fs-sm)/1.4 var(--font);color:var(--fg-2);margin-bottom:6px}
+ .field .help{font-size:var(--fs-sm);color:var(--muted);margin:7px 0 0;line-height:1.55}
+ .field+.field{margin-top:var(--s4)}
+ .two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--s2)}
+ label.check{display:flex;gap:10px;align-items:flex-start;padding:var(--s3);border:1px solid var(--line-2);
+   border-radius:var(--r);background:var(--sink);color:var(--fg-2);font-size:var(--fs);line-height:1.5;cursor:pointer}
+ label.check input{margin-top:2px}
+ label.check b{color:var(--fg)}
+ label.check:has(input:checked){border-color:var(--accent-line)}
+ label.check:has(#sf-dry:not(:checked)){border-color:var(--live-line);background:var(--live-soft)}
+ #sf-live-warn{border-left-color:var(--live)}
+ .two>.field{margin-top:0}
+ .opts{display:flex;flex-direction:column;gap:var(--s2)}
+ #c-phrase{font-family:var(--mono);letter-spacing:.04em}
+ #disclaimer{max-height:340px}
+ .notice{border:1px solid var(--line-2);border-left:2px solid var(--warn);border-radius:var(--r);padding:var(--s3) var(--s4);
+   font-size:var(--fs);color:var(--fg-2);background:var(--surface);line-height:1.55}
+ .notice b{color:var(--fg)}
+ .notice ul{margin:6px 0 0;padding-left:18px} .notice li{margin:3px 0}
+ .sep{display:flex;align-items:center;gap:var(--s3);color:var(--faint);font-size:var(--fs-sm)}
+ .sep::before,.sep::after{content:"";flex:1;height:1px;background:var(--line)}
+
+ /* access copy: three fact cells */
+ .facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--s2)}
+ .facts>div{border:1px solid var(--line);border-radius:var(--r);padding:10px 12px;background:var(--surface-2);
+   font-size:var(--fs-sm);color:var(--fg-2);line-height:1.5;min-width:0}
+ .facts h4{margin:0 0 4px;font:600 var(--fs-xs)/1.3 var(--font);letter-spacing:.08em;text-transform:uppercase;color:var(--fg)}
+
+ /* passes */
+ .passes{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:var(--s2)}
+ button.pass{height:auto;flex-direction:column;align-items:flex-start;gap:0;padding:12px 12px 11px;text-align:left;
+   border-radius:var(--r-lg);background:var(--surface-2);white-space:normal;min-width:0}
+ button.pass:hover{border-color:var(--accent-line);background:var(--raise)}
+ .pass .tagline{font:600 9px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--accent);height:9px;margin-bottom:8px}
+ .pass .q{font:600 22px/1 var(--mono);letter-spacing:-.02em;color:var(--fg)}
+ .pass .u{font:500 var(--fs-sm)/1.2 var(--font);color:var(--muted);margin-top:6px}
+ .pass .p{font:500 var(--fs-sm)/1 var(--mono);color:var(--fg-2);margin-top:12px;padding-top:10px;border-top:1px solid var(--line);width:100%}
+ button.pass.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset;background:var(--accent-soft)}
+ .status-line{font-size:var(--fs);color:var(--muted)}
+ .status-line:empty{display:none}
+
+ /* lightning invoice */
+ .invoice{display:flex;gap:var(--s5);align-items:flex-start;border:1px solid var(--line-2);border-radius:var(--r-lg);
+   background:var(--sink);padding:var(--s4)}
+ .invoice>.inv-r{flex:1;min-width:0}
+ .qr{width:168px;height:168px;flex:none;background:#fff;border-radius:var(--r);padding:8px}
+ .qr svg{width:100%;height:100%;display:block;border-radius:0!important}
+ .inv-quote{font:600 16px/1.35 var(--mono);color:var(--fg);letter-spacing:-.01em}
+ pre.bolt{margin:var(--s3) 0 0;padding:9px 10px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+   font:11.5px/1.5 var(--mono);color:var(--fg-2);white-space:pre-wrap;word-break:break-all;max-height:62px;overflow:auto}
+ .btnrow{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap;margin-top:var(--s3)}
+ .btnrow .msg-s{font-size:var(--fs-sm);color:var(--up)}
+ .inv-meta{font-size:var(--fs-sm);color:var(--muted);margin-top:var(--s3)!important;line-height:1.5}
+ #pass-box>*+*{margin-top:var(--s3)}
+ #pass-help ul{margin:6px 0 0;padding-left:18px}
+
+ /* advanced disclosure */
+ details.adv{border:1px solid var(--line);border-radius:var(--r-lg);background:var(--surface)}
+ details.adv>summary{list-style:none;cursor:pointer;display:flex;align-items:flex-start;gap:8px;padding:10px var(--s4);
+   font-size:var(--fs);color:var(--fg-2);line-height:1.45}
+ details.adv>summary::-webkit-details-marker{display:none}
+ details.adv>summary:hover{color:var(--fg)}
+ details.adv>summary .chev{margin-top:2px;transition:transform .15s;color:var(--muted)}
+ details.adv[open]>summary .chev{transform:rotate(90deg)}
+ details.adv[open]>summary{border-bottom:1px solid var(--line)}
+ .adv-b{padding:var(--s4)}
+ .adv-b>*+*{margin-top:var(--s3)}
+ .inrow{display:flex;gap:var(--s2);align-items:center}
+ .inrow input{flex:1;min-width:0}
+ #fund-box{border:1px solid var(--line);border-radius:var(--r);padding:var(--s4);background:var(--surface-2)}
+ #fund-box>*+*{margin-top:var(--s3)}
+
+ /* footers: the LAST .navrow of a step card */
+ .navrow{display:flex;gap:var(--s2);align-items:center;flex-wrap:wrap}
+ .wz-main section>.navrow:last-child{padding:var(--s4) var(--s6);border-top:1px solid var(--line);background:var(--surface-2);
+   border-radius:0 0 var(--r-lg) var(--r-lg);gap:var(--s3)}
+ .navrow.inline{padding:0;border:0;background:none}
+ .navrow .sp{flex:1}
+ .navrow .note{font-size:var(--fs-sm);color:var(--muted)}
+ .navrow span[id]:empty{display:none}
+ .navrow>span[id]{font-size:var(--fs-sm);overflow-wrap:anywhere;min-width:0}
+
+ /* broker fields + launch options */
+ #brk-fields .field{margin-top:var(--s3)}
+ #brk-fields label.check{margin-top:var(--s3)}
+ #brk-fields:empty{display:none}
+ .launch{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--s3)}
+ .opt{border:1px solid var(--line-2);border-radius:var(--r-lg);padding:var(--s4);background:var(--surface-2);min-width:0;display:flex;flex-direction:column}
+ .opt>h3+p{margin-top:6px}
+ .opt>*+*{margin-top:var(--s3)}
+ .opt h3{margin:0;font:600 var(--fs-md)/1.35 var(--font);color:var(--fg)}
+ .opt h3 .eyebrow{display:block;margin-bottom:6px}
+ .opt>.cta{margin-top:auto;padding-top:var(--s3)}
+ #done-body:empty{display:none}
+ #done-body details summary{cursor:pointer}
+ #deploy-msg:empty{display:none}
+
+ /* assistant */
+ #help.assist{margin-top:var(--s4)}
+ #help .pb>*+*{margin-top:var(--s3)}
+ #help #chatlog{height:160px}
+ #help #chatlog:empty{display:none}
+
+ @media (max-width:860px){
+   .wz-body{grid-template-columns:minmax(0,1fr);gap:var(--s4)}
+   .wz-main section>h2 .eyebrow{display:none}
+   .wz-side{position:static}
+   #stepbar .chip{display:none}
+   .stepnow{display:flex}
+   .stepseg{display:grid}
+   /* the aside dissolves so the update row can sit BELOW the step card + help */
+   .wz-side{display:contents}
+   #stepbar{order:0} .wz-main{order:1} .upd{order:2}
+   .upd{flex-direction:row;align-items:center;gap:var(--s3);flex-wrap:wrap;margin-top:0;padding:0;border:0;background:none}
+   .upd button{width:auto;margin:0}
+   .upd #upd-btn{background:transparent;border-color:transparent;color:var(--muted);padding-left:0}
+   .upd #upd-btn:hover{color:var(--fg)}
+   #upd-msg{flex:1 1 200px}
+   .fs-grid{grid-template-columns:minmax(0,1fr);gap:var(--s3)}
+ }
+ @media (max-width:640px){
+   .wz{padding:var(--s4) 16px var(--s6)}
+   .wz-head h1{font-size:21px}
+   .wz-head p{font-size:var(--fs)}
+   .wz-main section>h2:first-child,.sec-b,.wz-main section>.navrow:last-child{padding-left:var(--s4);padding-right:var(--s4)}
+   .wz-main section>p.ok{padding-left:var(--s4);padding-right:var(--s4)}
+   .wz-main section>h2:first-child{padding-top:var(--s4);padding-bottom:var(--s3);font-size:17px}
+   .sec-b{padding-top:var(--s4);padding-bottom:var(--s4)}
+   .passes{grid-template-columns:1fr 1fr}
+   .facts,.two,.launch{grid-template-columns:minmax(0,1fr)}
+   .invoice{flex-direction:column;align-items:stretch}
+   .qr{width:180px;height:180px;align-self:center}
+   .wz-main section>.navrow:last-child .sp{display:none}
+   .wz-main section>.navrow:last-child .btn-primary{flex:1;justify-content:center}
+   .wz-main section>.navrow:last-child .note{flex-basis:100%}
+   .wz-main section>.navrow:last-child>span[id]:not(:empty){flex-basis:100%}
+   details.adv>summary{min-height:44px;align-items:center}
+   details.adv>summary .chev{margin-top:0}
+   .stepnow button.nx{min-height:40px}
+   #help #chatlog{height:220px}
+ }
 </style></head><body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+ <symbol id="i-check" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7"/></symbol>
+ <symbol id="i-arrow" viewBox="0 0 16 16"><path d="M3 8h10M9 4l4 4-4 4"/></symbol>
+ <symbol id="i-back" viewBox="0 0 16 16"><path d="M13 8H3M7 4 3 8l4 4"/></symbol>
+ <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v3h-3"/></symbol>
+ <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5" y="5" width="8.5" height="8.5" rx="1.5"/><path d="M3 10.5V3.8C3 3.3 3.3 3 3.8 3h6.7"/></symbol>
+ <symbol id="i-ext" viewBox="0 0 16 16"><path d="M9 3h4v4M13 3 7.5 8.5M11.5 9.5v3c0 .6-.4 1-1 1h-7c-.6 0-1-.4-1-1v-7c0-.6.4-1 1-1h3"/></symbol>
+ <symbol id="i-chev" viewBox="0 0 16 16"><path d="M6 4l4 4-4 4"/></symbol>
+ <symbol id="i-bolt" viewBox="0 0 16 16"><path d="M9 1.8 3.5 9h4l-.6 5.2L12.5 7h-4z"/></symbol>
+ <symbol id="i-shield" viewBox="0 0 16 16"><path d="M8 1.8 2.8 3.8v4c0 3 2.2 5.4 5.2 6.4 3-1 5.2-3.4 5.2-6.4v-4z"/></symbol>
+ <symbol id="mark" viewBox="0 0 24 24"><rect x=".5" y=".5" width="23" height="23" rx="5.5" fill="#12161e" stroke="#343e50"/>
+  <path d="M5.5 15.5l4-4.5 3 2.6 5.5-6.6" fill="none" stroke="#5b9dff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="18" cy="7" r="1.6" fill="#5b9dff"/></symbol>
+</svg>
 <canvas id="bg" aria-hidden="true"></canvas>
-<div class="hero">
- <div class="logo" aria-hidden="true"></div>
- <div class="txt"><div class="tag">Agentic Trader</div>
-  <h1>Set up your trading agent</h1></div>
- <span class="grow"></span>
- <a class="chip done" href="/dash" style="align-self:center">Dashboard →</a>
-</div>
-<p class="lead">Everything runs on your own machine — this wizard is served from
-127.0.0.1 by your agent itself. It moves real money; read each step carefully.</p>
-<div class="navrow" style="margin:0 0 .9rem">
- <button onclick="checkUpdates()" id="upd-btn" style="background:var(--sink);border:1px solid var(--line-2);color:var(--muted);font-size:.82rem;padding:.4rem .8rem">⟳ Check for updates</button>
- <button onclick="pullUpdates()" id="upd-pull" style="display:none">Pull latest code</button>
- <span id="upd-msg" class="muted"></span>
-</div>
-<div class="stepbar" id="stepbar"></div>
 
-<section id="s-consent"><h2>Agreement</h2>
- <div class="disc" id="disclaimer">loading…</div>
- <p><label><input type="checkbox" id="c-read"> I have read the entire agreement
- above and I accept all of its terms, including that <b>all liability is mine</b>
- and that no party here is a registered investment adviser.</label></p>
- <p>Type exactly <b>I AGREE AND ACCEPT ALL LIABILITY</b> to accept:</p>
- <input type="text" id="c-phrase" autocomplete="off">
- <div class="navrow"><button onclick="doConsent()">Accept & continue</button>
- <span id="c-msg"></span></div>
-</section>
-
-<section id="s-llm"><h2>Connect your AI (recommended)</h2>
- <p class="muted">Any model works — Claude, ChatGPT/OpenAI, Grok, Gemini,
- OpenRouter (hundreds of models with one key), DeepSeek, Mistral, Groq, or a
- model running on this computer. It powers the help chat, your plain-English
- trading policy and the dashboard Q&amp;A. It never places trades. Skippable.</p>
- <label>1. Paste an API key</label>
- <input type="password" id="llm-key" placeholder="sk-ant-…, sk-…, xai-…, AIza…, sk-or-…"
-  autocomplete="off" oninput="llmKeyTyped()" onkeydown="if(event.key==='Enter')llmFind()">
- <p class="muted" style="margin:.3rem 0">The provider is detected from the key.
- Need one? <a id="llm-keys-link" href="https://console.anthropic.com/settings/keys"
- target="_blank" rel="noopener">Get a key ↗</a> · <b>Claude Max or Team plan?</b>
- It includes monthly API credits — link them to a Claude Console organization
- (claude.ai → your plan's API credits), then create a key there. Signing in
- with a chat account (claude.ai, chatgpt.com) doesn't connect here; the API
- key does. Keys stay on this computer.</p>
- <details id="llm-adv"><summary class="muted">Provider / local model / custom endpoint</summary>
-  <select id="llm-provider" onchange="llmProviderChanged()"></select>
-  <input type="text" id="llm-base" placeholder="Endpoint URL (custom / local only)">
-  <p class="muted">Local models (Ollama, LM Studio) need no key — pick
-  "Local model", check the URL, then press Find models.</p>
- </details>
- <div class="navrow"><button onclick="llmFind()">Find models</button>
- <span id="llm-find-msg"></span></div>
- <div id="llm-pick" style="display:none">
-  <label>2. Pick a model</label>
-  <input type="text" id="llm-model" list="llm-models" autocomplete="off"
-   placeholder="start typing to filter">
-  <datalist id="llm-models"></datalist>
-  <p class="muted">Bigger models follow your trading policy more reliably;
-  any error or unclear answer from the model means the trade is skipped.</p>
+<header class="appbar wz-bar"><div class="appbar-in">
+ <a class="brand" href="/dash"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg>
+  <span class="name">Agentic Trader</span><span class="crumb">/</span><span class="page">Setup</span></a>
+ <span class="sp"></span>
+ <span class="pill hide-sm" title="This page is served by your agent on this computer only"><span class="dot" style="color:var(--up)"></span>127.0.0.1 · local only</span>
+ <div class="actions acts-a">
+  <a class="btn" href="/dash">Dashboard<svg class="i"><use href="#i-arrow"/></svg></a>
  </div>
- <div class="navrow"><button id="llm-connect" onclick="doLLM()" style="display:none">Connect &amp; continue</button>
- <button class="back" onclick="skipLLM()">Skip for now</button>
- <span id="llm-msg"></span></div>
+</div></header>
+
+<main class="wz">
+<div class="wz-head">
+ <div class="eyebrow">Setup</div>
+ <h1>Set up your trading agent</h1>
+ <p>Everything runs on your own machine — this wizard is served from
+ 127.0.0.1 by your agent itself. It moves real money; read each step carefully.</p>
+</div>
+
+<div class="wz-body">
+<aside class="wz-side">
+ <div id="stepbar" role="navigation" aria-label="Setup steps"></div>
+ <div class="upd">
+  <button onclick="checkUpdates()" id="upd-btn"><svg class="i"><use href="#i-refresh"/></svg>Check for updates</button>
+  <button onclick="pullUpdates()" id="upd-pull" class="btn-primary" style="display:none">Pull latest code</button>
+  <span id="upd-msg" class="muted"></span>
+ </div>
+</aside>
+
+<div class="wz-main">
+<section id="s-consent"><h2 tabindex="-1"><span class="eyebrow">Step 1 of 7</span>Agreement</h2>
+ <div class="sec-b">
+  <div class="disc" id="disclaimer" tabindex="0" role="region" aria-label="User agreement and disclaimer">loading…</div>
+  <label class="check"><input type="checkbox" id="c-read"><span>I have read the entire agreement
+  above and I accept all of its terms, including that <b>all liability is mine</b>
+  and that no party here is a registered investment adviser.</span></label>
+  <div class="field">
+   <label for="c-phrase">Type exactly <b class="num">I AGREE AND ACCEPT ALL LIABILITY</b> to accept:</label>
+   <input type="text" id="c-phrase" autocomplete="off" spellcheck="false" autocapitalize="characters" autocorrect="off">
+  </div>
+ </div>
+ <div class="navrow"><span id="c-msg" role="status" aria-live="polite"></span><span class="sp"></span>
+  <button class="btn-primary" onclick="doConsent()">Accept &amp; continue<svg class="i"><use href="#i-arrow"/></svg></button></div>
 </section>
 
-<section id="s-source"><h2>Signal source</h2>
- <select id="src" onchange="srcChanged()">
-  <option value="agenthc">AgentHC Agentic Day Trade Ideas (journal feed, sats-priced)</option>
-  <option value="manual">My own commands (commands.jsonl)</option>
-  <option value="url">A JSON feed URL I provide</option>
- </select>
+<section id="s-llm"><h2 tabindex="-1"><span class="eyebrow">Step 2 of 7</span>Connect your AI (recommended)</h2>
+ <div class="sec-b">
+  <p class="copy">Any model works — Claude, ChatGPT/OpenAI, Grok, Gemini,
+  OpenRouter (hundreds of models with one key), DeepSeek, Mistral, Groq, or a
+  model running on this computer. It powers the help chat, your plain-English
+  trading policy and the dashboard Q&amp;A. It never places trades. Skippable.</p>
+ </div>
+ <div class="sec-b"><div class="fs-grid">
+  <div class="fs-lbl">API key<p>Claude, OpenAI, Grok, Gemini, OpenRouter or a local model.</p></div>
+  <div class="stack">
+   <div class="field"><label for="llm-key">1. Paste an API key</label>
+    <input type="password" id="llm-key" placeholder="sk-ant-…, sk-…, xai-…, AIza…, sk-or-…"
+     autocomplete="off" oninput="llmKeyTyped()" onkeydown="if(event.key==='Enter')llmFind()">
+    <p class="help">The provider is detected from the key.
+    Need one? <a id="llm-keys-link" href="https://console.anthropic.com/settings/keys"
+    target="_blank" rel="noopener">Get a key ↗</a> · <b>Claude Max or Team plan?</b>
+    It includes monthly API credits — link them to a Claude Console organization
+    (claude.ai → your plan's API credits), then create a key there. Signing in
+    with a chat account (claude.ai, chatgpt.com) doesn't connect here; the API
+    key does. Keys stay on this computer.</p></div>
+   <details id="llm-adv" class="adv"><summary><svg class="i chev"><use href="#i-chev"/></svg><span>Provider / local model / custom endpoint</span></summary>
+    <div class="adv-b">
+     <div class="field"><label for="llm-provider">Provider</label>
+      <select id="llm-provider" onchange="llmProviderChanged()" aria-label="Provider"></select></div>
+     <div class="field"><label for="llm-base">Endpoint URL (custom / local only)</label>
+      <input type="text" id="llm-base" placeholder="http://localhost:11434/v1" aria-label="Custom or local endpoint URL"></div>
+     <p class="muted">Local models (Ollama, LM Studio) need no key — pick
+     "Local model", check the URL, then press Find models.</p>
+    </div>
+   </details>
+   <div class="navrow inline"><button class="btn-primary" onclick="llmFind()">Find models</button>
+    <span id="llm-find-msg" role="status" aria-live="polite"></span></div>
+  </div>
+ </div></div>
+ <div class="sec-b" id="llm-pick" style="display:none"><div class="fs-grid">
+  <div class="fs-lbl">Model<p>Pick one the key can use.</p></div>
+  <div class="field"><label for="llm-model">2. Pick a model</label>
+   <input type="text" id="llm-model" list="llm-models" autocomplete="off"
+    placeholder="start typing to filter">
+   <datalist id="llm-models"></datalist>
+   <p class="help">Bigger models follow your trading policy more reliably;
+   any error or unclear answer from the model means the trade is skipped.</p></div>
+ </div></div>
+ <div class="navrow"><span id="llm-msg" role="status" aria-live="polite"></span><span class="sp"></span>
+  <button onclick="goBack()"><svg class="i"><use href="#i-back"/></svg>Back</button>
+  <button class="back" id="llm-skip" onclick="skipLLM()">Skip for now</button>
+  <button id="llm-connect" class="btn-primary" onclick="doLLM()" style="display:none">Connect &amp; continue<svg class="i"><use href="#i-arrow"/></svg></button></div>
+</section>
+
+<section id="s-source"><h2 tabindex="-1"><span class="eyebrow">Step 3 of 7</span>Signal source</h2>
+ <div class="sec-b"><div class="fs-grid">
+  <div class="fs-lbl">Feed<p>Where your agent's trade ideas come from.</p></div>
+  <div class="stack">
+   <div class="field"><label for="src">Source</label>
+   <select id="src" onchange="srcChanged()">
+    <option value="agenthc">AgentHC Agentic Day Trade Ideas (journal feed, sats-priced)</option>
+    <option value="manual">My own commands (commands.jsonl)</option>
+    <option value="url">A JSON feed URL I provide</option>
+   </select></div>
+  </div>
+ </div></div>
  <div id="src-agenthc">
-  <label>Which trade signals?</label>
-  <select id="hc-scope">
-   <option value="main">Main pick only — one high-conviction trade a day (default)</option>
-   <option value="all">Main pick + "other trades" — wider journal, several entries a day</option>
-  </select>
-  <p class="muted">"Other trades" follows AgentHC's broader shadow journal; your
-  daily entry cap and per-trade budget still apply to every signal.</p>
-  <label>Access — prepay signal days</label>
-  <p class="muted">One Lightning payment from the wallet you already use (Cash
-  App, Strike, Phoenix, Alby…) — ~$10 per signal day, priced in sats. A day
-  is only used when your agent actually receives a trade signal (an entry or
-  an exit) that day; quiet days are free. "Main pick only" uses a day only
-  for main-pick signals; adding "other trades" (above) uses days on those
-  too. Unused days carry over when you buy more. The agent never holds
-  money.</p>
-  <div class="navrow">
-   <button onclick="buyPass(1)">1 signal day (try it)</button>
-   <button onclick="buyPass(5)">5 signal days</button>
-   <button onclick="buyPass(20)">20 signal days</button>
-   <button onclick="buyPass(60)">60 signal days</button>
-  </div>
-  <p id="pass-status" class="muted"></p>
-  <div id="pass-box" style="display:none">
-   <p id="pass-quote"></p>
-   <div id="pass-qr" style="display:none;margin:.6rem 0"></div>
-   <pre id="pass-bolt11"></pre>
-   <p><button onclick="copyText('pass-bolt11','pass-copy-msg')">Copy invoice</button>
-   <span id="pass-copy-msg"></span>
-   <a id="pass-link" href="#">Open in my Lightning wallet app</a></p>
-   <p class="muted">Scan the QR with your phone's wallet, or copy the invoice
-   into any Lightning app. This page updates by itself once you pay (the
-   invoice is good for 1 hour).</p>
-   <div id="pass-help" style="display:none" class="disc">
-    <b>Payment not going through?</b> Nothing has arrived yet. Most failures
-    happen inside the paying wallet, before the payment leaves it:
-    <ul>
-     <li>Your wallet needs <b id="pass-need"></b> available (the invoice plus
-     a little for network fees).</li>
-     <li><b>Cash App</b> and some other apps limit Lightning payments or fail on
-     larger ones — try the <b>1 signal day</b> pass first, or pay from
-     <b>Strike</b> or <b>Phoenix</b>.</li>
-     <li>Still stuck? Use <b>Advanced → auto-pay from a wallet the agent
-     controls</b> below, or open the dashboard's <b>Help</b> panel and send
-     the support report.</li>
-    </ul>
+  <div class="sec-b"><div class="fs-grid">
+   <div class="fs-lbl">Signals<p>How many of AgentHC's ideas to follow.</p></div>
+   <div class="field"><label for="hc-scope">Which trade signals?</label>
+    <select id="hc-scope">
+     <option value="main">Main pick only — one high-conviction trade a day (default)</option>
+     <option value="all">Main pick + "other trades" — wider journal, several entries a day</option>
+    </select>
+    <p class="help">"Other trades" follows AgentHC's broader shadow journal; your
+    daily entry cap and per-trade budget still apply to every signal.</p></div>
+  </div></div>
+  <div class="sec-b"><div class="fs-grid">
+   <div class="fs-lbl">Access — prepay signal days<p>Prepaid in sats over Lightning.</p></div>
+   <div class="stack">
+    <p class="copy">One Lightning payment from the wallet you already use (Cash
+    App, Strike, Phoenix, Alby…) — <b>~$10 per signal day</b>, priced in sats.</p>
+    <div class="facts">
+     <div><h4>Billing</h4>A day
+     is only used when your agent actually receives a trade signal (an entry or
+     an exit) that day; quiet days are free.</div>
+     <div><h4>Carry-over</h4>Unused days carry over when you buy more.</div>
+     <div><h4>Custody</h4>The agent never
+     holds money. You pay each invoice from your own wallet.</div>
+    </div>
+    <p class="muted" style="font-size:var(--fs-sm)">"Main pick only" uses a day only
+    for main-pick signals; adding "other trades" (above) uses days on those
+    too.</p>
+    <div class="passes">
+     <button class="pass" data-days="1" onclick="buyPass(1)"><span class="tagline">Try it</span><span class="q">1</span><span class="u">signal day (try it)</span><span class="p">≈ $10</span></button>
+     <button class="pass" data-days="5" onclick="buyPass(5)"><span class="tagline"></span><span class="q">5</span><span class="u">signal days</span><span class="p">≈ $50</span></button>
+     <button class="pass" data-days="20" onclick="buyPass(20)"><span class="tagline"></span><span class="q">20</span><span class="u">signal days</span><span class="p">≈ $200</span></button>
+     <button class="pass" data-days="60" onclick="buyPass(60)"><span class="tagline"></span><span class="q">60</span><span class="u">signal days</span><span class="p">≈ $600</span></button>
+    </div>
+    <p id="pass-status" class="status-line" role="status"></p>
+    <div id="pass-box" style="display:none">
+     <div class="invoice">
+      <div id="pass-qr" class="qr" style="display:none"></div>
+      <div class="inv-r">
+       <p id="pass-quote" class="inv-quote"></p>
+       <pre id="pass-bolt11" class="bolt" tabindex="0" aria-label="Lightning invoice"></pre>
+       <div class="btnrow"><button onclick="copyText('pass-bolt11','pass-copy-msg')"><svg class="i"><use href="#i-copy"/></svg>Copy invoice</button>
+        <a id="pass-link" class="btn" href="#"><svg class="i"><use href="#i-bolt"/></svg>Open in my Lightning wallet app</a>
+        <span id="pass-copy-msg" class="msg-s"></span></div>
+       <p class="inv-meta">Scan the QR with your phone's wallet, or copy the invoice
+       into any Lightning app. This page updates by itself once you pay (the
+       invoice is good for 1 hour).</p>
+      </div>
+     </div>
+     <div id="pass-help" style="display:none" class="disc notice">
+      <b>Payment not going through?</b> Nothing has arrived yet. Most failures
+      happen inside the paying wallet, before the payment leaves it:
+      <ul>
+       <li>Your wallet needs <b id="pass-need"></b> available (the invoice plus
+       a little for network fees).</li>
+       <li><b>Cash App:</b> add money to your Cash App balance (or buy the
+       bitcoin) first, then pay from that balance. Payments that pull from your
+       bank often fail before they're sent. Cash App also limits Lightning
+       payments — try the <b>1 signal day</b> pass first, or pay from
+       <b>Strike</b> or <b>Phoenix</b>.</li>
+       <li>Still stuck? Use <b>Advanced → auto-pay from a wallet the agent
+       controls</b> below, or open the dashboard's <b>Help</b> panel and send
+       the support report.</li>
+      </ul>
+     </div>
+    </div>
+    <details id="adv-wallet" class="adv"><summary><svg class="i chev"><use href="#i-chev"/></svg><span>Advanced: auto-pay each day
+    from a Lightning wallet the agent controls, or use an API key</span></summary>
+    <div class="adv-b">
+     <p class="muted">The agent pays ~$10 each market day from a wallet it holds
+     the keys to. Only for people who want hands-off daily payments.</p>
+     <div class="navrow inline"><button onclick="makeWallet()">Create my agent's wallet for me</button>
+      <span id="mw-msg" role="status" aria-live="polite"></span></div>
+     <div id="fund-box" style="display:none">
+      <p>Wallet ready ✓ — now give your agent some sats. Pay this invoice from any
+      Lightning app (Strike, Cash App, Phoenix, Alby…):</p>
+      <div class="field"><label for="fund-sats">Amount (sats) — a day pass is ~$10 of bitcoin</label>
+       <div class="inrow"><input type="number" id="fund-sats" value="16000" min="1000" oninput="satsChanged()">
+        <button onclick="fundInvoice()">Show invoice</button></div></div>
+      <p id="fund-quote" class="muted" style="display:none;font-size:var(--fs-sm)"></p>
+      <p id="fund-note" class="ok" style="display:none"></p>
+      <div class="navrow inline">
+       <button id="recur-btn" onclick="toggleRecurring()">Recurring day-pass: OFF</button>
+       <span class="muted" style="flex:1 1 220px;font-size:var(--fs-sm)">ON = the agent buys each day's ~$10 pass from its
+       wallet automatically (never above your auto-pay cap). OFF = it never
+       spends without you.</span>
+      </div>
+      <div id="fund-qr" class="qr" style="display:none"></div>
+      <pre id="bolt11" class="bolt" style="display:none" tabindex="0" aria-label="Lightning invoice"></pre>
+      <p id="fund-open" style="display:none">
+      <button onclick="copyInvoice()"><svg class="i"><use href="#i-copy"/></svg>Copy invoice</button> <span id="copy-msg" class="up"></span>
+      <a id="fund-link" class="btn" href="#"><svg class="i"><use href="#i-bolt"/></svg>Open in my Lightning wallet app</a>
+      · balance: <span id="fund-bal" class="num">0</span> sats
+      <span class="muted">(scan the QR with your phone's wallet, or copy the
+      invoice and paste it in any Lightning app — updates automatically after
+      you pay)</span></p>
+      <p class="notice">Hosted wallet on demo.lnbits.com — a public TEST server
+      (custodial; it can be reset). Keep only a few days of passes there, or use
+      your own instance below.</p>
+     </div>
+     <p class="muted">Your own LNbits wallet:</p>
+     <div class="field"><label for="ln-url">LNbits instance URL</label>
+      <input type="text" id="ln-url" placeholder="https://…" aria-label="LNbits instance URL"></div>
+     <div class="field"><label for="ln-key">LNbits wallet admin key</label>
+      <input type="password" id="ln-key" placeholder="ADMIN key" aria-label="LNbits wallet admin key"></div>
+     <p class="sep">— or —</p>
+     <div class="field"><label for="hc-key">AgentHC Premium API key</label>
+      <input type="password" id="hc-key" placeholder="Premium API key" aria-label="AgentHC Premium API key"></div>
+    </div>
+    </details>
    </div>
+  </div></div>
+ </div>
+ <div id="src-url" style="display:none"><div class="sec-b">
+  <div class="field"><label for="src-url-input">Feed URL</label>
+  <input type="text" id="src-url-input" placeholder="https://my-feed.example.com/events"></div>
+ </div></div>
+ <div id="src-manual" style="display:none"><div class="sec-b"><p class="muted">You'll append JSON
+  lines to <code>~/.agentic-trader/commands.jsonl</code> — see the README.</p></div></div>
+ <div class="navrow"><span class="note">Your choice of source — not investment advice.</span>
+  <span id="src-msg" role="status" aria-live="polite"></span><span class="sp"></span>
+  <button onclick="goBack()"><svg class="i"><use href="#i-back"/></svg>Back</button>
+  <button class="btn-primary" onclick="doSource()">Save &amp; continue<svg class="i"><use href="#i-arrow"/></svg></button></div>
+</section>
+
+<section id="s-broker"><h2 tabindex="-1"><span class="eyebrow">Step 4 of 7</span>Broker — where orders execute</h2>
+ <div class="sec-b">
+  <p class="copy">Pick your platform. Robinhood is one-click OAuth; key-based
+  platforms take API keys (many offer a paper/simulated mode — the safest trial).</p>
+  <p id="brk-status" class="status-line" role="status"></p>
+ </div>
+ <div class="sec-b"><div class="fs-grid">
+  <div class="fs-lbl">Robinhood<p>One-click OAuth in a new tab.</p></div>
+  <div class="stack">
+   <div class="navrow inline"><button onclick="rhStart()">Connect Robinhood</button>
+    <span id="rh-msg" role="status" aria-live="polite"></span></div>
+   <div id="rh-accounts"></div>
   </div>
-  <details id="adv-wallet"><summary class="muted">Advanced: auto-pay each day
-  from a Lightning wallet the agent controls, or use an API key</summary>
-  <p class="muted">The agent pays ~$10 each market day from a wallet it holds
-  the keys to. Only for people who want hands-off daily payments.</p>
-  <button onclick="makeWallet()">Create my agent's wallet for me</button>
-  <span id="mw-msg"></span>
-  <div id="fund-box" style="display:none">
-   <p>Wallet ready ✓ — now give your agent some sats. Pay this invoice from any
-   Lightning app (Strike, Cash App, Phoenix, Alby…):</p>
-   <label>Amount (sats) — a day pass is ~$10 of bitcoin</label>
-   <input type="number" id="fund-sats" value="16000" min="1000" oninput="satsChanged()">
-   <button onclick="fundInvoice()">Show invoice</button>
-   <p id="fund-quote" class="muted" style="display:none"></p>
-   <p id="fund-note" class="ok" style="display:none"></p>
-   <div class="navrow">
-    <button id="recur-btn" onclick="toggleRecurring()">Recurring day-pass: OFF</button>
-    <span class="muted">ON = the agent buys each day's ~$10 pass from its
-    wallet automatically (never above your auto-pay cap). OFF = it never
-    spends without you.</span>
-   </div>
-   <div id="fund-qr" style="display:none;margin:.6rem 0"></div>
-   <pre id="bolt11" style="display:none"></pre>
-   <p id="fund-open" style="display:none">
-   <button onclick="copyInvoice()">Copy invoice</button> <span id="copy-msg"></span>
-   <a id="fund-link" href="#">Open in my Lightning wallet app</a>
-   · balance: <span id="fund-bal">0</span> sats
-   <span class="muted">(scan the QR with your phone's wallet, or copy the
-   invoice and paste it in any Lightning app — updates automatically after
-   you pay)</span></p>
-   <p class="muted">Hosted wallet on demo.lnbits.com — a public TEST server
-   (custodial; it can be reset). Keep only a few days of passes there, or use
-   your own instance below.</p>
+ </div></div>
+ <div class="sec-b"><div class="fs-grid">
+  <div class="fs-lbl">Key-based platform<p>Many offer a paper/simulated mode.</p></div>
+  <div class="stack">
+   <select id="brk-sel" onchange="brkFields()" aria-label="Key-based platform"></select>
+   <div id="brk-fields"></div>
+   <div class="navrow inline" id="brk-connect" style="display:none">
+    <button class="btn-primary" onclick="brkConnect()">Connect</button> <span id="brk-msg" role="status" aria-live="polite"></span></div>
   </div>
-   <p class="muted">Your own LNbits wallet:</p>
-   <input type="text" id="ln-url" placeholder="LNbits instance URL (https://…)">
-   <input type="password" id="ln-key" placeholder="LNbits wallet ADMIN key">
-   <p class="muted">— or —</p>
-   <input type="password" id="hc-key" placeholder="AgentHC Premium API key">
+ </div></div>
+ <div class="sec-b">
+  <details class="adv"><summary><svg class="i chev"><use href="#i-chev"/></svg><span>Don't see your
+  platform? Your agent can build the connector</span></summary>
+   <div class="adv-b"><p class="muted">Every platform needs a small adapter (different APIs). Your
+   agent can WRITE one for any platform with a trading API — after setup, in the
+   dashboard: <code>self-edit on</code> then
+   <code>code: add a broker adapter for &lt;platform&gt; using their API</code>.
+   You review the diff before it applies; it then appears here automatically.
+   moomoo, Interactive Brokers, Tastytrade, Tradier, etc. all work this way.</p></div>
   </details>
  </div>
- <div id="src-url" style="display:none">
-  <input type="text" id="src-url-input" placeholder="https://my-feed.example.com/events">
+ <div class="navrow"><span class="note">Orders execute at the broker you connect here.</span><span class="sp"></span>
+  <button onclick="goBack()"><svg class="i"><use href="#i-back"/></svg>Back</button>
+  <button class="btn-primary" data-next onclick="goStep(cur+1)">Continue<svg class="i"><use href="#i-arrow"/></svg></button></div>
+</section>
+
+<section id="s-sizing"><h2 tabindex="-1"><span class="eyebrow">Step 5 of 7</span>Position sizing</h2>
+ <div class="sec-b">
+  <p class="notice">Nobody here is an investment advisor and none of this
+  software can advise position sizing — this number is YOUR decision, made
+  with money you can afford to lose entirely.</p>
  </div>
- <div id="src-manual" style="display:none"><p class="muted">You'll append JSON
-  lines to <code>~/.agentic-trader/commands.jsonl</code> — see the README.</p></div>
- <div class="navrow"><button onclick="doSource()">Save & continue</button>
- <span id="src-msg"></span></div>
+ <div class="sec-b"><div class="fs-grid">
+  <div class="fs-lbl">Main pick<p>How each trade is sized.</p></div>
+  <div class="stack">
+   <div class="opts">
+    <label class="check"><input type="radio" name="szmode" value="budget" checked><span>Dollar budget
+    per trade (buys what fits; skips trades that exceed it)</span></label>
+    <label class="check"><input type="radio" name="szmode" value="contracts"><span>Fixed contracts
+    per trade</span></label>
+   </div>
+   <div class="field"><label for="sz-val">Budget ($) or contracts per trade</label>
+    <input type="number" id="sz-val" placeholder="e.g. 500" min="1" step="any"></div>
+  </div>
+ </div></div>
+ <div class="sec-b"><div class="fs-grid">
+  <div class="fs-lbl">Other trades<p>Optional.</p></div>
+  <div class="field"><label for="sz-other-val" class="muted">"Other trades" size — only used if your source includes
+   the wider other-trades journal; sized separately from the main pick
+   (blank = same as main)</label>
+   <input type="number" id="sz-other-val" placeholder="blank = same as main"
+   min="1" step="any"></div>
+ </div></div>
+ <div class="navrow"><span class="note">your choice — not advice</span><span id="sz-msg" role="status" aria-live="polite"></span><span class="sp"></span>
+  <button onclick="goBack()"><svg class="i"><use href="#i-back"/></svg>Back</button>
+  <button class="btn-primary" onclick="doSizing()">Save &amp; continue<svg class="i"><use href="#i-arrow"/></svg></button></div>
 </section>
 
-<section id="s-broker"><h2>Broker — where orders execute</h2>
- <p class="muted">Pick your platform. Robinhood is one-click OAuth; key-based
- platforms take API keys (many offer a paper/simulated mode — the safest trial).</p>
- <div class="navrow"><button onclick="rhStart()">Connect Robinhood</button>
- <span id="rh-msg"></span></div>
- <div id="rh-accounts"></div>
- <p class="muted" style="margin-top:1rem">— or a key-based platform —</p>
- <select id="brk-sel" onchange="brkFields()"></select>
- <div id="brk-fields"></div>
- <div class="navrow" id="brk-connect" style="display:none">
-  <button onclick="brkConnect()">Connect</button> <span id="brk-msg"></span></div>
- <details style="margin-top:1rem"><summary class="muted">Don't see your
- platform? Your agent can build the connector</summary>
-  <p class="muted">Every platform needs a small adapter (different APIs). Your
-  agent can WRITE one for any platform with a trading API — after setup, in the
-  dashboard: <code>self-edit on</code> then
-  <code>code: add a broker adapter for &lt;platform&gt; using their API</code>.
-  You review the diff before it applies; it then appears here automatically.
-  moomoo, Interactive Brokers, Tastytrade, Tradier, etc. all work this way.</p>
- </details>
+<section id="s-safety"><h2 tabindex="-1"><span class="eyebrow">Step 6 of 7</span>Safety rails &amp; extras</h2>
+ <div class="sec-b"><div class="fs-grid">
+  <div class="fs-lbl">Mode<p>Dry-run logs every decision and places no orders.</p></div>
+  <div class="stack">
+   <label class="check"><input type="checkbox" id="sf-dry" checked onchange="sfDryChanged()"><span>Start in
+   <b>dry-run</b> mode (log actions, place no orders — recommended)</span></label>
+   <div class="notice" id="sf-live-warn" role="alert" style="display:none"><b>LIVE mode:</b> the agent
+   will send real orders with real money to your broker — your decision, not advice.</div>
+  </div>
+ </div></div>
+ <div class="sec-b"><div class="fs-grid">
+  <div class="fs-lbl">Limits</div>
+  <div>
+   <div class="field"><label for="sf-cap">Max new entries per day</label>
+    <input type="number" id="sf-cap" value="5" min="1"></div>
+   <div class="field"><label for="sf-maxloss">Max daily loss in $ (optional, blank/0 = off) — once today's estimated
+    realized loss reaches this, no new entries until tomorrow; exits still run</label>
+    <input type="number" id="sf-maxloss" placeholder="e.g. 300" min="0"></div>
+  </div>
+ </div></div>
+ <div class="sec-b"><div class="fs-grid">
+  <div class="fs-lbl">Notifications<p>Any/all, optional.</p></div>
+  <div>
+   <div class="two">
+    <div class="field"><label for="nt-discord">Discord webhook URL</label>
+     <input type="text" id="nt-discord" placeholder="https://discord.com/api/webhooks/…"></div>
+    <div class="field"><label for="nt-ntfy">ntfy.sh topic</label>
+     <input type="text" id="nt-ntfy" placeholder="my-agent-alerts"></div>
+    <div class="field"><label for="nt-tg-token">Telegram bot token</label>
+     <input type="text" id="nt-tg-token" placeholder="123456:ABC…"></div>
+    <div class="field"><label for="nt-tg-chat">Telegram chat id</label>
+     <input type="text" id="nt-tg-chat" placeholder="e.g. 123456789"></div>
+   </div></div>
+ </div></div>
+ <div class="sec-b"><div class="fs-grid">
+  <div class="fs-lbl">Trading policy<p>Optional, veto-only.</p></div>
+  <div>
+   <div class="field"><label for="pol-text">My trading policy (optional — plain-English rules the agent's LLM
+   checks before every entry; veto-only; uses YOUR Anthropic API key)</label>
+    <textarea id="pol-text" rows="5"
+     placeholder="- Never trade more than 2 new entries per day.&#10;- Skip puts.&#10;- Only tickers: SPY, QQQ, NVDA."></textarea></div>
+   <div class="field"><label for="pol-key">Claude API key — only if you skipped step 2 (Connect your AI)</label>
+    <input type="password" id="pol-key" aria-label="Claude API key" placeholder="sk-ant-…" autocomplete="off">
+    <p class="help">Leave blank if your AI is already connected. Using another
+    provider? Connect it in step 2 instead.</p></div>
+  </div>
+ </div></div>
+ <div class="navrow"><span id="sf-msg" role="status" aria-live="polite"></span><span class="sp"></span>
+  <button onclick="goBack()"><svg class="i"><use href="#i-back"/></svg>Back</button>
+  <button class="btn-primary" onclick="doSafety()">Finish setup<svg class="i"><use href="#i-arrow"/></svg></button></div>
 </section>
 
-<section id="s-sizing"><h2>Position sizing</h2>
- <p class="muted">Nobody here is an investment advisor and none of this
- software can advise position sizing — this number is YOUR decision, made
- with money you can afford to lose entirely.</p>
- <label><input type="radio" name="szmode" value="budget" checked> Dollar budget
- per trade (buys what fits; skips trades that exceed it)</label><br>
- <label><input type="radio" name="szmode" value="contracts"> Fixed contracts
- per trade</label>
- <input type="number" id="sz-val" placeholder="e.g. 500" min="1" step="any">
- <label class="muted">"Other trades" size — only used if your source includes
- the wider other-trades journal; sized separately from the main pick
- (blank = same as main)</label>
- <input type="number" id="sz-other-val" placeholder="blank = same as main"
- min="1" step="any">
- <div class="navrow"><button onclick="doSizing()">Save & continue</button>
- <span id="sz-msg"></span></div>
-</section>
-
-<section id="s-safety"><h2>Safety rails & extras</h2>
- <p><label><input type="checkbox" id="sf-dry" checked> Start in
- <b>dry-run</b> mode (log actions, place no orders — recommended)</label></p>
- <label>Max new entries per day</label>
- <input type="number" id="sf-cap" value="5" min="1">
- <label>Max daily loss in $ (optional, blank/0 = off) — once today's estimated
-  realized loss reaches this, no new entries until tomorrow; exits still run</label>
- <input type="number" id="sf-maxloss" placeholder="e.g. 300" min="0">
- <label>Notifications (any/all, optional)</label>
- <input type="text" id="nt-discord" placeholder="Discord webhook URL">
- <input type="text" id="nt-ntfy" placeholder="ntfy.sh topic">
- <input type="text" id="nt-tg-token" placeholder="Telegram bot token">
- <input type="text" id="nt-tg-chat" placeholder="Telegram chat id">
- <label>My trading policy (optional — plain-English rules the agent's LLM
- checks before every entry; veto-only; uses YOUR Anthropic API key)</label>
- <textarea id="pol-text" rows="5"
-  placeholder="- Never trade more than 2 new entries per day.&#10;- Skip puts.&#10;- Only tickers: SPY, QQQ, NVDA."></textarea>
- <input type="password" id="pol-key" placeholder="Claude API key (if you skipped Connect your AI — any other provider: use that step)">
- <div class="navrow"><button onclick="doSafety()">Finish setup</button>
- <span id="sf-msg"></span></div>
-</section>
-
-<section id="s-done"><h2>Done — where should your agent live?</h2>
- <div id="done-body"></div>
- <div id="deploy-box">
-  <p><b>Option A — this computer:</b>
-   <button onclick="startLocal()">Start my agent now</button>
-   <span id="start-msg"></span></p>
-  <p class="muted">One click — the agent starts here and this page becomes its
-  dashboard. Keep this computer awake during market hours.</p>
-  <p><b>Option B — let your agent create its own cloud server</b> (~$6/mo on
-  YOUR DigitalOcean account): it provisions the server, moves its completed
-  setup there, and starts itself. Your token is used once and not stored.</p>
-  <input type="password" id="do-token" placeholder="DigitalOcean API token (write scope)">
-  <select id="do-region"><option>nyc3</option><option>sfo3</option><option>tor1</option>
-   <option>lon1</option><option>fra1</option><option>sgp1</option></select>
-  <button onclick="deploy()">Create my agent's server</button>
-  <div id="deploy-msg"></div>
+<section id="s-done"><h2 tabindex="-1"><span class="eyebrow">Step 7 of 7</span>Done — where should your agent live?</h2>
+ <div class="sec-b">
+  <div id="done-body"></div>
+  <div id="deploy-box" class="launch">
+   <div class="opt">
+    <h3>Option A — this computer</h3>
+    <p class="muted">One click — the agent starts here and this page becomes its
+    dashboard. Keep this computer awake during market hours.</p>
+    <p class="cta"><button class="btn-primary" onclick="startLocal()">Start my agent now</button>
+    <span id="start-msg" role="status" aria-live="polite" class="muted"></span></p>
+   </div>
+   <div class="opt">
+    <h3>Option B — let your agent create its own cloud server</h3>
+    <p class="muted">~$6/mo on
+    YOUR DigitalOcean account: it provisions the server, moves its completed
+    setup there, and starts itself. Your token is used once and not stored.</p>
+    <div class="field"><label for="do-token">DigitalOcean API token (write scope)</label>
+     <input type="password" id="do-token" placeholder="DigitalOcean API token" aria-label="DigitalOcean API token" autocomplete="off"></div>
+    <div class="field"><label for="do-region">Region</label>
+    <div class="inrow"><select id="do-region" aria-label="Region" style="flex:1"><option>nyc3</option><option>sfo3</option><option>tor1</option>
+     <option>lon1</option><option>fra1</option><option>sgp1</option></select>
+     <button onclick="deploy()">Create my agent's server</button></div></div>
+    <div id="deploy-msg" role="status" aria-live="polite"></div>
+   </div>
+  </div>
  </div>
+ <div class="navrow"><span class="note">Dry-run or LIVE is what you chose in Safety — switch any time from the dashboard. Your decision, not advice.</span><span class="sp"></span>
+  <button onclick="goBack()"><svg class="i"><use href="#i-back"/></svg>Back</button></div>
 </section>
 
-<div id="help">
- <p class="muted">Need help with this step? Ask your agent (works once your
- AI is connected in step 2 — any provider).</p>
- <div id="chatlog"></div>
- <div class="chatrow">
-  <input type="text" id="cmd" placeholder="e.g. what is dry-run? · is the hosted wallet safe?"
-   onkeydown="if(event.key==='Enter')ask()">
-  <button onclick="ask()">Ask</button>
+<div id="help" class="panel assist">
+ <div class="ph"><h2>Ask your agent</h2><span class="sp"></span><span class="muted" style="font-size:var(--fs-sm)">uses the AI from step 2</span></div>
+ <div class="pb">
+  <p class="muted">Need help with this step? Ask your agent (works once your
+  AI is connected in step 2 — any provider).</p>
+  <div id="chatlog" role="log" aria-live="polite" tabindex="0" aria-label="Conversation with your agent"></div>
+  <div class="chatrow">
+   <input type="text" id="cmd" aria-label="Ask your agent a question" placeholder="e.g. what is dry-run?"
+    onkeydown="if(event.key==='Enter')ask()">
+   <button class="btn-primary" onclick="ask()">Ask</button>
+  </div>
  </div>
 </div>
+</div>
+</div>
+</main>
 
 <script>
 // HTML-escape helper, hoisted so every builder can use it (loadBrokers/brkFields
@@ -521,15 +976,62 @@ const STEPS=[["s-consent","Agreement"],["s-llm","Your AI"],["s-source","Source"]
  ["s-broker","Broker"],["s-sizing","Sizing"],["s-safety","Safety"],["s-done","Launch"]];
 let doneSet=new Set(), cur=0, maxUnlocked=0;
 function idx(id){return STEPS.findIndex(s=>s[0]===id);}
+function goStep(i){if(i>=0&&i<=maxUnlocked&&i<STEPS.length){cur=i;render();
+  const m=document.querySelector('.wz-main');
+  if(m&&m.getBoundingClientRect().top<0)m.scrollIntoView({block:'start'});
+  focusStep();}}
+// The button that had focus just went display:none with its step — move
+// focus to the new step's heading so keyboard + screen-reader users follow.
+function focusStep(){
+  const h=document.querySelector('#'+STEPS[cur][0]+'>h2');
+  if(h){try{h.focus({preventScroll:true});}catch(e){h.focus();}}
+}
+function sfDryChanged(){
+  document.getElementById('sf-live-warn').style.display=
+    document.getElementById('sf-dry').checked?'none':'';
+}
+function goBack(){goStep(cur-1);}
 function render(){
   const bar=document.getElementById('stepbar');bar.innerHTML='';
+  const mk=(tag,cls,txt)=>{const e=document.createElement(tag);if(cls)e.className=cls;
+    if(txt!=null)e.textContent=txt;return e;};
   STEPS.forEach((s,i)=>{
-    const c=document.createElement('span');
-    c.className='chip'+(doneSet.has(s[0])?' done':'')+(i===cur?' cur':'');
-    c.textContent=(doneSet.has(s[0])?'✓ ':'')+(i+1)+' · '+s[1];
-    if(i<=maxUnlocked)c.onclick=()=>{cur=i;render();};
+    const d=doneSet.has(s[0]);
+    const c=mk('button','chip'+(d?' done':'')+(i===cur?' cur':'')+(i>maxUnlocked?' lock':''));
+    c.type='button';
+    c.appendChild(mk('span','n',d&&i!==cur?'✓':String(i+1)));
+    c.appendChild(mk('span','lbl',s[1]));
+    if(i===cur)c.setAttribute('aria-current','step');
+    if(i<=maxUnlocked)c.onclick=()=>goStep(i);
+    else{c.disabled=true;c.title='Locked — finish the earlier steps first';}
     bar.appendChild(c);
   });
+  // phones: "Step 3 of 7 · Source / Next: Broker" + a 7-segment bar
+  const now=mk('div','stepnow');
+  now.appendChild(mk('span','','Step '+(cur+1)+' of '+STEPS.length+' · '+STEPS[cur][1]));
+  if(cur+1<STEPS.length){
+    const open=cur+1<=maxUnlocked;
+    const nx=mk(open?'button':'span','nx'+(open?' go btn-ghost':''),'Next: '+STEPS[cur+1][1]+(open?' →':''));
+    if(open){nx.type='button';nx.onclick=()=>goStep(cur+1);}
+    now.appendChild(nx);
+  }
+  bar.appendChild(now);
+  // phones: the chips are hidden, so the segments ARE the step jumper —
+  // real buttons (40px hit area, focusable, labelled; disabled when locked)
+  const seg=mk('div','stepseg');
+  seg.setAttribute('role','group');seg.setAttribute('aria-label','Jump to step');
+  STEPS.forEach((s,i)=>{
+    const d=doneSet.has(s[0]);
+    const g=mk('button',(i===cur?'cur':(d?'done':''))+(i<=maxUnlocked?' on':''));
+    g.type='button';
+    g.setAttribute('aria-label','Step '+(i+1)+': '+s[1]+(d?' (done)':'')+(i>maxUnlocked?' (locked)':''));
+    g.title=(i+1)+' · '+s[1];
+    if(i===cur)g.setAttribute('aria-current','step');
+    if(i<=maxUnlocked)g.onclick=()=>goStep(i);else g.disabled=true;
+    seg.appendChild(g);
+  });
+  bar.appendChild(seg);
+  document.querySelectorAll('button[data-next]').forEach(b=>{b.disabled=cur+1>maxUnlocked;});
   STEPS.forEach((s,i)=>{document.getElementById(s[0]).className=(i===cur)?'active':'';});
 }
 function restoredNote(sec,txt){
@@ -541,7 +1043,11 @@ function restoredNote(sec,txt){
   let p=document.getElementById(sec+'-restored');
   if(!p){p=document.createElement('p');p.id=sec+'-restored';p.className='ok';
     el.insertBefore(p,el.children[1]||null);}
-  p.textContent='✓ '+txt;
+  // server copy says "4 signal day(s)" / "1 contract(s)": pluralise from n
+  p.textContent='✓ '+String(txt).replace(/(\\d[\\d,]*)(\\s+(?:[a-z-]+\\s+)?)(day|contract)\\(s\\)/gi,
+    (m,n,mid,w)=>n+mid+w+(n==='1'?'':'s'));
+  if(sec==='s-llm'){const b=document.getElementById('llm-skip');
+    if(b){b.textContent='Continue';b.className='btn-primary';}}
 }
 function done(id){
   // auto-advance only the FIRST time a step completes — re-saving an
@@ -550,7 +1056,9 @@ function done(id){
   doneSet.add(id);
   maxUnlocked=Math.max(maxUnlocked,Math.min(idx(id)+1,STEPS.length-1));
   if(first)cur=Math.min(idx(id)+1,STEPS.length-1);
-  render();}
+  render();
+  if(first&&booted)focusStep();}
+let booted=false;
 function unlock(id){maxUnlocked=Math.max(maxUnlocked,idx(id));render();}
 async function api(p, body){
   const r = await fetch(p, body?{method:'POST',headers:{'Content-Type':'application/json'},
@@ -673,6 +1181,7 @@ async function copyText(srcId,msgId){
 }
 let passTimer=null,passHelpTimer=null;
 async function buyPass(days){
+  document.querySelectorAll('button.pass').forEach(b=>b.classList.toggle('sel',b.dataset.days===String(days)));
   const st=document.getElementById('pass-status');st.textContent='creating invoice…';
   const r=await api('/api/pass/buy',{days:days});
   if(!r.ok){st.innerHTML='<span class="err">'+esc(r.error)+'</span>';
@@ -680,7 +1189,7 @@ async function buyPass(days){
   document.getElementById('pass-box').style.display='';
   document.getElementById('pass-quote').textContent=days+' signal day'+(days>1?'s':'')+' — '+
     r.amount_sats.toLocaleString()+' sats'+(r.amount_usd?' (~$'+r.amount_usd+')':'')+
-    (r.carried?' · plus '+r.carried+' unused day(s) carried over':'');
+    (r.carried?' · plus '+r.carried+' unused day'+(Number(r.carried)===1?'':'s')+' carried over':'');
   renderQr(r.qr,'pass-qr');
   const need=Math.ceil((r.amount_sats||0)*1.01)+50;
   document.getElementById('pass-need').textContent=need.toLocaleString()+' sats';
@@ -700,8 +1209,9 @@ async function checkPass(){
   if(r.status==='active'){
     if(passTimer){clearInterval(passTimer);passTimer=null;}
     document.getElementById('pass-box').style.display='none';
-    st.innerHTML='<span class="ok">Access active ✓ — '+(r.days_left??'?')+
-      ' signal day(s) left</span>';
+    {const n=Number(r.days_left);
+    st.innerHTML='<span class="ok">✓ Access active — '+(Number.isFinite(n)&&r.days_left!=null?n+' signal day'+(n===1?'':'s'):'? signal days')+
+      ' left</span>';}
   }else if(r.status==='pending'){st.textContent='waiting for payment…';}
   else if(r.status==='unpaid'){
     if(passTimer){clearInterval(passTimer);passTimer=null;}
@@ -715,7 +1225,16 @@ function srcChanged(){
   for(const k of ['agenthc','url','manual'])
     document.getElementById('src-'+k).style.display = (k===v)?'':'none';
 }
+// Show only the pass sizes the feed server sells right now (it can take
+// sizes off sale, e.g. while its node can't receive that large a payment).
+// If the server can't be asked, every card stays visible.
+async function passSizes(){
+  try{const r=await api('/api/pass/options');
+    if(r.options&&r.options.length)document.querySelectorAll('.pass[data-days]').forEach(b=>{
+      b.style.display=r.options.indexOf(+b.dataset.days)>=0?'':'none';});}catch(e){}
+}
 async function boot(){
+  passSizes();
   const st=await api('/api/state');
   document.getElementById('disclaimer').innerHTML=mdLite(st.disclaimer);
   const notes=st.notes||{};
@@ -729,20 +1248,28 @@ async function boot(){
   setRecurBtn(!!st.recurring);
   if(st.broker){done('s-broker');
     // numeric = Robinhood account last4; otherwise a key-based broker id
-    const t=/^\\d+$/.test(st.broker)?'account ····'+st.broker:st.broker;
-    document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ '+esc(t)+'</span>';
+    // (status goes in the step's own line, not beside the Robinhood button)
+    const t=/^\\d+$/.test(st.broker)?'Robinhood account ····'+st.broker:st.broker;
     restoredNote('s-broker','Broker connected: '+t);}
-  if(st.sizing){done('s-sizing');restoredNote('s-sizing',notes.sizing||'Sizing saved');}
+  if(st.sizing){done('s-sizing');restoredNote('s-sizing',notes.sizing||'Sizing saved');
+    restoreSizing(notes.sizing);}
   if(st.safety){done('s-safety');restoredNote('s-safety',notes.safety||'Safety saved');}
-  cur=Math.min(maxUnlocked,STEPS.length-1);render();
+  cur=Math.min(maxUnlocked,STEPS.length-1);render();booted=true;
   loadBrokers();
 }
 async function doConsent(){
-  if(!document.getElementById('c-read').checked){
-    document.getElementById('c-msg').innerHTML='<span class="err">check the box after reading</span>';return;}
-  const r=await api('/api/consent',{phrase:document.getElementById('c-phrase').value});
+  const rd=document.getElementById('c-read'),ph=document.getElementById('c-phrase');
+  // tie the error to the field it is about (screen readers read it on focus)
+  const mark=(el,bad)=>{if(bad){el.setAttribute('aria-invalid','true');el.setAttribute('aria-describedby','c-msg');}
+    else{el.removeAttribute('aria-invalid');el.removeAttribute('aria-describedby');}};
+  if(!rd.checked){mark(rd,true);mark(ph,false);
+    document.getElementById('c-msg').innerHTML='<span class="err">check the box after reading</span>';rd.focus();return;}
+  mark(rd,false);
+  const r=await api('/api/consent',{phrase:ph.value});
+  mark(ph,!r.ok);
   document.getElementById('c-msg').innerHTML=r.ok?'<span class="ok">accepted ✓</span>'
     :'<span class="err">'+r.error+'</span>';
+  if(!r.ok)ph.focus();
   if(r.ok)done('s-consent');
 }
 let llmBusy=false, LLMP={};
@@ -778,6 +1305,9 @@ async function llmFind(){
     document.getElementById('llm-model').value=r.suggested||'';
     document.getElementById('llm-pick').style.display='';
     document.getElementById('llm-connect').style.display='';
+    // one primary per footer: Connect & continue takes over from Continue
+    const sk=document.getElementById('llm-skip');
+    if(sk&&sk.className==='btn-primary')sk.className='back';
   }finally{llmBusy=false;}
 }
 async function doLLM(){
@@ -876,10 +1406,11 @@ function brkFields(){
   document.getElementById('brk-connect').style.display=b?'':'none';
   if(!b){box.innerHTML='';return;}
   box.innerHTML=b.fields.map(f=>{
-    if(f.type==='checkbox')return '<label><input type="checkbox" id="bf-'+f.id+'"'+
-      (f.default?' checked':'')+'> '+esc(f.label)+'</label><br>';
-    return '<input type="'+(f.type==='password'?'password':'text')+
-      '" id="bf-'+f.id+'" placeholder="'+esc(f.label)+'">';
+    if(f.type==='checkbox')return '<label class="check"><input type="checkbox" id="bf-'+f.id+'"'+
+      (f.default?' checked':'')+'><span>'+esc(f.label)+'</span></label>';
+    return '<div class="field"><label for="bf-'+f.id+'">'+esc(f.label)+'</label><input type="'+
+      (f.type==='password'?'password':'text')+
+      '" id="bf-'+f.id+'" placeholder="'+esc(f.label)+'" autocomplete="off"></div>';
   }).join('');
 }
 async function brkConnect(){
@@ -890,7 +1421,8 @@ async function brkConnect(){
   const r=await api('/api/broker/connect',{broker:id,values:vals});
   document.getElementById('brk-msg').innerHTML=r.ok?' <span class="ok">'+r.note+'</span>'
     :' <span class="err">'+r.error+'</span>';
-  if(r.ok)done('s-broker');
+  if(r.ok){document.getElementById('brk-status').innerHTML='<span class="ok">Connected: '+
+    esc(b.name||id)+' ✓</span>';done('s-broker');}
 }
 async function rhStart(){
   const r=await api('/api/rh/start');
@@ -901,14 +1433,35 @@ async function rhStart(){
 async function poll(){
   const st=await api('/api/state');
   if(st.broker){
-    document.getElementById('rh-msg').innerHTML='<span class="ok">connected ✓ account ····'+st.broker+'</span>';
+    document.getElementById('rh-msg').textContent='';
+    document.getElementById('brk-status').innerHTML='<span class="ok">Connected: Robinhood account ····'+
+      esc(st.broker)+' ✓</span>';
     if(st.rh_warning)document.getElementById('rh-accounts').innerHTML=
       '<p class="err">'+st.rh_warning+'</p>';
     done('s-broker');}
   else setTimeout(poll,1500);
 }
+// Pre-fill the sizing form from the saved-sizing note so the radios and
+// value match what is on file (re-saving with a blank "other" field would
+// otherwise silently clear the other-trades size). If the note can't be
+// read, un-check both modes rather than claim a choice that was never made.
+function restoreSizing(note){
+  const t=String(note||'');
+  const rb=v=>document.querySelector('input[name=szmode][value='+v+']');
+  const num=x=>String(x).replace(/,/g,'');
+  let m=t.match(/^Sizing saved: up to \\$([\\d.,eE+]+) per trade/), mode=null;
+  if(m){mode='budget';}
+  else if((m=t.match(/^Sizing saved: (\\d[\\d,]*) contract/))){mode='contracts';}
+  if(!mode){rb('budget').checked=false;rb('contracts').checked=false;return;}
+  rb(mode).checked=true;
+  document.getElementById('sz-val').value=num(m[1]);
+  const o=t.match(/other trades \\$?([\\d.,eE+]+)/);
+  if(o)document.getElementById('sz-other-val').value=num(o[1]);
+}
 async function doSizing(){
-  const mode=document.querySelector('input[name=szmode]:checked').value;
+  const sel=document.querySelector('input[name=szmode]:checked');
+  if(!sel){document.getElementById('sz-msg').innerHTML='<span class="err">choose budget or fixed contracts</span>';return;}
+  const mode=sel.value;
   const r=await api('/api/sizing',{mode:mode,value:document.getElementById('sz-val').value,
     other:document.getElementById('sz-other-val').value});
   document.getElementById('sz-msg').innerHTML=r.ok?'<span class="ok">saved ✓</span>'
@@ -971,9 +1524,11 @@ async function deploy(){
 async function ask(){
   const box=document.getElementById('cmd');const q=box.value.trim();if(!q)return;
   box.value='';const log=document.getElementById('chatlog');
-  log.innerHTML+='<div class="me">you: '+esc(q)+'</div>';log.scrollTop=log.scrollHeight;
+  const bub=(cls,t)=>{log.insertAdjacentHTML('beforeend','<div class="msg '+cls+'"><div class="who">'+
+    (cls==='me'?'You':'Agent')+'</div><div class="body">'+esc(t)+'</div></div>');log.scrollTop=log.scrollHeight;};
+  bub('me',q);
   const r=await api('/api/ask',{question:q});
-  log.innerHTML+='<div class="agent">'+esc(r.reply)+'</div>';log.scrollTop=log.scrollHeight;
+  bub('agent',r.reply);
 }
 boot();
 </script>
@@ -985,6 +1540,7 @@ boot();
    motion. Purely decorative — aria-hidden, never blocks the wizard. */
 (function(){
   var c=document.getElementById('bg'); if(!c||!window.WebGLRenderingContext) return;
+  if(getComputedStyle(c).display==='none') return;  // hidden in the current design: skip the GPU work
   var gl=null; try{ gl=c.getContext('webgl',{alpha:true,antialias:true,premultipliedAlpha:false}); }catch(e){}
   if(!gl) return;
   // Accessibility: honour reduced-motion by skipping the animation entirely —
@@ -1053,167 +1609,272 @@ boot();
 })();
 </script></body></html>"""
 
-_DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
+_DASH_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agentic-trader</title>""" + _STYLE + """
 <style>
- html{background:
-   radial-gradient(1000px 640px at 85% -12%,rgba(76,141,255,.10),transparent 60%),
-   var(--bg);background-repeat:no-repeat;background-attachment:fixed;min-height:100%}
- body{max-width:1180px;background:transparent}
- header{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:.4rem 0 1rem}
- header .sp{flex:1}
- .hero-mini{display:flex;align-items:center;gap:.7rem;min-width:0}
- .hero-mini .tag{font-size:.66rem;letter-spacing:.18em;text-transform:uppercase;color:var(--muted)}
- .hero-mini h1{margin:0;font-size:1.25rem;letter-spacing:-.02em}
- .logo{width:38px;height:38px;flex:none;border-radius:11px;position:relative;overflow:hidden;
-   background:radial-gradient(125% 125% at 30% 18%,#6ea0ff,#2f6bff 52%,#1c3d97);
-   box-shadow:0 6px 20px rgba(58,110,255,.45),inset 0 1px 0 rgba(255,255,255,.4)}
- .logo::after{content:"";position:absolute;inset:0;
-   background:conic-gradient(from 200deg,transparent,rgba(255,255,255,.4),transparent 42%)}
- .qbtn{background:var(--sink);color:var(--fg);border:1px solid var(--line-2);font-size:.85rem;
-   padding:.45rem .85rem;text-decoration:none;border-radius:8px;display:inline-block}
- .qbtn:hover{background:#1a2233;border-color:var(--accent);filter:none;text-decoration:none}
- .qbtn.warn{border-color:#78350f;color:#fbbf24}
- .pill{display:inline-block;font-size:.72rem;padding:.12rem .55rem;
-   border-radius:99px;border:1px solid var(--line-2);color:var(--muted)}
- .pill.live{border-color:#14532d;color:var(--ok);background:rgba(74,222,128,.08)}
- .pill.dry{border-color:#1e3a8a;color:#93c5fd;background:rgba(76,141,255,.08)}
- .pill.paused{border-color:#78350f;color:#fbbf24;background:rgba(251,191,36,.07)}
- .pill.bad{border-color:#7f1d1d;color:var(--err);background:rgba(248,113,113,.08)}
- .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:.75rem;margin-bottom:1rem}
- .tile{border:1px solid var(--line);border-radius:12px;padding:.75rem .9rem;
-   background:linear-gradient(180deg,var(--panel),var(--panel-2));box-shadow:var(--shadow)}
- .tile .k{font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
- .tile .v{font-size:1.3rem;font-weight:650;margin-top:.15rem;color:var(--fg);line-height:1.2}
- .tile .v.sm{font-size:1rem}
- .tile .s{font-size:.75rem;color:var(--muted);margin-top:.15rem}
- .meter{height:5px;border-radius:99px;background:var(--line);margin-top:.45rem;overflow:hidden}
- .meter i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent-2));width:0}
- .meter.hot i{background:linear-gradient(90deg,#f59e0b,#f87171)}
- .grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr);gap:1rem;align-items:start}
- @media(max-width:900px){.grid{grid-template-columns:1fr}}
- .col{display:flex;flex-direction:column;gap:1rem;min-width:0}
- .panel{border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);
-   background:linear-gradient(180deg,var(--panel),var(--panel-2))}
- .panel h2{margin:0;padding:.65rem .9rem;border-bottom:1px solid var(--line);font-size:.78rem;
-   text-transform:uppercase;letter-spacing:.07em;color:var(--muted);display:flex;gap:.5rem;align-items:center}
- .panel h2 .sp{flex:1}
- .panel .body{padding:.6rem .9rem .8rem}
- .empty{color:var(--muted);font-size:.85rem;padding:.4rem 0}
- .pos{display:flex;flex-wrap:wrap;gap:.5rem}
- .pcard{border:1px solid var(--line-2);border-radius:10px;padding:.45rem .7rem;background:var(--sink);
-   display:flex;gap:.55rem;align-items:baseline}
- .pcard b{font-size:.95rem} .pcard .muted{font-size:.78rem}
- .tag{font-size:.68rem;font-weight:650;padding:.05rem .4rem;border-radius:5px}
- .tag.call{background:rgba(74,222,128,.12);color:var(--ok)} .tag.put{background:rgba(248,113,113,.12);color:var(--err)}
- .tag.dry{background:rgba(76,141,255,.12);color:#93c5fd}
- .feed{list-style:none;margin:0;padding:0;max-height:380px;overflow-y:auto}
- .feed li{display:grid;grid-template-columns:1.6rem minmax(0,1fr) auto;gap:.55rem;align-items:start;
-   padding:.5rem 0;border-bottom:1px solid var(--line)}
+ .wrap{max-width:1360px;margin:0 auto;padding:var(--s5) 24px var(--s8)}
+ .wrap>*,.grid>*,.col>*{min-width:0}
+
+ /* mode banner */
+ .modebar{display:flex;align-items:center;gap:var(--s3);padding:9px var(--s4);margin-bottom:var(--s4);
+   border:1px solid var(--accent-line);background:linear-gradient(90deg,var(--accent-soft),transparent 70%);
+   border-radius:var(--r-lg);font-size:var(--fs);color:var(--fg-2)}
+ .modebar>svg{color:var(--accent);width:16px;height:16px}
+ .modebar b{color:var(--accent);font-weight:600}
+ .modebar .mb-txt{flex:1;min-width:0;display:flex;justify-content:space-between;gap:4px var(--s4);flex-wrap:wrap}
+ .modebar.live{border-color:var(--live-line);background:linear-gradient(90deg,var(--live-soft),transparent 70%)}
+ .modebar.live>svg,.modebar.live b{color:var(--live)}
+ .modebar.paused{border-color:var(--warn-line);background:linear-gradient(90deg,var(--warn-soft),transparent 70%)}
+ .modebar.paused>svg,.modebar.paused b.pz{color:var(--warn)}
+ /* LIVE stays red even while paused — amber only on the "Paused" word */
+ .modebar.live.paused{border-color:var(--live-line);background:linear-gradient(90deg,var(--live-soft),transparent 70%)}
+ .modebar.live.paused>svg{color:var(--live)}
+ .modebar.off{border-color:rgba(240,96,93,.45);background:linear-gradient(90deg,var(--down-soft),transparent 70%)}
+ .modebar.off>svg,.modebar.off b{color:var(--down)}
+ .modebar.off .mb-txt>.muted{display:none}
+
+ /* KPI strip */
+ .kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));border:1px solid var(--line);border-radius:var(--r-lg);
+   background:var(--surface);margin-bottom:var(--s4);overflow:hidden}
+ .kpi{padding:14px var(--s4);border-left:1px solid var(--line);min-width:0}
+ .kpi:first-child{border-left:0}
+ .kpi .k{font:600 var(--fs-xs)/1 var(--font);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+ .kpi .v{font:600 var(--fs-xl)/1 var(--mono);letter-spacing:-.02em;margin-top:10px;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ .kpi .v small{font:500 13px/1 var(--font);letter-spacing:0;color:var(--muted)}
+ .kpi .v.txt{font-family:var(--font);letter-spacing:-.01em;font-size:var(--fs-xl);line-height:1.1;white-space:normal;overflow-wrap:anywhere}
+ #t-sizing{white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;line-height:1.1}
+ #t-sizing-s{white-space:normal;overflow-wrap:anywhere}
+ .kpi .s{font-size:var(--fs-sm);color:var(--muted);margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ .kpi.bad{box-shadow:inset 0 2px 0 var(--down)} .kpi.bad .v{color:var(--down)}
+ .meter{height:3px;border-radius:2px;background:var(--line-2);margin-top:10px;overflow:hidden}
+ .meter i{display:block;height:100%;width:0;background:var(--accent);transition:width .3s}
+ .meter.hot i{background:var(--warn)}
+ .ok-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--up);margin-right:8px;vertical-align:2px}
+ .off-dot{display:inline-block;width:7px;height:7px;border-radius:50%;border:1px solid var(--faint);margin-right:8px;vertical-align:2px}
+
+ .grid{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:var(--s4);align-items:start}
+ .col{display:flex;flex-direction:column;gap:var(--s4);min-width:0}
+
+ /* proposal */
+ .panel.prop{border-color:var(--warn-line)}
+ .panel.prop .ph{background:var(--warn-soft);border-bottom-color:var(--warn-line);border-radius:var(--r-lg) var(--r-lg) 0 0}
+ .panel.prop .ph h2{color:var(--warn)}
+ #prop-expl{margin:0;color:var(--fg-2)}
+ .prop-warn{color:var(--warn);font-size:var(--fs-sm);margin:6px 0 0}
+ .prop-warn:empty{display:none}
+ pre.diff{margin:var(--s3) 0 0;padding:var(--s2) 0;max-height:260px;overflow:auto;white-space:pre;font:12px/1.65 var(--mono);word-break:normal}
+ .diff span{display:block;padding:0 var(--s3);min-width:max-content}
+ .diff .a{background:rgba(51,193,125,.08);color:#8fe0b5} .diff .d{background:rgba(240,96,93,.08);color:#f3a3a1} .diff .h{color:var(--muted)}
+ .btnrow{display:flex;gap:var(--s2);align-items:center;flex-wrap:wrap;margin-top:var(--s3)}
+
+ /* positions */
+ table.t{width:100%;border-collapse:collapse;font-size:var(--fs)}
+ .t th{font:600 var(--fs-xs)/1 var(--font);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);text-align:left;
+   padding:10px var(--s4);border-bottom:1px solid var(--line);white-space:nowrap}
+ .t td{padding:10px var(--s4);border-bottom:1px solid var(--line);white-space:nowrap}
+ .t tr:last-child td{border-bottom:0}
+ .t tbody tr:hover td{background:var(--surface-2)}
+ .t .r{text-align:right}
+ .t td.empty{color:var(--muted);text-align:center;padding:18px var(--s4)}
+ .t tbody tr:hover td.empty{background:none}
+ .sym{font-weight:600;letter-spacing:.01em}
+
+ /* activity chart */
+ .chart-wrap{padding:var(--s3) var(--s4) var(--s2);border-bottom:1px solid var(--line)}
+ .chart-head{display:flex;align-items:baseline;gap:var(--s3);margin-bottom:6px;flex-wrap:wrap}
+ .chart-head .big{font:600 20px/1 var(--mono);letter-spacing:-.02em}
+ .chart-head .meta{font:var(--fs-sm) var(--mono);color:var(--muted)}
+ #spark{width:100%;height:110px;display:block}
+ .chart-axis{display:flex;justify-content:space-between;gap:var(--s2);font:11px/1.4 var(--mono);color:var(--faint);margin-top:6px}
+ #pnl-total{font-size:var(--fs-sm)}
+
+ /* activity feed */
+ .feed{list-style:none;margin:0;padding:0}
+ .feed li{display:grid;grid-template-columns:62px 22px minmax(0,1fr) auto;gap:var(--s3);align-items:start;
+   padding:10px var(--s4);border-bottom:1px solid var(--line)}
  .feed li:last-child{border-bottom:0}
- .ic{width:1.6rem;height:1.6rem;border-radius:7px;display:grid;place-items:center;font-size:.8rem;font-weight:700}
- .ic.in{background:rgba(74,222,128,.13);color:var(--ok)} .ic.out{background:rgba(251,191,36,.13);color:#fbbf24}
- .ic.skip{background:var(--line);color:var(--muted)}
- .feed .t{font-size:.88rem} .feed .t b{font-weight:600} .feed .n{font-size:.78rem;color:var(--muted)}
- .feed .when{font-size:.75rem;color:var(--muted);white-space:nowrap}
- .pnl-pos{color:var(--ok)} .pnl-neg{color:var(--err)}
- #spark{width:100%;height:70px;display:block}
- .chatbox{display:flex;flex-direction:column;gap:.5rem}
- #chatlog{height:220px}
- .chatrow{display:flex;gap:.4rem} .chatrow input{margin:0;flex:1}
- .chips{display:flex;gap:.35rem;flex-wrap:wrap}
- .chips button{font-size:.75rem;padding:.25rem .6rem;background:var(--sink);border:1px solid var(--line-2);color:var(--muted)}
- .chips button:hover{color:var(--fg);border-color:var(--accent);filter:none}
- .hint{font-size:.76rem;color:var(--muted)}
- .navrow{display:flex;gap:.6rem;margin-top:.6rem;flex-wrap:wrap;align-items:center}
- #help{margin:0 0 1rem}
- @media(max-width:560px){body{margin-top:1rem}.tiles{grid-template-columns:1fr 1fr}
-   .tile .v{font-size:1.1rem}.hero-mini h1{font-size:1.1rem}}
+ .feed li:hover{background:var(--surface-2)}
+ .feed li.empty{display:block;color:var(--muted);text-align:center;padding:24px var(--s4)}
+ .feed li.empty:hover{background:none}
+ .feed .when{font:12px/20px var(--mono);color:var(--muted);white-space:nowrap}
+ .ic{width:20px;height:20px;border-radius:4px;display:grid;place-items:center}
+ .ic svg.i{width:12px;height:12px;stroke-width:2}
+ .ic.in{background:var(--up-soft);color:var(--up)} .ic.out{background:var(--accent-soft);color:var(--accent)}
+ .ic.skip{background:var(--raise);color:var(--muted)}
+ .feed .t{line-height:20px;color:var(--fg-2);overflow-wrap:anywhere} .feed .t b{color:var(--fg);font-weight:600}
+ .feed .n{font-size:var(--fs-sm);color:var(--muted);margin-top:2px;overflow-wrap:anywhere}
+ .feed .t .tags{white-space:nowrap}
+ .feed .pnl{font:600 var(--fs)/20px var(--mono);text-align:right;min-width:72px;white-space:nowrap}
+
+ /* chat */
+ .chips{display:flex;gap:6px;flex-wrap:wrap}
+ .chips button{height:24px;padding:0 9px;font:500 var(--fs-sm)/1 var(--mono);color:var(--fg-2)}
+ .chips button:hover{color:var(--fg);border-color:var(--accent-line)}
+ #p-chat #chatlog{margin:var(--s3) 0}
+ #p-chat .hint{margin-top:var(--s3)}
+
+ /* help */
+ .help-actions{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center}
+ #help p{margin:0 0 var(--s3);color:var(--fg-2)}
+ #help p.hint{margin:var(--s3) 0 0;color:var(--muted)}
+ #help-out{margin:var(--s3) 0 0;max-height:22rem}
+
+ @media (max-width:1100px){
+   .grid{grid-template-columns:minmax(0,1fr)}
+   .kpis{grid-template-columns:repeat(3,minmax(0,1fr))}
+   .kpi:nth-child(4){border-left:0}
+   .kpi:nth-child(n+4){border-top:1px solid var(--line)}
+ }
+ @media (max-width:640px){
+   .wrap{padding:var(--s4) 16px var(--s6)}
+   .modebar{align-items:flex-start}
+   .modebar>svg{margin-top:2px}
+   .modebar .mb-txt{flex-direction:column}
+   .kpis{grid-template-columns:1fr 1fr}
+   .kpi{border-left:1px solid var(--line)!important;border-top:1px solid var(--line)}
+   .kpi:nth-child(odd){border-left:0!important}
+   .kpi:nth-child(-n+2){border-top:0}
+   .kpi:last-child{grid-column:1/-1}
+   .kpi .v,.kpi .v.txt{font-size:20px}
+   .t th,.t td{padding:9px 12px}
+   .ph{padding:8px 12px}
+   .pb,.chart-wrap{padding-left:12px;padding-right:12px}
+   .feed li{grid-template-columns:20px minmax(0,1fr) auto;grid-template-rows:auto auto;padding:10px 12px;gap:4px 10px}
+   .feed .when{grid-column:2/4;grid-row:2;line-height:1.3;font-size:11px}
+   .feed .ic{grid-row:1/3}
+   .feed .pnl{min-width:0}
+   .feed .t .tags{display:block;margin-top:2px;line-height:16px}
+   .chips button{height:auto;min-height:40px;padding:0 12px}
+ }
 </style></head><body>
-<header>
- <div class="hero-mini"><div class="logo" aria-hidden="true"></div>
-  <div><div class="tag">Agentic Trader</div><h1>Dashboard</h1></div></div>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+ <symbol id="i-up" viewBox="0 0 16 16"><path d="M8 13V3M4 7l4-4 4 4"/></symbol>
+ <symbol id="i-out" viewBox="0 0 16 16"><path d="M8 3v10M4 9l4 4 4-4"/></symbol>
+ <symbol id="i-skip" viewBox="0 0 16 16"><path d="M4 8h8"/></symbol>
+ <symbol id="i-help" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2"/><path d="M6.3 6.3a1.8 1.8 0 0 1 3.4.6c0 1.2-1.7 1.5-1.7 2.6M8 11.6v.1"/></symbol>
+ <symbol id="i-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M3.6 12.4l1.1-1.1M11.3 4.7l1.1-1.1"/></symbol>
+ <symbol id="i-pause" viewBox="0 0 16 16"><path d="M6 3.5v9M10 3.5v9"/></symbol>
+ <symbol id="i-play" viewBox="0 0 16 16"><path d="M5 3.5v9l7-4.5z"/></symbol>
+ <symbol id="i-bolt" viewBox="0 0 16 16"><path d="M9 1.8 3.5 9h4l-.6 5.2L12.5 7h-4z"/></symbol>
+ <symbol id="i-shield" viewBox="0 0 16 16"><path d="M8 1.8 2.8 3.8v4c0 3 2.2 5.4 5.2 6.4 3-1 5.2-3.4 5.2-6.4v-4z"/></symbol>
+ <symbol id="mark" viewBox="0 0 24 24"><rect x=".5" y=".5" width="23" height="23" rx="5.5" fill="#12161e" stroke="#343e50"/>
+  <path d="M5.5 15.5l4-4.5 3 2.6 5.5-6.6" fill="none" stroke="#5b9dff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="18" cy="7" r="1.6" fill="#5b9dff"/></symbol>
+</svg>
+
+<header class="appbar"><div class="appbar-in">
+ <a class="brand" href="/dash"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg>
+  <span class="name">Agentic Trader</span><span class="crumb">/</span><span class="page">Dashboard</span></a>
+ <span class="vsep hide-sm"></span>
  <span class="pill" id="b-mode">…</span>
- <span class="pill" id="b-market"></span>
- <span class="pill paused" id="b-paused" style="display:none">⏸ paused</span>
+ <span class="pill" id="b-market" style="display:none"></span>
+ <span class="pill paused" id="b-paused" style="display:none">Paused</span>
  <span class="sp"></span>
- <a class="qbtn" id="upd-badge" href="/setup" style="display:none" title="Install it from settings (top of the page)">⬆ update available</a>
- <button class="qbtn" onclick="toggleHelp()">? help</button>
- <a class="qbtn" href="/setup">⚙ settings</a>
- <button class="qbtn" id="q-pause" onclick="quick(this.dataset.cmd)" data-cmd="pause">Pause</button>
- <button class="qbtn" id="q-dry" onclick="quick(this.dataset.cmd)" data-cmd="dry on">Dry-run</button>
-</header>
-
-<section id="help" style="display:none">
- <h2>Help</h2>
- <p class="muted">Something not working? These two buttons usually find the
- cause without any typing.</p>
- <p><button onclick="helpNet()">Check my connection</button>
- <button onclick="helpReport()">Copy support report</button>
- <span id="help-msg" class="muted"></span></p>
- <pre id="help-out" style="display:none;white-space:pre-wrap;max-height:22rem;overflow:auto"></pre>
- <p class="muted" style="font-size:.8rem">The report contains no keys, tokens,
- invoices or wallet IDs — they are removed before it's shown. Paste it to
- whoever helps you with the agent.</p>
-</section>
-
-<div class="tiles">
- <div class="tile"><div class="k">Entries today</div>
-  <div class="v" id="t-entries">–</div><div class="meter" id="m-entries"><i></i></div>
-  <div class="s" id="t-cap"></div></div>
- <div class="tile"><div class="k">Open positions</div>
-  <div class="v" id="t-pos">–</div><div class="s">opened by this agent</div></div>
- <div class="tile" id="tile-feed"><div class="k">Signal feed</div>
-  <div class="v sm" id="t-feed">–</div><div class="s" id="t-feed-s"></div></div>
- <div class="tile"><div class="k">Size per trade</div>
-  <div class="v sm" id="t-sizing">–</div><div class="s">your choice — not advice</div></div>
- <div class="tile"><div class="k">Your rules</div>
-  <div class="v sm" id="t-policy">–</div><div class="s" id="t-policy-hint"></div></div>
-</div>
-
-<div class="grid">
- <div class="col">
-  <div class="panel" id="p-proposal" style="display:none;border-color:#78350f">
-   <h2>Proposed code change — review before it applies</h2>
-   <div class="body">
-    <p id="prop-expl"></p><p id="prop-warn" class="err"></p>
-    <pre id="prop-diff" style="max-height:260px;overflow-y:auto"></pre>
-    <div class="navrow">
-     <button onclick="propApply()">Apply &amp; restart</button>
-     <button class="back" onclick="propReject()">Reject</button>
-     <span id="prop-msg"></span>
-    </div>
-   </div></div>
-  <div class="panel" id="p-positions"><h2>Open positions</h2>
-   <div class="body"><div class="pos" id="positions"><span class="empty">none</span></div></div></div>
-  <div class="panel" id="p-activity"><h2>Activity<span class="sp"></span>
-   <span id="pnl-total" class="hint"></span></h2>
-   <div class="body"><svg id="spark" viewBox="0 0 300 70" preserveAspectRatio="none" style="display:none"></svg>
-   <ul class="feed" id="trades"><li class="empty">nothing yet</li></ul></div></div>
+ <div class="actions acts-a">
+  <a class="btn btn-ghost" id="upd-badge" href="/setup" style="display:none;color:var(--accent)" title="Install it from settings (top of the page)">↑ Update<span class="lbl-sm">available</span></a>
+  <button class="btn-ghost" id="help-btn" onclick="toggleHelp()" title="Help" aria-expanded="false" aria-controls="help"><svg class="i"><use href="#i-help"/></svg><span class="lbl-sm">Help</span></button>
+  <a class="btn btn-ghost" href="/setup" title="Settings"><svg class="i"><use href="#i-gear"/></svg><span class="lbl-sm">Settings</span></a>
  </div>
- <div class="col">
-  <div class="panel" id="p-chat"><h2>Talk to your agent</h2>
-   <div class="body chatbox">
-    <div class="chips">
-     <button onclick="ask('status')">status</button>
-     <button onclick="ask('set cap 3')">set cap 3</button>
-     <button onclick="ask('set positions 5')">set positions 5</button>
-     <button onclick="ask('why did you skip the last signal?')">why the last skip?</button>
-    </div>
-    <div id="chatlog"><span class="hint">Ask anything, or give a command —
-    <code>pause</code>, <code>set budget 500</code>, <code>set cap 3</code>,
-    <code>dry off</code>, <code>stop</code>.</span></div>
-    <div class="chatrow">
-     <input type="text" id="cmd" placeholder="Ask or command…"
-      onkeydown="if(event.key==='Enter')send()">
-     <button onclick="send()">Send</button>
-    </div>
-    <div class="hint">Code changes: run Claude Code in the agent's folder on
-    this computer, then restart the agent.</div>
-   </div></div>
+ <span class="vsep hide-sm"></span>
+ <div class="actions acts-b">
+  <button id="q-pause" onclick="quick(this.dataset.cmd)" data-cmd="pause"><svg class="i"><use href="#i-pause"/></svg>Pause</button>
+  <button id="q-dry" onclick="quick(this.dataset.cmd)" data-cmd="dry on">Dry-run</button>
  </div>
-</div>
+</div></header>
+
+<main class="wrap">
+ <div id="modebar" class="modebar dry" role="status"><svg class="i"><use href="#i-shield"/></svg>
+  <div class="mb-txt"><span id="mb-main"><b>Dry-run.</b> The agent logs every decision but places no orders.</span>
+  <span class="muted">Going live sends real orders with real money — your decision, not advice.</span></div></div>
+
+ <div class="kpis">
+  <div class="kpi"><div class="k">Entries today</div>
+   <div class="v" id="t-entries">–</div><div class="meter" id="m-entries"><i></i></div>
+   <div class="s" id="t-cap"></div></div>
+  <div class="kpi"><div class="k">Open positions</div>
+   <div class="v" id="t-pos">–</div><div class="s">opened by this agent</div></div>
+  <div class="kpi" id="tile-feed"><div class="k">Signal feed</div>
+   <div class="v txt" id="t-feed">–</div><div class="s" id="t-feed-s"></div></div>
+  <div class="kpi"><div class="k">Size per trade</div>
+   <div class="v" id="t-sizing">–</div><div class="s" id="t-sizing-s">your choice — not advice</div></div>
+  <div class="kpi"><div class="k">Your rules</div>
+   <div class="v txt" id="t-policy">–</div><div class="s" id="t-policy-hint"></div></div>
+ </div>
+
+ <div class="grid">
+  <div class="col">
+   <section class="panel prop" id="p-proposal" style="display:none">
+    <div class="ph"><h2>Proposed code change — review before it applies</h2></div>
+    <div class="pb">
+     <p id="prop-expl"></p><p id="prop-warn" class="prop-warn"></p>
+     <pre id="prop-diff" class="diff" tabindex="0" aria-label="Proposed code diff"></pre>
+     <div class="btnrow">
+      <button class="btn-primary" onclick="propApply()">Apply &amp; restart</button>
+      <button class="back" onclick="propReject()">Reject</button>
+      <span class="muted">Nothing changes until you apply.</span>
+      <span id="prop-msg" role="status" aria-live="polite"></span>
+     </div>
+    </div>
+   </section>
+
+   <section class="panel" id="p-positions">
+    <div class="ph"><h2>Open positions</h2><span class="count" id="pos-count" style="display:none"></span></div>
+    <table class="t"><thead><tr><th style="width:24%">Symbol</th><th style="width:18%">Type</th><th style="width:24%">Expiry</th><th class="r">Strike</th></tr></thead>
+     <tbody id="positions"><tr><td colspan=4 class=empty>No open positions</td></tr></tbody></table>
+   </section>
+
+   <section class="panel" id="p-activity">
+    <div class="ph"><h2>Activity</h2><span class="count" style="display:none"></span><span class="sp"></span><span id="pnl-total" class="muted"></span></div>
+    <div class="chart-wrap" style="display:none">
+     <div class="chart-head"><span class="big" id="pnl-big"></span><span class="meta"></span></div>
+     <svg id="spark" viewBox="0 0 600 110" preserveAspectRatio="none" aria-hidden="true"></svg>
+     <div class="chart-axis"><span></span><span>┄ break-even</span><span></span></div>
+    </div>
+    <ul class="feed" id="trades"><li class="empty">Nothing yet — signals and the agent's decisions show up here</li></ul>
+   </section>
+  </div>
+
+  <div class="col">
+   <section class="panel" id="p-chat">
+    <div class="ph"><h2>Talk to your agent</h2></div>
+    <div class="pb">
+     <div class="chips">
+      <button onclick="ask('status')">status</button>
+      <button onclick="ask('set cap 3')">set cap 3</button>
+      <button onclick="ask('set positions 5')">set positions 5</button>
+      <button onclick="ask('why did you skip the last signal?')">why the last skip?</button>
+     </div>
+     <div id="chatlog" role="log" aria-live="polite" tabindex="0" aria-label="Conversation with your agent"><span class="hint">Ask anything, or give a command —
+     <code>pause</code>, <code>set budget 500</code>, <code>set cap 3</code>,
+     <code>dry off</code>, <code>stop</code>.</span></div>
+     <div class="chatrow">
+      <input type="text" id="cmd" aria-label="Ask your agent or give a command" placeholder="Ask or command…"
+       onkeydown="if(event.key==='Enter')send()">
+      <button class="btn-primary" onclick="send()">Send</button>
+     </div>
+     <div class="hint">Code changes: run Claude Code in the agent's folder on
+     this computer, then restart the agent.</div>
+    </div>
+   </section>
+
+   <section class="panel" id="help" style="display:none">
+    <div class="ph"><h2 tabindex="-1">Help</h2><span class="sp"></span><button class="btn-ghost btn-sm" onclick="toggleHelp()">Close</button></div>
+    <div class="pb">
+     <p>Something not working? These two buttons usually find the
+     cause without any typing.</p>
+     <div class="help-actions"><button onclick="helpNet()">Check my connection</button>
+     <button onclick="helpReport()">Copy support report</button>
+     <span id="help-msg" class="muted"></span></div>
+     <pre id="help-out" style="display:none" tabindex="0" aria-label="Help output"></pre>
+     <p class="hint">The report contains no keys, tokens,
+     invoices or wallet IDs — they are removed before it's shown. Paste it to
+     whoever helps you with the agent.</p>
+    </div>
+   </section>
+  </div>
+ </div>
+</main>
 <script>
 async function api(p, body){
   const r=await fetch(p, body?{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1222,7 +1883,15 @@ async function api(p, body){
 }
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
 function $(id){return document.getElementById(id);}
-function toggleHelp(){const h=$('help');h.style.display=h.style.display==='none'?'':'none';}
+function toggleHelp(){const h=$('help');const show=h.style.display==='none';h.style.display=show?'':'none';
+  const btn=$('help-btn');if(btn)btn.setAttribute('aria-expanded',show?'true':'false');
+  if(show){
+    // on narrow layouts the panel sits below Activity + Chat: move focus to
+    // it so keyboard / screen-reader users land on what just opened
+    const hd=h.querySelector('.ph h2');
+    try{if(hd)hd.focus({preventScroll:true});}catch(e){}
+    try{h.scrollIntoView({behavior:'smooth',block:'nearest'});}catch(e){}
+  }else if(btn){try{btn.focus({preventScroll:true});}catch(e){}}}
 async function helpGet(path,label){
   const msg=$('help-msg'),out=$('help-out');
   msg.textContent=label+'… (up to a minute)';out.style.display='none';
@@ -1247,107 +1916,184 @@ const SOURCES={agenthc:'AgentHC feed',url:'Your JSON feed',manual:'Manual comman
 const SKIPS={skip_stale:'signal was too old',skip_daily_cap:'daily entry cap reached',
   skip_position_cap:'max open positions reached',skip_daily_loss:'daily loss limit reached',
   policy_veto:'your rules said no'};
+const ICON=n=>'<svg class="i"><use href="#i-'+n+'"/></svg>';
+function cap1(s){s=String(s||'');return s.charAt(0).toUpperCase()+s.slice(1);}
+function shortDate(d){return d.toLocaleDateString([], {month:'short',day:'numeric'});}
+function hhmm(d){return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',hour12:false});}
 function when(ts){
+  // 24h HH:MM for today, "Oct 14" for older rows (full time in the title)
   const d=new Date(ts);if(isNaN(d))return esc(ts||'');
   const today=new Date().toDateString()===d.toDateString();
-  return (today?'':d.toLocaleDateString([], {month:'short',day:'numeric'})+' ')+
-    d.toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+  return '<span class="when" title="'+esc(d.toLocaleString())+'">'+esc(today?hhmm(d):shortDate(d))+'</span>';
+}
+function axisLabel(ts,withTime){
+  const d=new Date(ts);if(isNaN(d))return '';
+  const today=new Date().toDateString()===d.toDateString();
+  if(today)return hhmm(d);
+  return shortDate(d)+(withTime?' '+hhmm(d):'');
 }
 function money(v){const n=Number(v);return (n>=0?'+$':'−$')+Math.abs(n).toFixed(2);}
-function contractHtml(c){
-  // "NVDA 2026-10-16 $215 PUT" -> NVDA · Oct 16 · $215 PUT
+// one strike format everywhere: "$290" for whole strikes, "$717.50" otherwise
+function fmtStrike(v){const n=Number(v);if(!isFinite(n))return esc(String(v));
+  return '$'+(Number.isInteger(n)?String(n):n.toFixed(2));}
+function contractHtml(c,extra){
+  // "NVDA 2026-10-16 $215 PUT" -> NVDA Oct 16 $215 [PUT] [DRY-RUN|LIVE]
+  // tags sit in one no-wrap group so PUT + DRY-RUN never split across lines
   const m=String(c||'').match(/^(\\S+)\\s+(\\d{4})-(\\d{2})-(\\d{2})\\s+\\$?([\\d.]+)\\s+(CALL|PUT)$/i);
-  if(!m)return '<b>'+esc(c||'')+'</b>';
+  const tags=t=>(t?' <span class="tags">'+t+'</span>':'');
+  if(!m)return '<b>'+esc(c||'')+'</b>'+tags(extra||'');
   const d=new Date(+m[2],+m[3]-1,+m[4]);
-  return '<b>'+esc(m[1])+'</b> '+esc(d.toLocaleDateString([], {month:'short',day:'numeric'}))+
-    ' $'+esc(m[5])+' <span class="tag '+(m[6].toUpperCase()==='CALL'?'call':'put')+'">'+
-    esc(m[6].toUpperCase())+'</span>';
+  return '<b>'+esc(m[1])+'</b> <span class="num">'+esc(shortDate(d))+' '+fmtStrike(m[5])+'</span>'+
+    tags('<span class="tag '+(m[6].toUpperCase()==='CALL'?'call':'put')+'">'+
+    esc(m[6].toUpperCase())+'</span>'+(extra?' '+extra:''));
 }
 function feedTile(text){
   // "prepaid pass · 4 signal days left" / "wallet 41,000 sats" / "Premium API key"
   const t=String(text||'');
-  const tile=$('tile-feed');
+  const tile=$('tile-feed'),v=$('t-feed');
   const m=t.match(/(\\d+)\\s+signal day/);
-  if(m){$('t-feed').textContent=m[1]+' signal day'+(m[1]==='1'?'':'s')+' left';
-    $('t-feed-s').textContent='prepaid pass';}
-  else{$('t-feed').textContent=t||'–';$('t-feed-s').textContent='';}
+  if(m){const n=parseInt(m[1],10);v.className='v';
+    v.innerHTML=n+'<small> day'+(n===1?'':'s')+' left</small>';
+    $('t-feed-s').textContent='prepaid signal days';}
+  else{v.className='v txt';v.textContent=t||'–';$('t-feed-s').textContent='';}
+  v.title=t;
   const bad=/expired|used up|not paid|none|no access|exits only/i.test(t);
-  tile.style.borderColor=bad?'#7f1d1d':'';
+  tile.classList.toggle('bad',bad);
 }
 function spark(points){
-  const svg=$('spark');
-  if(points.length<2){svg.style.display='none';return;}
+  const svg=$('spark'),wrap=svg.closest('.chart-wrap');
+  if(points.length<2){wrap.style.display='none';svg.innerHTML='';return;}
   const min=Math.min(0,...points),max=Math.max(0,...points),span=(max-min)||1;
-  const x=i=>i*300/(points.length-1),y=v=>64-(v-min)*58/span;
+  const x=i=>i*600/(points.length-1),y=v=>102-(v-min)*94/span;
   const d=points.map((v,i)=>(i?'L':'M')+x(i).toFixed(1)+' '+y(v).toFixed(1)).join(' ');
-  const up=points[points.length-1]>=0;
-  svg.innerHTML='<line x1="0" x2="300" y1="'+y(0).toFixed(1)+'" y2="'+y(0).toFixed(1)+
-    '" stroke="#2c3446" stroke-dasharray="3 3"/><path d="'+d+'" fill="none" stroke="'+
-    (up?'#4ade80':'#f87171')+'" stroke-width="2" vector-effect="non-scaling-stroke"/>';
-  svg.style.display='';
+  const z=y(0).toFixed(1);
+  const col=points[points.length-1]>=0?'#33c17d':'#f0605d';
+  svg.innerHTML='<path d="'+d+' L600 '+z+' L0 '+z+'Z" fill="'+col+'" fill-opacity=".10" stroke="none"/>'+
+    '<line x1="0" x2="600" y1="'+z+'" y2="'+z+'" stroke="#343e50" stroke-dasharray="3 3" vector-effect="non-scaling-stroke"/>'+
+    '<path d="'+d+'" fill="none" stroke="'+col+'" stroke-width="1.75" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>';
+  wrap.style.display='';
+}
+function setMode(kind,live,paused){
+  // kind: 'ok' | 'off' | 'unreachable'
+  // #modebar is a live region polled every 5s: only touch the DOM when the
+  // text actually changes, or screen readers re-announce it on every poll.
+  const mb=$('modebar'),main=$('mb-main'),sub=mb.querySelector('.mb-txt>.muted');
+  const put=(cls,h)=>{if(mb.className!==cls)mb.className=cls;if(main.innerHTML!==h)main.innerHTML=h;};
+  if(kind==='off'){put('modebar off','<b>Agent not running.</b> Start it: <code>python agent.py run</code>');return;}
+  if(kind==='unreachable'){put('modebar off','<b>Can\\'t reach the agent on this computer</b> — is it still running?');return;}
+  put('modebar '+(live?'live':'dry')+(paused?' paused':''),
+    (live?'<b>LIVE.</b> Real orders with real money are sent to your broker.':
+    '<b>Dry-run.</b> The agent logs every decision but places no orders.')+
+    (paused?' <b class="pz">Paused</b> — no new entries until you press Resume.':''));
+  const st=live?'Switch to dry-run any time to stop sending orders — your decision, not advice.':
+    'Going live sends real orders with real money — your decision, not advice.';
+  if(sub.textContent!==st)sub.textContent=st;
+}
+function kpisBlank(){
+  ['t-entries','t-pos','t-sizing','t-policy','t-feed'].forEach(id=>{$(id).textContent='–';});
+  ['t-cap','t-feed-s','t-policy-hint'].forEach(id=>{$(id).textContent='';});
+  $('m-entries').firstChild.style.width='0%';$('tile-feed').classList.remove('bad');
+}
+function badMode(text,kind){
+  const bm=$('b-mode');bm.textContent=text;bm.className='pill bad';
+  $('b-market').style.display='none';$('b-paused').style.display='none';
+  setMode(kind);kpisBlank();
 }
 async function refresh(){
   try{
     const s=await api('/api/status');
-    if(s.mode==='OFFLINE'){
-      $('b-mode').textContent='agent not running';$('b-mode').className='pill bad';
-      $('t-feed').textContent='start it: agent.py run';return;}
+    if(s.mode==='OFFLINE'){badMode('Agent not running','off');return;}
     const f=s.fields||{};const live=s.mode==='LIVE';
     const bm=$('b-mode');
-    bm.textContent=live?'● LIVE — real orders':'◌ DRY-RUN — no orders';
+    bm.innerHTML=live?'<span class="dot"></span>LIVE · real orders':'<span class="dot"></span>Dry-run · no orders';
     bm.className='pill '+(live?'live':'dry');
-    $('b-market').textContent=(f['market']||'').startsWith('open')?'market open':'market closed';
+    const mk=$('b-market'),open=(f['market']||'').startsWith('open');
+    mk.innerHTML=open?'<span class="dot"></span>Market open':'Market closed';
+    mk.className='pill'+(open?' open':'');mk.style.display='';
     $('b-paused').style.display=s.paused?'':'none';
-    const qp=$('q-pause');qp.textContent=s.paused?'Resume':'Pause';qp.dataset.cmd=s.paused?'resume':'pause';
-    const qd=$('q-dry');qd.textContent=live?'Switch to dry-run':'Go live';
-    qd.dataset.cmd=live?'dry on':'dry off';qd.className='qbtn'+(live?'':' warn');
+    setMode('ok',live,!!s.paused);
+    const qp=$('q-pause');
+    qp.innerHTML=s.paused?ICON('play')+'Resume':ICON('pause')+'Pause';
+    qp.dataset.cmd=s.paused?'resume':'pause';qp.className=s.paused?'btn-primary':'';
+    const qd=$('q-dry');
+    qd.innerHTML=live?'Switch to dry-run':ICON('bolt')+'Go live';
+    qd.dataset.cmd=live?'dry on':'dry off';qd.className=live?'':'btn-warn';
     const ent=(f['entries today']||'').split('/');
     const n=parseInt(ent[0],10)||0,cap=parseInt((ent[1]||'').replace(/\\D+/g,''),10)||0;
-    $('t-entries').textContent=isNaN(parseInt(ent[0],10))?'–':n;
+    $('t-entries').innerHTML=isNaN(parseInt(ent[0],10))?'–':(n+(cap?'<small> / '+cap+'</small>':''));
     $('t-cap').textContent=cap?('of '+cap+' allowed today'):'';
     const mt=$('m-entries');mt.firstChild.style.width=(cap?Math.min(100,n*100/cap):0)+'%';
     mt.className='meter'+(cap&&n>=cap?' hot':'');
     const pos=(f['open positions']||'none');
     const list=pos==='none'?[]:pos.split(', ');
     $('t-pos').textContent=list.length;
+    const pc=$('pos-count');pc.textContent=list.length;pc.style.display=list.length?'':'none';
     $('positions').innerHTML=list.length?list.map(p=>{
       const a=p.split('|');
-      if(a.length<4)return '<div class="pcard"><b>'+esc(p)+'</b></div>';
-      return '<div class="pcard">'+contractHtml(a[0]+' '+a[1]+' $'+a[2]+' '+(a[3]==='C'?'CALL':'PUT'))+'</div>';
-    }).join(''):'<span class="empty">none</span>';
-    $('t-sizing').textContent=(f['sizing']||'–').replace('contract(s)/trade','contract(s)');
+      if(a.length<4)return '<tr><td class=sym colspan=4>'+esc(p)+'</td></tr>';
+      const d=new Date(a[1]+'T12:00:00');const k=Number(a[2]);
+      return '<tr><td class=sym>'+esc(a[0])+'</td><td><span class="tag '+(a[3]==='C'?'call':'put')+'">'+
+        (a[3]==='C'?'CALL':'PUT')+'</span></td><td class=num>'+esc(isNaN(d)?a[1]:shortDate(d))+
+        '</td><td class="r num">'+(isNaN(k)?esc(a[2]):fmtStrike(k))+'</td></tr>';
+    }).join(''):'<tr><td colspan=4 class=empty>No open positions</td></tr>';
+    // "$500/trade budget (other trades: $100/trade)" / "1 contract(s)/trade":
+    // the main sizing goes in the value, the other-trades part in the caption
+    // (no hover on touch screens), and "contract(s)" is pluralised from n.
+    const szRaw=String(f['sizing']||'–');
+    const plur=s=>s.replace(/(\\d+) contract\\(s\\)(\\/trade)?/g,(m,n)=>n+' contract'+(n==='1'?'':'s'));
+    const oi=szRaw.indexOf(' (other trades:');
+    const sz=plur(oi>=0?szRaw.slice(0,oi):szRaw);
+    const szOther=oi>=0?plur(szRaw.slice(oi+2).replace(/\\)\\s*$/,'')):'';
+    const sm=sz.match(/^(\\S+)\\s+(.+)$/);const sv=$('t-sizing');sv.title=szRaw+' — your choice, not advice';
+    sv.innerHTML=sm?esc(sm[1])+'<small> '+esc(sm[2])+'</small>':esc(sz);
+    $('t-sizing-s').textContent=szOther||'your choice — not advice';
+    $('t-sizing-s').title=szOther?szOther+' — your choice, not advice':'';
     const polOn=f['policy brain']==='on';
-    $('t-policy').textContent=polOn?'On':'Off';
+    $('t-policy').innerHTML=polOn?'<span class="ok-dot"></span>On':'<span class="off-dot"></span>Off';
     $('t-policy-hint').textContent=polOn?'checked before every entry':'add rules in settings → Safety';
     if(f['source']==='agenthc')feedTile(f['feed access']);
-    else{$('t-feed').textContent=SOURCES[f['source']]||f['source']||'–';$('t-feed-s').textContent='signal source';}
+    else{const v=$('t-feed');v.className='v txt';v.textContent=SOURCES[f['source']]||f['source']||'–';
+      $('t-feed-s').textContent='signal source';$('tile-feed').classList.remove('bad');}
     try{
       const p=await api('/api/proposal');const panel=$('p-proposal');
       if(p.pending){panel.style.display='';
         $('prop-expl').textContent=p.explanation;
         $('prop-warn').textContent=(p.warnings||[]).join('  ');
-        $('prop-diff').textContent=p.diff;}
+        $('prop-diff').innerHTML=String(p.diff||'').split('\\n').map(l=>{
+          const c=l.charAt(0);
+          const k=(l.startsWith('+++')||l.startsWith('---')||c==='@')?'h':c==='+'?'a':c==='-'?'d':'';
+          return '<span'+(k?' class="'+k+'"':'')+'>'+(esc(l)||' ')+'</span>';}).join('');}
       else panel.style.display='none';
     }catch(e){}
     const t=await api('/api/trades');
     const rows=t.trades||[];
-    let cum=0;const pts=[0];
-    rows.slice().reverse().forEach(x=>{if(x.action==='exit'&&x.est_pnl_usd!=null){cum+=Number(x.est_pnl_usd);pts.push(cum);}});
+    let cum=0;const pts=[0],exTs=[];
+    rows.slice().reverse().forEach(x=>{if(x.action==='exit'&&x.est_pnl_usd!=null){cum+=Number(x.est_pnl_usd);pts.push(cum);exTs.push(x.ts);}});
     spark(pts);
-    $('pnl-total').innerHTML=pts.length>1?'est. P&amp;L of exits shown: <span class="'+
-      (cum>=0?'pnl-pos':'pnl-neg')+'">'+money(cum)+'</span>':'';
+    const ac=document.querySelector('#p-activity .ph .count');ac.textContent=rows.length;ac.style.display=rows.length?'':'none';
+    if(pts.length>1){
+      $('pnl-total').textContent='est. P&L of exits shown';
+      const big=$('pnl-big');big.textContent=money(cum);big.className='big '+(cum>=0?'up':'down');
+      const nx=exTs.length,a1=axisLabel(exTs[0],false),a2=axisLabel(exTs[nx-1],true);
+      document.querySelector('#p-activity .chart-head .meta').textContent=nx+' exit'+(nx===1?'':'s')+(a1?' · '+a1+' → '+a2:'');
+      const ax=document.querySelectorAll('#p-activity .chart-axis>span');ax[0].textContent=a1;ax[2].textContent=a2;
+    }else{$('pnl-total').textContent='';$('pnl-big').textContent='';}
     $('trades').innerHTML=rows.length?rows.map(x=>{
-      const a=x.action||'';let ic='skip',icon='–',title;
-      if(a==='entry'){ic='in';icon='▲';title='Entered '+contractHtml(x.contract);}
-      else if(a==='exit'){ic='out';icon='▼';title='Exited '+contractHtml(x.contract)+
-        (x.est_pnl_usd!=null?' <span class="'+(x.est_pnl_usd>=0?'pnl-pos':'pnl-neg')+'">'+money(x.est_pnl_usd)+'</span>':'');}
-      else{title='Skipped '+contractHtml(x.contract)+' — '+esc(SKIPS[a]||a.replace(/_/g,' '));}
+      const a=x.action||'';let ic='skip',icon='skip',title,pnl='<span class="pnl faint">—</span>';
       const note=(a==='policy_veto'||a==='entry'||a==='exit')&&x.reason?esc(String(x.reason).slice(0,120)):'';
-      return '<li><span class="ic '+ic+'">'+icon+'</span><div><div class="t">'+title+
-        (x.dry?' <span class="tag dry">dry-run</span>':'')+'</div>'+
-        (note?'<div class="n">'+note+'</div>':'')+'</div><span class="when">'+when(x.ts)+'</span></li>';
-    }).join(''):'<li class="empty">nothing yet — signals and the agent\\'s decisions show up here</li>';
-  }catch(e){$('b-mode').textContent='agent unreachable';$('b-mode').className='pill bad';}
+      let n=note;
+      // real-money rows get an explicit LIVE tag — absence of DRY-RUN is not a signal
+      const mt=x.dry?'<span class="tag dry">DRY-RUN</span>':(x.dry===false?'<span class="tag live">LIVE</span>':'');
+      if(a==='entry'){ic='in';icon='up';title='Entered '+contractHtml(x.contract,mt);}
+      else if(a==='exit'){ic='out';icon='out';title='Exited '+contractHtml(x.contract,mt);
+        if(x.est_pnl_usd!=null){const v=Number(x.est_pnl_usd);
+          pnl='<span class="pnl '+(v>=0?'up':'down')+'">'+money(v)+'</span>';}}
+      else{title='Skipped '+contractHtml(x.contract,x.dry?'<span class="tag dry">DRY-RUN</span>':'');
+        n=esc(cap1(SKIPS[a]||a.replace(/_/g,' ')))+(note?' — '+note:'');}
+      return '<li>'+when(x.ts)+'<span class="ic '+ic+'">'+ICON(icon)+'</span><div><div class="t">'+title+'</div>'+
+        (n?'<div class="n">'+n+'</div>':'')+'</div>'+pnl+'</li>';
+    }).join(''):'<li class="empty">Nothing yet — signals and the agent\\'s decisions show up here</li>';
+  }catch(e){badMode('Agent unreachable','unreachable');}
 }
 async function propApply(){
   $('prop-msg').textContent='applying…';
@@ -1359,10 +2105,13 @@ let chatStarted=false;
 function chatAdd(cls,text){
   const log=$('chatlog');
   if(!chatStarted){log.innerHTML='';chatStarted=true;}
-  log.insertAdjacentHTML('beforeend','<div class="'+cls+'">'+(cls==='me'?'you: ':'')+esc(text)+'</div>');
+  log.insertAdjacentHTML('beforeend','<div class="msg '+cls+'"><div class="who">'+(cls==='me'?'You':'Agent')+
+    '</div><div class="body">'+esc(text)+'</div></div>');
   log.scrollTop=log.scrollHeight;
 }
 async function quick(cmd){
+  // Going LIVE is a real-money action: never on a single (mis-)tap.
+  if(cmd==='dry off'&&!confirm('Go LIVE? The agent will send real orders with real money to your broker from now on. Your decision — not advice.'))return;
   chatAdd('me',cmd);
   const r=await api('/api/command',{text:cmd});chatAdd('agent',r.reply);refresh();
 }
@@ -1994,6 +2743,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "carried": body.get("carried_over_days") or 0,
                 "access_until": body.get("access_until")}
 
+    def pass_options_route(_h):
+        from sources import agenthc_day_trade_ideas as hc
+        return {"options": hc.pass_options()}
+
     def pass_status_route(_h):
         """Pending purchase first (promote it once paid), else the current pass."""
         from sources import agenthc_day_trade_ideas as hc
@@ -2295,6 +3048,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/wallet/quote": wallet_quote,
                     "/api/llm/providers": llm_providers,
                     "/api/pass/status": pass_status_route,
+                    "/api/pass/options": pass_options_route,
                     "/api/status": d_status, "/api/trades": d_trades,
                     "/api/proposal": proposal_get}
     def ask(_h, data):

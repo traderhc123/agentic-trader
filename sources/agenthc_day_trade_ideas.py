@@ -88,6 +88,19 @@ def buy_pass(days, extend_token=None):
     return resp.json()
 
 
+def pass_options():
+    """Pass sizes (signal days) the server sells right now, e.g. [1, 5];
+    None if it can't be asked. The server answers a days=0 request with its
+    options and creates no invoice."""
+    try:
+        resp = _http.post(f"{AGENTHC_API}{PASS_PATH}", json={"days": 0}, timeout=10)
+        detail = resp.json().get("detail") or {}
+        opts = detail.get("options") if isinstance(detail, dict) else None
+        return sorted(int(n) for n in opts) if opts else None
+    except Exception:
+        return None
+
+
 def pass_status(token):
     """{'status': pending|active|exits_only|used_up|superseded|expired|invalid,
     'days_left', 'valid_until', …}."""
