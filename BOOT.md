@@ -183,6 +183,7 @@ watched several days of activity and explicitly ask to go live.
 | Robinhood order rejected, buying power | Fund the Agentic account |
 | `invalid_grant` during OAuth | Code expired (minutes) — rerun setup, paste faster |
 | Feed returns `events: []` | Normal — no journal events published yet today, or the feed is paused upstream |
+| `SSL handshake failed`, `ERR_SSL_PROTOCOL_ERROR`, can't connect | Almost always the human's own computer/network (antivirus HTTPS scanning, VPN, router/DNS filter). Run `python agent.py netcheck` — it names the cause and the fix |
 
 
 ## Optional: provisioning a VPS for the human
