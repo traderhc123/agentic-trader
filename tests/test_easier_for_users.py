@@ -166,3 +166,23 @@ def test_report_says_none_when_no_feed_access(monkeypatch, tmp_path):
     monkeypatch.setattr(nc, "proxy_for", lambda url: "")
     text = support.report(str(tmp_path), lambda: ([], {}), {}, "api.traderhc.com")
     assert "feed access: none" in text
+
+
+def test_pass_options_reads_the_servers_sizes(fresh_http, monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda url, **kw: _R(400, {
+        "detail": {"error": "invalid_days", "options": [5, 1]}}))
+    assert hc.pass_options() == [1, 5]
+
+
+def test_pass_options_unknown_when_server_unreachable(fresh_http, monkeypatch):
+    monkeypatch.setattr(nc, "proxy_for", lambda url: "")
+
+    def boom(url, **kw):
+        raise requests.exceptions.ConnectionError("down")
+    monkeypatch.setattr(requests, "post", boom)
+    assert hc.pass_options() is None
+
+
+def test_wizard_hides_pass_sizes_not_on_sale():
+    html = webui._WIZARD_HTML
+    assert "passSizes()" in html and "/api/pass/options" in html

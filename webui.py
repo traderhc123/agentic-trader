@@ -425,7 +425,7 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  .facts h4{margin:0 0 4px;font:600 var(--fs-xs)/1.3 var(--font);letter-spacing:.08em;text-transform:uppercase;color:var(--fg)}
 
  /* passes */
- .passes{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:var(--s2)}
+ .passes{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:var(--s2)}
  button.pass{height:auto;flex-direction:column;align-items:flex-start;gap:0;padding:12px 12px 11px;text-align:left;
    border-radius:var(--r-lg);background:var(--surface-2);white-space:normal;min-width:0}
  button.pass:hover{border-color:var(--accent-line);background:var(--raise)}
@@ -713,8 +713,10 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
       <ul>
        <li>Your wallet needs <b id="pass-need"></b> available (the invoice plus
        a little for network fees).</li>
-       <li><b>Cash App</b> and some other apps limit Lightning payments or fail on
-       larger ones — try the <b>1 signal day</b> pass first, or pay from
+       <li><b>Cash App:</b> add money to your Cash App balance (or buy the
+       bitcoin) first, then pay from that balance. Payments that pull from your
+       bank often fail before they're sent. Cash App also limits Lightning
+       payments — try the <b>1 signal day</b> pass first, or pay from
        <b>Strike</b> or <b>Phoenix</b>.</li>
        <li>Still stuck? Use <b>Advanced → auto-pay from a wallet the agent
        controls</b> below, or open the dashboard's <b>Help</b> panel and send
@@ -1223,7 +1225,16 @@ function srcChanged(){
   for(const k of ['agenthc','url','manual'])
     document.getElementById('src-'+k).style.display = (k===v)?'':'none';
 }
+// Show only the pass sizes the feed server sells right now (it can take
+// sizes off sale, e.g. while its node can't receive that large a payment).
+// If the server can't be asked, every card stays visible.
+async function passSizes(){
+  try{const r=await api('/api/pass/options');
+    if(r.options&&r.options.length)document.querySelectorAll('.pass[data-days]').forEach(b=>{
+      b.style.display=r.options.indexOf(+b.dataset.days)>=0?'':'none';});}catch(e){}
+}
 async function boot(){
+  passSizes();
   const st=await api('/api/state');
   document.getElementById('disclaimer').innerHTML=mdLite(st.disclaimer);
   const notes=st.notes||{};
@@ -2732,6 +2743,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "carried": body.get("carried_over_days") or 0,
                 "access_until": body.get("access_until")}
 
+    def pass_options_route(_h):
+        from sources import agenthc_day_trade_ideas as hc
+        return {"options": hc.pass_options()}
+
     def pass_status_route(_h):
         """Pending purchase first (promote it once paid), else the current pass."""
         from sources import agenthc_day_trade_ideas as hc
@@ -3033,6 +3048,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/wallet/quote": wallet_quote,
                     "/api/llm/providers": llm_providers,
                     "/api/pass/status": pass_status_route,
+                    "/api/pass/options": pass_options_route,
                     "/api/status": d_status, "/api/trades": d_trades,
                     "/api/proposal": proposal_get}
     def ask(_h, data):
