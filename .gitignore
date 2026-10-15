@@ -7,3 +7,8 @@ robinhood_oauth.json
 .agentic-trader/
 commands.jsonl
 .pytest_cache/
+
+# zip-install updater (snapshot_update.py)
+.installed_commit
+.update-backup/
+*.update-tmp

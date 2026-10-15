@@ -119,7 +119,7 @@ def test_tls_cut_on_this_computer_when_server_answers(net):
     net.setattr(nc, "_plain_probe", lambda ip, host, timeout:
                 "HTTP/1.1 400 Bad Request\r\n\r\nThe plain HTTP request was sent to HTTPS port")
     d = nc.diagnose(HOST)
-    assert d["problem"] == "tls_cut" and "server is reachable" in d["detail"]
+    assert d["problem"] == "tls_cut" and "is reachable" in d["detail"]
     assert "HTTPS/SSL scanning" in d["fix"]
 
 
