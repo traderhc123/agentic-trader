@@ -164,6 +164,12 @@ checks everything (consent, source, wallet + balance, feed reachability,
 broker connection, notifications) and prints the exact command that fixes
 each ✗. Run it any time the agent isn't doing what you expect.
 
+**"SSL handshake failed" / can't connect to AgentHC?** Run
+`./.venv/bin/python agent.py netcheck`. It works out what on your computer or
+network is blocking the connection (antivirus HTTPS scanning, a VPN, a
+router or DNS filter) and tells you how to fix it. The running agent does
+the same automatically and sends you the answer as a notification.
+
 **moomoo users**: the adapter talks to moomoo's local **OpenD** gateway —
 download it from moomoo.com → API, log in once, keep it running, and
 `.venv/bin/pip install moomoo-api` (Windows: `.venv\Scripts\pip.exe install moomoo-api`). `doctor` will tell you if either piece

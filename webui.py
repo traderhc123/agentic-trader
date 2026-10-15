@@ -181,7 +181,7 @@ _STYLE = """
  button:hover{filter:brightness(1.08)} button:active{transform:translateY(1px)}
  button:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(76,141,255,.38)}
  button:disabled{background:#2a303c;color:#6b7280;cursor:not-allowed;box-shadow:none;filter:none}
- .muted{color:var(--muted);font-size:.86rem} .ok{color:var(--ok)} .err{color:var(--err)}
+ .muted{color:var(--muted);font-size:.86rem} .ok{color:var(--ok)} .err{color:var(--err);white-space:pre-line}
  pre{background:var(--sink);padding:.75rem;border-radius:8px;overflow-x:auto;border:1px solid var(--line);
      white-space:pre-wrap;word-break:break-word;font-size:.8rem}
  .disc{max-height:280px;overflow-y:auto;border:1px solid var(--line-2);padding:.85rem;
@@ -1391,6 +1391,21 @@ def _fund_quote(sats, invoice_cap=0):
 _qr_bootstrap_attempted = False
 
 
+def _net_error_text(exc):
+    """Error text for the wizard; connection failures get the diagnosed
+    cause + fix (antivirus, VPN, DNS filter…) instead of a raw SSL error."""
+    import net_check
+    if net_check.is_connection_error(exc):
+        try:
+            from agent import _agenthc_host
+            diag = net_check.diagnose(_agenthc_host())
+        except Exception:
+            diag = None
+        if diag and not diag["ok"]:
+            return net_check.summary(diag)
+    return str(exc)[:200]
+
+
 def _qr_matrix(data):
     """QR module matrix (list of 0/1 rows) for `data`, or None when the
     qrcode package is unavailable (fail-soft — the wizard still offers the
@@ -1766,7 +1781,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         except hc.PassUnavailable as exc:
             return {"ok": False, "error": str(exc), "unavailable": True}
         except Exception as exc:
-            return {"ok": False, "error": str(exc)[:200]}
+            return {"ok": False, "error": _net_error_text(exc)}
         import time as _t
         cfg["source"] = "agenthc"
         cfg["feed_pass_pending"] = {

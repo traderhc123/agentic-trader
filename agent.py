@@ -21,6 +21,8 @@ Robinhood's trading MCP).
                              # (everything except the owner's own steps)
     python agent.py fund N   # print a Lightning invoice to add N sats
     python agent.py link     # print the dashboard login link
+    python agent.py netcheck # can't reach AgentHC? names the cause (antivirus,
+                             # VPN, DNS filter…) and the fix
 
 HARD CONSENT GATE: this program will not perform ANY setup or trading action
 until you have accepted DISCLAIMER.md (all liability is yours; no party here
@@ -842,6 +844,8 @@ def cmd_run(app_window=False):
             return
         except Exception as exc:
             print(f"heartbeat error (will retry): {str(exc)[:200]}")
+            if cfg.get("source") == "agenthc":
+                _explain_connection_error(exc, cfg, state, save_state)
         try:
             _maybe_daily_digest(cfg, state, save_state)
         except Exception:
@@ -852,6 +856,47 @@ def cmd_run(app_window=False):
             time.sleep(2)
         else:
             time.sleep(poll if _market_open_now() else max(poll, 300))
+
+
+def _agenthc_host():
+    from urllib.parse import urlparse
+    from sources.agenthc_day_trade_ideas import AGENTHC_API
+    return urlparse(AGENTHC_API).hostname or "api.traderhc.com"
+
+
+_NET_DIAG_EVERY_S = 900  # re-diagnose a persisting outage at most every 15 min
+
+
+def _explain_connection_error(exc, cfg, state, save_state, now=None):
+    """The feed can't be reached: work out WHY (antivirus, VPN, DNS filter…)
+    and tell the owner once per day per cause, with the fix."""
+    import net_check
+    if not net_check.is_connection_error(exc):
+        return None
+    now = time.time() if now is None else now
+    if now - float(state.get("net_diag_at") or 0) < _NET_DIAG_EVERY_S:
+        return None
+    state["net_diag_at"] = now
+    diag = net_check.diagnose(_agenthc_host())
+    if diag["ok"]:
+        save_state(state)
+        return diag
+    print(net_check.summary(diag))
+    key = f"{datetime.now(MARKET_TZ).date()}:{diag['problem']}"
+    if state.get("net_diag_notified") != key:
+        state["net_diag_notified"] = key
+        notify(cfg, "agentic-trader: " + net_check.summary(diag))
+    save_state(state)
+    return diag
+
+
+def cmd_netcheck():
+    import net_check
+    host = _agenthc_host()
+    print(f"Checking the connection to {host} …")
+    diag = net_check.diagnose(host)
+    print(net_check.summary(diag))
+    sys.exit(0 if diag["ok"] else 1)
 
 
 def cmd_status():
@@ -926,8 +971,15 @@ def doctor_checks():
             check("agenthc_api", r.status_code in (200, 402), "AgentHC API reachable",
                   detail, "check your internet connection / firewall")
         except Exception as exc:
-            check("agenthc_api", False, "AgentHC API reachable", str(exc)[:80],
-                  "check your internet connection / firewall")
+            import net_check
+            diag = (net_check.diagnose(_agenthc_host())
+                    if net_check.is_connection_error(exc) else None)
+            if diag and not diag["ok"]:
+                check("agenthc_api", False, "AgentHC API reachable",
+                      diag["detail"], diag["fix"], who="owner")
+            else:
+                check("agenthc_api", False, "AgentHC API reachable", str(exc)[:80],
+                      "check your internet connection / firewall")
         _feed_access_check(cfg, state, check)
 
     broker_name = cfg.get("broker", "")
@@ -1113,6 +1165,11 @@ def _is_ready():
 
 
 def main():
+    # Verify HTTPS with the OS certificate store, like the browser does — so
+    # antivirus/workplace HTTPS inspection with an installed certificate
+    # doesn't break the agent while Chrome works.
+    import net_check
+    net_check.use_system_trust()
     # No subcommand = do the right thing. Safe because nothing can trade until
     # the legal agreement is accepted: not set up -> open the browser wizard;
     # set up -> run the agent. So `python agent.py` is the whole thing.
@@ -1148,6 +1205,8 @@ def main():
         cmd_status()
     elif cmd == "doctor":
         cmd_doctor(as_json="--json" in sys.argv)
+    elif cmd == "netcheck":
+        cmd_netcheck()
     elif cmd == "link":
         import webui
         print("Dashboard login link (keep it private — it unlocks the dashboard):")

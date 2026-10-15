@@ -6,3 +6,7 @@ qrcode>=7.4
 # Windows has no system timezone database; zoneinfo (US market hours) needs
 # this package there. Linux/macOS use the OS tz database.
 tzdata>=2024.1; sys_platform == "win32"
+# Verify HTTPS with the OS certificate store (like the browser) — antivirus
+# or workplace HTTPS inspection then doesn't break the agent while Chrome
+# works. Fail-soft: without it, Python's bundled certificates are used.
+truststore>=0.9
