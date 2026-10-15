@@ -184,6 +184,10 @@ _STYLE = """
  .muted{color:var(--muted);font-size:.86rem} .ok{color:var(--ok)} .err{color:var(--err);white-space:pre-line}
  pre{background:var(--sink);padding:.75rem;border-radius:8px;overflow-x:auto;border:1px solid var(--line);
      white-space:pre-wrap;word-break:break-word;font-size:.8rem}
+ .disc h3,.disc h4,.disc h5,.disc h6{margin:.9rem 0 .35rem;font-size:.92rem;color:var(--fg)}
+  .disc h3{font-size:1rem} .disc p{margin:.45rem 0} .disc ul{margin:.3rem 0 .5rem 1.1rem;padding:0}
+  .disc blockquote{margin:.5rem 0;padding:.4rem .7rem;border-left:3px solid var(--accent);color:var(--muted)}
+  .disc code{font-size:.78rem;background:var(--line);padding:.05rem .3rem;border-radius:4px}
  .disc{max-height:280px;overflow-y:auto;border:1px solid var(--line-2);padding:.85rem;
        border-radius:8px;font-size:.82rem;background:var(--sink)}
  .badge{font-size:.72rem;padding:.12rem .55rem;border-radius:99px;
@@ -204,7 +208,7 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
  html{background:
    radial-gradient(1100px 720px at 82% -10%,rgba(76,141,255,.12),transparent 58%),
    radial-gradient(900px 620px at 4% 2%,rgba(76,141,255,.07),transparent 55%),
-   var(--bg)}
+   var(--bg);background-repeat:no-repeat;background-attachment:fixed;min-height:100%}
  body{max-width:880px;background:transparent}
  #bg{position:fixed;inset:0;width:100%;height:100%;z-index:-1;display:block}
  .hero{display:flex;align-items:center;gap:.85rem;margin:.5rem 0 .1rem}
@@ -246,7 +250,7 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <p class="lead">Everything runs on your own machine — this wizard is served from
 127.0.0.1 by your agent itself. It moves real money; read each step carefully.</p>
 <div class="navrow" style="margin:0 0 .9rem">
- <button onclick="checkUpdates()" id="upd-btn">⟳ Check for code updates</button>
+ <button onclick="checkUpdates()" id="upd-btn" style="background:var(--sink);border:1px solid var(--line-2);color:var(--muted);font-size:.82rem;padding:.4rem .8rem">⟳ Check for updates</button>
  <button onclick="pullUpdates()" id="upd-pull" style="display:none">Pull latest code</button>
  <span id="upd-msg" class="muted"></span>
 </div>
@@ -485,7 +489,7 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
 
 <div id="help">
  <p class="muted">Need help with this step? Ask your agent (works once your
- Anthropic key is connected).</p>
+ AI is connected in step 2 — any provider).</p>
  <div id="chatlog"></div>
  <div class="chatrow">
   <input type="text" id="cmd" placeholder="e.g. what is dry-run? · is the hosted wallet safe?"
@@ -498,6 +502,21 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
 // HTML-escape helper, hoisted so every builder can use it (loadBrokers/brkFields
 // run during boot(), before any local definition would exist).
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
+// Tiny, safe markdown for the agreement: escape EVERYTHING first, then add
+// only headings, bold, inline code, quotes, bullets and paragraphs.
+function mdLite(src){
+  const inl=t=>t.replace(/\\*\\*([^*]+)\\*\\*/g,'<b>$1</b>').replace(/`([^`]+)`/g,'<code>$1</code>');
+  return esc(src||'').split(/\\n\\s*\\n/).map(block=>{
+    const ls=block.split('\\n');
+    if(ls.every(l=>/^\\s*[-*]\\s+/.test(l)))
+      return '<ul>'+ls.map(l=>'<li>'+inl(l.replace(/^\\s*[-*]\\s+/,''))+'</li>').join('')+'</ul>';
+    const h=block.match(/^(#{1,4})\\s+(.*)$/);
+    if(h&&ls.length===1)return '<h'+(h[1].length+2)+'>'+inl(h[2])+'</h'+(h[1].length+2)+'>';
+    if(ls.every(l=>/^&gt;/.test(l)))
+      return '<blockquote>'+inl(ls.map(l=>l.replace(/^&gt;\\s?/,'')).join(' '))+'</blockquote>';
+    return '<p>'+inl(ls.join(' '))+'</p>';
+  }).join('');
+}
 const STEPS=[["s-consent","Agreement"],["s-llm","Your AI"],["s-source","Source"],
  ["s-broker","Broker"],["s-sizing","Sizing"],["s-safety","Safety"],["s-done","Launch"]];
 let doneSet=new Set(), cur=0, maxUnlocked=0;
@@ -698,7 +717,7 @@ function srcChanged(){
 }
 async function boot(){
   const st=await api('/api/state');
-  document.getElementById('disclaimer').textContent=st.disclaimer;
+  document.getElementById('disclaimer').innerHTML=mdLite(st.disclaimer);
   const notes=st.notes||{};
   if(st.consent){done('s-consent');restoredNote('s-consent',notes.consent||'Agreement signed — on file');}
   if(st.llm){done('s-llm');restoredNote('s-llm',notes.llm||'AI connected');}
@@ -1038,7 +1057,10 @@ _DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agentic-trader</title>""" + _STYLE + """
 <style>
- body{max-width:1180px}
+ html{background:
+   radial-gradient(1000px 640px at 85% -12%,rgba(76,141,255,.10),transparent 60%),
+   var(--bg);background-repeat:no-repeat;background-attachment:fixed;min-height:100%}
+ body{max-width:1180px;background:transparent}
  header{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:.4rem 0 1rem}
  header .sp{flex:1}
  .hero-mini{display:flex;align-items:center;gap:.7rem;min-width:0}
@@ -1049,54 +1071,76 @@ _DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
    box-shadow:0 6px 20px rgba(58,110,255,.45),inset 0 1px 0 rgba(255,255,255,.4)}
  .logo::after{content:"";position:absolute;inset:0;
    background:conic-gradient(from 200deg,transparent,rgba(255,255,255,.4),transparent 42%)}
- .qbtn{background:var(--sink);color:var(--fg);border:1px solid var(--line-2);font-size:.85rem}
- .qbtn:hover{background:#1a2233;border-color:var(--accent);filter:none}
- .grid{display:grid;grid-template-columns:2fr 1fr;gap:1rem;align-items:start}
- @media(max-width:900px){.grid{grid-template-columns:1fr}}
- .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
-        gap:.8rem;margin-bottom:1rem}
- .tile{border:1px solid var(--line);border-radius:12px;
-       background:linear-gradient(180deg,var(--panel),var(--panel-2));
-       box-shadow:var(--shadow);padding:.7rem .9rem;position:relative;overflow:hidden}
- .tile::before{content:"";position:absolute;inset:0 auto 0 0;width:3px;
-       background:linear-gradient(180deg,var(--accent),transparent)}
- .tile .k{font-size:.72rem;color:var(--muted);text-transform:uppercase;
-          letter-spacing:.04em}
- .tile .v{font-size:1.35rem;font-weight:600;margin-top:.15rem;color:var(--accent-2)}
- .tile .s{font-size:.75rem;color:var(--muted)}
- .panel{border:1px solid var(--line);border-radius:12px;
-        background:linear-gradient(180deg,var(--panel),var(--panel-2));
-        box-shadow:var(--shadow);display:flex;flex-direction:column;min-height:0}
- .panel h2{margin:0;padding:.6rem .9rem;border-bottom:1px solid var(--line);
-           font-size:.85rem;text-transform:uppercase;letter-spacing:.04em;
-           color:var(--accent-2)}
- .panel .body{padding:.4rem .9rem .7rem;overflow-y:auto}
- #p-activity .body{max-height:320px}
- #p-positions .body{max-height:160px}
- .col-left{display:flex;flex-direction:column;gap:1rem;min-width:0}
- #p-chat{position:sticky;top:1rem;height:calc(100vh - 2rem);max-height:640px}
- #p-chat .body{flex:1;display:flex;flex-direction:column;gap:.5rem}
- #chatlog{flex:1;height:auto}
- .chatrow{display:flex;gap:.4rem}
- .chatrow input{margin:0;flex:1}
- .pill{display:inline-block;font-size:.72rem;padding:.05rem .5rem;
-       border-radius:99px;border:1px solid var(--line-2);color:var(--muted)}
+ .qbtn{background:var(--sink);color:var(--fg);border:1px solid var(--line-2);font-size:.85rem;
+   padding:.45rem .85rem;text-decoration:none;border-radius:8px;display:inline-block}
+ .qbtn:hover{background:#1a2233;border-color:var(--accent);filter:none;text-decoration:none}
+ .qbtn.warn{border-color:#78350f;color:#fbbf24}
+ .pill{display:inline-block;font-size:.72rem;padding:.12rem .55rem;
+   border-radius:99px;border:1px solid var(--line-2);color:var(--muted)}
  .pill.live{border-color:#14532d;color:var(--ok);background:rgba(74,222,128,.08)}
  .pill.dry{border-color:#1e3a8a;color:#93c5fd;background:rgba(76,141,255,.08)}
  .pill.paused{border-color:#78350f;color:#fbbf24;background:rgba(251,191,36,.07)}
- td.act-in{color:var(--ok);font-weight:600} td.act-out{color:#fbbf24;font-weight:600}
- td.act-skip{color:var(--muted)}
+ .pill.bad{border-color:#7f1d1d;color:var(--err);background:rgba(248,113,113,.08)}
+ .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:.75rem;margin-bottom:1rem}
+ .tile{border:1px solid var(--line);border-radius:12px;padding:.75rem .9rem;
+   background:linear-gradient(180deg,var(--panel),var(--panel-2));box-shadow:var(--shadow)}
+ .tile .k{font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+ .tile .v{font-size:1.3rem;font-weight:650;margin-top:.15rem;color:var(--fg);line-height:1.2}
+ .tile .v.sm{font-size:1rem}
+ .tile .s{font-size:.75rem;color:var(--muted);margin-top:.15rem}
+ .meter{height:5px;border-radius:99px;background:var(--line);margin-top:.45rem;overflow:hidden}
+ .meter i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent-2));width:0}
+ .meter.hot i{background:linear-gradient(90deg,#f59e0b,#f87171)}
+ .grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr);gap:1rem;align-items:start}
+ @media(max-width:900px){.grid{grid-template-columns:1fr}}
+ .col{display:flex;flex-direction:column;gap:1rem;min-width:0}
+ .panel{border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);
+   background:linear-gradient(180deg,var(--panel),var(--panel-2))}
+ .panel h2{margin:0;padding:.65rem .9rem;border-bottom:1px solid var(--line);font-size:.78rem;
+   text-transform:uppercase;letter-spacing:.07em;color:var(--muted);display:flex;gap:.5rem;align-items:center}
+ .panel h2 .sp{flex:1}
+ .panel .body{padding:.6rem .9rem .8rem}
+ .empty{color:var(--muted);font-size:.85rem;padding:.4rem 0}
+ .pos{display:flex;flex-wrap:wrap;gap:.5rem}
+ .pcard{border:1px solid var(--line-2);border-radius:10px;padding:.45rem .7rem;background:var(--sink);
+   display:flex;gap:.55rem;align-items:baseline}
+ .pcard b{font-size:.95rem} .pcard .muted{font-size:.78rem}
+ .tag{font-size:.68rem;font-weight:650;padding:.05rem .4rem;border-radius:5px}
+ .tag.call{background:rgba(74,222,128,.12);color:var(--ok)} .tag.put{background:rgba(248,113,113,.12);color:var(--err)}
+ .tag.dry{background:rgba(76,141,255,.12);color:#93c5fd}
+ .feed{list-style:none;margin:0;padding:0;max-height:380px;overflow-y:auto}
+ .feed li{display:grid;grid-template-columns:1.6rem minmax(0,1fr) auto;gap:.55rem;align-items:start;
+   padding:.5rem 0;border-bottom:1px solid var(--line)}
+ .feed li:last-child{border-bottom:0}
+ .ic{width:1.6rem;height:1.6rem;border-radius:7px;display:grid;place-items:center;font-size:.8rem;font-weight:700}
+ .ic.in{background:rgba(74,222,128,.13);color:var(--ok)} .ic.out{background:rgba(251,191,36,.13);color:#fbbf24}
+ .ic.skip{background:var(--line);color:var(--muted)}
+ .feed .t{font-size:.88rem} .feed .t b{font-weight:600} .feed .n{font-size:.78rem;color:var(--muted)}
+ .feed .when{font-size:.75rem;color:var(--muted);white-space:nowrap}
+ .pnl-pos{color:var(--ok)} .pnl-neg{color:var(--err)}
+ #spark{width:100%;height:70px;display:block}
+ .chatbox{display:flex;flex-direction:column;gap:.5rem}
+ #chatlog{height:220px}
+ .chatrow{display:flex;gap:.4rem} .chatrow input{margin:0;flex:1}
+ .chips{display:flex;gap:.35rem;flex-wrap:wrap}
+ .chips button{font-size:.75rem;padding:.25rem .6rem;background:var(--sink);border:1px solid var(--line-2);color:var(--muted)}
+ .chips button:hover{color:var(--fg);border-color:var(--accent);filter:none}
+ .hint{font-size:.76rem;color:var(--muted)}
+ .navrow{display:flex;gap:.6rem;margin-top:.6rem;flex-wrap:wrap;align-items:center}
+ #help{margin:0 0 1rem}
+ @media(max-width:560px){body{margin-top:1rem}.tiles{grid-template-columns:1fr 1fr}
+   .tile .v{font-size:1.1rem}.hero-mini h1{font-size:1.1rem}}
 </style></head><body>
 <header>
  <div class="hero-mini"><div class="logo" aria-hidden="true"></div>
   <div><div class="tag">Agentic Trader</div><h1>Dashboard</h1></div></div>
  <span class="pill" id="b-mode">…</span>
  <span class="pill" id="b-market"></span>
- <span class="pill paused" id="b-paused" style="display:none">⏸ PAUSED</span>
+ <span class="pill paused" id="b-paused" style="display:none">⏸ paused</span>
  <span class="sp"></span>
- <a class="qbtn" id="upd-badge" href="/setup" style="display:none;text-decoration:none;padding:.5rem 1rem;border-radius:6px" title="Install it from settings (top of the page)">⬆ update available</a>
+ <a class="qbtn" id="upd-badge" href="/setup" style="display:none" title="Install it from settings (top of the page)">⬆ update available</a>
  <button class="qbtn" onclick="toggleHelp()">? help</button>
- <a class="qbtn" href="/setup" style="text-decoration:none;padding:.5rem 1rem;border-radius:6px">⚙ settings</a>
+ <a class="qbtn" href="/setup">⚙ settings</a>
  <button class="qbtn" id="q-pause" onclick="quick(this.dataset.cmd)" data-cmd="pause">Pause</button>
  <button class="qbtn" id="q-dry" onclick="quick(this.dataset.cmd)" data-cmd="dry on">Dry-run</button>
 </header>
@@ -1116,51 +1160,58 @@ _DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 
 <div class="tiles">
  <div class="tile"><div class="k">Entries today</div>
-  <div class="v" id="t-entries">–</div><div class="s" id="t-cap"></div></div>
+  <div class="v" id="t-entries">–</div><div class="meter" id="m-entries"><i></i></div>
+  <div class="s" id="t-cap"></div></div>
  <div class="tile"><div class="k">Open positions</div>
-  <div class="v" id="t-pos">–</div><div class="s">only ones this agent opened</div></div>
- <div class="tile"><div class="k">Sizing</div>
-  <div class="v" id="t-sizing" style="font-size:1.05rem">–</div>
-  <div class="s">your decision — not advice</div></div>
- <div class="tile"><div class="k">Policy brain</div>
-  <div class="v" id="t-policy" style="font-size:1.05rem">–</div>
-  <div class="s" id="t-policy-hint"></div></div>
- <div class="tile"><div class="k">Signal source</div>
-  <div class="v" id="t-source" style="font-size:1.05rem">–</div>
-  <div class="s">where trade ideas come from</div></div>
+  <div class="v" id="t-pos">–</div><div class="s">opened by this agent</div></div>
+ <div class="tile" id="tile-feed"><div class="k">Signal feed</div>
+  <div class="v sm" id="t-feed">–</div><div class="s" id="t-feed-s"></div></div>
+ <div class="tile"><div class="k">Size per trade</div>
+  <div class="v sm" id="t-sizing">–</div><div class="s">your choice — not advice</div></div>
+ <div class="tile"><div class="k">Your rules</div>
+  <div class="v sm" id="t-policy">–</div><div class="s" id="t-policy-hint"></div></div>
 </div>
 
 <div class="grid">
- <div class="col-left">
+ <div class="col">
   <div class="panel" id="p-proposal" style="display:none;border-color:#78350f">
    <h2>Proposed code change — review before it applies</h2>
    <div class="body">
     <p id="prop-expl"></p><p id="prop-warn" class="err"></p>
     <pre id="prop-diff" style="max-height:260px;overflow-y:auto"></pre>
     <div class="navrow">
-     <button onclick="propApply()">Apply & restart</button>
+     <button onclick="propApply()">Apply &amp; restart</button>
      <button class="back" onclick="propReject()">Reject</button>
      <span id="prop-msg"></span>
     </div>
    </div></div>
   <div class="panel" id="p-positions"><h2>Open positions</h2>
-   <div class="body" id="positions"><span class="muted">none</span></div></div>
-  <div class="panel" id="p-activity"><h2>Activity</h2>
-   <div class="body" id="trades"><span class="muted">nothing yet</span></div></div>
-  <p class="muted" style="font-size:.78rem">Settings change in chat
-  (<code>set budget 500</code>, <code>set cap 3</code>, <code>set positions 5</code>, <code>dry off</code>,
-  <code>stop</code>). Code changes: run Claude Code in the repo folder on this
-  machine, then restart the agent.</p>
+   <div class="body"><div class="pos" id="positions"><span class="empty">none</span></div></div></div>
+  <div class="panel" id="p-activity"><h2>Activity<span class="sp"></span>
+   <span id="pnl-total" class="hint"></span></h2>
+   <div class="body"><svg id="spark" viewBox="0 0 300 70" preserveAspectRatio="none" style="display:none"></svg>
+   <ul class="feed" id="trades"><li class="empty">nothing yet</li></ul></div></div>
  </div>
- <div class="panel" id="p-chat"><h2>Talk to your agent</h2>
-  <div class="body">
-   <div id="chatlog"></div>
-   <div class="chatrow">
-    <input type="text" id="cmd" placeholder="pause · set budget 500 · or ask anything…"
-     onkeydown="if(event.key==='Enter')send()">
-    <button onclick="send()">Send</button>
-   </div>
-  </div>
+ <div class="col">
+  <div class="panel" id="p-chat"><h2>Talk to your agent</h2>
+   <div class="body chatbox">
+    <div class="chips">
+     <button onclick="ask('status')">status</button>
+     <button onclick="ask('set cap 3')">set cap 3</button>
+     <button onclick="ask('set positions 5')">set positions 5</button>
+     <button onclick="ask('why did you skip the last signal?')">why the last skip?</button>
+    </div>
+    <div id="chatlog"><span class="hint">Ask anything, or give a command —
+    <code>pause</code>, <code>set budget 500</code>, <code>set cap 3</code>,
+    <code>dry off</code>, <code>stop</code>.</span></div>
+    <div class="chatrow">
+     <input type="text" id="cmd" placeholder="Ask or command…"
+      onkeydown="if(event.key==='Enter')send()">
+     <button onclick="send()">Send</button>
+    </div>
+    <div class="hint">Code changes: run Claude Code in the agent's folder on
+    this computer, then restart the agent.</div>
+   </div></div>
  </div>
 </div>
 <script>
@@ -1169,11 +1220,11 @@ async function api(p, body){
     body:JSON.stringify(body)}:{});
   return await r.json();
 }
-function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
-function toggleHelp(){const h=document.getElementById('help');
-  h.style.display=h.style.display==='none'?'':'none';}
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
+function $(id){return document.getElementById(id);}
+function toggleHelp(){const h=$('help');h.style.display=h.style.display==='none'?'':'none';}
 async function helpGet(path,label){
-  const msg=document.getElementById('help-msg'),out=document.getElementById('help-out');
+  const msg=$('help-msg'),out=$('help-out');
   msg.textContent=label+'… (up to a minute)';out.style.display='none';
   try{
     const r=await fetch(path);const j=await r.json();
@@ -1185,93 +1236,141 @@ async function helpNet(){await helpGet('/api/help/netcheck','checking the connec
 async function helpReport(){
   const t=await helpGet('/api/help/report','building the report');
   if(!t)return;
-  try{await navigator.clipboard.writeText(t);document.getElementById('help-msg').textContent='copied ✓ — paste it to support';}
-  catch(e){document.getElementById('help-msg').textContent='select the text below and copy it';}
+  try{await navigator.clipboard.writeText(t);$('help-msg').textContent='copied ✓ — paste it to support';}
+  catch(e){$('help-msg').textContent='select the text below and copy it';}
 }
 // "update available" badge: one quiet check per page load; never installs.
 (async function(){try{const r=await (await fetch('/api/update/check')).json();
-  if(r.ok&&r.behind)document.getElementById('upd-badge').style.display='';}catch(e){}})();
+  if(r.ok&&r.behind)$('upd-badge').style.display='';}catch(e){}})();
+
+const SOURCES={agenthc:'AgentHC feed',url:'Your JSON feed',manual:'Manual commands'};
+const SKIPS={skip_stale:'signal was too old',skip_daily_cap:'daily entry cap reached',
+  skip_position_cap:'max open positions reached',skip_daily_loss:'daily loss limit reached',
+  policy_veto:'your rules said no'};
+function when(ts){
+  const d=new Date(ts);if(isNaN(d))return esc(ts||'');
+  const today=new Date().toDateString()===d.toDateString();
+  return (today?'':d.toLocaleDateString([], {month:'short',day:'numeric'})+' ')+
+    d.toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+}
+function money(v){const n=Number(v);return (n>=0?'+$':'−$')+Math.abs(n).toFixed(2);}
+function contractHtml(c){
+  // "NVDA 2026-10-16 $215 PUT" -> NVDA · Oct 16 · $215 PUT
+  const m=String(c||'').match(/^(\\S+)\\s+(\\d{4})-(\\d{2})-(\\d{2})\\s+\\$?([\\d.]+)\\s+(CALL|PUT)$/i);
+  if(!m)return '<b>'+esc(c||'')+'</b>';
+  const d=new Date(+m[2],+m[3]-1,+m[4]);
+  return '<b>'+esc(m[1])+'</b> '+esc(d.toLocaleDateString([], {month:'short',day:'numeric'}))+
+    ' $'+esc(m[5])+' <span class="tag '+(m[6].toUpperCase()==='CALL'?'call':'put')+'">'+
+    esc(m[6].toUpperCase())+'</span>';
+}
+function feedTile(text){
+  // "prepaid pass · 4 signal days left" / "wallet 41,000 sats" / "Premium API key"
+  const t=String(text||'');
+  const tile=$('tile-feed');
+  const m=t.match(/(\\d+)\\s+signal day/);
+  if(m){$('t-feed').textContent=m[1]+' signal day'+(m[1]==='1'?'':'s')+' left';
+    $('t-feed-s').textContent='prepaid pass';}
+  else{$('t-feed').textContent=t||'–';$('t-feed-s').textContent='';}
+  const bad=/expired|used up|not paid|none|no access|exits only/i.test(t);
+  tile.style.borderColor=bad?'#7f1d1d':'';
+}
+function spark(points){
+  const svg=$('spark');
+  if(points.length<2){svg.style.display='none';return;}
+  const min=Math.min(0,...points),max=Math.max(0,...points),span=(max-min)||1;
+  const x=i=>i*300/(points.length-1),y=v=>64-(v-min)*58/span;
+  const d=points.map((v,i)=>(i?'L':'M')+x(i).toFixed(1)+' '+y(v).toFixed(1)).join(' ');
+  const up=points[points.length-1]>=0;
+  svg.innerHTML='<line x1="0" x2="300" y1="'+y(0).toFixed(1)+'" y2="'+y(0).toFixed(1)+
+    '" stroke="#2c3446" stroke-dasharray="3 3"/><path d="'+d+'" fill="none" stroke="'+
+    (up?'#4ade80':'#f87171')+'" stroke-width="2" vector-effect="non-scaling-stroke"/>';
+  svg.style.display='';
+}
 async function refresh(){
   try{
     const s=await api('/api/status');
     if(s.mode==='OFFLINE'){
-      document.getElementById('b-mode').textContent='agent not running';
-      document.getElementById('b-mode').className='pill paused';
-      document.getElementById('t-source').textContent='start it: agent.py run';
-      return;}
-    const live=s.mode==='LIVE';
-    const bm=document.getElementById('b-mode');
+      $('b-mode').textContent='agent not running';$('b-mode').className='pill bad';
+      $('t-feed').textContent='start it: agent.py run';return;}
+    const f=s.fields||{};const live=s.mode==='LIVE';
+    const bm=$('b-mode');
     bm.textContent=live?'● LIVE — real orders':'◌ DRY-RUN — no orders';
     bm.className='pill '+(live?'live':'dry');
-    document.getElementById('b-market').textContent=
-      (s.fields['market']||'').startsWith('open')?'market open':'market closed';
-    document.getElementById('b-paused').style.display=s.paused?'':'none';
-    const qp=document.getElementById('q-pause');
-    qp.textContent=s.paused?'Resume':'Pause';qp.dataset.cmd=s.paused?'resume':'pause';
-    const qd=document.getElementById('q-dry');
-    qd.textContent=live?'Switch to dry-run':'Go live';
-    qd.dataset.cmd=live?'dry on':'dry off';
-    const ent=(s.fields['entries today']||'').split('/');
-    document.getElementById('t-entries').textContent=(ent[0]||'–').trim();
-    document.getElementById('t-cap').textContent='of '+((ent[1]||'').replace('cap','').trim()||'?')+' daily cap';
-    const pos=(s.fields['open positions']||'none');
+    $('b-market').textContent=(f['market']||'').startsWith('open')?'market open':'market closed';
+    $('b-paused').style.display=s.paused?'':'none';
+    const qp=$('q-pause');qp.textContent=s.paused?'Resume':'Pause';qp.dataset.cmd=s.paused?'resume':'pause';
+    const qd=$('q-dry');qd.textContent=live?'Switch to dry-run':'Go live';
+    qd.dataset.cmd=live?'dry on':'dry off';qd.className='qbtn'+(live?'':' warn');
+    const ent=(f['entries today']||'').split('/');
+    const n=parseInt(ent[0],10)||0,cap=parseInt((ent[1]||'').replace(/\\D+/g,''),10)||0;
+    $('t-entries').textContent=isNaN(parseInt(ent[0],10))?'–':n;
+    $('t-cap').textContent=cap?('of '+cap+' allowed today'):'';
+    const mt=$('m-entries');mt.firstChild.style.width=(cap?Math.min(100,n*100/cap):0)+'%';
+    mt.className='meter'+(cap&&n>=cap?' hot':'');
+    const pos=(f['open positions']||'none');
     const list=pos==='none'?[]:pos.split(', ');
-    document.getElementById('t-pos').textContent=list.length;
-    document.getElementById('positions').innerHTML = list.length ?
-      '<table>'+list.map(p=>{const a=p.split('|');
-        return '<tr><td>'+esc(a[0]||p)+'</td><td>'+esc(a[1]||'')+'</td><td>$'+
-        esc(a[2]||'')+'</td><td>'+esc(a[3]==='C'?'CALL':a[3]==='P'?'PUT':'')+'</td></tr>';
-      }).join('')+'</table>' : '<span class="muted">none</span>';
-    document.getElementById('t-sizing').textContent=s.fields['sizing']||'–';
-    const polOn=s.fields['policy brain']==='on';
-    document.getElementById('t-policy').textContent=polOn?'ON (your rules)':'off';
-    document.getElementById('t-policy-hint').textContent=
-      polOn?'checks every entry':'add rules in Setup → Safety to enable';
-    document.getElementById('t-source').textContent=s.fields['source']||'–';
+    $('t-pos').textContent=list.length;
+    $('positions').innerHTML=list.length?list.map(p=>{
+      const a=p.split('|');
+      if(a.length<4)return '<div class="pcard"><b>'+esc(p)+'</b></div>';
+      return '<div class="pcard">'+contractHtml(a[0]+' '+a[1]+' $'+a[2]+' '+(a[3]==='C'?'CALL':'PUT'))+'</div>';
+    }).join(''):'<span class="empty">none</span>';
+    $('t-sizing').textContent=(f['sizing']||'–').replace('contract(s)/trade','contract(s)');
+    const polOn=f['policy brain']==='on';
+    $('t-policy').textContent=polOn?'On':'Off';
+    $('t-policy-hint').textContent=polOn?'checked before every entry':'add rules in settings → Safety';
+    if(f['source']==='agenthc')feedTile(f['feed access']);
+    else{$('t-feed').textContent=SOURCES[f['source']]||f['source']||'–';$('t-feed-s').textContent='signal source';}
     try{
-      const p=await api('/api/proposal');
-      const panel=document.getElementById('p-proposal');
+      const p=await api('/api/proposal');const panel=$('p-proposal');
       if(p.pending){panel.style.display='';
-        document.getElementById('prop-expl').textContent=p.explanation;
-        document.getElementById('prop-warn').textContent=(p.warnings||[]).join('  ');
-        document.getElementById('prop-diff').textContent=p.diff;}
+        $('prop-expl').textContent=p.explanation;
+        $('prop-warn').textContent=(p.warnings||[]).join('  ');
+        $('prop-diff').textContent=p.diff;}
       else panel.style.display='none';
     }catch(e){}
     const t=await api('/api/trades');
-    document.getElementById('trades').innerHTML = t.trades.length ?
-      '<table><tr><th>time (UTC)</th><th>action</th><th>contract</th><th>note</th></tr>'+
-      t.trades.map(x=>{
-        const a=(x.action||'').toUpperCase();
-        const cls=a.indexOf('ENTER')>=0||a.indexOf('BUY')>=0?'act-in'
-          :a.indexOf('EXIT')>=0||a.indexOf('SELL')>=0?'act-out':'act-skip';
-        return '<tr><td>'+esc((x.ts||'').replace('T',' ').slice(5,16))+
-        '</td><td class="'+cls+'">'+esc(x.action||'')+'</td><td>'+esc(x.contract||'')+
-        '</td><td>'+esc((x.reason||'').slice(0,80))+'</td></tr>';}).join('')+'</table>'
-      : '<span class="muted">nothing yet</span>';
-  }catch(e){document.getElementById('status')&&(document.getElementById('status').textContent='agent unreachable');}
+    const rows=t.trades||[];
+    let cum=0;const pts=[0];
+    rows.slice().reverse().forEach(x=>{if(x.action==='exit'&&x.est_pnl_usd!=null){cum+=Number(x.est_pnl_usd);pts.push(cum);}});
+    spark(pts);
+    $('pnl-total').innerHTML=pts.length>1?'est. P&amp;L of exits shown: <span class="'+
+      (cum>=0?'pnl-pos':'pnl-neg')+'">'+money(cum)+'</span>':'';
+    $('trades').innerHTML=rows.length?rows.map(x=>{
+      const a=x.action||'';let ic='skip',icon='–',title;
+      if(a==='entry'){ic='in';icon='▲';title='Entered '+contractHtml(x.contract);}
+      else if(a==='exit'){ic='out';icon='▼';title='Exited '+contractHtml(x.contract)+
+        (x.est_pnl_usd!=null?' <span class="'+(x.est_pnl_usd>=0?'pnl-pos':'pnl-neg')+'">'+money(x.est_pnl_usd)+'</span>':'');}
+      else{title='Skipped '+contractHtml(x.contract)+' — '+esc(SKIPS[a]||a.replace(/_/g,' '));}
+      const note=(a==='policy_veto'||a==='entry'||a==='exit')&&x.reason?esc(String(x.reason).slice(0,120)):'';
+      return '<li><span class="ic '+ic+'">'+icon+'</span><div><div class="t">'+title+
+        (x.dry?' <span class="tag dry">dry-run</span>':'')+'</div>'+
+        (note?'<div class="n">'+note+'</div>':'')+'</div><span class="when">'+when(x.ts)+'</span></li>';
+    }).join(''):'<li class="empty">nothing yet — signals and the agent\\'s decisions show up here</li>';
+  }catch(e){$('b-mode').textContent='agent unreachable';$('b-mode').className='pill bad';}
 }
 async function propApply(){
-  document.getElementById('prop-msg').textContent='applying…';
+  $('prop-msg').textContent='applying…';
   const r=await api('/api/proposal/apply',{});
-  document.getElementById('prop-msg').textContent=r.reply;
+  $('prop-msg').textContent=r.reply;
 }
-async function propReject(){
-  await api('/api/proposal/reject',{});refresh();
+async function propReject(){await api('/api/proposal/reject',{});refresh();}
+let chatStarted=false;
+function chatAdd(cls,text){
+  const log=$('chatlog');
+  if(!chatStarted){log.innerHTML='';chatStarted=true;}
+  log.insertAdjacentHTML('beforeend','<div class="'+cls+'">'+(cls==='me'?'you: ':'')+esc(text)+'</div>');
+  log.scrollTop=log.scrollHeight;
 }
 async function quick(cmd){
-  const r=await api('/api/command',{text:cmd});
-  const log=document.getElementById('chatlog');
-  log.innerHTML+='<div class="me">you: '+esc(cmd)+'</div><div class="agent">'+esc(r.reply)+'</div>';
-  log.scrollTop=log.scrollHeight;refresh();
+  chatAdd('me',cmd);
+  const r=await api('/api/command',{text:cmd});chatAdd('agent',r.reply);refresh();
 }
+function ask(text){$('cmd').value=text;send();}
 async function send(){
-  const box=document.getElementById('cmd');const text=box.value.trim();if(!text)return;
-  box.value='';const log=document.getElementById('chatlog');
-  log.innerHTML+='<div class="me">you: '+esc(text)+'</div>';
-  log.scrollTop=log.scrollHeight;
-  const r=await api('/api/command',{text:text});
-  log.innerHTML+='<div class="agent">'+esc(r.reply)+'</div>';
-  log.scrollTop=log.scrollHeight;refresh();
+  const box=$('cmd');const text=box.value.trim();if(!text)return;
+  box.value='';chatAdd('me',text);
+  const r=await api('/api/command',{text:text});chatAdd('agent',r.reply);refresh();
 }
 refresh();setInterval(refresh,5000);
 </script></body></html>"""
