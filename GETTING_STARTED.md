@@ -164,6 +164,10 @@ checks everything (consent, source, wallet + balance, feed reachability,
 broker connection, notifications) and prints the exact command that fixes
 each ✗. Run it any time the agent isn't doing what you expect.
 
+**Easiest: the dashboard's `? help` button.** "Check my connection" names
+whatever is blocking the agent; "Copy support report" copies one block of
+text (no keys or tokens in it) to paste to whoever helps you.
+
 **"SSL handshake failed" / can't connect to AgentHC?** Run
 `./.venv/bin/python agent.py netcheck`. It works out what on your computer or
 network is blocking the connection (antivirus HTTPS scanning, a VPN, a

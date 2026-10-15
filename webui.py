@@ -322,6 +322,7 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
   too. Unused days carry over when you buy more. The agent never holds
   money.</p>
   <div class="navrow">
+   <button onclick="buyPass(1)">1 signal day (try it)</button>
    <button onclick="buyPass(5)">5 signal days</button>
    <button onclick="buyPass(20)">20 signal days</button>
    <button onclick="buyPass(60)">60 signal days</button>
@@ -337,6 +338,20 @@ _WIZARD_HTML = """<!doctype html><html><head><meta charset="utf-8">
    <p class="muted">Scan the QR with your phone's wallet, or copy the invoice
    into any Lightning app. This page updates by itself once you pay (the
    invoice is good for 1 hour).</p>
+   <div id="pass-help" style="display:none" class="disc">
+    <b>Payment not going through?</b> Nothing has arrived yet. Most failures
+    happen inside the paying wallet, before the payment leaves it:
+    <ul>
+     <li>Your wallet needs <b id="pass-need"></b> available (the invoice plus
+     a little for network fees).</li>
+     <li><b>Cash App</b> and some other apps limit Lightning payments or fail on
+     larger ones — try the <b>1 signal day</b> pass first, or pay from
+     <b>Strike</b> or <b>Phoenix</b>.</li>
+     <li>Still stuck? Use <b>Advanced → auto-pay from a wallet the agent
+     controls</b> below, or open the dashboard's <b>Help</b> panel and send
+     the support report.</li>
+    </ul>
+   </div>
   </div>
   <details id="adv-wallet"><summary class="muted">Advanced: auto-pay each day
   from a Lightning wallet the agent controls, or use an API key</summary>
@@ -637,17 +652,22 @@ async function copyText(srcId,msgId){
   try{await navigator.clipboard.writeText(t);msg.textContent='copied ✓';}
   catch(e){msg.textContent='clipboard blocked — select the invoice text above and copy it';}
 }
-let passTimer=null;
+let passTimer=null,passHelpTimer=null;
 async function buyPass(days){
   const st=document.getElementById('pass-status');st.textContent='creating invoice…';
   const r=await api('/api/pass/buy',{days:days});
   if(!r.ok){st.innerHTML='<span class="err">'+esc(r.error)+'</span>';
     if(r.unavailable)document.getElementById('adv-wallet').open=true;return;}
   document.getElementById('pass-box').style.display='';
-  document.getElementById('pass-quote').textContent=days+' signal days — '+
+  document.getElementById('pass-quote').textContent=days+' signal day'+(days>1?'s':'')+' — '+
     r.amount_sats.toLocaleString()+' sats'+(r.amount_usd?' (~$'+r.amount_usd+')':'')+
     (r.carried?' · plus '+r.carried+' unused day(s) carried over':'');
   renderQr(r.qr,'pass-qr');
+  const need=Math.ceil((r.amount_sats||0)*1.01)+50;
+  document.getElementById('pass-need').textContent=need.toLocaleString()+' sats';
+  document.getElementById('pass-help').style.display='none';
+  if(passHelpTimer)clearTimeout(passHelpTimer);
+  passHelpTimer=setTimeout(()=>{if(passTimer)document.getElementById('pass-help').style.display='';},120000);
   document.getElementById('pass-bolt11').textContent=r.bolt11;
   document.getElementById('pass-link').href='lightning:'+r.bolt11;
   document.getElementById('pass-copy-msg').textContent='';
@@ -1074,10 +1094,25 @@ _DASH_HTML = """<!doctype html><html><head><meta charset="utf-8">
  <span class="pill" id="b-market"></span>
  <span class="pill paused" id="b-paused" style="display:none">⏸ PAUSED</span>
  <span class="sp"></span>
+ <a class="qbtn" id="upd-badge" href="/setup" style="display:none;text-decoration:none;padding:.5rem 1rem;border-radius:6px" title="Install it from settings (top of the page)">⬆ update available</a>
+ <button class="qbtn" onclick="toggleHelp()">? help</button>
  <a class="qbtn" href="/setup" style="text-decoration:none;padding:.5rem 1rem;border-radius:6px">⚙ settings</a>
  <button class="qbtn" id="q-pause" onclick="quick(this.dataset.cmd)" data-cmd="pause">Pause</button>
  <button class="qbtn" id="q-dry" onclick="quick(this.dataset.cmd)" data-cmd="dry on">Dry-run</button>
 </header>
+
+<section id="help" style="display:none">
+ <h2>Help</h2>
+ <p class="muted">Something not working? These two buttons usually find the
+ cause without any typing.</p>
+ <p><button onclick="helpNet()">Check my connection</button>
+ <button onclick="helpReport()">Copy support report</button>
+ <span id="help-msg" class="muted"></span></p>
+ <pre id="help-out" style="display:none;white-space:pre-wrap;max-height:22rem;overflow:auto"></pre>
+ <p class="muted" style="font-size:.8rem">The report contains no keys, tokens,
+ invoices or wallet IDs — they are removed before it's shown. Paste it to
+ whoever helps you with the agent.</p>
+</section>
 
 <div class="tiles">
  <div class="tile"><div class="k">Entries today</div>
@@ -1135,6 +1170,27 @@ async function api(p, body){
   return await r.json();
 }
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+function toggleHelp(){const h=document.getElementById('help');
+  h.style.display=h.style.display==='none'?'':'none';}
+async function helpGet(path,label){
+  const msg=document.getElementById('help-msg'),out=document.getElementById('help-out');
+  msg.textContent=label+'… (up to a minute)';out.style.display='none';
+  try{
+    const r=await fetch(path);const j=await r.json();
+    out.textContent=j.text||j.error||'no answer';out.style.display='';msg.textContent='';
+    return j.text||'';
+  }catch(e){msg.textContent='Could not reach the agent on this computer — is it still running?';return '';}
+}
+async function helpNet(){await helpGet('/api/help/netcheck','checking the connection');}
+async function helpReport(){
+  const t=await helpGet('/api/help/report','building the report');
+  if(!t)return;
+  try{await navigator.clipboard.writeText(t);document.getElementById('help-msg').textContent='copied ✓ — paste it to support';}
+  catch(e){document.getElementById('help-msg').textContent='select the text below and copy it';}
+}
+// "update available" badge: one quiet check per page load; never installs.
+(async function(){try{const r=await (await fetch('/api/update/check')).json();
+  if(r.ok&&r.behind)document.getElementById('upd-badge').style.display='';}catch(e){}})();
 async function refresh(){
   try{
     const s=await api('/api/status');
@@ -1735,6 +1791,17 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     def update_check(_h):
         return check_code_updates()
 
+    def help_netcheck(_h):
+        import support
+        from agent import _agenthc_host
+        return {"ok": True, "text": "\n".join(support.connection_check(_agenthc_host()))}
+
+    def help_report(_h):
+        import support
+        from agent import _agenthc_host
+        return {"ok": True, "text": support.report(_repo_dir(), A.doctor_checks,
+                                                   cfg, _agenthc_host())}
+
     def update_pull(_h, data):
         expect = str((data or {}).get("expect") or "").strip()
         if not expect:
@@ -1804,10 +1871,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         try:
             days = int(data.get("days") or 0)
         except (TypeError, ValueError):
-            return {"ok": False, "error": "pick 5, 20 or 60 days"}
+            return {"ok": False, "error": "pick 1, 5, 20 or 60 days"}
         current = (cfg.get("feed_pass") or {}).get("token")
         try:
             body = hc.buy_pass(days, extend_token=current)
+        except hc.PassSizeUnavailable as exc:
+            return {"ok": False, "error": str(exc)}
         except hc.PassUnavailable as exc:
             return {"ok": False, "error": str(exc), "unavailable": True}
         except Exception as exc:
@@ -2122,6 +2191,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/deploy/status": deploy_status,
                     "/api/brokers": brokers_list,
                     "/api/update/check": update_check,
+                    "/api/help/netcheck": help_netcheck,
+                    "/api/help/report": help_report,
                     "/api/wallet/quote": wallet_quote,
                     "/api/llm/providers": llm_providers,
                     "/api/pass/status": pass_status_route,

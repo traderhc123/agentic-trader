@@ -844,6 +844,8 @@ def cmd_run(app_window=False):
             return
         except Exception as exc:
             print(f"heartbeat error (will retry): {str(exc)[:200]}")
+            import support
+            support.note_error(f"heartbeat error: {exc}")
             if cfg.get("source") == "agenthc":
                 _explain_connection_error(exc, cfg, state, save_state)
         try:
@@ -882,6 +884,8 @@ def _explain_connection_error(exc, cfg, state, save_state, now=None):
         save_state(state)
         return diag
     print(net_check.summary(diag))
+    import support
+    support.note_error(net_check.summary(diag))
     key = f"{datetime.now(MARKET_TZ).date()}:{diag['problem']}"
     if state.get("net_diag_notified") != key:
         state["net_diag_notified"] = key
