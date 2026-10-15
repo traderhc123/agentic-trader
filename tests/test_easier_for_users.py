@@ -186,3 +186,19 @@ def test_pass_options_unknown_when_server_unreachable(fresh_http, monkeypatch):
 def test_wizard_hides_pass_sizes_not_on_sale():
     html = webui._WIZARD_HTML
     assert "passSizes()" in html and "/api/pass/options" in html
+
+
+def test_polled_status_errors_are_diagnosed_once_per_minute(monkeypatch):
+    calls = []
+    monkeypatch.setattr(webui, "_NET_DIAG_CACHE", {"at": 0.0, "text": ""})
+    monkeypatch.setattr(nc, "diagnose", lambda host: calls.append(host) or nc._result(
+        False, "not_tls", "a web page answered instead", "allow-list it"))
+    exc = requests.exceptions.SSLError("[SSL: WRONG_VERSION_NUMBER] wrong version number")
+    first = webui._net_error_text(exc, cache_s=60)
+    second = webui._net_error_text(exc, cache_s=60)
+    assert first == second and "a web page answered instead" in first
+    assert len(calls) == 1
+
+
+def test_wizard_shows_pass_status_errors():
+    assert "r.status==='error'&&r.error" in webui._WIZARD_HTML

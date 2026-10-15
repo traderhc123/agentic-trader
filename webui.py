@@ -1218,6 +1218,7 @@ async function checkPass(){
     document.getElementById('pass-box').style.display='none';
     st.innerHTML='<span class="err">That invoice expired unpaid — pick a pass again.</span>';
   }else if(r.status==='exits_only'){st.innerHTML='<span class="err">Your signal days are used up — exits still come through for a few days. Buy more above.</span>';}
+  else if(r.status==='error'&&r.error){st.innerHTML='<span class="err">'+esc(r.error)+'</span>';}
   else if(r.status==='expired'||r.status==='used_up'){st.innerHTML='<span class="err">Your pass has run out — buy more days above.</span>';}
 }
 function srcChanged(){
@@ -2325,18 +2326,29 @@ def _fund_quote(sats, invoice_cap=0):
 _qr_bootstrap_attempted = False
 
 
-def _net_error_text(exc):
+_NET_DIAG_CACHE = {"at": 0.0, "text": ""}
+
+
+def _net_error_text(exc, cache_s=0):
     """Error text for the wizard; connection failures get the diagnosed
-    cause + fix (antivirus, VPN, DNS filter…) instead of a raw SSL error."""
+    cause + fix (antivirus, VPN, DNS filter…) instead of a raw SSL error.
+    `cache_s` reuses a recent diagnosis — for routes the page polls every
+    few seconds (a diagnosis takes seconds and makes network probes)."""
+    import time
     import net_check
     if net_check.is_connection_error(exc):
+        if cache_s and _NET_DIAG_CACHE["text"] and \
+                time.time() - _NET_DIAG_CACHE["at"] < cache_s:
+            return _NET_DIAG_CACHE["text"]
         try:
             from agent import _agenthc_host
             diag = net_check.diagnose(_agenthc_host())
         except Exception:
             diag = None
         if diag and not diag["ok"]:
-            return net_check.summary(diag)
+            text = net_check.summary(diag)
+            _NET_DIAG_CACHE.update(at=time.time(), text=text)
+            return text
     return str(exc)[:200]
 
 
@@ -2777,7 +2789,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "days_left": st.get("days_left", st.get("trading_days_left")),
                     "access_until": st.get("access_until")}
         except Exception as exc:
-            return {"ok": False, "status": "error", "error": str(exc)[:160]}
+            return {"ok": False, "status": "error", "error": _net_error_text(exc, cache_s=60)}
 
     def wallet_create(_h, _data):
         if not A.consent_ok():
