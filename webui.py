@@ -523,26 +523,56 @@ async function api(p, body){
     body:JSON.stringify(body)}:{});
   return await r.json();
 }
+// Update button: never silent. A ticking "checking… 12s" while the server
+// works, a hard timeout, and every failure shown in words.
+let updTick=null;
+function updBusy(label){
+  const msg=document.getElementById('upd-msg');const t0=Date.now();
+  if(updTick)clearInterval(updTick);
+  const draw=()=>{const s=Math.round((Date.now()-t0)/1000);
+    msg.textContent=label+'… '+s+'s'+(s>=20?' (downloading from GitHub — this can take up to a minute)':'');};
+  draw();updTick=setInterval(draw,1000);
+}
+function updDone(html){
+  if(updTick){clearInterval(updTick);updTick=null;}
+  document.getElementById('upd-msg').innerHTML=html;
+}
+async function updCall(p,body,ms){
+  const ctl=new AbortController();const to=setTimeout(()=>ctl.abort(),ms);
+  try{
+    const r=await fetch(p,body?{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body),signal:ctl.signal}:{signal:ctl.signal});
+    if(r.status===401||r.status===403)
+      return {ok:false,error:'Your dashboard login expired — open the link from '+
+        '`python agent.py link` (or restart the agent) and try again.'};
+    try{return await r.json();}
+    catch(e){return {ok:false,error:'The agent answered unexpectedly (HTTP '+r.status+'). Restart it and try again.'};}
+  }catch(e){
+    return {ok:false,error:(e&&e.name==='AbortError')
+      ?'No answer after '+Math.round(ms/1000)+'s. Your network may be blocking GitHub — run `python agent.py netcheck` in the agent folder, or re-run the installer.'
+      :'Could not reach the agent on this computer — is it still running? Restart it, then reload this page.'};
+  }finally{clearTimeout(to);}
+}
 async function checkUpdates(){
-  const msg=document.getElementById('upd-msg');msg.textContent='checking…';
   document.getElementById('upd-pull').style.display='none';
-  const r=await api('/api/update/check');
-  if(!r.ok){msg.innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}
-  if(!r.behind){msg.innerHTML='<span class="ok">up to date ✓</span>';return;}
+  updBusy('checking');
+  const r=await updCall('/api/update/check',null,150000);
+  if(!r.ok){updDone('<span class="err">'+esc(r.error||'update check failed')+'</span>');return;}
+  if(!r.behind){updDone('<span class="ok">up to date ✓</span>');return;}
   updTarget=r.target||'';
-  msg.innerHTML='<span class="ok">'+r.behind+' update'+(r.behind>1?'s':'')+
+  updDone('<span class="ok">'+r.behind+' update'+(r.behind>1?'s':'')+
     ' available</span> — review before pulling:<pre style="white-space:pre-wrap;'+
     'max-height:12rem;overflow:auto">'+esc(r.summary||'')+'</pre>'+
     '<span class="muted">installs exactly '+esc(updTarget.slice(0,12))+
-    ' from github.com/traderhc123/agentic-trader</span>';
+    ' from github.com/traderhc123/agentic-trader</span>');
   document.getElementById('upd-pull').style.display='';
 }
 let updTarget='';
 async function pullUpdates(){
-  const msg=document.getElementById('upd-msg');msg.textContent='pulling…';
-  const r=await api('/api/update/pull',{expect:updTarget});
-  msg.innerHTML=r.ok?'<span class="ok">'+esc(r.note)+'</span>'
-    :'<span class="err">'+esc(r.error)+'</span>';
+  updBusy('installing');
+  const r=await updCall('/api/update/pull',{expect:updTarget},400000);
+  updDone(r.ok?'<span class="ok">'+esc(r.note)+'</span>'
+    :'<span class="err">'+esc(r.error||'update failed')+'</span>');
   if(r.ok)document.getElementById('upd-pull').style.display='none';
   if(r.ok&&r.restarting){
     // Server is re-execing onto the new code — poll until it's back,
@@ -2192,9 +2222,56 @@ def _repo_dir():
 # ── code updates (wizard "check for updates" button) ────────────────────────
 
 def _git(args, timeout=60):
+    import os
     import subprocess
+    # Never let git wait for a password/credential prompt nobody can see
+    # (a stuck prompt made the Update button look like it did nothing).
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
     return subprocess.run(["git", "-C", _repo_dir(), *args],
-                          capture_output=True, text=True, timeout=timeout)
+                          capture_output=True, text=True, timeout=timeout, env=env)
+
+
+_FETCH_TIMEOUT_S = 45
+_NET_HINTS = ("could not resolve", "unable to access", "ssl", "tls", "timed out",
+              "failed to connect", "connection", "proxy", "certificate",
+              "network", "unreachable", "schannel", "gnutls")
+
+
+def _snapshot_mode():
+    """No git checkout (zip install) or no git on PATH → update from
+    GitHub's zip of the reviewed commit instead (snapshot_update)."""
+    import os
+    import shutil
+    return (not os.path.isdir(os.path.join(_repo_dir(), ".git"))
+            or shutil.which("git") is None)
+
+
+def _github_unreachable(raw):
+    """Error text for a failed update download: the diagnosed cause + fix
+    when it looks like a network problem, else the raw error."""
+    raw = str(raw or "").strip()
+    if any(h in raw.lower() for h in _NET_HINTS):
+        try:
+            import net_check
+            diag = net_check.diagnose("github.com")
+            if not diag["ok"]:
+                return net_check.summary(diag, name="GitHub (where updates come from)")
+        except Exception:
+            pass
+    return raw[:300] or "the update download failed"
+
+
+def _fetch_origin():
+    """git fetch with a short timeout. Returns an error string or None."""
+    import subprocess
+    try:
+        f = _git(["fetch", "--quiet", "origin"], timeout=_FETCH_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return _github_unreachable(
+            f"fetch timed out after {_FETCH_TIMEOUT_S}s (network timed out)")
+    if f.returncode != 0:
+        return "fetch failed: " + _github_unreachable((f.stderr or f.stdout).strip())
+    return None
 
 
 def _update_upstream():
@@ -2237,18 +2314,19 @@ def check_code_updates():
     """Fetch origin and report how far behind HEAD is. Never raises.
     Returns the exact commit (`target`) the user is shown, so the pull can
     install THAT commit and nothing pushed after they looked."""
-    import os
-    if not os.path.isdir(os.path.join(_repo_dir(), ".git")):
-        return {"ok": False, "error": "this install is not a git checkout — "
-                "update by re-running the installer"}
+    if _snapshot_mode():
+        import snapshot_update
+        try:
+            return snapshot_update.check(_repo_dir())
+        except Exception as exc:
+            return {"ok": False, "error": _github_unreachable(exc)}
     try:
         problem = _remote_problem()
         if problem:
             return {"ok": False, "error": problem}
-        r = _git(["fetch", "--quiet", "origin"], timeout=120)
-        if r.returncode != 0:
-            return {"ok": False, "error": "fetch failed: "
-                    + (r.stderr or r.stdout).strip()[:200]}
+        err = _fetch_origin()
+        if err:
+            return {"ok": False, "error": err}
         upstream = _update_upstream()
         behind = _git(["rev-list", "--count", f"HEAD..{upstream}"])
         if behind.returncode != 0:
@@ -2275,13 +2353,19 @@ def pull_code_updates(expect=None):
     merged over silently — a diverged tree is reported, not resolved.
     `expect` (the `target` from check_code_updates) pins the exact commit the
     user reviewed: if the remote moved since, nothing is installed."""
+    if _snapshot_mode():
+        import snapshot_update
+        try:
+            return snapshot_update.pull(_repo_dir(), expect)
+        except Exception as exc:
+            return False, _github_unreachable(exc)
     try:
         problem = _remote_problem()
         if problem:
             return False, problem
-        f = _git(["fetch", "--quiet", "origin"], timeout=120)
-        if f.returncode != 0:
-            return False, "fetch failed: " + (f.stderr or f.stdout).strip()[:200]
+        err = _fetch_origin()
+        if err:
+            return False, err
         upstream = _update_upstream()
         head = _git(["rev-parse", upstream]).stdout.strip()
         if expect and head != expect:

@@ -1,4 +1,5 @@
-"""Why can't this computer reach AgentHC? — a plain-English answer.
+"""Why can't this computer reach AgentHC (or GitHub, for updates)? — a
+plain-English answer.
 
 When the agent can't connect, the cause is almost always on the user's own
 machine or network, not the server: antivirus that scans HTTPS, a VPN or
@@ -200,7 +201,7 @@ def diagnose(host=HOST, timeout=8):
     if bad:
         return _result(False, "dns_blocked",
                        f"{host} resolves to {bad[0]} — a block page or filter, "
-                       "not the AgentHC server",
+                       "not the real server",
                        "A DNS filter (router parental controls, ISP filter, "
                        "Cisco Umbrella/OpenDNS, or security software) is blocking "
                        f"{host}. Allow-list it there, or set DNS to 1.1.1.1. " + _TRY)
@@ -242,9 +243,12 @@ def _connect(host, ip, timeout):
             page = _plain_probe(ip, host, timeout)
         except OSError:
             page = ""
-        if "HTTPS port" in page:
+        # A real HTTPS server answers plain HTTP on 443 with "400 Bad Request"
+        # (nginx: "plain HTTP request was sent to HTTPS port"); a filter or
+        # block page answers with something else.
+        if "HTTPS port" in page or page.startswith(("HTTP/1.1 400", "HTTP/1.0 400")):
             return _result(False, "tls_cut",
-                           "the AgentHC server is reachable, but the secure "
+                           f"{host} is reachable, but the secure "
                            f"connection is cut off on this computer ({exc})",
                            "Security software or a VPN on this computer is "
                            "breaking HTTPS. Turn off its HTTPS/SSL scanning (often "
@@ -252,7 +256,7 @@ def _connect(host, ip, timeout):
                            f"add an exception for {host}. " + _TRY)
         if page.startswith("HTTP/"):
             return _result(False, "not_tls",
-                           "something on your network answered instead of AgentHC "
+                           f"something on your network answered instead of {host} "
                            "with an unencrypted web page (a filter or block page)",
                            "A router/ISP filter, workplace proxy or security software "
                            f"is blocking {host}. Allow-list it there. " + _TRY)
@@ -298,8 +302,8 @@ def _https_ok(host, timeout):
         return False
 
 
-def summary(diag):
+def summary(diag, name="AgentHC"):
     """One block of text for a log line, notification or wizard message."""
     if diag["ok"]:
         return f"Connection OK — {diag['detail']}"
-    return f"Can't reach AgentHC: {diag['detail']}.\nFix: {diag['fix']}"
+    return f"Can't reach {name}: {diag['detail']}.\nFix: {diag['fix']}"

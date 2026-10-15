@@ -91,10 +91,15 @@ def test_pull_without_prior_check_fetches_itself(repos):
     assert (install / "f.txt").read_text() == "v2\n"
 
 
-def test_not_a_git_checkout(tmp_path, monkeypatch):
+def test_not_a_git_checkout_updates_from_github_zip(tmp_path, monkeypatch):
+    """A zip install (no .git) no longer dead-ends with 're-run the
+    installer': it checks GitHub directly (snapshot_update)."""
+    import snapshot_update
     monkeypatch.setattr(webui, "_repo_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(snapshot_update, "check",
+                        lambda d: {"ok": True, "behind": 0, "mode": "snapshot"})
     r = webui.check_code_updates()
-    assert not r["ok"] and "not a git checkout" in r["error"]
+    assert r["ok"] and r["mode"] == "snapshot"
 
 
 def test_install_requirements_no_file(tmp_path, monkeypatch):
