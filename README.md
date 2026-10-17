@@ -131,9 +131,13 @@ The AgentHC feed costs **~$10 per signal day, paid in bitcoin sats** (the sats
 amount floats with Bitcoin's price). Two ways to pay:
 
 **Prepaid signal days (recommended).** In the setup wizard's *Signal source*
-step, pick **5, 20 or 60 signal days**. You get one Lightning invoice (QR
+step, pick **1 (try it), 5, 20 or 60 signal days**. You get one Lightning invoice (QR
 code) — pay it from the wallet you already use (Cash App, Strike, Phoenix,
 Alby, …) and the page confirms by itself. The agent never holds money.
+A size can be briefly off sale while the server's Lightning node refills
+capacity after a large purchase (try a smaller pass or again in about an
+hour), and the big passes (≈$200 / ≈$600) may exceed some wallets'
+Lightning send limits.
 
 A day is only used when your agent actually **receives a trade signal — an
 entry or an exit — that day**; quiet days (no picks, or your agent was off)
