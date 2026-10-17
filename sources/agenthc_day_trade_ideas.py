@@ -56,6 +56,31 @@ class PassSizeUnavailable(RuntimeError):
     server offers it)."""
 
 
+class PassSizeRefilling(PassSizeUnavailable):
+    """This size is briefly off sale (HTTP 503 pass_size_temporarily_unavailable)
+    while the server's Lightning node refills inbound capacity after a large
+    purchase. Smaller sizes may still be on sale; this one returns in ~1h."""
+
+
+PASS_REFILL_MSG = ("That size is briefly unavailable while our node refills — "
+                   "try a smaller pass or again in about an hour.")
+
+
+def _error_code(resp):
+    """The server's error code from {"detail": {"error": ..}}, {"error": ..}
+    or {"detail": ".."}; None if the body isn't JSON."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    d = body.get("detail", body)
+    if isinstance(d, dict):
+        return d.get("error")
+    return d if isinstance(d, str) else body.get("error")
+
+
 def buy_pass(days, extend_token=None):
     """Ask AgentHC for an invoice covering `days` SIGNAL days — a market day
     is only used when the agent is served an entry/exit that day. Returns the
@@ -77,6 +102,8 @@ def buy_pass(days, extend_token=None):
             sizes = ", ".join(str(n) for n in d.get("options") or [])
             raise PassSizeUnavailable(f"{days}-day passes aren't on sale right now"
                                   + (f" — pick {sizes} signal days." if sizes else "."))
+    if resp.status_code == 503 and _error_code(resp) == "pass_size_temporarily_unavailable":
+        raise PassSizeRefilling(PASS_REFILL_MSG)
     if resp.status_code != 200:
         try:
             detail = resp.json().get("detail")

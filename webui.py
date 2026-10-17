@@ -687,7 +687,7 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     for main-pick signals; adding "other trades" (above) uses days on those
     too.</p>
     <div class="passes">
-     <button class="pass" data-days="1" onclick="buyPass(1)"><span class="tagline">Try it</span><span class="q">1</span><span class="u">signal day (try it)</span><span class="p">≈ $10</span></button>
+     <button class="pass" data-days="1" onclick="buyPass(1)"><span class="tagline">Try it</span><span class="q">1</span><span class="u">signal day</span><span class="p">≈ $10</span></button>
      <button class="pass" data-days="5" onclick="buyPass(5)"><span class="tagline"></span><span class="q">5</span><span class="u">signal days</span><span class="p">≈ $50</span></button>
      <button class="pass" data-days="20" onclick="buyPass(20)"><span class="tagline"></span><span class="q">20</span><span class="u">signal days</span><span class="p">≈ $200</span></button>
      <button class="pass" data-days="60" onclick="buyPass(60)"><span class="tagline"></span><span class="q">60</span><span class="u">signal days</span><span class="p">≈ $600</span></button>
@@ -1185,6 +1185,7 @@ async function buyPass(days){
   const st=document.getElementById('pass-status');st.textContent='creating invoice…';
   const r=await api('/api/pass/buy',{days:days});
   if(!r.ok){st.innerHTML='<span class="err">'+esc(r.error)+'</span>';
+    if(r.refresh_sizes){document.querySelectorAll('button.pass').forEach(b=>b.classList.remove('sel'));passSizes();}
     if(r.unavailable)document.getElementById('adv-wallet').open=true;return;}
   document.getElementById('pass-box').style.display='';
   document.getElementById('pass-quote').textContent=days+' signal day'+(days>1?'s':'')+' — '+
@@ -2735,8 +2736,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         current = (cfg.get("feed_pass") or {}).get("token")
         try:
             body = hc.buy_pass(days, extend_token=current)
+        except hc.PassSizeRefilling as exc:
+            # Size briefly off sale (node refilling) — the wizard re-asks
+            # which sizes are on sale so the card disappears until it's back.
+            return {"ok": False, "error": str(exc), "refresh_sizes": True}
         except hc.PassSizeUnavailable as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": str(exc), "refresh_sizes": True}
         except hc.PassUnavailable as exc:
             return {"ok": False, "error": str(exc), "unavailable": True}
         except Exception as exc:

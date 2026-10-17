@@ -112,6 +112,29 @@ def test_unsold_pass_size_is_a_friendly_message(fresh_http, monkeypatch):
     assert "1-day passes aren't on sale right now — pick 5, 20, 60" in str(exc.value)
 
 
+def test_refilling_pass_size_is_a_friendly_message(fresh_http, monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda url, **kw: _R(503, {
+        "detail": {"error": "pass_size_temporarily_unavailable"}}))
+    with pytest.raises(hc.PassSizeRefilling) as exc:
+        hc.buy_pass(60)
+    assert "briefly unavailable while our node refills" in str(exc.value)
+    assert isinstance(exc.value, hc.PassSizeUnavailable)
+
+
+def test_other_503_stays_a_generic_failure(fresh_http, monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda url, **kw: _R(503, {
+        "detail": "maintenance"}))
+    with pytest.raises(RuntimeError) as exc:
+        hc.buy_pass(5)
+    assert not isinstance(exc.value, hc.PassSizeUnavailable)
+
+
+def test_wizard_refreshes_sizes_when_one_is_off_sale():
+    html = webui._WIZARD_HTML
+    assert "r.refresh_sizes" in html and "passSizes();" in html
+    assert "signal day (try it)" not in html
+
+
 def test_wizard_offers_one_day_and_payment_help():
     html = webui._WIZARD_HTML
     assert 'buyPass(1)' in html and "1 signal day" in html
