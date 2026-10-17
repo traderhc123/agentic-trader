@@ -692,6 +692,7 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
      <button class="pass" data-days="20" onclick="buyPass(20)"><span class="tagline"></span><span class="q">20</span><span class="u">signal days</span><span class="p">≈ $200</span></button>
      <button class="pass" data-days="60" onclick="buyPass(60)"><span class="tagline"></span><span class="q">60</span><span class="u">signal days</span><span class="p">≈ $600</span></button>
     </div>
+    <p id="pass-sizes-note" class="status-line" role="status"></p>
     <p id="pass-status" class="status-line" role="status"></p>
     <div id="pass-box" style="display:none">
      <div class="invoice">
@@ -1229,14 +1230,21 @@ function srcChanged(){
 }
 // Show only the pass sizes the feed server sells right now (it can take
 // sizes off sale, e.g. while its node can't receive that large a payment).
-// If the server can't be asked, every card stays visible.
+// If the server can't be asked, every card stays visible. An empty list
+// means every size is paused. Re-checked every few minutes so a size comes
+// back on its own once the node has refilled.
 async function passSizes(){
   try{const r=await api('/api/pass/options');
-    if(r.options&&r.options.length)document.querySelectorAll('.pass[data-days]').forEach(b=>{
-      b.style.display=r.options.indexOf(+b.dataset.days)>=0?'':'none';});}catch(e){}
+    if(!Array.isArray(r.options))return;
+    document.querySelectorAll('.pass[data-days]').forEach(b=>{
+      b.style.display=r.options.indexOf(+b.dataset.days)>=0?'':'none';});
+    const n=document.getElementById('pass-sizes-note');
+    if(n)n.textContent=r.options.length?'':'Passes are paused for a little while — '+
+      'our node is refilling so it can receive the payment. This page checks again every few minutes.';
+  }catch(e){}
 }
 async function boot(){
-  passSizes();
+  passSizes();setInterval(passSizes,180000);
   const st=await api('/api/state');
   document.getElementById('disclaimer').innerHTML=mdLite(st.disclaimer);
   const notes=st.notes||{};

@@ -197,6 +197,12 @@ def test_pass_options_reads_the_servers_sizes(fresh_http, monkeypatch):
     assert hc.pass_options() == [1, 5]
 
 
+def test_pass_options_empty_list_means_all_paused(fresh_http, monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda url, **kw: _R(400, {
+        "detail": {"error": "invalid_days", "options": [], "paused": [1, 5, 20, 60]}}))
+    assert hc.pass_options() == []
+
+
 def test_pass_options_unknown_when_server_unreachable(fresh_http, monkeypatch):
     monkeypatch.setattr(nc, "proxy_for", lambda url: "")
 
@@ -209,6 +215,9 @@ def test_pass_options_unknown_when_server_unreachable(fresh_http, monkeypatch):
 def test_wizard_hides_pass_sizes_not_on_sale():
     html = webui._WIZARD_HTML
     assert "passSizes()" in html and "/api/pass/options" in html
+    assert "Array.isArray(r.options)" in html          # [] hides every card
+    assert "setInterval(passSizes" in html             # sizes come back on their own
+    assert 'id="pass-sizes-note"' in html
 
 
 def test_polled_status_errors_are_diagnosed_once_per_minute(monkeypatch):
