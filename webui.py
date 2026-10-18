@@ -830,25 +830,36 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   with money you can afford to lose entirely.</p>
  </div>
  <div class="sec-b"><div class="fs-grid">
-  <div class="fs-lbl">Main pick<p>How each trade is sized.</p></div>
+  <div class="fs-lbl">Main book<p>The daily main pick.</p></div>
   <div class="stack">
    <div class="opts">
-    <label class="check"><input type="radio" name="szmode" value="budget" checked><span>Dollar budget
-    per trade (buys what fits; skips trades that exceed it)</span></label>
-    <label class="check"><input type="radio" name="szmode" value="contracts"><span>Fixed contracts
-    per trade</span></label>
+    <label class="check"><input type="radio" name="szmode" value="budget" checked onchange="szModeChanged('main')"><span>Fixed dollar
+    amount per trade (buys what fits; skips trades that exceed it)</span></label>
+    <label class="check"><input type="radio" name="szmode" value="contracts" onchange="szModeChanged('main')"><span>Fixed number of
+    contracts per trade</span></label>
+    <label class="check"><input type="radio" name="szmode" value="percent" onchange="szModeChanged('main')"><span>Percent of
+    account per trade (re-read from your broker at each entry; skips trades that exceed it)</span></label>
    </div>
-   <div class="field"><label for="sz-val">Budget ($) or contracts per trade</label>
-    <input type="number" id="sz-val" placeholder="e.g. 500" min="1" step="any"></div>
+   <div class="field"><label for="sz-val" id="sz-val-lbl">Dollars per trade</label>
+    <input type="number" id="sz-val" placeholder="e.g. 500" min="0" step="any"></div>
   </div>
  </div></div>
  <div class="sec-b"><div class="fs-grid">
-  <div class="fs-lbl">Other trades<p>Optional.</p></div>
-  <div class="field"><label for="sz-other-val" class="muted">"Other trades" size — only used if your source includes
-   the wider other-trades journal; sized separately from the main pick
-   (blank = same as main)</label>
-   <input type="number" id="sz-other-val" placeholder="blank = same as main"
-   min="1" step="any"></div>
+  <div class="fs-lbl">Shadow book<p>"Other trades" — only used if your source includes them.</p></div>
+  <div class="stack">
+   <div class="opts">
+    <label class="check"><input type="radio" name="szomode" value="same" checked onchange="szModeChanged('other')"><span>Same
+    as the main book</span></label>
+    <label class="check"><input type="radio" name="szomode" value="budget" onchange="szModeChanged('other')"><span>Fixed dollar
+    amount per trade</span></label>
+    <label class="check"><input type="radio" name="szomode" value="contracts" onchange="szModeChanged('other')"><span>Fixed number of
+    contracts per trade</span></label>
+    <label class="check"><input type="radio" name="szomode" value="percent" onchange="szModeChanged('other')"><span>Percent of
+    account per trade</span></label>
+   </div>
+   <div class="field" id="sz-other-field" style="display:none"><label for="sz-other-val" id="sz-other-lbl">Dollars per trade</label>
+    <input type="number" id="sz-other-val" placeholder="e.g. 100" min="0" step="any"></div>
+  </div>
  </div></div>
  <div class="navrow"><span class="note">your choice — not advice</span><span id="sz-msg" role="status" aria-live="polite"></span><span class="sp"></span>
   <button onclick="goBack()"><svg class="i"><use href="#i-back"/></svg>Back</button>
@@ -1262,7 +1273,7 @@ async function boot(){
     const t=/^\\d+$/.test(st.broker)?'Robinhood account ····'+st.broker:st.broker;
     restoredNote('s-broker','Broker connected: '+t);}
   if(st.sizing){done('s-sizing');restoredNote('s-sizing',notes.sizing||'Sizing saved');
-    restoreSizing(notes.sizing);}
+    restoreSizing(st.sizing_detail);}
   if(st.safety){done('s-safety');restoredNote('s-safety',notes.safety||'Safety saved');}
   cur=Math.min(maxUnlocked,STEPS.length-1);render();booted=true;
   loadBrokers();
@@ -1451,29 +1462,42 @@ async function poll(){
     done('s-broker');}
   else setTimeout(poll,1500);
 }
-// Pre-fill the sizing form from the saved-sizing note so the radios and
-// value match what is on file (re-saving with a blank "other" field would
-// otherwise silently clear the other-trades size). If the note can't be
-// read, un-check both modes rather than claim a choice that was never made.
-function restoreSizing(note){
-  const t=String(note||'');
-  const rb=v=>document.querySelector('input[name=szmode][value='+v+']');
-  const num=x=>String(x).replace(/,/g,'');
-  let m=t.match(/^Sizing saved: up to \\$([\\d.,eE+]+) per trade/), mode=null;
-  if(m){mode='budget';}
-  else if((m=t.match(/^Sizing saved: (\\d[\\d,]*) contract/))){mode='contracts';}
-  if(!mode){rb('budget').checked=false;rb('contracts').checked=false;return;}
-  rb(mode).checked=true;
-  document.getElementById('sz-val').value=num(m[1]);
-  const o=t.match(/other trades \\$?([\\d.,eE+]+)/);
-  if(o)document.getElementById('sz-other-val').value=num(o[1]);
+// Sizing form: each book (main / shadow "other trades") picks its own mode.
+// The label + placeholder follow the mode so the number's unit is obvious.
+const SZ_UNITS={budget:['Dollars per trade','e.g. 500','1'],
+  contracts:['Contracts per trade','e.g. 1','1'],
+  percent:['Percent of account per trade','e.g. 2','0.1']};
+function szModeChanged(book){
+  const main=book==='main';
+  const sel=document.querySelector('input[name='+(main?'szmode':'szomode')+']:checked');
+  const mode=sel?sel.value:(main?'budget':'same');
+  if(!main)document.getElementById('sz-other-field').style.display=mode==='same'?'none':'';
+  const u=SZ_UNITS[mode];if(!u)return;
+  document.getElementById(main?'sz-val-lbl':'sz-other-lbl').textContent=u[0];
+  const inp=document.getElementById(main?'sz-val':'sz-other-val');
+  inp.placeholder=u[1];inp.step=mode==='contracts'?'1':'any';
+  inp.max=mode==='percent'?'100':'';
+}
+// Pre-fill the sizing form from the saved config (structured, from
+// /api/state) so re-saving never silently clears a book's size. Nothing on
+// file = un-check the main modes rather than claim a choice never made.
+function restoreSizing(sz){
+  const rb=(n,v)=>document.querySelector('input[name='+n+'][value='+v+']');
+  if(!sz||!sz.main||!rb('szmode',sz.main.mode)){
+    document.querySelectorAll('input[name=szmode]').forEach(e=>{e.checked=false;});return;}
+  rb('szmode',sz.main.mode).checked=true;
+  document.getElementById('sz-val').value=sz.main.value;
+  const o=sz.other&&rb('szomode',sz.other.mode)?sz.other:{mode:'same',value:''};
+  rb('szomode',o.mode).checked=true;
+  document.getElementById('sz-other-val').value=o.value;
+  szModeChanged('main');szModeChanged('other');
 }
 async function doSizing(){
   const sel=document.querySelector('input[name=szmode]:checked');
-  if(!sel){document.getElementById('sz-msg').innerHTML='<span class="err">choose budget or fixed contracts</span>';return;}
-  const mode=sel.value;
-  const r=await api('/api/sizing',{mode:mode,value:document.getElementById('sz-val').value,
-    other:document.getElementById('sz-other-val').value});
+  if(!sel){document.getElementById('sz-msg').innerHTML='<span class="err">choose how the main book is sized</span>';return;}
+  const osel=document.querySelector('input[name=szomode]:checked');
+  const r=await api('/api/sizing',{main:{mode:sel.value,value:document.getElementById('sz-val').value},
+    other:{mode:osel?osel.value:'same',value:document.getElementById('sz-other-val').value}});
   document.getElementById('sz-msg').innerHTML=r.ok?'<span class="ok">saved ✓</span>'
     :'<span class="err">'+r.error+'</span>';
   if(r.ok)done('s-sizing');
@@ -1856,7 +1880,7 @@ _DASH_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
       <button onclick="ask('why did you skip the last signal?')">why the last skip?</button>
      </div>
      <div id="chatlog" role="log" aria-live="polite" tabindex="0" aria-label="Conversation with your agent"><span class="hint">Ask anything, or give a command —
-     <code>pause</code>, <code>set budget 500</code>, <code>set cap 3</code>,
+     <code>pause</code>, <code>set budget 500</code>, <code>set percent 2</code>, <code>set cap 3</code>,
      <code>dry off</code>, <code>stop</code>.</span></div>
      <div class="chatrow">
       <input type="text" id="cmd" aria-label="Ask your agent or give a command" placeholder="Ask or command…"
@@ -2417,24 +2441,38 @@ def _restore_notes(cfg, acceptance=None):
         elif src == "url" and cfg.get("source_url"):
             detail = f" · {cfg['source_url']}"
         notes["source"] = f"Source saved: {src}{detail}"
-    if cfg.get("sizing_mode") == "budget":
-        notes["sizing"] = (f"Sizing saved: up to "
-                           f"${cfg.get('budget_per_trade_usd', 0):g} per trade")
-    elif cfg.get("sizing_mode"):
-        n = cfg.get("contracts_per_trade", 1)
-        notes["sizing"] = f"Sizing saved: {n} contract{'s' if n != 1 else ''} per trade"
-    if notes.get("sizing") and cfg.get("other_sizing_mode"):
-        if cfg["other_sizing_mode"] == "budget":
-            notes["sizing"] += (" · other trades "
-                                f"${cfg.get('other_budget_per_trade_usd', 0):g}/trade")
-        else:
-            notes["sizing"] += (" · other trades "
-                                f"{cfg.get('other_contracts_per_trade', 1)} contract(s)")
+    def _book_note(prefix):
+        mode = cfg.get(f"{prefix}sizing_mode")
+        if mode == "budget":
+            return f"up to ${cfg.get(f'{prefix}budget_per_trade_usd', 0):g} per trade"
+        if mode == "percent":
+            return f"{cfg.get(f'{prefix}percent_per_trade', 0):g}% of account per trade"
+        n = cfg.get(f"{prefix}contracts_per_trade", 1)
+        return f"{n} contract{'s' if n != 1 else ''} per trade"
+    if cfg.get("sizing_mode"):
+        notes["sizing"] = "Sizing saved: " + _book_note("")
+        if cfg.get("other_sizing_mode"):
+            notes["sizing"] += " · shadow book " + _book_note("other_")
     if cfg.get("max_entries_per_day") is not None:
         notes["safety"] = (
             f"Safety saved: {'DRY-RUN' if cfg.get('dry_run', True) else 'LIVE'}"
             f" · max {cfg.get('max_entries_per_day')} entries/day")
     return notes
+
+
+_SZ_VALUE_KEY = {"budget": "budget_per_trade_usd",
+                 "contracts": "contracts_per_trade",
+                 "percent": "percent_per_trade"}
+
+
+def _sizing_detail(cfg):
+    """Saved sizing per book, for the wizard to pre-fill its form."""
+    def book(prefix):
+        mode = cfg.get(f"{prefix}sizing_mode")
+        if mode not in _SZ_VALUE_KEY:
+            return None
+        return {"mode": mode, "value": cfg.get(f"{prefix}{_SZ_VALUE_KEY[mode]}", "")}
+    return {"main": book(""), "other": book("other_")}
 
 
 def _broker_display(cfg, last4=""):
@@ -2478,6 +2516,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "rh_warning": pending["rh_warning"],
             "llm": __import__("llm_client").configured(cfg),
             "sizing": bool(cfg.get("sizing_mode")),
+            "sizing_detail": _sizing_detail(cfg),
             "safety": cfg.get("max_entries_per_day") is not None,
             "notes": _restore_notes(cfg, A._load(A.ACCEPTANCE_PATH, {})),
             "wallet": {
@@ -2926,44 +2965,21 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         raise _Redirect()
 
     def sizing(_h, data):
-        mode = data.get("mode")
-        try:
-            val = float(data.get("value") or 0)
-        except (TypeError, ValueError):
-            val = 0
-        if val <= 0:
-            return {"ok": False, "error": "enter a positive number"}
-        if mode == "budget":
-            cfg["sizing_mode"] = "budget"
-            cfg["budget_per_trade_usd"] = val
-            cfg.setdefault("contracts_per_trade", 1)
-        else:
-            cfg["sizing_mode"] = "contracts"
-            cfg["contracts_per_trade"] = max(1, int(val))
-        cfg.setdefault("max_contracts_per_trade", 100)
-        # Optional per-track override: "other trades" journal events sized
-        # separately from the main pick (same mode); blank clears it.
-        other_raw = str(data.get("other") or "").strip()
-        if other_raw:
-            try:
-                oval = float(other_raw)
-            except (TypeError, ValueError):
-                oval = 0
-            if oval <= 0:
-                return {"ok": False,
-                        "error": "other-trades size must be a positive number"}
-            if mode == "budget":
-                cfg["other_sizing_mode"] = "budget"
-                cfg["other_budget_per_trade_usd"] = oval
-                cfg.pop("other_contracts_per_trade", None)
-            else:
-                cfg["other_sizing_mode"] = "contracts"
-                cfg["other_contracts_per_trade"] = max(1, int(oval))
-                cfg.pop("other_budget_per_trade_usd", None)
-        else:
-            for k in ("other_sizing_mode", "other_budget_per_trade_usd",
-                      "other_contracts_per_trade"):
-                cfg.pop(k, None)
+        """Each book sized on its own: main = the daily pick, other = the
+        shadow "other trades" journal (mode "same" = follow main).
+        Validated on a copy so a bad shadow-book value never half-saves."""
+        main = data.get("main") if isinstance(data.get("main"), dict) else {}
+        other = data.get("other") if isinstance(data.get("other"), dict) else {}
+        new = dict(cfg)
+        ok, err = A.set_book_sizing(new, "main", main.get("mode"), main.get("value"))
+        if not ok:
+            return {"ok": False, "error": f"main book: {err}"}
+        ok, err = A.set_book_sizing(new, "other", other.get("mode") or "same",
+                                    other.get("value"))
+        if not ok:
+            return {"ok": False, "error": f"shadow book: {err}"}
+        cfg.clear()
+        cfg.update(new)
         save()
         return {"ok": True}
 
@@ -3348,7 +3364,8 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "status and trade-log data provided. You cannot place, "
                 "modify, or size trades — for control, tell the user the "
                 "exact command (pause, resume, dry on/off, set budget N, "
-                "set positions N, "
+                "set contracts N, set percent N, set other budget|contracts|"
+                "percent N, other sizing same, set positions N, "
                 "set cap N, stop). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),

@@ -194,8 +194,15 @@ def apply(plan, cfg, consent_ok, home):
             if b:
                 new.update({"sizing_mode": "budget", "budget_per_trade_usd": b})
                 applied.append(f"sizing: ${b:,.0f} per trade")
+        elif mode == "percent":
+            p = _pos_number(sz.get("percent_per_trade"), "sizing.percent_per_trade", errors)
+            if p and p > 100:
+                errors.append("sizing.percent_per_trade must be at most 100")
+            elif p:
+                new.update({"sizing_mode": "percent", "percent_per_trade": p})
+                applied.append(f"sizing: {p:g}% of account per trade")
         else:
-            errors.append("sizing.mode must be contracts or budget")
+            errors.append("sizing.mode must be contracts, budget or percent")
 
     # ── safety rails ──
     sf = plan.get("safety") or {}

@@ -150,6 +150,22 @@ def quote_price(rh, option_id, side="buy"):
     return _find_number(payload, keys)
 
 
+def account_value(rh, cfg):
+    """Total account value for %-of-account sizing (0.0 when unavailable).
+    Prefers equity / portfolio value; falls back to buying power, which is
+    never larger for a cash account, so a schema surprise sizes smaller."""
+    try:
+        payload = content_json(rh.call_tool(
+            "get_portfolio", {"account_number": cfg.get("robinhood_account", "")}))
+    except Exception:
+        return 0.0
+    if payload is None:
+        return 0.0
+    return (_find_number(payload, ["total_equity", "equity", "portfolio_equity",
+                                   "total_value", "portfolio_value"])
+            or _find_number(payload, ["buying_power", "cash"]))
+
+
 def mark_price(rh, cfg, event, side="buy"):
     """Per-share quote for the agent's P&L estimate (0.0 when unavailable)."""
     option_id = resolve_instrument(rh, event)
@@ -185,7 +201,13 @@ def size_contracts(rh, cfg, option_id):
     sizing_mode "budget": floor(budget_per_trade_usd / (price*100)); if even
     one contract exceeds the budget, SKIP (respecting the budget beats
     forcing a trade). Returns (qty, note) — qty 0 means skip.
+    sizing_mode "percent" is resolved to "budget" by the agent first.
     """
+    if str(cfg.get("sizing_mode")) == "percent":
+        # The agent turns % of account into a dollar budget before calling
+        # the broker; reaching here means that step was skipped. Never fall
+        # back to a fixed count the user didn't choose.
+        return 0, "%-of-account sizing not resolved to a budget — skipped"
     if str(cfg.get("sizing_mode", "contracts")) == "budget":
         budget = float(cfg.get("budget_per_trade_usd", 0) or 0)
         if budget <= 0:
