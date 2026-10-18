@@ -156,14 +156,20 @@ def test_alpaca_account_value(monkeypatch):
     assert alpaca.account_value(None, {"alpaca_key_id": "k", "alpaca_secret": "s"}) == 12345.67
 
 
-def test_robinhood_account_value_prefers_equity(monkeypatch):
+def test_robinhood_account_value_uses_total_value(monkeypatch):
+    """Shape of a real get_portfolio read (2026-07-27), with holdings added:
+    total_value is the account; equity_value (stocks only) must be ignored."""
     monkeypatch.setattr(robinhood, "content_json", lambda r: r)
+    seen = {}
 
     class RH:
         def call_tool(self, name, args):
-            assert name == "get_portfolio"
-            return {"data": {"buying_power": "800", "total_equity": "1200"}}
-    assert robinhood.account_value(RH(), {"robinhood_account": "1"}) == 1200
+            seen.update(name=name, args=args)
+            return {"data": {"total_value": "1500", "cash": "200",
+                             "buying_power": "200", "equity_value": "1000",
+                             "options_value": "300"}}
+    assert robinhood.account_value(RH(), {"robinhood_account": "693"}) == 1500
+    assert seen == {"name": "get_portfolio", "args": {"account_number": "693"}}
 
 
 def test_robinhood_account_value_falls_back_to_buying_power(monkeypatch):
