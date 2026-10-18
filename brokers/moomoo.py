@@ -188,7 +188,34 @@ def mark_price(cl, cfg, event, side="buy"):
     return _ask_price(cfg, _sdk(), _moomoo_code(event))
 
 
+def account_value(cl, cfg):
+    """Total assets for %-of-account sizing (0.0 when unavailable)."""
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    ctx = None
+    try:
+        sdk = _sdk()
+        ctx = _trade_ctx(cfg, sdk)
+        ret, data = ctx.accinfo_query(trd_env=_trd_env(cfg, sdk))
+        if ret != sdk.RET_OK or data is None or not len(data):
+            return 0.0
+        row = data.iloc[0]
+        return float(row.get("total_assets") or 0)
+    except Exception:
+        return 0.0
+    finally:
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
 def _size(cfg, price):
+    if str(cfg.get("sizing_mode")) == "percent":
+        # The agent turns % of account into a dollar budget before calling
+        # the broker; reaching here means that step was skipped. Never fall
+        # back to a fixed count the user didn't choose.
+        return 0, "%-of-account sizing not resolved to a budget — skipped"
     if str(cfg.get("sizing_mode", "contracts")) == "budget":
         budget = float(cfg.get("budget_per_trade_usd", 0) or 0)
         if budget > 0 and price > 0:

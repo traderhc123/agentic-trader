@@ -117,7 +117,26 @@ def mark_price(cl, cfg, event, side="buy"):
     return _quote_price(cfg, _occ_symbol(event))
 
 
+def account_value(cl, cfg):
+    """Account equity for %-of-account sizing (0.0 when unavailable)."""
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    try:
+        resp = requests.get(f"{_base(cfg)}/v2/account", headers=_headers(cfg),
+                            timeout=_TIMEOUT)
+        if resp.status_code != 200:
+            return 0.0
+        acct = resp.json()
+        return float(acct.get("equity") or 0) or float(acct.get("portfolio_value") or 0)
+    except Exception:
+        return 0.0
+
+
 def _size(cfg, occ):
+    if str(cfg.get("sizing_mode")) == "percent":
+        # The agent turns % of account into a dollar budget before calling
+        # the broker; reaching here means that step was skipped. Never fall
+        # back to a fixed count the user didn't choose.
+        return 0, "%-of-account sizing not resolved to a budget — skipped"
     if str(cfg.get("sizing_mode", "contracts")) == "budget":
         budget = float(cfg.get("budget_per_trade_usd", 0) or 0)
         price = _quote_price(cfg, occ)

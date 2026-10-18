@@ -137,12 +137,19 @@ docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trad
   several entries a day) during setup — or later via
   `"include_other_trades": true` in `~/.agentic-trader/config.json`. The daily
   cap and per-trade budget apply either way.
-- **Per-track sizing**: every feed event is flagged `track: "main"` or
-  `track: "other"`, and "other trades" can be sized separately from the main
-  pick — set it in the wizard's Sizing step, or via
-  `"other_budget_per_trade_usd": 100` (with `"other_sizing_mode": "budget"`)
-  / `"other_contracts_per_trade": 1` (with `"other_sizing_mode":
-  "contracts"`) in config.json. Unset = same sizing as the main pick.
+- **Three ways to size, per book**: a fixed dollar amount, a fixed number
+  of contracts, or a percent of your account value per trade. The main book
+  (the daily pick) and the shadow book ("other trades") each pick their own —
+  set it in the wizard's Sizing step, with chat commands (`set budget 500`,
+  `set contracts 2`, `set percent 2`, `set other percent 1`,
+  `other sizing same`), or in config.json (`"sizing_mode"`:
+  `"budget"`/`"contracts"`/`"percent"` with `"budget_per_trade_usd"` /
+  `"contracts_per_trade"` / `"percent_per_trade"`; the same keys prefixed
+  `other_` for the shadow book — unset = same as the main book).
+  Percent mode re-reads your account value from the broker at each entry and
+  turns it into a dollar budget for that trade; if the value can't be read,
+  the entry is skipped rather than guessed. `max_contracts_per_trade` caps
+  every mode.
 - **No weekend spend**: the recurring day-pass never auto-buys on Saturday or
   Sunday — the feed only publishes on market days, so a weekend pass would be
   wasted sats.

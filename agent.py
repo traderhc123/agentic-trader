@@ -345,8 +345,10 @@ def require_consent_or_exit():
 
 # ── event pipeline: validate -> staleness -> caps -> policy -> execute ───────
 
+SIZING_MODES = ("budget", "contracts", "percent")
 _TRACK_SIZING_KEYS = ("sizing_mode", "budget_per_trade_usd",
-                      "contracts_per_trade", "max_contracts_per_trade")
+                      "contracts_per_trade", "percent_per_trade",
+                      "max_contracts_per_trade")
 
 
 def _sizing_cfg(cfg, event):
@@ -359,6 +361,43 @@ def _sizing_cfg(cfg, event):
     overrides = {k: cfg[f"other_{k}"] for k in _TRACK_SIZING_KEYS
                  if cfg.get(f"other_{k}") not in (None, "")}
     return {**cfg, **overrides} if overrides else cfg
+
+
+def _account_value(broker, client, cfg):
+    """Total account value from the broker (0.0 when it can't be read)."""
+    fn = getattr(broker, "account_value", None)
+    if fn is None or client is None:
+        return 0.0
+    try:
+        return max(0.0, float(fn(client, cfg) or 0))
+    except Exception:
+        return 0.0
+
+
+def _resolve_percent(cfg, broker, client):
+    """'% of account' sizing -> a dollar budget for this one entry.
+
+    Reads the account value from the broker at entry time and hands the
+    broker an ordinary budget-mode config, so every broker's existing
+    budget logic (skip if one contract doesn't fit, max-contracts cap)
+    applies unchanged. Returns (cfg, skip_reason); a non-empty reason means
+    skip the entry — never guess a size without knowing the account value.
+    """
+    if str(cfg.get("sizing_mode")) != "percent":
+        return cfg, ""
+    try:
+        pct = float(cfg.get("percent_per_trade") or 0)
+    except (TypeError, ValueError):
+        pct = 0.0
+    if not 0 < pct <= 100:
+        return cfg, "%-of-account mode but percent_per_trade unset — skipped"
+    value = _account_value(broker, client, cfg)
+    if value <= 0:
+        return cfg, ("couldn't read your account value for %-of-account "
+                     "sizing — skipped")
+    budget = round(value * pct / 100.0, 2)
+    print(f"  sizing: {pct:g}% of ${value:,.0f} account = ${budget:,.2f} budget")
+    return {**cfg, "sizing_mode": "budget", "budget_per_trade_usd": budget}, ""
 
 
 def _execute_dry(cfg, event, state, broker=None, client=None):
@@ -455,6 +494,14 @@ def handle_event(ev, cfg, state, broker, client, save_state):
     dry = bool(cfg.get("dry_run")) or bool(existing and existing.get("dry"))
 
     ecfg = _sizing_cfg(cfg, ev)  # per-track sizing (main vs "other trades")
+    if ev["event"] == "ENTERED" and not existing:
+        ecfg, skip = _resolve_percent(ecfg, broker, client)
+        if skip:
+            msg = f"{'[DRY-RUN] ' if dry else ''}SKIPPED {contract}: {skip}"
+            print(msg)
+            _log_trade({"action": "skip_sizing", "event_id": ev["event_id"],
+                        "contract": contract, "reason": skip})
+            return msg
     prior_pos = dict(existing) if existing else None  # qty/entry mark for P&L
     if dry:
         action = _execute_dry(ecfg, ev, state, broker, client)
@@ -512,8 +559,22 @@ def cmd_setup():
     print("\n  1) Dollar budget per trade — buys as many contracts as fit;")
     print("     skips the trade if even one contract exceeds the budget")
     print("  2) Fixed number of contracts per trade")
-    mode = input("Choose [1/2, default 1]: ").strip() or "1"
-    if mode == "2":
+    print("  3) Percent of account value per trade (re-read at each entry)")
+    mode = input("Choose [1-3, default 1]: ").strip() or "1"
+    if mode == "3":
+        cfg["sizing_mode"] = "percent"
+        while True:
+            raw = input("Percent of account per trade (e.g. 2): ").strip().rstrip("%")
+            try:
+                p = float(raw)
+                if 0 < p <= 100:
+                    break
+            except ValueError:
+                pass
+            print("Enter a percent between 0 and 100.")
+        cfg["percent_per_trade"] = p
+        cfg.setdefault("contracts_per_trade", 1)
+    elif mode == "2":
         cfg["sizing_mode"] = "contracts"
         while True:
             raw = input("Contracts per trade [1]: ").strip() or "1"
@@ -544,25 +605,19 @@ def cmd_setup():
     cfg.setdefault("max_contracts_per_trade", 100)
 
     if cfg.get("include_other_trades"):
-        print("\nYour source includes the \"other trades\" journal. Size those")
-        print("separately from the main pick? (blank = same sizing as above)")
-        raw = input("Other-trades " +
-                    ("budget in USD" if cfg["sizing_mode"] == "budget"
-                     else "contracts per trade") + " [same]: ").strip()
-        if raw:
-            try:
-                if cfg["sizing_mode"] == "budget":
-                    val = float(raw)
-                    assert val > 0
-                    cfg["other_sizing_mode"] = "budget"
-                    cfg["other_budget_per_trade_usd"] = val
-                else:
-                    val = int(raw)
-                    assert val >= 1
-                    cfg["other_sizing_mode"] = "contracts"
-                    cfg["other_contracts_per_trade"] = val
-            except (ValueError, AssertionError):
-                print("Not a valid number — other trades will use the main sizing.")
+        print("\nYour source includes the \"other trades\" (shadow) journal. Size")
+        print("those separately from the main pick?")
+        print("  0) Same as the main pick (default)  1) Dollar budget")
+        print("  2) Fixed contracts  3) Percent of account")
+        omode = {"1": "budget", "2": "contracts", "3": "percent"}.get(
+            input("Choose [0-3, default 0]: ").strip(), "")
+        if omode:
+            raw = input({"budget": "Other-trades budget in USD: ",
+                         "contracts": "Other-trades contracts per trade: ",
+                         "percent": "Other-trades percent of account: "}[omode])
+            ok, err = set_book_sizing(cfg, "other", omode, raw)
+            if not ok:
+                print(f"{err} — other trades will use the main sizing.")
 
     print("\n== Step 4/4: Safety rails & extras ==")
     dry = input("Start in DRY-RUN mode (log actions, place NO orders — "
@@ -593,19 +648,64 @@ def _feed_access(cfg, state):
         return "unknown"
 
 
+def _book_desc(cfg, prefix=""):
+    """One book's sizing in words; prefix "" = main pick, "other_" = shadow."""
+    mode = str(cfg.get(f"{prefix}sizing_mode") or "contracts")
+    if mode == "budget":
+        return (f"${float(cfg.get(f'{prefix}budget_per_trade_usd', 0) or 0):,.0f}"
+                "/trade budget")
+    if mode == "percent":
+        return (f"{float(cfg.get(f'{prefix}percent_per_trade', 0) or 0):g}%"
+                " of account/trade")
+    return f"{int(cfg.get(f'{prefix}contracts_per_trade', 1) or 1)} contract(s)/trade"
+
+
 def _sizing_desc(cfg):
-    if str(cfg.get("sizing_mode", "contracts")) == "budget":
-        desc = f"${float(cfg.get('budget_per_trade_usd', 0) or 0):,.0f}/trade budget"
-    else:
-        desc = f"{int(cfg.get('contracts_per_trade', 1))} contract(s)/trade"
-    other = str(cfg.get("other_sizing_mode") or "")
-    if other == "budget":
-        desc += (f" (other trades: "
-                 f"${float(cfg.get('other_budget_per_trade_usd', 0) or 0):,.0f}/trade)")
-    elif other == "contracts":
-        desc += (f" (other trades: "
-                 f"{int(cfg.get('other_contracts_per_trade', 1))} contract(s))")
+    desc = _book_desc(cfg)
+    if str(cfg.get("other_sizing_mode") or "") in SIZING_MODES:
+        desc += f" (other trades: {_book_desc(cfg, 'other_')})"
     return desc
+
+
+_BOOK_VALUE_KEY = {"budget": "budget_per_trade_usd",
+                   "contracts": "contracts_per_trade",
+                   "percent": "percent_per_trade"}
+
+
+def set_book_sizing(cfg, book, mode, value):
+    """Set one book's sizing in cfg (not saved). book: "main" or "other".
+    mode: budget | contracts | percent, or "same" (other only) to clear the
+    override. Returns (ok, error). Shared by the CLI wizard, the dashboard
+    wizard and chat commands so all three validate the same way."""
+    prefix = "" if book == "main" else "other_"
+    if book == "other" and mode in ("same", "", None):
+        for k in ("sizing_mode", *_BOOK_VALUE_KEY.values(), "max_contracts_per_trade"):
+            cfg.pop(f"other_{k}", None)
+        return True, ""
+    if mode not in SIZING_MODES:
+        return False, "choose dollar budget, contracts, or % of account"
+    try:
+        val = float(str(value).strip().lstrip("$").rstrip("%").replace(",", ""))
+    except (TypeError, ValueError):
+        val = 0.0
+    if mode == "contracts":
+        if val < 1 or val != int(val):
+            return False, "contracts must be a whole number of 1 or more"
+        val = int(val)
+    elif mode == "percent":
+        if not 0 < val <= 100:
+            return False, "percent must be more than 0 and at most 100"
+    elif val <= 0:
+        return False, "budget must be a positive dollar amount"
+    cfg[f"{prefix}sizing_mode"] = mode
+    for m, key in _BOOK_VALUE_KEY.items():
+        if m != mode and book == "other":
+            cfg.pop(f"other_{key}", None)  # stale override values confuse the overlay
+    cfg[f"{prefix}{_BOOK_VALUE_KEY[mode]}"] = val
+    if book == "main":
+        cfg.setdefault("contracts_per_trade", 1)
+    cfg.setdefault("max_contracts_per_trade", 100)
+    return True, ""
 
 
 def _apply_command(text):
@@ -668,10 +768,25 @@ def _apply_command(text):
         _save(CONFIG_PATH, cfg, private=True)
         return True, (f"'Other trades' sizing set to {val} contract(s)/trade — "
                       "main pick keeps its own sizing.")
+    if t.startswith("set percent") or t.startswith("set other percent"):
+        book = "other" if t.startswith("set other") else "main"
+        ok, err = set_book_sizing(cfg, book, "percent", t.split()[-1])
+        if not ok:
+            return True, (f"{err}. Usage: set {'other ' if book == 'other' else ''}"
+                          "percent 2")
+        _save(CONFIG_PATH, cfg, private=True)
+        who = "'Other trades'" if book == "other" else "Main pick"
+        return True, (f"{who} sizing set to {_book_desc(cfg, 'other_' if book == 'other' else '')}"
+                      " — sized from your account value at each entry "
+                      "(your decision — see DISCLAIMER.md).")
+    if t.startswith("set contracts"):
+        ok, err = set_book_sizing(cfg, "main", "contracts", t.split()[-1])
+        if not ok:
+            return True, f"{err}. Usage: set contracts 1"
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, f"Main pick sizing set to {_book_desc(cfg)}."
     if t in ("other sizing same", "clear other sizing"):
-        for k in ("other_sizing_mode", "other_budget_per_trade_usd",
-                  "other_contracts_per_trade", "other_max_contracts_per_trade"):
-            cfg.pop(k, None)
+        set_book_sizing(cfg, "other", "same", None)
         _save(CONFIG_PATH, cfg, private=True)
         return True, "'Other trades' now size the same as the main pick."
     if t.startswith("set cap"):
