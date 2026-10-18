@@ -152,8 +152,12 @@ def quote_price(rh, option_id, side="buy"):
 
 def account_value(rh, cfg):
     """Total account value for %-of-account sizing (0.0 when unavailable).
-    Prefers equity / portfolio value; falls back to buying power, which is
-    never larger for a cash account, so a schema surprise sizes smaller."""
+
+    get_portfolio returns total_value, cash, buying_power, equity_value and
+    options_value (read on a live Agentic account 2026-07-27). total_value
+    is the whole account; equity_value is STOCK holdings only, so it is
+    never used. Falls back to buying power, which is never larger for a
+    cash account, so a schema change sizes smaller, not bigger."""
     try:
         payload = content_json(rh.call_tool(
             "get_portfolio", {"account_number": cfg.get("robinhood_account", "")}))
@@ -161,8 +165,7 @@ def account_value(rh, cfg):
         return 0.0
     if payload is None:
         return 0.0
-    return (_find_number(payload, ["total_equity", "equity", "portfolio_equity",
-                                   "total_value", "portfolio_value"])
+    return (_find_number(payload, ["total_value"])
             or _find_number(payload, ["buying_power", "cash"]))
 
 
