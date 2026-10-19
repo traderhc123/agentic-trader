@@ -885,7 +885,8 @@ def cmd_run(app_window=False):
                    if c.get("source") == "agenthc" else {}),
                 "sizing": _sizing_desc(c),
                 "entries today": f"{_entries_today()} / cap {c.get('max_entries_per_day', 5)}",
-                "policy brain": "on" if llm_policy.enabled(c) else "off",
+                "policy brain": ("blocked" if llm_policy.entries_blocked(c)
+                                 else "on" if llm_policy.enabled(c) else "off"),
                 "market": "open" if _market_open_now() else "closed (slow polling)",
                 "open positions": ", ".join(st.get("positions", {})) or "none",
             },
@@ -909,6 +910,10 @@ def cmd_run(app_window=False):
             import webui
             webui.open_app_window(dash_url)
     print("Reminder: you are responsible for every order this agent places.")
+    if llm_policy.entries_blocked(cfg):
+        print("\n" + "!" * 72 + "\nWARNING: " + llm_policy.BLOCKED_MSG
+              + "\n" + "!" * 72 + "\n")
+        notify(cfg, "agentic-trader WARNING: " + llm_policy.BLOCKED_MSG)
     notify(cfg, f"agentic-trader heartbeat started [{mode}], source={cfg['source']}"
                 # never send the login token to a third-party notifier
                 + (f" — dashboard {dash_url.split('?')[0]}" if dash_url else ""))
@@ -1123,6 +1128,14 @@ def doctor_checks():
     check("sizing", True, "Position sizing",
           _sizing_desc(cfg) + ("" if sized else " (default — only the owner changes it)"),
           who="owner")
+
+    blocked = llm_policy.entries_blocked(cfg)
+    check("policy_ai", not blocked, "Trading policy can be checked",
+          "no policy" if not llm_policy.enabled(cfg)
+          else "policy + AI connected" if not blocked
+          else "policy set but NO AI connected: every entry will be skipped",
+          "the OWNER connects an AI in the wizard (step 2), or removes "
+          + llm_policy.policy_path(), who="owner")
 
     notif = bool(cfg.get("discord_webhook_url") or cfg.get("ntfy_topic")
                  or cfg.get("telegram_bot_token"))

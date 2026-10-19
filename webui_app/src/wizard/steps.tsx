@@ -649,7 +649,7 @@ export function SafetyStep() {
           </Field>
         </div>
       </Block>
-      <Block label="Trading policy" desc="Optional, veto-only.">
+      <Block label="Trading policy" desc="Optional, veto-only. Needs a connected AI: with rules and no AI, every entry is skipped.">
         <Field
           htmlFor="pol-text"
           label="My trading policy"
@@ -678,7 +678,15 @@ export function SafetyStep() {
 
 // ── 7. launch ───────────────────────────────────────────────────────────────
 export function LaunchStep() {
-  const { next } = useWiz();
+  const { next, st, reloadState } = useWiz();
+  const blocked = !!st?.policy_blocks_entries;
+  const [polMsg, setPolMsg] = useState<MsgT>(null);
+  const turnOffPolicy = async () => {
+    const r = await api("/api/policy/disable", {});
+    if (!r.ok) return setPolMsg(err(r.error || "Could not turn the policy off."));
+    setPolMsg(ok(r.note || "Policy turned off."));
+    reloadState();
+  };
   const [startMsg, setStartMsg] = useState<MsgT>(null);
   const [doToken, setDoToken] = useState("");
   const [region, setRegion] = useState("nyc3");
@@ -756,7 +764,22 @@ export function LaunchStep() {
       }
     >
       <Block>
-        {next != null && (
+        {blocked && (
+          <Notice tone="live" role="alert">
+            <p className="m-0">
+              <b>Your agent would never enter a trade.</b> You saved a trading policy but didn't connect an AI. The agent needs an
+              AI to check your rules, so without one it skips every entry to stay safe.
+            </p>
+            <p className="m-0 mt-2">
+              Fix it one of two ways: go back to <b>step 2 (Connect your AI)</b>, or turn the policy off and trade without rules.
+            </p>
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <Button onClick={turnOffPolicy}>Turn my policy off</Button>
+              <Msg m={polMsg} />
+            </div>
+          </Notice>
+        )}
+        {next != null && !blocked && (
           <div className="space-y-2">
             <p className="m-0 text-sm text-up">Setup complete. Pick where your agent should live.</p>
             {next && (
@@ -773,7 +796,7 @@ export function LaunchStep() {
               One click: the agent starts here and this page becomes its dashboard. Keep this computer awake during market hours.
             </p>
             <div className="mt-auto flex flex-wrap items-center gap-3 pt-2">
-              <Button variant="primary" onClick={startLocal}>
+              <Button variant="primary" onClick={startLocal} disabled={blocked}>
                 Start my agent now
               </Button>
               <Msg m={startMsg} />
@@ -795,7 +818,7 @@ export function LaunchStep() {
                     <option key={r}>{r}</option>
                   ))}
                 </Select>
-                <Button onClick={deploy} className="h-9">
+                <Button onClick={deploy} className="h-9" disabled={blocked}>
                   Create my agent's server
                 </Button>
               </div>

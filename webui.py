@@ -2135,9 +2135,9 @@ async function refresh(){
     sv.innerHTML=sm?esc(sm[1])+'<small> '+esc(sm[2])+'</small>':esc(sz);
     $('t-sizing-s').textContent=szOther||'your choice — not advice';
     $('t-sizing-s').title=szOther?szOther+' — your choice, not advice':'';
-    const polOn=f['policy brain']==='on';
-    $('t-policy').innerHTML=polOn?'<span class="ok-dot"></span>On':'<span class="off-dot"></span>Off';
-    $('t-policy-hint').textContent=polOn?'checked before every entry':'add rules in settings → Safety';
+    const polOn=f['policy brain']==='on', polBlk=f['policy brain']==='blocked';
+    $('t-policy').innerHTML=polBlk?'<span class="off-dot"></span>Blocking entries':polOn?'<span class="ok-dot"></span>On':'<span class="off-dot"></span>Off';
+    $('t-policy-hint').textContent=polBlk?'no AI connected: every entry is skipped. Connect your AI in Setup':polOn?'checked before every entry':'add rules in settings → Safety';
     if(f['source']==='agenthc')feedTile(f['feed access']);
     else{const v=$('t-feed');v.className='v txt';v.textContent=SOURCES[f['source']]||f['source']||'–';
       $('t-feed-s').textContent='signal source';$('tile-feed').classList.remove('bad');}
@@ -2574,6 +2574,29 @@ def _reuse_saved_llm(cfg, pid, key, base):
     return saved["provider"], saved["key"], cfg.get("llm_base_url", "")
 
 
+def _policy_save_error(cfg, policy, key):
+    """Safety step: refuse a trading policy that no AI could ever check.
+    With a policy and no AI, the agent skips EVERY entry (fail-safe), which
+    looks to the owner like the agent silently never trades."""
+    import llm_client
+    if not str(policy or "").strip():
+        return None
+    if llm_client.configured(cfg):
+        return None
+    if str(cfg.get("llm_fallback", "skip")).lower() == "act":
+        return None
+    key = str(key or "").strip()
+    if key and llm_client.detect_provider(key) == "anthropic":
+        return None
+    if key:
+        return ("That key isn't a Claude key. Connect other AI providers in "
+                "step 2 (Connect your AI), then save this step again.")
+    return ("A trading policy needs a connected AI to check it. Without one, "
+            "every entry would be skipped and the agent would never trade. "
+            "Connect your AI in step 2, paste a Claude key below, or clear "
+            "the policy box.")
+
+
 def _broker_display(cfg, last4=""):
     """What the wizard's broker step shows as connected: the in-session hint,
     else the Robinhood account last4, else the persisted key-based broker id
@@ -2614,6 +2637,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "broker": _broker_display(cfg, pending["broker_last4"]),
             "rh_warning": pending["rh_warning"],
             "llm": __import__("llm_client").configured(cfg),
+            "policy_blocks_entries": __import__("llm_policy").entries_blocked(cfg),
             "sizing": bool(cfg.get("sizing_mode")),
             "sizing_detail": _sizing_detail(cfg),
             "safety": cfg.get("max_entries_per_day") is not None,
@@ -2765,6 +2789,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
 
     def deploy(_h, data):
         import provision
+        import llm_policy
+        if llm_policy.entries_blocked(cfg):
+            return {"ok": False, "error": llm_policy.BLOCKED_MSG}
         token = str(data.get("token", "")).strip()
         if not token:
             return {"ok": False, "error": "paste a DigitalOcean API token"}
@@ -3089,6 +3116,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         return {"ok": True}
 
     def safety(_h, data):
+        perr = _policy_save_error(cfg, data.get("policy", ""),
+                                  data.get("anthropic_key", ""))
+        if perr:
+            return {"ok": False, "error": perr}
         cfg["dry_run"] = bool(data.get("dry", True))
         try:
             cfg["max_entries_per_day"] = max(1, int(data.get("cap") or 5))
@@ -3134,6 +3165,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                "GETTING_STARTED.md)")
         return {"ok": True, "next": nxt}
 
+    def policy_disable(_h, _data):
+        import llm_policy
+        moved = llm_policy.disable_policy()
+        return {"ok": True, "note": ("policy turned off (saved as policy.md.disabled)"
+                                     if moved else "no policy was set")}
+
     def finish(_h, _data):
         pending["finished"].set()
         return {"ok": True}
@@ -3149,6 +3186,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         if not (cfg.get("source") and broker_ready(cfg)):
             return {"ok": False,
                     "error": "finish the source and broker steps first"}
+        import llm_policy
+        if llm_policy.entries_blocked(cfg):
+            return {"ok": False, "error": llm_policy.BLOCKED_MSG}
         save()
         import os
         import platform_compat
@@ -3213,6 +3253,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     W.routes_post = {"/api/consent": consent, "/api/source": source,
                      "/api/sizing": sizing, "/api/safety": safety,
                      "/api/finish": finish, "/api/ask": ask,
+                     "/api/policy/disable": policy_disable,
                      "/api/start-local": start_local,
                      "/api/wallet/create": wallet_create,
                      "/api/pass/buy": pass_buy,

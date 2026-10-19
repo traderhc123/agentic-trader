@@ -239,6 +239,12 @@ def apply(plan, cfg, consent_ok, home):
     policy = plan.get("policy")
     if policy is not None and not isinstance(policy, str):
         errors.append("policy must be plain text")
+    elif isinstance(policy, str) and policy.strip():
+        import llm_client
+        if (not llm_client.configured(new)
+                and str(new.get("llm_fallback", "skip")).lower() != "act"):
+            errors.append("policy needs a connected AI to check it (add an "
+                          "\"ai\" section) — without one every entry is skipped")
 
     if errors:
         report["applied"] = []
