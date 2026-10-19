@@ -52,6 +52,11 @@ FOUNDATION = frozenset({
     "requirements.txt",  # what the Update button pip-installs
 })
 
+# Whole folders under the same rule: the dashboard + wizard app (its source
+# and the built files the server actually runs). A rewrite there could flip
+# the go-live confirmation or the consent screen just like webui.py could.
+FOUNDATION_DIRS = ("webui_app", "webui_dist")
+
 # Order-placement and signal code: EXISTING modules here are locked (a
 # proposal could otherwise change how orders are placed or strip the auto-pay
 # cap), but the agent may still ADD new adapters — a new file can't alter an
@@ -67,6 +72,9 @@ def _is_foundation(rel):
     dots/spaces from names — so a plain `rel in FOUNDATION` would let
     `Agent.py` or `agent.py.` overwrite the real consent gate."""
     norm = os.path.normcase(rel.rstrip(". "))
+    top = norm.replace("\\", "/").split("/")[0].rstrip(". ").casefold()
+    if any(top == d.casefold() for d in FOUNDATION_DIRS):
+        return True
     return any(norm.casefold() == os.path.normcase(f).casefold()
                for f in FOUNDATION)
 
@@ -265,7 +273,12 @@ def propose(cfg, request):
 
 def _same_as_foundation(dst_real, repo_real):
     """Filesystem-level backstop for _is_foundation: does `dst_real` resolve
-    to the same file as any FOUNDATION file (hard links, 8.3 short names)?"""
+    to the same file as any FOUNDATION file (hard links, 8.3 short names),
+    or land inside a FOUNDATION folder (e.g. through a symlinked directory)?"""
+    for d in FOUNDATION_DIRS:
+        dr = os.path.normcase(os.path.realpath(os.path.join(repo_real, d)))
+        if os.path.normcase(dst_real).startswith(dr + os.sep):
+            return True
     if not os.path.exists(dst_real):
         return False
     for f in FOUNDATION:
