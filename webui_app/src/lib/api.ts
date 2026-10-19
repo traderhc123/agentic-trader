@@ -80,6 +80,7 @@ export interface WizardState {
   broker: string;
   rh_warning: string;
   llm: boolean;
+  policy_blocks_entries?: boolean; // policy saved but no AI: every entry would be skipped
   sizing: boolean;
   sizing_detail: { main: { mode: string; value: unknown } | null; other: { mode: string; value: unknown } | null };
   safety: boolean;

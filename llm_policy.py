@@ -84,6 +84,33 @@ def enabled(cfg):
     return bool(policy_text())
 
 
+BLOCKED_MSG = ("You have a trading policy but no AI connected, so EVERY entry "
+               "will be skipped (the agent can't check your rules without an "
+               "AI). Connect your AI in Setup step 2, or remove the policy.")
+
+
+def entries_blocked(cfg):
+    """True when a policy exists but no AI can check it, so evaluate() would
+    skip every entry. The wizard, launch and agent startup all warn on this."""
+    if not enabled(cfg):
+        return False
+    if str((cfg or {}).get("llm_fallback", "skip")).lower() == "act":
+        return False
+    import llm_client
+    return not llm_client.configured(cfg or {})
+
+
+def disable_policy():
+    """Move policy.md aside (policy.md.disabled) so entries stop being vetoed.
+    Reversible: rename it back to turn the rules on again. Returns True if a
+    policy was moved."""
+    path = policy_path()
+    if not os.path.exists(path):
+        return False
+    os.replace(path, path + ".disabled")
+    return True
+
+
 def evaluate(cfg, event, recent_trades):
     """Return {"act": bool, "reason": str} for one ENTERED event.
 

@@ -283,6 +283,7 @@ function StatusStrip({ conn, f }: { conn: Conn; f: Record<string, string> }) {
     }
   }
   const polOn = f["policy brain"] === "on";
+  const polBlocked = f["policy brain"] === "blocked";
 
   return (
     <div className="grid grid-cols-5 divide-x divide-line overflow-hidden rounded-md border border-line bg-panel max-lg:grid-cols-3 max-lg:divide-x-0 max-sm:grid-cols-2 [&>*]:border-line max-lg:[&>*]:border-b max-lg:[&>*]:border-r">
@@ -327,11 +328,24 @@ function StatusStrip({ conn, f }: { conn: Conn; f: Record<string, string> }) {
           )}
         </span>
       </Cell>
-      <Cell k="Your rules" sub={ok ? (polOn ? "checked before every entry" : "add rules in Settings → Safety") : ""} className="max-sm:col-span-2">
+      <Cell
+        k="Your rules"
+        bad={ok && polBlocked}
+        sub={
+          ok
+            ? polBlocked
+              ? "no AI connected: every entry is skipped. Connect your AI in Setup"
+              : polOn
+                ? "checked before every entry"
+                : "add rules in Settings → Safety"
+            : ""
+        }
+        className="max-sm:col-span-2"
+      >
         {ok ? (
           <span className="inline-flex items-center gap-2 font-sans text-lg">
-            <span className={cn("h-2 w-2 rounded-full", polOn ? "bg-up" : "border border-faint")} />
-            {polOn ? "On" : "Off"}
+            <span className={cn("h-2 w-2 rounded-full", polBlocked ? "bg-down" : polOn ? "bg-up" : "border border-faint")} />
+            {polBlocked ? "Blocking entries" : polOn ? "On" : "Off"}
           </span>
         ) : (
           "–"

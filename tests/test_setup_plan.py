@@ -48,7 +48,8 @@ def test_good_plan_applies_and_stays_dry_run(tmp_path):
             "safety": {"max_entries_per_day": 3, "max_daily_loss_usd": 0},
             "notifications": {"ntfy_topic": "t"},
             "policy": "- Skip puts."}
-    new, rep = _apply(plan, home=str(tmp_path))
+    # a policy needs an AI to check it — this owner already connected one
+    new, rep = _apply(plan, cfg={"anthropic_api_key": "sk-ant-x"}, home=str(tmp_path))
     assert rep["ok"] and new["dry_run"] is True
     assert new["source"] == "agenthc" and new["include_other_trades"] is True
     assert new["budget_per_trade_usd"] == 250 and new["max_entries_per_day"] == 3
@@ -112,3 +113,13 @@ def test_cli_setup_from_lists_owner_steps(home, monkeypatch, tmp_path, capsys):
 def test_example_plan_is_itself_valid_shape():
     assert set(setup_plan.EXAMPLE_PLAN) <= setup_plan.ALLOWED_TOP
     assert not setup_plan._find_forbidden(setup_plan.EXAMPLE_PLAN)
+
+
+def test_policy_without_ai_is_refused(tmp_path, monkeypatch):
+    """A policy no AI can check would skip every entry — refuse the plan."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    plan = {"source": {"type": "manual"}, "policy": "- Skip puts."}
+    new, rep = _apply(plan, home=str(tmp_path))
+    assert new is None
+    assert any("policy needs a connected AI" in e for e in rep["errors"])
+    assert not (tmp_path / "policy.md").exists()
