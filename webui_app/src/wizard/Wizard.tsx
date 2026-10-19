@@ -1,7 +1,7 @@
 import { ArrowRight, Check, Lock } from "lucide-react";
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { AppBar, Pill } from "../components/AppBar";
-import { ChatLog, type ChatMsg } from "../components/Chat";
+import { ChatLog, nextMsgId, type ChatMsg } from "../components/Chat";
 import { UpdateBox } from "../components/UpdateBox";
 import { Button, LinkButton } from "../components/ui/button";
 import { Input } from "../components/ui/field";
@@ -163,16 +163,16 @@ export function Wizard() {
               <div className="h-64 animate-pulse rounded-md border border-line bg-panel" />
             ) : (
               <>
-                {id === "consent" && <ConsentStep />}
-                {id === "llm" && <LlmStep />}
-                {/* Source stays mounted so an invoice in progress keeps polling */}
-                <div hidden={id !== "source"}>
-                  <SourceStep active={id === "source"} />
-                </div>
-                {id === "broker" && <BrokerStep />}
-                {id === "sizing" && <SizingStep />}
-                {id === "safety" && <SafetyStep />}
-                {id === "done" && <LaunchStep />}
+                {/* Every step stays mounted (hidden when not current), like the
+                    old page: a Robinhood approval wait, a cloud deploy, an invoice
+                    or half-filled form keeps going while you look at another step. */}
+                <div hidden={id !== "consent"}><ConsentStep /></div>
+                <div hidden={id !== "llm"}><LlmStep /></div>
+                <div hidden={id !== "source"}><SourceStep /></div>
+                <div hidden={id !== "broker"}><BrokerStep /></div>
+                <div hidden={id !== "sizing"}><SizingStep /></div>
+                <div hidden={id !== "safety"}><SafetyStep /></div>
+                <div hidden={id !== "done"}><LaunchStep /></div>
               </>
             )}
             <AssistPanel />
@@ -365,14 +365,15 @@ function AssistPanel() {
     const t = q.trim();
     if (!t) return;
     setQ("");
-    setMsgs((m) => [...m, { who: "me", text: t }, { who: "agent", text: "…", pending: true }]);
+    const id = nextMsgId();
+    setMsgs((m) => [...m, { who: "me", text: t }, { who: "agent", text: "…", pending: true, id }]);
     let reply = "";
     try {
       reply = (await api<{ reply: string }>("/api/ask", { question: t })).reply;
     } catch {
       reply = "Could not reach the setup server on this computer.";
     }
-    setMsgs((m) => [...m.slice(0, -1), { who: "agent", text: reply }]);
+    setMsgs((m) => m.map((x) => (x.id === id ? { who: "agent", text: reply } : x)));
   };
   return (
     <Panel title="Ask your agent" right={<span className="text-xs text-muted">uses the AI from step 2</span>} bodyClass="space-y-3 p-4">

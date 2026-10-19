@@ -21,7 +21,8 @@ reviewer can rebuild and diff.
 
 Live-reload while editing: start the agent (it listens on 8721), open its
 login link once so the browser has the session cookie, then `npm run dev`
-and open the Vite URL with `/setup` or `/dash`. API calls proxy to 8721.
+and open `http://127.0.0.1:5173/dash` (or `/setup`). Use 127.0.0.1, not
+localhost, so the cookie applies. API calls proxy to 8721.
 
 ## Rules this app follows
 

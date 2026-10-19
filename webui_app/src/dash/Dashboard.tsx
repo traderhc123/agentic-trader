@@ -1,7 +1,7 @@
 import { ArrowDownRight, ArrowUpRight, CircleHelp, Minus, Pause, Play, Settings, ShieldCheck, Zap } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { AppBar, Pill } from "../components/AppBar";
-import { ChatLog, type ChatMsg } from "../components/Chat";
+import { ChatLog, nextMsgId, type ChatMsg } from "../components/Chat";
 import { Button, LinkButton } from "../components/ui/button";
 import { ConfirmDialog } from "../components/ui/dialog";
 import { Input } from "../components/ui/field";
@@ -67,14 +67,15 @@ export function Dashboard() {
   const send = async (text: string) => {
     const t = text.trim();
     if (!t) return;
-    setMsgs((m) => [...m, { who: "me", text: t }, { who: "agent", text: "…", pending: true }]);
+    const id = nextMsgId();
+    setMsgs((m) => [...m, { who: "me", text: t }, { who: "agent", text: "…", pending: true, id }]);
     let reply = "";
     try {
       reply = (await api<{ reply: string }>("/api/command", { text: t })).reply;
     } catch {
       reply = "Could not reach the agent on this computer. Is it still running?";
     }
-    setMsgs((m) => [...m.slice(0, -1), { who: "agent", text: reply }]);
+    setMsgs((m) => m.map((x) => (x.id === id ? { who: "agent", text: reply } : x)));
     refresh();
   };
 

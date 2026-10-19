@@ -5,7 +5,11 @@ export interface ChatMsg {
   who: "me" | "agent";
   text: string;
   pending?: boolean;
+  id?: number; // set on a pending reply so it can be filled in later
 }
+
+let seq = 0;
+export const nextMsgId = () => ++seq;
 
 /** Console-style log: your lines prefixed ›, the agent's replies indented. */
 export function ChatLog({
