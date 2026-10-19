@@ -225,3 +225,16 @@ def test_apply_refuses_ui_folder_reached_through_symlink(sandbox):
     ok, msg = self_edit.apply_and_restart(restart=False)
     assert not ok
     assert not (repo / "webui_dist" / "app.js").exists()
+
+
+def test_repo_files_skip_node_modules(sandbox):
+    """`npm ci` in webui_app/ drops thousands of package READMEs; none of
+    them belong in what the model is shown."""
+    repo, _ = sandbox
+    nm = repo / "webui_app" / "node_modules" / "react"
+    nm.mkdir(parents=True)
+    (nm / "README.md").write_text("package docs\n")
+    (repo / "webui_app" / "README.md").write_text("ui docs\n")
+    files = self_edit._repo_files()
+    assert not any("node_modules" in k for k in files)
+    assert os.path.join("webui_app", "README.md") in files

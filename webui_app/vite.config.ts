@@ -15,8 +15,23 @@ export default defineConfig({
     chunkSizeWarningLimit: 700,
   },
   server: {
-    // `npm run dev`: proxy the API to a running agent on 8721 (log in on
-    // 8721 first so the browser has the session cookie for 127.0.0.1).
-    proxy: { "/api": "http://127.0.0.1:8721" },
+    // `npm run dev`: open http://127.0.0.1:5173/dash after logging in on
+    // 8721 once (cookies ignore ports, so the session carries over). The
+    // proxy presents the agent's own Host/Origin so its anti-CSRF guard lets
+    // the calls through.
+    host: "127.0.0.1",
+    port: 5173,
+    strictPort: true,
+    proxy: {
+      "/api": {
+        target: "http://127.0.0.1:8721",
+        changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on("proxyReq", (req) => {
+            if (req.getHeader("origin")) req.setHeader("origin", "http://127.0.0.1:8721");
+          });
+        },
+      },
+    },
   },
 });

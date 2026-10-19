@@ -132,8 +132,8 @@ def _repo_files():
     """All editable source files (path -> content)."""
     out = {}
     for root, dirs, files in os.walk(_repo()):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"
-                   and d != ".venv"]
+        dirs[:] = [d for d in dirs if not d.startswith(".")
+                   and d not in ("__pycache__", ".venv", "node_modules")]
         for name in files:
             if name.startswith(".") or not name.endswith((".py", ".md", ".txt",
                                                           ".yaml", ".service")):

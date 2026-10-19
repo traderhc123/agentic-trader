@@ -20,7 +20,7 @@ interface Invoice {
   need: number;
 }
 
-export function SourceStep({ active }: { active: boolean }) {
+export function SourceStep() {
   const { st, done, isDone } = useWiz();
   const [src, setSrc] = useState<string>(st?.source || "agenthc");
   const [scope, setScope] = useState("main");
@@ -295,7 +295,7 @@ export function SourceStep({ active }: { active: boolean }) {
               onToggle={setAdvOpen}
               summary="Advanced: auto-pay each day from a Lightning wallet the agent controls, or use an API key"
             >
-              <AgentWallet active={active} />
+              <AgentWallet />
               <p className="m-0 text-xs text-muted">Your own LNbits wallet:</p>
               <Field htmlFor="ln-url" label="LNbits instance URL">
                 <Input id="ln-url" placeholder="https://…" value={lnUrl} onChange={(e) => setLnUrl(e.target.value)} />
@@ -334,7 +334,7 @@ export function SourceStep({ active }: { active: boolean }) {
 }
 
 // ── agent-held wallet (advanced) ────────────────────────────────────────────
-function AgentWallet({ active }: { active: boolean }) {
+function AgentWallet() {
   const { st } = useWiz();
   const [made, setMade] = useState<{ label: string; page?: string } | null>(
     st?.wallet?.connected ? { label: "Wallet connected", page: st.wallet.page } : null,
@@ -359,13 +359,6 @@ function AgentWallet({ active }: { active: boolean }) {
     },
     [],
   );
-  // balance polling only matters while the step is on screen
-  useEffect(() => {
-    if (!active && balTimer.current) {
-      clearInterval(balTimer.current);
-      balTimer.current = null;
-    }
-  }, [active]);
 
   const updateQuote = async (s: string) => {
     const n = parseInt(s || "0", 10);
