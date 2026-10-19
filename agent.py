@@ -429,6 +429,24 @@ def _execute_dry(cfg, event, state, broker=None, client=None):
     return None
 
 
+def _notify_ai_problem_once(cfg, state, save_state, contract, reason):
+    """An entry was skipped because the AI is missing or failing (not because
+    the owner's rules said no). Tell the owner, at most once per day, since
+    every entry will keep being skipped until they fix it."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get("ai_problem_notified") == today:
+        return
+    state["ai_problem_notified"] = today
+    try:
+        save_state(state)
+    except Exception:
+        pass
+    notify(cfg, f"agentic-trader: entry SKIPPED ({contract}) because your trading "
+                f"policy couldn't be checked: {reason}. Every entry will be "
+                "skipped until you fix your AI (Setup → Connect your AI) or turn "
+                "the policy off. No more alerts about this today.")
+
+
 def handle_event(ev, cfg, state, broker, client, save_state):
     """Run one new event through the safety pipeline. Returns a log line or None."""
     contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
@@ -483,6 +501,9 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             print(msg)
             _log_trade({"action": "policy_veto", "event_id": ev["event_id"],
                         "contract": contract, "reason": verdict["reason"]})
+            if verdict.get("ai_problem"):
+                _notify_ai_problem_once(cfg, state, save_state, contract,
+                                        verdict["reason"])
             return msg
         policy_reason = verdict["reason"]
     else:
@@ -728,11 +749,18 @@ def _apply_command(text):
         webui.CONTROLS["stop"] = True
         return True, ("Stopping after this cycle. Open positions remain in your "
                       "brokerage account — close them there if needed.")
+    if t in ("policy off", "disable policy"):
+        moved = llm_policy.disable_policy()
+        return True, (f"Policy turned off (kept as {llm_policy.policy_path()}.disabled)."
+                      if moved else "No policy was set.")
     if t in ("dry on", "dry-run on"):
         cfg["dry_run"] = True
         _save(CONFIG_PATH, cfg, private=True)
         return True, "Dry-run ON — actions logged, no real orders."
     if t in ("dry off", "dry-run off", "go live"):
+        if llm_policy.entries_blocked(cfg):
+            return True, ("Not going live: " + llm_policy.BLOCKED_MSG
+                          + " (Say 'policy off' to remove it.)")
         cfg["dry_run"] = False
         _save(CONFIG_PATH, cfg, private=True)
         return True, "Dry-run OFF — the agent will place REAL orders from now on."
@@ -865,6 +893,20 @@ def cmd_run(app_window=False):
         sys.exit(1)
     state = _load(STATE_PATH, {"seen": [], "positions": {}})
     seen = set(state["seen"])
+    if llm_policy.entries_blocked(cfg):
+        if state.get("positions"):
+            print("WARNING: " + llm_policy.BLOCKED_MSG + " Starting anyway so "
+                  "your open positions still get their exits.")
+        else:
+            print("Not starting: " + llm_policy.BLOCKED_MSG
+                  + "\n  Connect your AI:  python agent.py setup --web  (step 2)"
+                  + f"\n  or remove:        {llm_policy.policy_path()}")
+            today = datetime.now(timezone.utc).date().isoformat()
+            if state.get("policy_block_notified") != today:
+                state["policy_block_notified"] = today
+                _save(STATE_PATH, state, private=True)
+                notify(cfg, "agentic-trader did NOT start: " + llm_policy.BLOCKED_MSG)
+            sys.exit(1)
 
     def save_state(st):
         _save(STATE_PATH, st, private=True)  # holds the day-pass L402 token

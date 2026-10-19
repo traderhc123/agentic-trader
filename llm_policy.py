@@ -114,7 +114,9 @@ def disable_policy():
 def evaluate(cfg, event, recent_trades):
     """Return {"act": bool, "reason": str} for one ENTERED event.
 
-    Never raises. No policy configured -> act. Errors -> cfg["llm_fallback"]
+    Never raises. Fallback results carry "ai_problem": True so the agent can
+    tell "your rules said no" from "the AI is missing/failing".
+    No policy configured -> act. Errors -> cfg["llm_fallback"]
     ("skip" default: the safe direction is to not trade).
     """
     policy = policy_text()
@@ -126,7 +128,7 @@ def evaluate(cfg, event, recent_trades):
 
     import llm_client
     if not llm_client.configured(cfg):
-        return {"act": fallback_act,
+        return {"act": fallback_act, "ai_problem": True,
                 "reason": "no AI model connected (Setup → Connect your AI) — " + tail}
     user_msg = (
         f"OWNER'S POLICY:\n{policy}\n\n"
@@ -144,14 +146,14 @@ def evaluate(cfg, event, recent_trades):
                 "refused": "policy check refused",
                 "bad_output": "policy check gave an unreadable verdict"}.get(
                     exc.reason, f"policy check failed ({str(exc)[:120]})")
-        return {"act": fallback_act, "reason": f"{what} — {tail}"}
+        return {"act": fallback_act, "ai_problem": True, "reason": f"{what} — {tail}"}
     except Exception as exc:  # never let the brain crash the heartbeat
-        return {"act": fallback_act,
+        return {"act": fallback_act, "ai_problem": True,
                 "reason": f"policy check failed ({str(exc)[:120]}) — {tail}"}
     # Strict: only a real JSON boolean approves. Weaker models sometimes
     # answer "true"/"yes" strings or omit the field — treat that as an error.
     if not isinstance(verdict.get("act"), bool):
-        return {"act": fallback_act,
+        return {"act": fallback_act, "ai_problem": True,
                 "reason": f"policy check gave no clear yes/no — {tail}"}
     return {"act": verdict["act"], "reason": str(verdict.get("reason", ""))[:300]}
 
@@ -189,8 +191,18 @@ def setup(cfg):
     else:
         print(f"Using existing {path}.")
     import llm_client
-    if not llm_client.configured(cfg):
+    while not llm_client.configured(cfg):
         cfg = connect_cli(cfg)
+        if llm_client.configured(cfg):
+            break
+        print("\nYour policy needs a connected AI. Without one, EVERY entry is "
+              "skipped and the agent never trades.")
+        again = input("Try connecting an AI again? [Y/n] (n = turn the policy "
+                      "off): ").strip().lower()
+        if again == "n":
+            disable_policy()
+            print(f"Policy turned off (kept as {policy_path()}.disabled).")
+            return cfg
     cfg.setdefault("llm_fallback", "skip")
     print(f"Policy brain on: {llm_client.describe(cfg)}, on error -> "
           f"{cfg['llm_fallback']} (fail-safe).")
