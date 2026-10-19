@@ -17,7 +17,9 @@ Dashboard (served by the same app once ``python agent.py run`` starts, /dash):
     against the live status and trade log. Command handling is deliberately
     a fixed allowlist; the LLM can only ANSWER, never trade.
 
-Stdlib only (http.server + threading) — no new dependencies.
+Stdlib only (http.server + threading) — no new Python dependencies. The page
+UI is a React app built from webui_app/ into webui_dist/ (committed; no Node
+needed to run it). Without a build, the built-in pages below are served.
 """
 
 import json
@@ -154,6 +156,55 @@ class _AppServer(ThreadingHTTPServer):
 
 WIZARD_PORT = APP_PORT
 DASH_PORT = APP_PORT
+
+# ── the app UI (React build, committed) ──────────────────────────────────────
+# Source lives in webui_app/ (React + Vite); `npm run build` there writes
+# webui_dist/, which is committed so users never need Node. /setup and /dash
+# serve webui_dist/index.html; /assets/* serves its hashed files. If the build
+# is missing (or the user opens ?ui=classic) the built-in pages below are used.
+_DIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui_dist")
+_ASSET_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+}
+# The app loads nothing from the network: scripts, styles and fonts all come
+# from this agent. Inline styles are allowed (UI library positioning); inline
+# scripts are not.
+_APP_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+            "object-src 'none'; base-uri 'none'; form-action 'self'; "
+            "frame-ancestors 'none'")
+
+
+def _app_index():
+    """The built app's index.html, or None when no build is present."""
+    try:
+        with open(os.path.join(_DIST_DIR, "index.html"), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _asset_path(path):
+    """Filesystem path for a `/assets/<name>` URL, or None. Only plain file
+    names directly inside webui_dist/assets — no sub-paths, no traversal."""
+    import re
+    name = path[len("/assets/"):]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}", name) or ".." in name:
+        return None
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in _ASSET_TYPES:
+        return None
+    base = os.path.realpath(os.path.join(_DIST_DIR, "assets"))
+    full = os.path.realpath(os.path.join(base, name))
+    if os.path.dirname(full) != base or not os.path.isfile(full):
+        return None
+    return full
 
 # Run-loop controls the dashboard can flip; agent.py polls these.
 CONTROLS = {"paused": False, "stop": False}
@@ -2226,6 +2277,17 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_raw(self, body, ctype, status=200, cache="no-store", extra=None):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", cache)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if not self._guard(check_origin=False):
             return
@@ -2243,7 +2305,23 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if path in self.pages:
-            return self._send(None, html=self.pages[path])
+            app = None if "ui=classic" in self.path else _app_index()
+            if app is None:
+                return self._send(None, html=self.pages[path])
+            return self._send_raw(app.encode(), "text/html; charset=utf-8",
+                                  extra={"Content-Security-Policy": _APP_CSP,
+                                         "X-Frame-Options": "DENY",
+                                         "Referrer-Policy": "no-referrer"})
+        if path.startswith("/assets/"):
+            full = _asset_path(path)
+            if full is None:
+                return self._send({"error": "not found"}, 404)
+            with open(full, "rb") as f:
+                body = f.read()
+            # file names carry a content hash: safe to cache for good
+            return self._send_raw(
+                body, _ASSET_TYPES[os.path.splitext(full)[1].lower()],
+                cache="private, max-age=31536000, immutable")
         fn = self.routes_get.get(path)
         if fn is None:
             return self._send({"error": "not found"}, 404)

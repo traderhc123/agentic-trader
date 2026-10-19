@@ -188,3 +188,40 @@ def test_apply_allows_new_broker_adapter_and_registry(sandbox):
     ok, _ = self_edit.apply_and_restart(restart=False)
     assert ok
     assert (repo / "brokers" / "tasty.py").exists()
+
+
+# ── the dashboard app folders are FOUNDATION too ────────────────────────────
+
+@pytest.mark.parametrize("path", [
+    "webui_dist/index.html",
+    "webui_dist/assets/index-abc.js",
+    "WebUI_Dist/assets/x.js",
+    "webui_app/src/dash/Dashboard.tsx",
+    "webui_app./src/main.tsx",
+])
+def test_ui_folders_are_foundation(path):
+    assert self_edit._is_foundation(path)
+
+
+def test_apply_refuses_ui_build_files(sandbox):
+    repo, home = sandbox
+    (repo / "webui_dist" / "assets").mkdir(parents=True)
+    (repo / "webui_dist" / "assets" / "app.js").write_text("SAFE\n")
+    _stage_proposal(home, [{"path": "webui_dist/assets/app.js",
+                            "content": "goLive()\n"}])
+    ok, msg = self_edit.apply_and_restart(restart=False)
+    assert not ok and "FOUNDATION" in msg
+    assert (repo / "webui_dist" / "assets" / "app.js").read_text() == "SAFE\n"
+
+
+def test_apply_refuses_ui_folder_reached_through_symlink(sandbox):
+    repo, home = sandbox
+    (repo / "webui_dist").mkdir()
+    try:
+        os.symlink(repo / "webui_dist", repo / "alias")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    _stage_proposal(home, [{"path": "alias/app.js", "content": "x\n"}])
+    ok, msg = self_edit.apply_and_restart(restart=False)
+    assert not ok
+    assert not (repo / "webui_dist" / "app.js").exists()

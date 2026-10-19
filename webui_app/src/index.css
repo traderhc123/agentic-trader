@@ -1,0 +1,83 @@
+@import "@fontsource/ibm-plex-sans/latin-400.css";
+@import "@fontsource/ibm-plex-sans/latin-500.css";
+@import "@fontsource/ibm-plex-sans/latin-600.css";
+@import "@fontsource/ibm-plex-mono/latin-400.css";
+@import "@fontsource/ibm-plex-mono/latin-500.css";
+@import "@fontsource/ibm-plex-mono/latin-600.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Desk palette: navy ink, not neutral black. Channels are "R G B" so
+   Tailwind can apply opacity (bg-up/10 etc). */
+:root {
+  color-scheme: dark;
+  --bg: 9 14 23;          /* #090e17 page */
+  --sink: 7 11 18;        /* #070b12 wells: inputs, code, logs */
+  --panel: 13 20 32;      /* #0d1420 */
+  --panel-2: 17 26 41;    /* #111a29 headers, footers */
+  --raise: 23 34 52;      /* #172234 hover */
+  --line: 29 41 60;       /* #1d293c */
+  --line-2: 39 54 77;     /* #27364d */
+  --line-3: 54 72 100;    /* #364864 */
+  --fg: 229 235 244;      /* #e5ebf4 */
+  --fg-2: 180 192 210;    /* #b4c0d2 */
+  --muted: 137 152 176;   /* #8998b0 — 6:1 on panel */
+  --faint: 118 133 158;   /* #76859e — 4.6:1 on panel */
+  --accent: 76 141 255;   /* #4c8dff */
+  --accent-hi: 112 165 255;
+  --accent-ink: 6 18 40;
+  --up: 34 197 142;       /* #22c58e */
+  --down: 242 85 94;      /* #f2555e */
+  --warn: 232 166 64;     /* #e8a640 */
+  --live: 255 77 94;      /* #ff4d5e */
+}
+
+html { background: rgb(var(--bg)); }
+body {
+  margin: 0;
+  background: rgb(var(--bg));
+  color: rgb(var(--fg));
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 20px;
+  -webkit-font-smoothing: antialiased;
+}
+.tnum { font-variant-numeric: tabular-nums; }
+.font-mono { font-variant-numeric: tabular-nums slashed-zero; }
+
+:focus-visible { outline: 2px solid rgb(var(--accent)); outline-offset: 1px; }
+::placeholder { color: rgb(var(--faint)); }
+::selection { background: rgb(var(--accent) / 0.35); }
+
+/* thin, dark scrollbars on wells */
+.scroll-thin { scrollbar-width: thin; scrollbar-color: rgb(var(--line-3)) transparent; }
+
+/* native form controls keep native semantics; we only restyle them */
+input[type="checkbox"], input[type="radio"] { accent-color: rgb(var(--accent)); }
+select.at-select {
+  appearance: none; -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238998b0' stroke-width='1.5' fill='none'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 10px center; padding-right: 30px;
+}
+select.at-select option { background: rgb(var(--panel)); color: rgb(var(--fg)); }
+
+/* Agreement text (escaped, then lightly formatted by mdLite) */
+.prose-terms h3, .prose-terms h4, .prose-terms h5, .prose-terms h6 { margin: 14px 0 6px; font-weight: 600; color: rgb(var(--fg)); font-size: 13px; }
+.prose-terms h3 { font-size: 14px; }
+.prose-terms p { margin: 6px 0; }
+.prose-terms ul { margin: 4px 0 8px 18px; padding: 0; list-style: disc; }
+.prose-terms blockquote { margin: 8px 0; padding: 6px 10px; border-left: 2px solid rgb(var(--accent)); color: rgb(var(--muted)); }
+.prose-terms code { font-family: "IBM Plex Mono", monospace; font-size: 12px; background: rgb(var(--raise)); padding: 0 4px; border-radius: 3px; }
+
+/* Lightweight Charts attribution link: keep it visible but quiet */
+#tv-attr-logo { opacity: 0.55; }
+
+@media (max-width: 640px) {
+  /* 16px fields so iOS Safari does not zoom on focus */
+  input[type="text"], input[type="password"], input[type="number"], select, textarea { font-size: 16px !important; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
