@@ -1260,7 +1260,9 @@ async function boot(){
   document.getElementById('disclaimer').innerHTML=mdLite(st.disclaimer);
   const notes=st.notes||{};
   if(st.consent){done('s-consent');restoredNote('s-consent',notes.consent||'Agreement signed — on file');}
-  if(st.llm){done('s-llm');restoredNote('s-llm',notes.llm||'AI connected');}
+  if(st.llm){done('s-llm');restoredNote('s-llm',notes.llm||'AI connected');
+    // Key on file: leave the box blank and press Find models to switch model.
+    document.getElementById('llm-key').placeholder='saved key on file — leave blank and press Find models to change model';}
   if(st.source){done('s-source');restoredNote('s-source',notes.source||('Source saved: '+st.source));
     const sel=document.getElementById('src');sel.value=st.source;srcChanged();}
   if(st.wallet&&st.wallet.connected){showWallet(st.wallet.page,'wallet connected ✓');
@@ -2475,6 +2477,25 @@ def _sizing_detail(cfg):
     return {"main": book(""), "other": book("other_")}
 
 
+def _reuse_saved_llm(cfg, pid, key, base):
+    """No new key typed: reuse the connected one so the owner can switch to
+    any model that key can use without pasting it again. The saved key only
+    goes back to its own provider and endpoint — never to a different
+    provider or a URL typed into the form. Returns (provider, key, base)."""
+    import llm_client
+    if key:
+        return pid, key, base
+    saved = llm_client.resolve(cfg)
+    if not saved:
+        return pid, key, base
+    if pid and pid != saved["provider"]:
+        return pid, key, base
+    preset_base = llm_client.PROVIDERS[saved["provider"]]["base_url"].rstrip("/")
+    if base.rstrip("/") not in ("", saved["base_url"].rstrip("/"), preset_base):
+        return pid, key, base
+    return saved["provider"], saved["key"], cfg.get("llm_base_url", "")
+
+
 def _broker_display(cfg, last4=""):
     """What the wizard's broker step shows as connected: the in-session hint,
     else the Robinhood account last4, else the persisted key-based broker id
@@ -2600,8 +2621,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     def _llm_target(data):
         import llm_client
         key = str(data.get("key", "")).strip()
-        pid = str(data.get("provider", "")).strip() or llm_client.detect_provider(key)
+        pid = str(data.get("provider", "")).strip()
         base = str(data.get("base_url", "")).strip()
+        pid, key, base = _reuse_saved_llm(cfg, pid, key, base)
+        pid = pid or llm_client.detect_provider(key)
         if not pid:
             return None, key, base, ("couldn't tell which provider that key is "
                                      "for — pick it under Provider")
@@ -2631,8 +2654,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"ok": False, "error": msg, "need_provider": exc.reason == "auth"}
         if not models:
             return {"ok": False, "error": "the provider listed no models for this key"}
+        suggested = llm_client.suggest_model(pid, models)
+        saved = llm_client.resolve(cfg) or {}
+        if saved.get("provider") == pid and saved.get("model") in models:
+            suggested = saved["model"]  # switching models: start from the current one
         return {"ok": True, "provider": pid, "models": models,
-                "suggested": llm_client.suggest_model(pid, models)}
+                "suggested": suggested}
 
     def llm(_h, data):
         import llm_client
