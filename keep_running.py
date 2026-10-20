@@ -555,7 +555,10 @@ def autostart_outdated():
     # .lnk files store their strings as UTF-16; the others are UTF-8
     def has(text):
         return text.encode() in raw or text.encode("utf-16-le") in raw
-    return not (has(AT_LOGIN_FLAG) and has(agent_script()))
+    script = agent_script()
+    # the XDG .desktop entry escapes backslashes (matters for Windows paths)
+    return not (has(AT_LOGIN_FLAG)
+                and (has(script) or has(_desktop_quote(script)[1:-1])))
 
 
 def refresh_autostart():
