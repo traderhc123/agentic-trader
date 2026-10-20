@@ -1,4 +1,4 @@
-import { ArrowDownRight, ArrowUpRight, CircleHelp, Minus, Pause, Play, Settings, ShieldCheck, Zap } from "lucide-react";
+import { AlertTriangle, ArrowDownRight, ArrowUpRight, CircleHelp, Minus, Pause, Play, Settings, ShieldCheck, Zap } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { AppBar, Pill } from "../components/AppBar";
 import { ChatLog, nextMsgId, type ChatMsg } from "../components/Chat";
@@ -7,7 +7,7 @@ import { ConfirmDialog } from "../components/ui/dialog";
 import { Input } from "../components/ui/field";
 import { Count, Panel } from "../components/ui/panel";
 import { ModeTag, RightTag } from "../components/ui/tag";
-import { api, type Proposal, type StatusResp, type Trade } from "../lib/api";
+import { api, type Problem, type Proposal, type StatusResp, type Trade } from "../lib/api";
 import { cn } from "../lib/cn";
 import { copyToClipboard, useInterval } from "../lib/hooks";
 import { cap1, hhmm, isToday, money, parseContract, parsePositions, shortDate, whenShort, type Contract } from "../lib/format";
@@ -20,6 +20,15 @@ const SKIPS: Record<string, string> = {
   skip_position_cap: "max open positions reached",
   skip_daily_loss: "daily loss limit reached",
   policy_veto: "your rules said no",
+  skip_sizing: "couldn't size the trade",
+  order_failed: "the broker rejected the order",
+  skip_budget: "one contract costs more than your budget",
+  skip_no_quote: "no price quote for the contract",
+  skip_no_contract: "contract not found at the broker",
+  entry_unfilled: "order placed but never filled",
+  exit_failed: "exit order didn't go through (retrying)",
+  exit_partial: "exit only partly filled",
+  broker_no_order: "the broker didn't place the order",
 };
 
 type Conn = "loading" | "ok" | "off" | "unreachable";
@@ -160,6 +169,7 @@ export function Dashboard() {
       <main className="mx-auto max-w-[1440px] px-6 pb-10 pt-5 max-sm:px-4 max-sm:pt-4">
         <ModeBanner conn={conn} live={live} paused={paused} />
         <StatusStrip conn={conn} f={f} />
+        {conn === "ok" && <WhyNoTrades warning={status?.cash_warning || ""} problems={status?.problems || []} live={live} />}
 
         <div className="mt-4 grid grid-cols-[minmax(0,1fr)_400px] items-start gap-4 max-xl:grid-cols-1">
           <div className="flex min-w-0 flex-col gap-4">
@@ -178,6 +188,41 @@ export function Dashboard() {
   );
 }
 
+// ── why trades didn't happen today ──────────────────────────────────────────
+function WhyNoTrades({ warning, problems, live }: { warning: string; problems: Problem[]; live: boolean }) {
+  if (!warning && !problems.length) return null;
+  return (
+    <div role="alert" className="mt-4 rounded-md border border-warn/45 bg-warn/[0.07] px-4 py-3 text-sm text-fg2">
+      <div className="flex items-start gap-3">
+        <AlertTriangle className="mt-0.5 h-4 w-4 flex-none text-warn" />
+        <div className="min-w-0 flex-1 space-y-2">
+          <b className="text-fg">Trades that didn't happen today, and why</b>
+          {warning && (
+            <p className="m-0">
+              {warning}
+              {!live && " (You're in dry-run, so nothing is blocked yet.)"}
+            </p>
+          )}
+          {problems.length > 0 && (
+            <ul className="m-0 list-none space-y-1.5 p-0">
+              {problems.map((p) => (
+                <li key={p.kind} className="[overflow-wrap:anywhere]">
+                  <b className="text-fg">{cap1(SKIPS[p.kind] || p.kind.replace(/_/g, " "))}</b>
+                  {p.count > 1 ? ` ×${p.count}` : ""}
+                  {p.at ? <span className="text-muted"> · last {hhmm(new Date(p.at))}</span> : null}
+                  {p.contract ? <span className="text-muted"> · {p.contract}</span> : null}
+                  {p.last ? <div className="text-muted">{String(p.last).slice(0, 240)}</div> : null}
+                  {p.hint ? <div className="text-fg">Fix: {p.hint}</div> : null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── mode banner ─────────────────────────────────────────────────────────────
 function ModeBanner({ conn, live, paused }: { conn: Conn; live: boolean; paused: boolean }) {
   if (conn === "loading") return <div className="h-10" />;
@@ -191,7 +236,7 @@ function ModeBanner({ conn, live, paused }: { conn: Conn; live: boolean; paused:
         {conn === "off" ? (
           <span>
             <b className="text-down">Agent not running.</b> Start it with{" "}
-            <code className="rounded-sm bg-raise px-1 font-mono text-xs">python agent.py run</code>
+            <code className="rounded-sm bg-raise px-1 font-mono text-xs">python agent.py start</code>
           </span>
         ) : conn === "unreachable" ? (
           <span>
@@ -484,7 +529,7 @@ function Td({ children, className, colSpan }: { children: React.ReactNode; class
 function rowOf(x: Trade) {
   const a = x.action || "";
   const c = parseContract(x.contract);
-  const note = (a === "policy_veto" || a === "entry" || a === "exit") && x.reason ? String(x.reason).slice(0, 160) : "";
+  const note = x.reason ? String(x.reason).slice(0, 160) + (x.hint ? ` · Fix: ${String(x.hint)}` : "") : "";
   let kind: "in" | "out" | "skip" = "skip",
     verb = "Skipped",
     detail = note;

@@ -12,6 +12,8 @@ agent opened. Requires options approval on the Alpaca account.
 
 import requests
 
+import broker_events
+
 _TIMEOUT = 15
 
 # Wizard descriptor — lets the web setup render this broker's fields generically
@@ -131,6 +133,23 @@ def account_value(cl, cfg):
         return 0.0
 
 
+def buying_power(cl, cfg):
+    """Cash available for option orders, or None when unreadable."""
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    try:
+        resp = requests.get(f"{_base(cfg)}/v2/account", headers=_headers(cfg),
+                            timeout=_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        acct = resp.json()
+        for k in ("options_buying_power", "buying_power", "cash"):
+            if acct.get(k) is not None:
+                return float(acct[k])
+    except Exception:
+        pass
+    return None
+
+
 def _size(cfg, occ):
     if str(cfg.get("sizing_mode")) == "percent":
         # The agent turns % of account into a dollar budget before calling
@@ -167,6 +186,9 @@ def _order(cfg, occ, side, qty):
                          timeout=_TIMEOUT)
     if resp.status_code not in (200, 201):
         print(f"  ORDER FAILED HTTP {resp.status_code}: {resp.text[:200]}")
+        broker_events.report("order_failed" if side == "buy" else "exit_failed",
+                             f"Alpaca rejected the {side} order (HTTP "
+                             f"{resp.status_code}): {resp.text[:300]}")
         return None
     oid = resp.json().get("id", "submitted")
     print(f"  alpaca order {side} x{qty} -> {oid}")
@@ -238,6 +260,9 @@ def execute(cl, cfg, event, state):
         qty, note = _size(cfg, occ)
         if qty < 1:
             print(f"SKIPPED {contract}: {note}")
+            broker_events.report(
+                "skip_budget" if "exceeds your" in note else
+                "skip_no_quote" if "no quote" in note else "skip_sizing", note)
             return False
         print(f"ENTERED event -> buying {qty}x {contract} ({note})")
         oid = _order(cfg, occ, "buy", qty)
@@ -245,6 +270,9 @@ def execute(cl, cfg, event, state):
             filled = _confirm_fill(cfg, oid, qty)
             if filled < 1:
                 print(f"  entry never filled — no position recorded ({contract})")
+                broker_events.report("entry_unfilled",
+                                     f"buy order for {contract} was placed but "
+                                     "never filled")
                 return False
             state["positions"][pos_key] = {"option_id": occ, "qty": filled,
                                            "opened_event": event.get("event_id")}
@@ -262,6 +290,9 @@ def execute(cl, cfg, event, state):
                 pos["qty"] = remaining
                 print(f"  ⚠️ exit only filled {sold}/{pos['qty'] + sold} — "
                       f"{remaining}x still held; close manually if needed")
+                broker_events.report("exit_partial",
+                                     f"exit filled {sold}/{pos['qty'] + sold} — "
+                                     f"{remaining}x {contract} still held")
             else:
                 del state["positions"][pos_key]
             return True

@@ -14,6 +14,8 @@ import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import broker_events
+
 from .robinhood_mcp import RobinhoodMCP, content_json, tool_ok
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -169,6 +171,30 @@ def account_value(rh, cfg):
             or _find_number(payload, ["buying_power", "cash"]))
 
 
+def buying_power(rh, cfg):
+    """Cash available for new orders, or None when it can't be read (so an
+    unreadable portfolio never looks like a $0 account)."""
+    try:
+        payload = content_json(rh.call_tool(
+            "get_portfolio", {"account_number": cfg.get("robinhood_account", "")}))
+    except Exception:
+        return None
+    if payload is None:
+        return None
+    for keys in (["buying_power"], ["cash"]):
+        if _has_key(payload, keys[0]):
+            return float(_find_number(payload, keys) or 0.0)
+    return None
+
+
+def _has_key(obj, key):
+    if isinstance(obj, dict):
+        return key in obj or any(_has_key(v, key) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_has_key(v, key) for v in obj)
+    return False
+
+
 def mark_price(rh, cfg, event, side="buy"):
     """Per-share quote for the agent's P&L estimate (0.0 when unavailable)."""
     option_id = resolve_instrument(rh, event)
@@ -195,6 +221,14 @@ def _blackout_limit_price(rh, option_id, side):
         buffered = cents * 95 // 100           # floor(price * 0.95)
         ticked = max(1, buffered // 5 * 5)     # round DOWN, floor $0.01
     return ticked / 100.0
+
+
+def _skip_kind(note):
+    if "exceeds your" in note:
+        return "skip_budget"
+    if "no quote" in note:
+        return "skip_no_quote"
+    return "skip_sizing"
 
 
 def size_contracts(rh, cfg, option_id):
@@ -315,13 +349,26 @@ def place(rh, cfg, option_id, side, effect, qty):
     result = rh.call_tool("place_option_order", args)
     if not tool_ok(result):
         print(f"  ORDER FAILED: {str(result)[:300]}")
+        broker_events.report("order_failed" if side == "buy" else "exit_failed",
+                             f"Robinhood rejected the {side} order: "
+                             f"{_error_text(result)}")
         return None
     oid = _extract_order_id(result)
     print(f"  order {side}/{effect} x{qty} -> {oid or 'submitted (no id)'}")
     return {"order_id": oid, "was_limit": limit_price is not None}
 
 
-def _finalize_pending(state, pos_key, filled_total):
+def _error_text(result):
+    """The readable part of a failed tool result (Robinhood's own reason)."""
+    body = content_json(result)
+    if isinstance(body, dict):
+        for k in ("detail", "error", "message", "non_field_errors", "reason"):
+            if body.get(k):
+                return str(body[k])[:300]
+    return str(result)[:300]
+
+
+def _finalize_pending(state, pos_key, filled_total, report_unfilled=True):
     """Terminal order state reached: reconcile the ledger with what actually
     filled, so an unfilled buy never leaves a phantom position and a partial
     exit keeps the remainder."""
@@ -342,6 +389,11 @@ def _finalize_pending(state, pos_key, filled_total):
         else:
             del state["positions"][pos_key]
             print(f"  entry never filled — no position recorded ({pos_key})")
+            if report_unfilled:
+                broker_events.report(
+                    "entry_unfilled",
+                    f"buy order for {pos_key.replace('|', ' ')} was placed but "
+                    "never filled (cancelled or rejected by Robinhood)")
     else:
         remaining = int(pos.get("qty", 0)) - filled_total
         if remaining <= 0:
@@ -352,6 +404,11 @@ def _finalize_pending(state, pos_key, filled_total):
             print(f"  ⚠️ exit only filled {filled_total}/{pend['requested']} — "
                   f"{remaining}x still held ({pos_key}); reconcile keeps working "
                   "it, or close manually in the app")
+            broker_events.report(
+                "exit_partial",
+                f"exit filled {filled_total}/{pend['requested']} — {remaining}x "
+                f"{pos_key.replace('|', ' ')} still held; close it in the "
+                "Robinhood app if it doesn't clear")
 
 
 def _record_pending(state, pos_key, placed, side, qty):
@@ -464,10 +521,13 @@ def execute(rh, cfg, event, state):
         option_id = resolve_instrument(rh, event)
         if not option_id:
             print(f"  could not resolve instrument for {contract} — skipped")
+            broker_events.report("skip_no_contract",
+                                 f"Robinhood has no tradable contract {contract}")
             return False
         qty, note = size_contracts(rh, cfg, option_id)
         if qty < 1:
             print(f"SKIPPED {contract}: {note}")
+            broker_events.report(_skip_kind(note), note)
             return False
         print(f"ENTERED event -> buying {qty}x {contract} ({note} — your configuration)")
         placed = place(rh, cfg, option_id, "buy", "open", qty)
@@ -491,7 +551,8 @@ def execute(rh, cfg, event, state):
             _, filled = _order_status(rh, cfg.get("robinhood_account", ""),
                                       pend["order_id"])
             _finalize_pending(state, pos_key,
-                              max(filled, pend.get("filled", 0)))
+                              max(filled, pend.get("filled", 0)),
+                              report_unfilled=False)  # signal exited first
             pos = state["positions"].get(pos_key)
             if not pos:
                 print(f"  entry never filled — nothing to sell ({contract})")

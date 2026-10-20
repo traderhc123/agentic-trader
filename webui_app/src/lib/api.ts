@@ -57,6 +57,16 @@ export interface StatusResp {
   mode: "LIVE" | "DRY-RUN" | "OFFLINE" | string;
   paused: boolean;
   fields: Record<string, string>;
+  cash_warning?: string;
+  problems?: Problem[];
+}
+export interface Problem {
+  kind: string;
+  count: number;
+  last?: string;
+  hint?: string;
+  contract?: string;
+  at?: string;
 }
 export interface Trade {
   ts?: string;

@@ -689,6 +689,12 @@ export function LaunchStep() {
   };
   const [startMsg, setStartMsg] = useState<MsgT>(null);
   const [autostart, setAutostart] = useState(true);
+  const [cash, setCash] = useState<{ known?: boolean; buying_power?: number; warning?: string; dry_run?: boolean } | null>(null);
+  useEffect(() => {
+    api("/api/broker/cash")
+      .then((r) => setCash(r))
+      .catch(() => {});
+  }, []);
   const [doToken, setDoToken] = useState("");
   const [region, setRegion] = useState("nyc3");
   const [deployMsg, setDeployMsg] = useState<React.ReactNode>(null);
@@ -778,6 +784,18 @@ export function LaunchStep() {
               <Button onClick={turnOffPolicy}>Turn my policy off</Button>
               <Msg m={polMsg} />
             </div>
+          </Notice>
+        )}
+        {cash?.warning && (
+          <Notice tone={cash.dry_run ? "warn" : "live"} role="alert">
+            <p className="m-0">
+              <b>Check your broker cash.</b> {cash.warning}
+            </p>
+            <p className="m-0 mt-2 text-muted">
+              {cash.dry_run
+                ? "You're starting in dry-run, so nothing is blocked yet. Add cash before you go live."
+                : "Add cash in your broker's app (or lower your per-trade budget in Sizing) before starting, or every order will be rejected."}
+            </p>
           </Notice>
         )}
         {next != null && !blocked && (
