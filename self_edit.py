@@ -47,6 +47,7 @@ FOUNDATION = frozenset({
     "LICENSE",
     "webui.py",          # dashboard: dry-run toggle, updates, consent page
     "keep_running.py",   # one-copy lock (a second copy would double every order)
+    "broker_events.py",  # how dropped trades reach the owner (can't be muted)
     "platform_compat.py",  # process launch/restart plumbing
     "llm_client.py",     # carries the AI key; the policy brain's only door
     "setup_plan.py",     # enforces what an assistant may never set (go live…)
@@ -208,7 +209,7 @@ def propose(cfg, request):
         "FOUNDATION FILES ARE READ-ONLY and any change to them will be "
         "rejected by the apply layer: agent.py, self_edit.py, "
         "llm_policy.py, llm_client.py, lightning_wallet.py, webui.py, "
-        "platform_compat.py, keep_running.py, requirements.txt, DISCLAIMER.md, "
+        "platform_compat.py, keep_running.py, broker_events.py, requirements.txt, DISCLAIMER.md, "
         "SECURITY.md, install.sh, install.ps1, LICENSE, and every "
         "EXISTING file in brokers/ and sources/ (you may ADD new "
         "adapter files there and register them in __init__.py) "

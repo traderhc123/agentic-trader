@@ -451,6 +451,121 @@ def _notify_ai_problem_once(cfg, state, save_state, contract, reason):
                 "the policy off. No more alerts about this today.")
 
 
+class ExitNotDone(Exception):
+    """An EXITED event couldn't close the position (order rejected, no
+    quote…). Raised so the heartbeat leaves the event unseen and tries again
+    next poll — an exit is never silently dropped."""
+
+
+_problems_logged = set()  # (event_id, kind) already written this run
+
+
+def _report_problem(cfg, state, save_state, kind, contract, message,
+                    event_id=None, dry=False):
+    """Write a 'why this trade didn't happen' row to the trade log (what the
+    dashboard shows) and notify at most once per kind per day."""
+    import broker_events
+    key = (event_id, kind)
+    if event_id and key in _problems_logged:
+        return
+    if event_id:
+        _problems_logged.add(key)
+    hint = broker_events.hint(message)
+    rec = {"action": kind, "contract": contract, "reason": message}
+    if event_id:
+        rec["event_id"] = event_id
+    if hint:
+        rec["hint"] = hint
+    if dry:
+        rec["dry"] = True
+    _log_trade(rec)
+    if kind not in broker_events.NOTIFY or dry:
+        return
+    today = datetime.now(timezone.utc).date().isoformat()
+    sent = state.setdefault("problem_notified", {})
+    if sent.get(kind) == today:
+        return
+    sent[kind] = today
+    try:
+        save_state(state)
+    except Exception:
+        pass
+    label = broker_events.KINDS.get(kind, kind.replace("_", " "))
+    notify(cfg, f"agentic-trader: trade NOT placed ({contract}) — {label}: "
+                f"{message}" + (f"\nFix: {hint}" if hint else "")
+                + "\n(No more alerts about this today; every case is in the "
+                "dashboard activity log.)")
+
+
+def _buying_power(broker, client, cfg):
+    """Broker cash available for orders, or None if unknown/unsupported."""
+    fn = getattr(broker, "buying_power", None)
+    if fn is None or client is None:
+        return None
+    try:
+        bp = fn(client, cfg)
+        return None if bp is None else float(bp)
+    except Exception:
+        return None
+
+
+LOW_CASH_USD = 50.0
+
+
+def _cash_warning(cfg, bp):
+    """Plain-English warning when buying power can't cover trades, or ''."""
+    if bp is None:
+        return ""
+    if bp < LOW_CASH_USD:
+        return (f"Your broker account has ${bp:,.2f} buying power — orders will "
+                "be rejected until you add cash.")
+    if str(cfg.get("sizing_mode")) == "budget":
+        budget = float(cfg.get("budget_per_trade_usd") or 0)
+        if budget > bp:
+            return (f"Your per-trade budget (${budget:,.0f}) is more than your "
+                    f"buying power (${bp:,.2f}) — trades costing more than "
+                    f"${bp:,.0f} will be rejected.")
+    return ""
+
+
+def _refresh_cash(cfg, state, save_state, broker, client, cash):
+    """Re-read buying power (every ~10 min) for the dashboard, and warn once
+    a day in LIVE mode when it can't cover trades."""
+    cash["at"] = time.time()
+    cash["dry"] = bool(cfg.get("dry_run"))
+    cash["bp"] = _buying_power(broker, client, cfg)
+    warn = _cash_warning(cfg, cash["bp"])
+    cash["warning"] = warn
+    if not warn or cfg.get("dry_run"):
+        return
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get("low_cash_notified") == today:
+        return
+    state["low_cash_notified"] = today
+    try:
+        save_state(state)
+    except Exception:
+        pass
+    print("WARNING: " + warn)
+    notify(cfg, "agentic-trader WARNING: " + warn)
+
+
+def _problems_today():
+    """Today's 'trade didn't happen' rows, grouped for the dashboard."""
+    import broker_events
+    today = datetime.now(timezone.utc).date().isoformat()
+    kinds = set(broker_events.KINDS) | {"skip_stale", "skip_sizing"}
+    out = {}
+    for t in _recent_trades(300):
+        if t.get("action") not in kinds or not str(t.get("ts", "")).startswith(today):
+            continue
+        p = out.setdefault(t["action"], {"kind": t["action"], "count": 0})
+        p["count"] += 1
+        p.update(last=t.get("reason", ""), hint=t.get("hint", ""),
+                 contract=t.get("contract", ""), at=t.get("ts", ""))
+    return sorted(out.values(), key=lambda p: p["at"], reverse=True)
+
+
 def handle_event(ev, cfg, state, broker, client, save_state):
     """Run one new event through the safety pipeline. Returns a log line or None."""
     contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
@@ -462,8 +577,10 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         msg = f"SKIPPED stale ENTERED ({contract}) — older than " \
               f"{int(cfg.get('max_event_age_s', 300))}s"
         print(msg)
-        _log_trade({"action": "skip_stale", "event_id": ev["event_id"],
-                    "contract": contract})
+        _report_problem(cfg, state, save_state, "skip_stale", contract,
+                        f"signal was {int(cfg.get('max_event_age_s', 300))}s+ old "
+                        "when the agent saw it (computer asleep or offline?)",
+                        event_id=ev["event_id"])
         return msg
 
     if ev["event"] == "ENTERED":
@@ -524,17 +641,42 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         if skip:
             msg = f"{'[DRY-RUN] ' if dry else ''}SKIPPED {contract}: {skip}"
             print(msg)
-            _log_trade({"action": "skip_sizing", "event_id": ev["event_id"],
-                        "contract": contract, "reason": skip})
+            _report_problem(cfg, state, save_state, "skip_sizing", contract, skip,
+                            event_id=ev["event_id"], dry=dry)
             return msg
     prior_pos = dict(existing) if existing else None  # qty/entry mark for P&L
     if dry:
         action = _execute_dry(ecfg, ev, state, broker, client)
         prefix = "[DRY-RUN] "
     else:
+        import broker_events
+        broker_events.begin()
         changed = broker.execute(client, ecfg, ev, state)
+        reported = broker_events.drain()
         action = ("entry" if ev["event"] == "ENTERED" else "exit") if changed else None
         prefix = ""
+        for r in reported:
+            msg = r["message"]
+            if r["kind"] == "order_failed" and broker_events.is_cash_problem(msg):
+                bp = _buying_power(broker, client, cfg)
+                if bp is not None:
+                    msg += f" (buying power now ${bp:,.2f})"
+            _report_problem(cfg, state, save_state, r["kind"], contract, msg,
+                            event_id=ev["event_id"])
+        if not action and ev["event"] == "ENTERED" and not existing and not reported:
+            _report_problem(cfg, state, save_state, "broker_no_order", contract,
+                            "the broker adapter didn't place the order and gave "
+                            "no reason — see agent-run.log",
+                            event_id=ev["event_id"])
+        if not action and ev["event"] == "EXITED":
+            held = state["positions"].get(pos_key)
+            if held and not held.get("pending"):
+                if not reported:
+                    _report_problem(cfg, state, save_state, "exit_failed",
+                                    contract, "the exit order wasn't placed",
+                                    event_id=ev["event_id"])
+                raise ExitNotDone(f"exit for {contract} not done — retrying "
+                                  "next poll")
 
     if action:
         record = {"action": action, "event_id": ev["event_id"],
@@ -937,6 +1079,8 @@ def cmd_run(app_window=False):
     def save_state(st):
         _save(STATE_PATH, st, private=True)  # holds the day-pass L402 token
 
+    cash = {"at": 0.0, "bp": None, "warning": ""}
+
     # The agent serves its OWN dashboard — status, trade log, and a command/
     # chat box — on localhost. No central server involved.
     import webui
@@ -959,7 +1103,11 @@ def cmd_run(app_window=False):
                 "open positions": ", ".join(st.get("positions", {})) or "none",
                 "start at login": ("on" if keep_running.autostart_enabled()
                                    else "off"),
+                **({"buying power": f"${cash['bp']:,.2f}"}
+                   if cash["bp"] is not None else {}),
             },
+            "cash_warning": cash.get("warning", ""),
+            "problems": _problems_today(),
         }
 
     dash_url = None
@@ -970,6 +1118,7 @@ def cmd_run(app_window=False):
     except OSError as exc:
         print(f"dashboard not started ({exc}) — continuing headless")
 
+    _refresh_cash(cfg, state, save_state, broker, client, cash)
     mode = "DRY-RUN (no orders)" if cfg.get("dry_run") else "LIVE"
     print(f"Heartbeat started [{mode}]: source={cfg['source']}, "
           f"{_sizing_desc(cfg)}, policy brain "
@@ -1010,12 +1159,21 @@ def cmd_run(app_window=False):
                 except Exception as exc:
                     print(f"expiry prune error (non-fatal): {str(exc)[:150]}")
                 if client is not None and hasattr(broker, "reconcile"):
+                    import broker_events
+                    broker_events.begin()
                     try:
                         # progress any unverified orders (fill verification,
                         # blackout-limit conversion) before new events
                         broker.reconcile(client, cfg, state, save_state)
                     except Exception as exc:
                         print(f"order reconcile error (non-fatal): {str(exc)[:150]}")
+                    for r in broker_events.drain():
+                        _report_problem(cfg, state, save_state, r["kind"],
+                                        "", r["message"])
+                # every 10 min, and right away when the owner goes live
+                if (time.time() - cash["at"] > 600
+                        or bool(cfg.get("dry_run")) != cash.get("dry")):
+                    _refresh_cash(cfg, state, save_state, broker, client, cash)
                 events = source.poll(cfg, state, save_state)
                 for ev in events:
                     if ev.get("event_id") in seen:
@@ -1239,6 +1397,22 @@ def doctor_checks():
           else "policy set but NO AI connected: every entry will be skipped",
           "the OWNER connects an AI in the wizard (step 2), or removes "
           + llm_policy.policy_path(), who="owner")
+
+    if mod is not None and hasattr(mod, "buying_power"):
+        try:
+            cl = mod.client(cfg)
+        except Exception:
+            cl = None
+        bp = _buying_power(mod, cl, cfg)
+        warn = _cash_warning(cfg, bp)
+        dry = bool(cfg.get("dry_run"))
+        check("buying_power", dry or not warn, "Broker buying power",
+              ("couldn't read it" if bp is None else f"${bp:,.2f}")
+              + (f" — {warn}" if warn else "")
+              + (" (dry-run: no orders, so this can't block trades yet)"
+                 if dry and warn else ""),
+              "the OWNER adds cash to the broker account or lowers the "
+              "per-trade budget", who="owner")
 
     notif = bool(cfg.get("discord_webhook_url") or cfg.get("ntfy_topic")
                  or cfg.get("telegram_bot_token"))

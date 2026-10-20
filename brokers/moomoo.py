@@ -17,6 +17,7 @@ are not reliably accepted through OpenD), qty from the same budget sizing as
 the other brokers.
 """
 
+import broker_events
 import platform_compat
 
 _TIMEOUT = 15
@@ -210,6 +211,31 @@ def account_value(cl, cfg):
                 pass
 
 
+def buying_power(cl, cfg):
+    """Cash available for new orders, or None when unreadable."""
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    ctx = None
+    try:
+        sdk = _sdk()
+        ctx = _trade_ctx(cfg, sdk)
+        ret, data = ctx.accinfo_query(trd_env=_trd_env(cfg, sdk))
+        if ret != sdk.RET_OK or data is None or not len(data):
+            return None
+        row = data.iloc[0]
+        for k in ("power", "cash"):
+            if row.get(k) is not None:
+                return float(row.get(k))
+    except Exception:
+        pass
+    finally:
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+    return None
+
+
 def _size(cfg, price):
     if str(cfg.get("sizing_mode")) == "percent":
         # The agent turns % of account into a dollar budget before calling
@@ -234,6 +260,10 @@ def _size(cfg, price):
                int(cfg.get("max_contracts_per_trade", 100))), "fixed contract count"
 
 
+def _fail_kind(side):
+    return "order_failed" if side == "buy" else "exit_failed"
+
+
 def _order(cfg, sdk, code, side, qty, price):
     """Marketable limit at the given price. Returns order id or None."""
     ctx = None
@@ -245,10 +275,14 @@ def _order(cfg, sdk, code, side, qty, price):
             if not pwd:
                 print("  ORDER BLOCKED: live moomoo orders need your trade "
                       "password — re-run setup")
+                broker_events.report(_fail_kind(side), "live moomoo orders need "
+                                     "your trade password — re-run setup")
                 return None
             ret, data = ctx.unlock_trade(pwd)
             if ret != sdk.RET_OK:
                 print(f"  ORDER FAILED: trade unlock rejected: {data}")
+                broker_events.report(_fail_kind(side),
+                                     f"moomoo rejected the trade unlock: {data}")
                 return None
         trd_side = sdk.TrdSide.BUY if side == "buy" else sdk.TrdSide.SELL
         ret, data = ctx.place_order(
@@ -256,6 +290,8 @@ def _order(cfg, sdk, code, side, qty, price):
             trd_side=trd_side, order_type=sdk.OrderType.NORMAL, trd_env=env)
         if ret != sdk.RET_OK:
             print(f"  ORDER FAILED: {data}")
+            broker_events.report(_fail_kind(side),
+                                 f"moomoo rejected the {side} order: {data}")
             return None
         try:
             oid = str(data.iloc[0]["order_id"])
@@ -265,6 +301,7 @@ def _order(cfg, sdk, code, side, qty, price):
         return oid
     except Exception as exc:
         print(f"  ORDER FAILED: {exc}")
+        broker_events.report(_fail_kind(side), f"moomoo order error: {exc}")
         return None
     finally:
         if ctx is not None:
@@ -281,6 +318,7 @@ def execute(cl, cfg, event, state):
         sdk = _sdk()
     except RuntimeError as exc:
         print(f"SKIPPED: {exc}")
+        broker_events.report("broker_no_order", str(exc))
         return False
     contract = f"{event['ticker']} {event['expiry']} ${event['strike']:g} " \
                f"{'CALL' if event['type'] == 'C' else 'PUT'}"
@@ -293,10 +331,16 @@ def execute(cl, cfg, event, state):
         if ask <= 0:
             print(f"SKIPPED {contract}: no quote from OpenD (options quote "
                   "subscription active on the moomoo account?)")
+            broker_events.report("skip_no_quote",
+                                 f"no quote from OpenD for {contract} — is the "
+                                 "options quote subscription active?")
             return False
         qty, note = _size(cfg, ask)
         if qty < 1:
             print(f"SKIPPED {contract}: {note}")
+            broker_events.report(
+                "skip_budget" if "exceeds your" in note else
+                "skip_no_quote" if "no quote" in note else "skip_sizing", note)
             return False
         print(f"ENTERED event -> buying {qty}x {contract} ({note})")
         if _order(cfg, sdk, code, "buy", qty, ask):
@@ -313,6 +357,8 @@ def execute(cl, cfg, event, state):
         if price <= 0:
             print(f"SKIPPED {contract}: no quote from OpenD for exit — "
                   "will retry on the next poll")
+            broker_events.report("exit_failed",
+                                 f"no quote from OpenD to exit {contract}")
             return False
         print(f"EXITED event -> selling {pos['qty']}x {contract}")
         if _order(cfg, sdk, code, "sell", pos["qty"], price):

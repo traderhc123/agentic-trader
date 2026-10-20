@@ -2818,6 +2818,22 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         from brokers import key_brokers
         return {"brokers": key_brokers()}
 
+    def broker_cash(_h):
+        """Buying power for the Launch step: warn before going live with an
+        account that can't pay for a single trade."""
+        from brokers import BROKERS
+        mod = BROKERS.get(cfg.get("broker", ""))
+        if mod is None or not hasattr(mod, "buying_power"):
+            return {"known": False}
+        try:
+            cl = mod.client(cfg)
+        except Exception:
+            cl = None
+        bp = A._buying_power(mod, cl, cfg)
+        return {"known": bp is not None, "buying_power": bp,
+                "warning": A._cash_warning(cfg, bp),
+                "dry_run": bool(cfg.get("dry_run"))}
+
     def broker_connect(_h, data):
         if not A.consent_ok():
             return {"ok": False, "error": "accept the agreement first"}
@@ -3244,6 +3260,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/wallet/balance": wallet_balance,
                     "/api/deploy/status": deploy_status,
                     "/api/brokers": brokers_list,
+                    "/api/broker/cash": broker_cash,
                     "/api/update/check": update_check,
                     "/api/help/netcheck": help_netcheck,
                     "/api/help/report": help_report,
