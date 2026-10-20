@@ -106,6 +106,15 @@ cd ~/agentic-trader
 ./.venv/bin/python agent.py run            # foreground instead (Ctrl-C stops)
 ```
 
+**Moving to another computer:** press **Move computer** on the dashboard. It
+packs your whole setup (settings, broker login, prepaid pass, wallet, open
+positions, history, rules) into one file locked with a passphrase you pick,
+then stops the agent on the old computer so two machines never trade the same
+account. On the new computer run the installer and choose **"Moving from
+another computer?"** on the first setup page. The setup starts there in
+dry-run; say `dry off` when you're ready. (Terminal: `agent.py export FILE` /
+`agent.py import FILE`.)
+
 Only one copy can run at a time — starting a second one (another window,
 start-at-login, the wizard) just points you at the running one, so orders are
 never placed twice. Background output goes to `~/.agentic-trader/agent-run.log`.

@@ -108,6 +108,13 @@ font:12px/1.6 ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:#b4bccb;over
 or print it again with:</p><pre>python agent.py link</pre></div></body></html>"""
 
 
+class RawResponse:
+    """A GET route's non-JSON reply (e.g. a file download)."""
+
+    def __init__(self, body, ctype="application/octet-stream", headers=None):
+        self.body, self.ctype, self.headers = body, ctype, headers or {}
+
+
 def _token_path():
     home = os.path.expanduser(os.getenv("AGENT_HOME", "~/.agentic-trader"))
     return os.path.join(home, "ui_token")
@@ -2329,7 +2336,10 @@ class _Handler(BaseHTTPRequestHandler):
         if fn is None:
             return self._send({"error": "not found"}, 404)
         try:
-            return self._send(fn(self))
+            res = fn(self)
+            if isinstance(res, RawResponse):
+                return self._send_raw(res.body, res.ctype, extra=res.headers)
+            return self._send(res)
         except Exception as exc:
             return self._send({"ok": False, "error": str(exc)[:200]}, 500)
 
@@ -3213,6 +3223,60 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         save()
         return {"ok": True, "note": "plain-English rules saved"}
 
+    # ── move to another computer ──
+    def move_export(_h, data):
+        import transfer
+        try:
+            blob = transfer.export_bundle(str(data.get("passphrase") or ""))
+        except transfer.TransferError as exc:
+            return {"ok": False, "error": str(exc)}
+        pending["move_blob"] = blob
+        return {"ok": True, "filename": transfer.export_filename(),
+                "kb": max(1, len(blob) // 1024)}
+
+    def move_download(_h):
+        import transfer
+        blob = pending.get("move_blob")
+        if not blob:
+            return {"ok": False, "error": "create the move file first"}
+        return RawResponse(blob, "application/octet-stream", {
+            "Content-Disposition":
+                f'attachment; filename="{transfer.export_filename()}"'})
+
+    def move_finish(_h, _data):
+        """After the owner saved the file: retire this computer so the two
+        can never both trade."""
+        import transfer
+        note = transfer.mark_moved_away()
+        pending.pop("move_blob", None)
+        if get_status is not None:  # the agent is running: stop it
+            CONTROLS["stop"] = True
+            note += "; the agent here is stopping"
+        return {"ok": True, "note": note}
+
+    def move_import(_h, data):
+        import base64
+        import keep_running
+        import transfer
+        if get_status is not None or keep_running.is_running():
+            return {"ok": False, "error": "stop the agent on this computer first "
+                    "(dashboard: stop, or python agent.py stop)"}
+        try:
+            blob = base64.b64decode(str(data.get("data") or ""), validate=False)
+            info = transfer.import_bundle(blob, str(data.get("passphrase") or ""),
+                                          replace=bool(data.get("replace")))
+        except transfer.TransferError as exc:
+            if str(exc) == "NEEDS_REPLACE":
+                return {"ok": False, "needs_replace": True,
+                        "error": "this computer already has a setup — replace it?"}
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "error": f"import failed: {str(exc)[:150]}"}
+        # the wizard keeps config in memory: reload it from the imported file
+        cfg.clear()
+        cfg.update(A._load(A.CONFIG_PATH, {}) or {})
+        return {"ok": True, **info}
+
     def policy_disable(_h, _data):
         import llm_policy
         moved = llm_policy.disable_policy()
@@ -3239,6 +3303,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         import llm_policy
         if llm_policy.entries_blocked(cfg):
             return {"ok": False, "error": llm_policy.BLOCKED_MSG}
+        import transfer
+        if transfer.moved_away():
+            return {"ok": False, "error": (
+                "this setup was moved to another computer, so it won't start "
+                "here — to run it here again, stop the other computer and run: "
+                "python agent.py resume-here")}
         save()
         import keep_running
         auto_note = ""
@@ -3296,7 +3366,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/pass/options": pass_options_route,
                     "/api/status": d_status, "/api/trades": d_trades,
                     "/api/proposal": proposal_get,
-                    "/api/autostart": autostart_get}
+                    "/api/autostart": autostart_get,
+                    "/api/move/download": move_download}
     def ask(_h, data):
         q = str(data.get("question", "")).strip()
         wiz_state = {k: v for k, v in state(None).items() if k != "disclaimer"}
@@ -3316,6 +3387,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/policy/disable": policy_disable,
                      "/api/start-local": start_local,
                      "/api/policy": policy_save,
+                     "/api/move/export": move_export,
+                     "/api/move/finish": move_finish,
+                     "/api/move/import": move_import,
                      "/api/autostart": autostart_set,
                      "/api/wallet/create": wallet_create,
                      "/api/pass/buy": pass_buy,
