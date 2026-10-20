@@ -417,8 +417,12 @@ def _resolve_percent(cfg, broker, client):
     return {**cfg, "sizing_mode": "budget", "budget_per_trade_usd": budget}, ""
 
 
-def _execute_dry(cfg, event, state, broker=None, client=None):
-    """Dry-run bookkeeping: identical position tracking, zero orders."""
+def _execute_dry(cfg, event, state, broker=None, client=None, on_skip=None):
+    """Dry-run bookkeeping: identical position tracking, zero orders.
+
+    on_skip(kind, note) is called when a live run would have skipped the
+    entry too (budget too small, no quote), so dry-run shows the same
+    "didn't happen" reasons as live."""
     contract = f"{event['ticker']} {event['expiry']} ${event['strike']:g} " \
                f"{'CALL' if event['type'] == 'C' else 'PUT'}"
     pos_key = f"{event['ticker']}|{event['expiry']}|{event['strike']}|{event['type']}"
@@ -435,6 +439,10 @@ def _execute_dry(cfg, event, state, broker=None, client=None):
                 pass
         if qty < 1:
             print(f"[DRY-RUN] would SKIP {contract}: {note}")
+            if on_skip is not None:
+                on_skip("skip_budget" if "exceeds your" in note else
+                        "skip_no_quote" if "no quote" in note else
+                        "skip_sizing", note)
             return None
         state["positions"][pos_key] = {"option_id": "dry", "qty": qty, "dry": True}
         print(f"[DRY-RUN] would buy {qty}x {contract} ({note})")
@@ -474,7 +482,7 @@ _problems_logged = set()  # (event_id, kind) already written this run
 
 
 def _report_problem(cfg, state, save_state, kind, contract, message,
-                    event_id=None, dry=False):
+                    event_id=None, dry=False, book=None):
     """Write a 'why this trade didn't happen' row to the trade log (what the
     dashboard shows) and notify at most once per kind per day."""
     import broker_events
@@ -491,6 +499,8 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
         rec["hint"] = hint
     if dry:
         rec["dry"] = True
+    if book:
+        rec["book"] = book
     _log_trade(rec)
     if kind not in broker_events.NOTIFY or dry:
         return
@@ -563,11 +573,17 @@ def _refresh_cash(cfg, state, save_state, broker, client, cash):
     notify(cfg, "agentic-trader WARNING: " + warn)
 
 
+# Your own limits and rules: not problems, but still a reason a signal didn't
+# become a trade, so the dashboard lists them with the rest.
+_OWN_SKIPS = {"skip_daily_cap", "skip_position_cap", "skip_daily_loss",
+              "skip_rule", "policy_veto"}
+
+
 def _problems_today():
     """Today's 'trade didn't happen' rows, grouped for the dashboard."""
     import broker_events
     today = datetime.now(timezone.utc).date().isoformat()
-    kinds = set(broker_events.KINDS) | {"skip_stale", "skip_sizing"}
+    kinds = set(broker_events.KINDS) | {"skip_stale", "skip_sizing"} | _OWN_SKIPS
     out = {}
     for t in _recent_trades(300):
         if t.get("action") not in kinds or not str(t.get("ts", "")).startswith(today):
@@ -579,9 +595,48 @@ def _problems_today():
     return sorted(out.values(), key=lambda p: p["at"], reverse=True)
 
 
+_COST_RE = re.compile(r"1 contract ≈ \$([\d,]+)")
+
+
+def _budget_hints(cfg):
+    """Per book: today's entries that cost more than the budget, what they
+    cost, and a budget that would have covered most of them. Built from the
+    agent's own skip messages (the feed carries no prices). [] when none."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    costs = {}
+    for t in _recent_trades(500):
+        if t.get("action") != "skip_budget" or not str(t.get("ts", "")).startswith(today):
+            continue
+        m = _COST_RE.search(str(t.get("reason", "")))
+        if m:
+            costs.setdefault(t.get("book") or "main", []).append(
+                float(m.group(1).replace(",", "")))
+    out = []
+    for book, vals in sorted(costs.items()):
+        prefix = "other_" if book == "shadow" else ""
+        bcfg = _sizing_cfg(cfg, {"track": "other" if book == "shadow" else "main"})
+        if str(bcfg.get("sizing_mode")) != "budget":
+            continue  # sizing changed since — the hint no longer applies
+        budget = float(bcfg.get("budget_per_trade_usd") or 0)
+        vals.sort()
+        # cover ~3 of 4 skipped trades, rounded up to $50
+        pick = vals[min(len(vals) - 1, (len(vals) * 3) // 4)]
+        suggest = int(-(-pick // 50) * 50)
+        if suggest <= budget:
+            continue
+        out.append({
+            "book": book, "budget": budget, "skipped": len(vals),
+            "min_cost": vals[0], "max_cost": vals[-1], "suggest": suggest,
+            "would_take": sum(1 for v in vals if v <= suggest),
+            "command": (f"set {'other ' if prefix else ''}budget {suggest}"),
+        })
+    return out
+
+
 def handle_event(ev, cfg, state, broker, client, save_state):
     """Run one new event through the safety pipeline. Returns a log line or None."""
     contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
+    book = "main" if str(ev.get("track", "main")) == "main" else "shadow"
 
     if not _valid_event(ev):
         print(f"skipped invalid event from source: {str(ev)[:120]}")
@@ -593,7 +648,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         _report_problem(cfg, state, save_state, "skip_stale", contract,
                         f"signal was {int(cfg.get('max_event_age_s', 300))}s+ old "
                         "when the agent saw it (computer asleep or offline?)",
-                        event_id=ev["event_id"])
+                        event_id=ev["event_id"], book=book)
         return msg
 
     if ev["event"] == "ENTERED":
@@ -602,7 +657,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         if _entries_today() >= cap:
             msg = f"SKIPPED {contract}: daily entry cap reached ({cap})"
             print(msg)
-            _log_trade({"action": "skip_daily_cap", "event_id": ev["event_id"],
+            _log_trade({"action": "skip_daily_cap", "book": book, "event_id": ev["event_id"],
                         "contract": contract})
             return msg
         # Concurrent-exposure cap: the daily cap resets every day, so without
@@ -612,7 +667,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             msg = (f"SKIPPED {contract}: max open positions reached "
                    f"({pos_cap}) — close positions or raise max_open_positions")
             print(msg)
-            _log_trade({"action": "skip_position_cap", "event_id": ev["event_id"],
+            _log_trade({"action": "skip_position_cap", "book": book, "event_id": ev["event_id"],
                         "contract": contract})
             return msg
         # Max daily loss (opt-in): once today's estimated realized loss reaches
@@ -625,7 +680,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                        f"(est. ${-pnl:,.0f} of ${loss_cap:,.0f}) — no new "
                        "entries until tomorrow")
                 print(msg)
-                _log_trade({"action": "skip_daily_loss", "event_id": ev["event_id"],
+                _log_trade({"action": "skip_daily_loss", "book": book, "event_id": ev["event_id"],
                             "contract": contract})
                 return msg
         # Built-in rules (plain settings, no AI): tickers, calls/puts, min
@@ -635,7 +690,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         if not ok:
             msg = f"SKIPPED {contract}: {why} (your rules)"
             print(msg)
-            _log_trade({"action": "skip_rule", "event_id": ev["event_id"],
+            _log_trade({"action": "skip_rule", "book": book, "event_id": ev["event_id"],
                         "contract": contract, "reason": why})
             return msg
         # The user's own policy, applied by the LLM policy brain (veto-only).
@@ -643,7 +698,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         if not verdict["act"]:
             msg = f"POLICY VETO {contract}: {verdict['reason']}"
             print(msg)
-            _log_trade({"action": "policy_veto", "event_id": ev["event_id"],
+            _log_trade({"action": "policy_veto", "book": book, "event_id": ev["event_id"],
                         "contract": contract, "reason": verdict["reason"]})
             if verdict.get("ai_problem"):
                 _notify_ai_problem_once(cfg, state, save_state, contract,
@@ -665,11 +720,15 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             msg = f"{'[DRY-RUN] ' if dry else ''}SKIPPED {contract}: {skip}"
             print(msg)
             _report_problem(cfg, state, save_state, "skip_sizing", contract, skip,
-                            event_id=ev["event_id"], dry=dry)
+                            event_id=ev["event_id"], dry=dry, book=book)
             return msg
     prior_pos = dict(existing) if existing else None  # qty/entry mark for P&L
     if dry:
-        action = _execute_dry(ecfg, ev, state, broker, client)
+        action = _execute_dry(
+            ecfg, ev, state, broker, client,
+            on_skip=lambda kind, note: _report_problem(
+                cfg, state, save_state, kind, contract, note,
+                event_id=ev["event_id"], dry=True, book=book))
         prefix = "[DRY-RUN] "
     else:
         import broker_events
@@ -685,12 +744,12 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 if bp is not None:
                     msg += f" (buying power now ${bp:,.2f})"
             _report_problem(cfg, state, save_state, r["kind"], contract, msg,
-                            event_id=ev["event_id"])
+                            event_id=ev["event_id"], book=book)
         if not action and ev["event"] == "ENTERED" and not existing and not reported:
             _report_problem(cfg, state, save_state, "broker_no_order", contract,
                             "the broker adapter didn't place the order and gave "
                             "no reason — see agent-run.log",
-                            event_id=ev["event_id"])
+                            event_id=ev["event_id"], book=book)
         if not action and ev["event"] == "EXITED":
             held = state["positions"].get(pos_key)
             if held and not held.get("pending"):
@@ -1222,6 +1281,7 @@ def cmd_run(app_window=False):
             },
             "cash_warning": cash.get("warning", ""),
             "problems": _problems_today(),
+            "budget_hints": _budget_hints(c),
             "would_have": dry_run_preview.summary(c),
         }
 

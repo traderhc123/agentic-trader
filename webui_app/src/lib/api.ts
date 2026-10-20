@@ -59,6 +59,7 @@ export interface StatusResp {
   fields: Record<string, string>;
   cash_warning?: string;
   problems?: Problem[];
+  budget_hints?: BudgetHint[];
   would_have?: WouldHave | null;
 }
 export interface WouldHaveRow {
@@ -83,6 +84,16 @@ export interface WouldHave {
   updated_at?: number | null;
   error?: string;
   unavailable?: boolean;
+}
+export interface BudgetHint {
+  book: "main" | "shadow";
+  budget: number;
+  skipped: number;
+  min_cost: number;
+  max_cost: number;
+  suggest: number;
+  would_take: number;
+  command: string;
 }
 export interface Problem {
   kind: string;
