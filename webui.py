@@ -2668,6 +2668,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "rule_min_strike", "rule_skip_0dte", "rule_loss_streak")},
             "rules_summary": __import__("rules").describe(cfg),
             "policy_on": __import__("llm_policy").enabled(cfg),
+            # the agent itself is serving this page (vs. the setup wizard)
+            "running": get_status is not None,
         }
 
     def consent(_h, data):
@@ -3258,13 +3260,30 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         import base64
         import keep_running
         import transfer
-        if get_status is not None or keep_running.is_running():
+        running_here = get_status is not None
+        if not running_here and keep_running.is_running():
             return {"ok": False, "error": "stop the agent on this computer first "
                     "(dashboard: stop, or python agent.py stop)"}
         try:
             blob = base64.b64decode(str(data.get("data") or ""), validate=False)
-            info = transfer.import_bundle(blob, str(data.get("passphrase") or ""),
-                                          replace=bool(data.get("replace")))
+            pw = str(data.get("passphrase") or "")
+            transfer.decrypt(blob, pw)  # fail fast before pausing anything
+            if transfer.existing_setup() and not data.get("replace"):
+                raise transfer.TransferError("NEEDS_REPLACE")
+            if running_here:
+                # The agent is serving this page: stop new polls and let any
+                # in-flight event finish its state save, so nothing in memory
+                # overwrites the imported files. A restart then loads them.
+                import time as _t
+                CONTROLS["paused"] = True
+                _t.sleep(2.0)
+            try:
+                info = transfer.import_bundle(blob, pw,
+                                              replace=bool(data.get("replace")))
+            except Exception:
+                if running_here:
+                    CONTROLS["paused"] = False  # nothing changed: carry on
+                raise
         except transfer.TransferError as exc:
             if str(exc) == "NEEDS_REPLACE":
                 return {"ok": False, "needs_replace": True,
@@ -3275,6 +3294,17 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         # the wizard keeps config in memory: reload it from the imported file
         cfg.clear()
         cfg.update(A._load(A.CONFIG_PATH, {}) or {})
+        if running_here:
+            import sys as _sys
+
+            def _restart():
+                import time as _t
+                _t.sleep(1.5)  # let this response reach the browser
+                os.environ["AGENT_UPDATE_RESTARTED"] = "1"
+                import platform_compat
+                platform_compat.restart_self(list(_sys.argv), APP_PORT)
+            threading.Thread(target=_restart, daemon=True).start()
+            info["restarting"] = True
         return {"ok": True, **info}
 
     def policy_disable(_h, _data):

@@ -6,7 +6,6 @@ import { ChoiceRow, Field, Input, Select, Textarea } from "../components/ui/fiel
 import { Msg, err, info, ok, type MsgT } from "../components/ui/tag";
 import { api } from "../lib/api";
 import { mdLite } from "../lib/md";
-import { MoveImport } from "./MoveImport";
 import { Block, Notice, StepCard, useWiz } from "./Wizard";
 
 export function BackBtn() {
@@ -60,11 +59,6 @@ export function ConsentStep() {
         </>
       }
     >
-      {!isDone("consent") && (
-        <Block>
-          <MoveImport />
-        </Block>
-      )}
       <Block>
         <div
           tabIndex={0}
