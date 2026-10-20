@@ -86,7 +86,7 @@ def enabled(cfg):
 
 BLOCKED_MSG = ("You have a trading policy but no AI connected, so EVERY entry "
                "will be skipped (the agent can't check your rules without an "
-               "AI). Connect your AI in Setup step 2, or remove the policy.")
+               "AI). Connect your AI in Setup (AI step), or remove the policy.")
 
 
 def entries_blocked(cfg):
