@@ -910,10 +910,23 @@ def _book_desc(cfg, prefix=""):
     return f"{int(cfg.get(f'{prefix}contracts_per_trade', 1) or 1)} contract(s)/trade"
 
 
+def shadow_sizing_unused(cfg):
+    """True when the shadow book has its own sizing but the AgentHC source is
+    set to main pick only — that sizing can never be used, because no "other
+    trades" signals are requested. (Other sources may send any track.)"""
+    return (cfg.get("source", "agenthc") == "agenthc"
+            and not cfg.get("include_other_trades")
+            and str(cfg.get("other_sizing_mode") or "") in SIZING_MODES)
+
+
 def _sizing_desc(cfg):
     desc = _book_desc(cfg)
     if str(cfg.get("other_sizing_mode") or "") in SIZING_MODES:
-        desc += f" (other trades: {_book_desc(cfg, 'other_')})"
+        desc += f" (other trades: {_book_desc(cfg, 'other_')}"
+        if shadow_sizing_unused(cfg):
+            desc += (" — NOT USED: your signal source is main pick only; "
+                     "say 'other trades on' to include them")
+        desc += ")"
     return desc
 
 
@@ -1127,6 +1140,15 @@ def _apply_command(text):
             return True, f"{err}. Usage: set contracts 1"
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Main pick sizing set to {_book_desc(cfg)}."
+    if t in ("other trades on", "other trades off"):
+        if cfg.get("source", "agenthc") != "agenthc":
+            return True, "That setting is for the AgentHC signal source only."
+        cfg["include_other_trades"] = t.endswith("on")
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, ("Now getting the main pick + \"other trades\" (shadow book) "
+                      "signals, sized with: " + _sizing_desc(cfg) + "."
+                      if cfg["include_other_trades"] else
+                      "Now getting the main pick only — no \"other trades\" signals.")
     if t in ("other sizing same", "clear other sizing"):
         set_book_sizing(cfg, "other", "same", None)
         _save(CONFIG_PATH, cfg, private=True)

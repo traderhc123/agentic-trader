@@ -23,7 +23,9 @@ interface Invoice {
 export function SourceStep() {
   const { st, done, isDone } = useWiz();
   const [src, setSrc] = useState<string>(st?.source || "agenthc");
-  const [scope, setScope] = useState("main");
+  // Start from the saved choice: re-saving this step (e.g. to buy a pass)
+  // must never silently switch "other trades" off.
+  const [scope, setScope] = useState(st?.include_other_trades ? "all" : "main");
   const [srcUrl, setSrcUrl] = useState("");
   const [lnUrl, setLnUrl] = useState("");
   const [lnKey, setLnKey] = useState("");

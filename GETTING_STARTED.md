@@ -182,6 +182,9 @@ docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trad
   `"budget"`/`"contracts"`/`"percent"` with `"budget_per_trade_usd"` /
   `"contracts_per_trade"` / `"percent_per_trade"`; the same keys prefixed
   `other_` for the shadow book — unset = same as the main book).
+  The shadow book's size is only used when your signal source includes
+  "other trades" (Signal source step, or chat `other trades on`); the Sizing
+  step and the dashboard warn you when it doesn't.
   Percent mode re-reads your account value from the broker at each entry and
   turns it into a dollar budget for that trade; if the value can't be read,
   the entry is skipped rather than guessed. `max_contracts_per_trade` caps

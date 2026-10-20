@@ -485,7 +485,7 @@ const SZ_UNITS: Record<string, [string, string]> = {
   percent: ["Percent of account per trade", "e.g. 2"],
 };
 export function SizingStep() {
-  const { st, done, isDone } = useWiz();
+  const { st, done, isDone, reloadState } = useWiz();
   // Pre-fill from the saved config so re-saving never silently clears a
   // book's size. Nothing on file = no main mode picked rather than claim a
   // choice never made.
@@ -495,6 +495,14 @@ export function SizingStep() {
   const [omode, setOmode] = useState<string>(sd?.other && SZ_UNITS[sd.other.mode] ? sd.other.mode : "same");
   const [oval, setOval] = useState(sd?.other ? String(sd.other.value ?? "") : "");
   const [msg, setMsg] = useState<MsgT>(null);
+  const [scopeMsg, setScopeMsg] = useState<MsgT>(null);
+  // Shadow sizing only matters when the AgentHC source asks for "other trades".
+  const mainOnly = (st?.source || "agenthc") === "agenthc" && !st?.include_other_trades;
+  const includeOther = async () => {
+    const r = await api("/api/source/scope", { scope: "all" });
+    setScopeMsg(r.ok ? ok("Signal source now includes other trades") : err(r.error));
+    if (r.ok) reloadState();
+  };
 
   const save = async () => {
     if (!mode) return setMsg(err("Choose how the main book is sized."));
@@ -558,6 +566,20 @@ export function SizingStep() {
         )}
       </Block>
       <Block label="Shadow book" desc={'"Other trades". Only used if your source includes them.'}>
+        {mainOnly && omode !== "same" && (
+          <div className="mb-3">
+            <Notice role="alert">
+              <b>Your signal source is set to main pick only</b>, so this shadow-book size is never used: the agent
+              doesn't receive any "other trades" signals.
+              <div className="mt-2 flex flex-wrap items-center gap-3">
+                <Button size="sm" onClick={includeOther}>
+                  Include other trades
+                </Button>
+                <Msg m={scopeMsg} />
+              </div>
+            </Notice>
+          </div>
+        )}
         <div role="radiogroup" aria-label="Shadow book sizing" className="flex flex-col gap-2">
           <ChoiceRow type="radio" name="szomode" value="same" checked={omode === "same"} onChange={() => setOmode("same")}>
             Same as the main book

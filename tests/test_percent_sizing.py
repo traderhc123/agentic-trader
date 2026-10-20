@@ -185,7 +185,8 @@ def test_robinhood_account_value_falls_back_to_buying_power(monkeypatch):
 
 def test_sizing_desc_both_books():
     cfg = {"sizing_mode": "percent", "percent_per_trade": 2,
-           "other_sizing_mode": "contracts", "other_contracts_per_trade": 1}
+           "other_sizing_mode": "contracts", "other_contracts_per_trade": 1,
+           "include_other_trades": True}
     assert agent._sizing_desc(cfg) == \
         "2% of account/trade (other trades: 1 contract(s)/trade)"
 
