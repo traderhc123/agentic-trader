@@ -1329,7 +1329,8 @@ async function boot(){
     // Key on file: leave the box blank and press Find models to switch model.
     document.getElementById('llm-key').placeholder='saved key on file — leave blank and press Find models to change model';}
   if(st.source){done('s-source');restoredNote('s-source',notes.source||('Source saved: '+st.source));
-    const sel=document.getElementById('src');sel.value=st.source;srcChanged();}
+    const sel=document.getElementById('src');sel.value=st.source;srcChanged();
+    document.getElementById('hc-scope').value=st.include_other_trades?'all':'main';}
   if(st.wallet&&st.wallet.connected){showWallet(st.wallet.page,'wallet connected ✓');
     document.getElementById('adv-wallet').open=true;}
   if(st.pass)checkPass();
@@ -2657,6 +2658,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "policy_blocks_entries": __import__("llm_policy").entries_blocked(cfg),
             "sizing": bool(cfg.get("sizing_mode")),
             "sizing_detail": _sizing_detail(cfg),
+            "include_other_trades": bool(cfg.get("include_other_trades")),
             "safety": cfg.get("max_entries_per_day") is not None,
             "notes": _restore_notes(cfg, A._load(A.ACCEPTANCE_PATH, {})),
             "wallet": {
@@ -3157,6 +3159,17 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         save()
         return {"ok": True}
 
+    def source_scope(_h, data):
+        """Just the "which signals" choice (main / main + other trades), so the
+        Sizing step can fix a mismatch without re-saving the whole source."""
+        if cfg.get("source", "agenthc") != "agenthc":
+            return {"ok": False, "error": "only the AgentHC source has this setting"}
+        if data.get("scope") not in ("main", "all"):
+            return {"ok": False, "error": "scope must be main or all"}
+        cfg["include_other_trades"] = data["scope"] == "all"
+        save()
+        return {"ok": True}
+
     def safety(_h, data):
         perr = _policy_save_error(cfg, data.get("policy", ""),
                                   data.get("anthropic_key", ""))
@@ -3419,6 +3432,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         return {"reply": reply}
 
     W.routes_post = {"/api/consent": consent, "/api/source": source,
+                     "/api/source/scope": source_scope,
                      "/api/sizing": sizing, "/api/safety": safety,
                      "/api/finish": finish, "/api/ask": ask,
                      "/api/policy/disable": policy_disable,
@@ -3686,7 +3700,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "modify, or size trades — for control, tell the user the "
                 "exact command (pause, resume, dry on/off, set budget N, "
                 "set contracts N, set percent N, set other budget|contracts|"
-                "percent N, other sizing same, set positions N, "
+                "percent N, other sizing same, other trades on|off, set positions N, "
                 "set cap N, stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
