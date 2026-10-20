@@ -111,10 +111,11 @@ def test_unsafe_paths_rejected(tmp_path, monkeypatch, evil):
 
 
 def test_moved_away_computer_refuses_to_run(home, capsys, monkeypatch, tmp_path):
-    monkeypatch.setattr(keep_running, "IS_WINDOWS", False)
-    monkeypatch.setattr(keep_running, "IS_MAC", False)
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-    keep_running.enable_autostart()
+    # OS-neutral stand-in for the login entry (the real one differs per OS)
+    entry = tmp_path / "autostart-entry"
+    entry.write_text("x")
+    monkeypatch.setattr(keep_running, "autostart_paths", lambda: [str(entry)])
+    assert keep_running.autostart_enabled()
     transfer.mark_moved_away()
     assert not keep_running.autostart_enabled()
     with pytest.raises(SystemExit) as e:
