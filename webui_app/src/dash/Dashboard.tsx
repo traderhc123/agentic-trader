@@ -7,7 +7,7 @@ import { ConfirmDialog } from "../components/ui/dialog";
 import { Input } from "../components/ui/field";
 import { Count, Panel } from "../components/ui/panel";
 import { ModeTag, RightTag } from "../components/ui/tag";
-import { api, type Problem, type Proposal, type StatusResp, type Trade, type WouldHave } from "../lib/api";
+import { api, type BudgetHint, type Problem, type Proposal, type StatusResp, type Trade, type WouldHave } from "../lib/api";
 import { cn } from "../lib/cn";
 import { copyToClipboard, useInterval } from "../lib/hooks";
 import { cap1, hhmm, isToday, money, parseContract, parsePositions, shortDate, whenShort, type Contract } from "../lib/format";
@@ -32,6 +32,9 @@ const SKIPS: Record<string, string> = {
   exit_partial: "exit only partly filled",
   broker_no_order: "the broker didn't place the order",
 };
+
+/** "$1,250" — whole dollars, no sign (budgets and contract costs). */
+const usd = (v: number) => "$" + Math.round(v).toLocaleString("en-US");
 
 type Conn = "loading" | "ok" | "off" | "unreachable";
 
@@ -176,7 +179,7 @@ export function Dashboard() {
       <main className="mx-auto max-w-[1440px] px-6 pb-10 pt-5 max-sm:px-4 max-sm:pt-4">
         <ModeBanner conn={conn} live={live} paused={paused} />
         <StatusStrip conn={conn} f={f} />
-        {conn === "ok" && <WhyNoTrades warning={status?.cash_warning || ""} problems={status?.problems || []} live={live} />}
+        {conn === "ok" && <WhyNoTrades warning={status?.cash_warning || ""} problems={status?.problems || []} hints={status?.budget_hints || []} live={live} onCommand={send} />}
 
         <div className="mt-4 grid grid-cols-[minmax(0,1fr)_400px] items-start gap-4 max-xl:grid-cols-1">
           <div className="flex min-w-0 flex-col gap-4">
@@ -277,8 +280,22 @@ function WouldHavePanel({ p }: { p: WouldHave }) {
 }
 
 // ── why trades didn't happen today ──────────────────────────────────────────
-function WhyNoTrades({ warning, problems, live }: { warning: string; problems: Problem[]; live: boolean }) {
-  if (!warning && !problems.length) return null;
+function WhyNoTrades({
+  warning,
+  problems,
+  hints,
+  live,
+  onCommand,
+}: {
+  warning: string;
+  problems: Problem[];
+  hints: BudgetHint[];
+  live: boolean;
+  onCommand: (text: string) => void;
+}) {
+  const [ask, setAsk] = useState<BudgetHint | null>(null);
+  if (!warning && !problems.length && !hints.length) return null;
+  const who = (h: BudgetHint) => (h.book === "shadow" ? "Other trades (shadow book)" : "Main pick");
   return (
     <div role="alert" className="mt-4 rounded-md border border-warn/45 bg-warn/[0.07] px-4 py-3 text-sm text-fg2">
       <div className="flex items-start gap-3">
@@ -305,8 +322,37 @@ function WhyNoTrades({ warning, problems, live }: { warning: string; problems: P
               ))}
             </ul>
           )}
+          {hints.map((h) => (
+            <div key={h.book} className="rounded-md border border-line2 bg-panel px-3 py-2">
+              <p className="m-0">
+                <b className="text-fg">{who(h)}: </b>
+                {h.skipped} {h.skipped === 1 ? "signal" : "signals"} today cost more than your {usd(h.budget)} per-trade
+                budget. One contract ran {usd(h.min_cost)}
+                {h.max_cost > h.min_cost ? ` to ${usd(h.max_cost)}` : ""}. A {usd(h.suggest)} budget would have taken{" "}
+                {h.would_take} of {h.skipped}.
+              </p>
+              <Button size="sm" className="mt-2" onClick={() => setAsk(h)}>
+                Set budget to {usd(h.suggest)}
+              </Button>
+            </div>
+          ))}
         </div>
       </div>
+      <ConfirmDialog
+        open={!!ask}
+        onOpenChange={(o) => !o && setAsk(null)}
+        title="Raise your per-trade budget?"
+        confirmLabel={ask ? `Set ${usd(ask.suggest)}` : "Set"}
+        onConfirm={() => ask && onCommand(ask.command)}
+      >
+        {ask && (
+          <>
+            {who(ask)} will spend up to <b className="text-fg">{usd(ask.suggest)}</b> per trade instead of{" "}
+            {usd(ask.budget)}
+            {live ? ", with real money" : ""}. You can change it back any time in Settings. Your decision, not advice.
+          </>
+        )}
+      </ConfirmDialog>
     </div>
   );
 }
