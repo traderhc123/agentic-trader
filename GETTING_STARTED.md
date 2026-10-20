@@ -92,6 +92,11 @@ button. Every decision and all day-to-day use happens in your browser.
    type `stop` in the dashboard, or run `python agent.py stop`. Only one copy
    ever runs — opening it again just takes you to the dashboard.
 
+   **New computer?** Press **Move computer** on the dashboard: it saves one
+   passphrase-locked file with your whole setup and stops the agent on the
+   old computer. On the new one, run the same installer and pick **"Moving
+   from another computer?"** on the first setup page. No re-setup needed.
+
    The dashboard is login-protected: the
    browser that opened it stays logged in; anywhere else (another browser, a
    remote server), run `python agent.py link` and open the link it prints.

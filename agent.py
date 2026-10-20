@@ -18,6 +18,10 @@ Robinhood's trading MCP).
     python agent.py stop     # stop the background agent
     python agent.py autostart on|off|status   # start at every login
     python agent.py status   # running?, config, wallet balance, open positions
+    python agent.py export FILE   # pack this setup into one passphrase-locked
+                             # file to move it to another computer
+    python agent.py import FILE   # unpack a move file on the new computer
+    python agent.py resume-here   # run a moved-away setup here again
     python agent.py doctor   # check EVERYTHING (config, wallet, feed, broker)
                              # and print the exact command to fix each problem
                              # (--json: machine-readable, for AI assistants)
@@ -1108,6 +1112,14 @@ def cmd_run(app_window=False):
         print("Stop it with: python agent.py stop")
         sys.exit(0)
     keep_running.clear_stop()
+    import transfer
+    moved = transfer.moved_away()
+    if moved:
+        print(f"This setup was moved to another computer ({moved.get('moved_at', '?')}). "
+              "Not starting here, so the two computers can't both trade.")
+        print("Running it on THIS computer again? First stop the other one, then: "
+              "python agent.py resume-here")
+        sys.exit(0)
     require_consent_or_exit()
     cfg = _load(CONFIG_PATH)
     from brokers import broker_ready as _broker_ready
@@ -1669,6 +1681,12 @@ def cmd_start():
     if not _is_ready():
         print("Not set up yet — run: python agent.py setup --web")
         sys.exit(1)
+    import transfer
+    if transfer.moved_away():
+        print("This setup was moved to another computer, so it won't start here. "
+              "To run it here again (stop the other one first): "
+              "python agent.py resume-here")
+        sys.exit(1)
     proc = keep_running.start_background(port=webui.APP_PORT)
     print("Starting the agent in the background…")
     if keep_running.wait_until_running(timeout=40, proc=proc):
@@ -1684,6 +1702,70 @@ def cmd_start():
     for line in keep_running.last_log_lines():
         print("  " + line)
     sys.exit(1)
+
+
+def cmd_export(path):
+    import getpass
+    import keep_running
+    import transfer
+    if not path:
+        path = transfer.export_filename()
+    pw = getpass.getpass("Pick a passphrase for the move file (8+ characters): ")
+    if getpass.getpass("Type it again: ") != pw:
+        print("The passphrases didn't match — nothing exported.")
+        sys.exit(1)
+    try:
+        blob = transfer.export_bundle(pw)
+    except transfer.TransferError as exc:
+        print(f"Export failed: {exc}")
+        sys.exit(1)
+    with open(path, "wb") as f:
+        f.write(blob)
+    print(f"Saved {path} ({len(blob) // 1024} KB). It holds your broker login and "
+          "wallet keys — keep it like a password, and delete it after the move.")
+    if input("Stop the agent on THIS computer now so only the new one trades? "
+             "[Y/n] ").strip().lower() in ("", "y", "yes"):
+        if keep_running.is_running():
+            keep_running.stop()
+        print(transfer.mark_moved_away())
+    print("On the new computer: run the installer, then in the setup page choose "
+          "\"Moving from another computer?\" (or: python agent.py import FILE).")
+
+
+def cmd_import(path):
+    import getpass
+    import keep_running
+    import transfer
+    if not path or not os.path.exists(path):
+        print("Usage: python agent.py import <move file>")
+        sys.exit(1)
+    if keep_running.is_running():
+        print("Stop the agent on this computer first: python agent.py stop")
+        sys.exit(1)
+    with open(path, "rb") as f:
+        blob = f.read()
+    pw = getpass.getpass("Passphrase for the move file: ")
+    replace = False
+    while True:
+        try:
+            info = transfer.import_bundle(blob, pw, replace=replace)
+            break
+        except transfer.TransferError as exc:
+            if str(exc) == "NEEDS_REPLACE" and not replace:
+                if input("This computer already has a setup. Replace it? [y/N] "
+                         ).strip().lower() in ("y", "yes"):
+                    replace = True
+                    continue
+                print("Nothing changed.")
+                sys.exit(1)
+            print(f"Import failed: {exc}")
+            sys.exit(1)
+    print(f"Imported your setup ({info['files']} files, from {info['from_os']}, "
+          f"{info['created_at']}).")
+    print("It starts in DRY-RUN. Make sure the old computer is off, then say "
+          "`dry off` in the dashboard" + (" to go live again." if info["was_live"]
+                                         else " when you want to go live."))
+    print("Start it: python agent.py start")
 
 
 def cmd_stop():
@@ -1780,6 +1862,15 @@ def main():
         cmd_start()
     elif cmd == "stop":
         cmd_stop()
+    elif cmd == "export":
+        cmd_export(sys.argv[2] if len(sys.argv) > 2 else "")
+    elif cmd == "import":
+        cmd_import(sys.argv[2] if len(sys.argv) > 2 else "")
+    elif cmd == "resume-here":
+        import transfer
+        print("OK — this computer may run the agent again. Make sure the other "
+              "computer is stopped." if transfer.resume_here()
+              else "This setup wasn't marked as moved away.")
     elif cmd == "supervise":
         cmd_supervise()
     elif cmd == "autostart":

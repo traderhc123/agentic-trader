@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowDownRight, ArrowUpRight, CircleHelp, Minus, Pause, Play, Settings, ShieldCheck, Zap } from "lucide-react";
+import { AlertTriangle, ArrowDownRight, ArrowUpRight, CircleHelp, Laptop, Minus, Pause, Play, Settings, ShieldCheck, Zap } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { AppBar, Pill } from "../components/AppBar";
 import { ChatLog, nextMsgId, type ChatMsg } from "../components/Chat";
@@ -11,6 +11,7 @@ import { api, type Problem, type Proposal, type StatusResp, type Trade } from ".
 import { cn } from "../lib/cn";
 import { copyToClipboard, useInterval } from "../lib/hooks";
 import { cap1, hhmm, isToday, money, parseContract, parsePositions, shortDate, whenShort, type Contract } from "../lib/format";
+import { MovePanel } from "./MovePanel";
 import { PnlChart, type PnlPoint } from "./PnlChart";
 
 const SOURCES: Record<string, string> = { agenthc: "AgentHC feed", url: "Your JSON feed", manual: "Manual commands" };
@@ -41,6 +42,7 @@ export function Dashboard() {
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [updateAvail, setUpdateAvail] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [moveOpen, setMoveOpen] = useState(false);
   const [confirmLive, setConfirmLive] = useState(false);
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
 
@@ -122,6 +124,10 @@ export function Dashboard() {
               Update available
             </LinkButton>
           )}
+          <Button variant="ghost" size="sm" onClick={() => setMoveOpen((o) => !o)} aria-expanded={moveOpen} aria-controls="move" title="Move to another computer">
+            <Laptop className="h-4 w-4" />
+            <span className="max-lg:hidden">Move computer</span>
+          </Button>
           <Button variant="ghost" size="sm" onClick={() => setHelpOpen((o) => !o)} aria-expanded={helpOpen} aria-controls="help">
             <CircleHelp className="h-4 w-4" />
             <span className="max-lg:hidden">Help</span>
@@ -180,6 +186,7 @@ export function Dashboard() {
             <Blotter trades={trades} />
           </div>
           <div className="flex min-w-0 flex-col gap-4 xl:sticky xl:top-[68px]">
+            {moveOpen && <MovePanel onClose={() => setMoveOpen(false)} />}
             {helpOpen && <HelpPanel onClose={() => setHelpOpen(false)} />}
             <ConsolePanel msgs={msgs} send={send} />
           </div>
