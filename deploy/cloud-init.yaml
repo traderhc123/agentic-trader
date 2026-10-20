@@ -12,7 +12,10 @@ users:
 package_update: true
 packages: [git, python3, python3-venv, python3-pip, tmux]
 runcmd:
-  - sudo -u trader bash -c 'curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | AGENTIC_TRADER_DIR=/home/trader/agentic-trader bash'
+  # runuser, not sudo: DigitalOcean's emailed root password starts expired,
+  # and sudo refuses to run at all until it's changed.
+  - chown trader:trader /home/trader
+  - runuser -u trader -- env HOME=/home/trader USER=trader bash -c 'curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/install.sh | AGENTIC_TRADER_NO_LAUNCH=1 AGENTIC_TRADER_DIR=/home/trader/agentic-trader bash'
   - cp /home/trader/agentic-trader/deploy/agentic-trader.service /etc/systemd/system/
   - systemctl daemon-reload
   # NOT enabled yet on purpose — run setup first:

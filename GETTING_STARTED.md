@@ -138,6 +138,16 @@ button. Every decision and all day-to-day use happens in your browser.
      in the comments at the top of that file. Then it auto-starts on boot
      and restarts if it crashes.
 
+**One-click from the wizard ("On its own cloud server"):** paste a
+DigitalOcean API token and the agent creates the server for you. It picks a
+nearby region if the one you chose has no room for the $6 server, makes an
+SSH login key on this computer (`~/.agentic-trader/do_ssh_key`) and adds it
+to the server, then installs and starts itself (about 5 minutes after the
+server appears). The wizard shows the exact `ssh -i … -L 8721:…` command for
+the dashboard. No "heartbeat started" notification after 15 minutes? Log in
+with that command and run `sudo tail -50 /var/log/cloud-init-output.log`.
+DigitalOcean's browser **Web Console** also works.
+
 ### Option C — Docker (if you already use Docker)
 
 ```bash

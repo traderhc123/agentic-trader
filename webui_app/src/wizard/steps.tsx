@@ -828,14 +828,18 @@ export function LaunchStep() {
       if (s.ip) {
         setDeployMsg(
           <div className="space-y-1.5">
-            <p className="m-0 text-up">Your agent is live on its own server at {s.ip}</p>
+            <p className="m-0 text-up">Server created at {s.ip}</p>
             <p className="m-0 text-muted">
-              It started automatically and will send your startup notification shortly. This computer no longer needs to run
-              anything, so you can close this window. Dashboard from here:
+              It's installing the agent now (about 5 minutes). You'll get the "heartbeat started" notification when it's
+              running; after that this computer doesn't need to run anything. Dashboard from here:
             </p>
             <pre className="m-0 overflow-auto rounded border border-line bg-sink p-2 font-mono text-xs text-fg2">
-              {`ssh -L 8721:127.0.0.1:8721 trader@${s.ip}\nthen open http://127.0.0.1:8721/dash`}
+              {`${s.ssh || `ssh -L 8721:127.0.0.1:8721 trader@${s.ip}`}\nthen open http://127.0.0.1:8721/dash`}
             </pre>
+            <p className="m-0 text-muted">
+              No notification after 15 minutes? Log in with the command above and run{" "}
+              <code className="font-mono text-xs">sudo tail -50 /var/log/cloud-init-output.log</code>
+            </p>
           </div>,
         );
         api("/api/finish", {});
@@ -920,7 +924,7 @@ export function LaunchStep() {
             <h3 className="m-0 text-base font-semibold">On its own cloud server</h3>
             <p className="m-0 text-sm text-muted">
               About $6 a month on <b className="text-fg2">your</b> DigitalOcean account. The agent creates the server, moves its finished
-              setup there, and starts itself. Your token is used once and not stored.
+              setup there, and starts itself. It also makes a login key on this computer so you can reach the dashboard. Your token is used once and not stored.
             </p>
             <Field htmlFor="do-token" label="DigitalOcean API token (write scope)">
               <Input id="do-token" type="password" autoComplete="off" placeholder="DigitalOcean API token" value={doToken} onChange={(e) => setDoToken(e.target.value)} />
