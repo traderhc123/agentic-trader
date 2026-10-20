@@ -253,3 +253,28 @@ def test_dashboard_chat_toggles_autostart(home, tmp_path, monkeypatch):
     assert handled and "ON" in reply
     agent._apply_command("autostart off")
     assert not keep_running.autostart_enabled()
+
+
+# ── `python agent.py` (no arguments) must not tie the agent to the terminal ──
+
+def test_bare_command_starts_in_background(home, monkeypatch):
+    calls = []
+    monkeypatch.setattr(sys, "argv", ["agent.py"])
+    monkeypatch.setattr(agent, "_open_running_dashboard", lambda: False)
+    monkeypatch.setattr(agent, "_is_ready", lambda: True)
+    monkeypatch.setattr(agent, "cmd_run", lambda **k: calls.append("run"))
+    monkeypatch.setattr(agent, "cmd_start", lambda **k: calls.append(("start", k)))
+    agent.main()
+    assert calls == [("start", {"open_dashboard": True})]
+
+
+def test_app_starts_in_background_and_run_stays_foreground(home, monkeypatch):
+    calls = []
+    monkeypatch.setattr(agent, "cmd_run", lambda **k: calls.append(("run", k)))
+    monkeypatch.setattr(agent, "cmd_start", lambda **k: calls.append(("start", k)))
+    monkeypatch.setattr(sys, "argv", ["agent.py", "app"])
+    agent.main()
+    monkeypatch.setattr(sys, "argv", ["agent.py", "run"])
+    agent.main()
+    assert calls == [("start", {"open_dashboard": True, "app_window": True}),
+                     ("run", {"app_window": False})]
