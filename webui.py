@@ -975,8 +975,11 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div id="deploy-box" class="launch">
    <div class="opt">
     <h3>Option A — this computer</h3>
-    <p class="muted">One click — the agent starts here and this page becomes its
-    dashboard. Keep this computer awake during market hours.</p>
+    <p class="muted">One click — the agent starts here in the background and this
+    page becomes its dashboard. You can close the terminal window; it keeps
+    running. Keep this computer awake during market hours.</p>
+    <p><label><input type="checkbox" id="autostart" checked> Also start it
+    automatically when I log in to this computer</label></p>
     <p class="cta"><button class="btn-primary" onclick="startLocal()">Start my agent now</button>
     <span id="start-msg" role="status" aria-live="polite" class="muted"></span></p>
    </div>
@@ -1576,7 +1579,7 @@ async function startLocal(){
   const el=document.getElementById('start-msg');
   el.textContent=' starting…';
   let r;
-  try{r=await api('/api/start-local',{});}
+  try{r=await api('/api/start-local',{autostart:document.getElementById('autostart').checked});}
   catch(e){el.innerHTML=' <span class="err">could not reach setup server</span>';return;}
   if(!r.ok){el.innerHTML=' <span class="err">'+esc(r.error)+'</span>';return;}
   el.textContent=' starting… (the agent takes over this address in a few seconds)';
@@ -2649,6 +2652,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             },
             "recurring": bool(cfg.get("day_pass_recurring")),
             "pass": bool(cfg.get("feed_pass") or cfg.get("feed_pass_pending")),
+            "autostart": __import__("keep_running").autostart_enabled(),
         }
 
     def consent(_h, data):
@@ -3160,9 +3164,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         save()
         import platform_compat
         nxt = ("cd " + _repo_dir() + "\n"
-               + platform_compat.venv_python() + " agent.py run\n\n"
-               "(or enable the systemd service / Docker container — see "
-               "GETTING_STARTED.md)")
+               + platform_compat.venv_python() + " agent.py start\n"
+               + platform_compat.venv_python() + " agent.py autostart on"
+               "   # optional: start at every login\n\n"
+               "(start = background; closing the window doesn't stop it. "
+               "Servers: the systemd service or Docker — see GETTING_STARTED.md)")
         return {"ok": True, "next": nxt}
 
     def policy_disable(_h, _data):
@@ -3175,11 +3181,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         pending["finished"].set()
         return {"ok": True}
 
-    def start_local(_h, _data):
-        """Option A as one click: spawn the agent detached, then hand it this
-        port. The child waits until the wizard's socket is actually free
-        before exec'ing `agent.py run`, so the dashboard (same port) can't
-        lose the bind race and fall back to headless."""
+    def start_local(_h, data):
+        """Option A as one click: start the agent in the background (under
+        keep_running's supervisor, so closing the terminal doesn't stop it
+        and a crash restarts it), optionally at every login too, then hand
+        it this port. The supervisor waits until the wizard's socket is
+        free before running `agent.py run`, so the dashboard (same port)
+        can't lose the bind race and fall back to headless."""
         if not A.consent_ok():
             return {"ok": False, "error": "accept the agreement first"}
         from brokers import broker_ready
@@ -3190,18 +3198,26 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         if llm_policy.entries_blocked(cfg):
             return {"ok": False, "error": llm_policy.BLOCKED_MSG}
         save()
-        import os
-        import platform_compat
-        script = os.path.join(_repo_dir(), "agent.py")
-        log_path = os.path.join(os.path.dirname(A.CONFIG_PATH), "agent-run.log")
+        import keep_running
+        auto_note = ""
+        if "autostart" in (data or {}):
+            _ok, auto_note = keep_running.set_autostart(bool(data["autostart"]))
         try:
-            platform_compat.spawn_after_port_free(
-                script, ["run"], APP_PORT, log_path=log_path, cwd=_repo_dir())
+            keep_running.start_background(port=APP_PORT)
         except Exception as exc:
             return {"ok": False, "error": f"could not start the agent: {exc}"}
         # release the port AFTER this response has flushed
         threading.Timer(0.5, pending["finished"].set).start()
-        return {"ok": True}
+        return {"ok": True, "autostart_note": auto_note}
+
+    def autostart_get(_h):
+        import keep_running
+        return keep_running.autostart_status()
+
+    def autostart_set(_h, data):
+        import keep_running
+        ok, note = keep_running.set_autostart(bool(data.get("enabled")))
+        return {"ok": ok, "note": note, **keep_running.autostart_status()}
 
     def d_status(_h):
         if get_status is None:
@@ -3236,7 +3252,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/pass/status": pass_status_route,
                     "/api/pass/options": pass_options_route,
                     "/api/status": d_status, "/api/trades": d_trades,
-                    "/api/proposal": proposal_get}
+                    "/api/proposal": proposal_get,
+                    "/api/autostart": autostart_get}
     def ask(_h, data):
         q = str(data.get("question", "")).strip()
         wiz_state = {k: v for k, v in state(None).items() if k != "disclaimer"}
@@ -3255,6 +3272,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/finish": finish, "/api/ask": ask,
                      "/api/policy/disable": policy_disable,
                      "/api/start-local": start_local,
+                     "/api/autostart": autostart_set,
                      "/api/wallet/create": wallet_create,
                      "/api/pass/buy": pass_buy,
                      "/api/wallet/fund": wallet_fund,
@@ -3312,8 +3330,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         try:
             pending["finished"].wait()
             print("Setup complete. If you clicked \"Start my agent now\", it "
-                  "is taking over this address — the browser page becomes the "
-                  "dashboard. Otherwise start it any time with: agent.py run")
+                  "is now running in the background and the browser page "
+                  "becomes its dashboard — you can close this window, the "
+                  "agent keeps going. Stop it from the dashboard or with: "
+                  "agent.py stop. Not started yet? Run: agent.py start")
         except KeyboardInterrupt:
             print("\nWizard aborted.")
         server.shutdown()
@@ -3512,7 +3532,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "exact command (pause, resume, dry on/off, set budget N, "
                 "set contracts N, set percent N, set other budget|contracts|"
                 "percent N, other sizing same, set positions N, "
-                "set cap N, stop). Never give investment advice; you may "
+                "set cap N, stop, autostart on|off). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
             f"STATUS:\n{json.dumps(status_fields, indent=1)}\n\n"

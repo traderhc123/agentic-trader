@@ -11,6 +11,12 @@ import sys
 
 IS_WINDOWS = os.name == "nt"
 
+# Set by keep_running's supervisor on the agent it runs. A supervised agent
+# that needs a restart exits with RESTART_EXIT and the supervisor re-runs it,
+# instead of spawning an unsupervised successor (Windows has no exec).
+SUPERVISED_ENV = "AGENTIC_TRADER_SUPERVISED"
+RESTART_EXIT = 75
+
 # Child-side bootstrap: wait until nobody is listening on PORT (the parent's
 # dashboard/wizard socket has been released), then run SCRIPT ARGS... in this
 # same interpreter. Pure Python, so it works without a POSIX shell.
@@ -69,6 +75,24 @@ def venv_pip(prefix="./.venv"):
     return prefix + "/bin/pip"
 
 
+def wait_port_free(port, timeout=20.0):
+    """Wait until nothing is listening on 127.0.0.1:port. True if free."""
+    import socket
+    import time
+    deadline = time.time() + timeout
+    while True:
+        s = socket.socket()
+        try:
+            busy = s.connect_ex(("127.0.0.1", int(port))) == 0
+        finally:
+            s.close()
+        if not busy:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
 def _detach_kwargs(new_console=False):
     if IS_WINDOWS:
         if new_console:
@@ -107,6 +131,9 @@ def restart_self(argv, port):
     if not IS_WINDOWS:
         os.execv(sys.executable, [sys.executable, *argv])
         return  # pragma: no cover — execv does not return
+    if os.environ.get(SUPERVISED_ENV):
+        os._exit(RESTART_EXIT)  # the supervisor runs us again
+        return  # pragma: no cover — _exit does not return
     interactive = False
     try:
         interactive = sys.stdout is not None and sys.stdout.isatty()

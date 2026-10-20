@@ -81,7 +81,16 @@ button. Every decision and all day-to-day use happens in your browser.
    your agent's live dashboard: status, every action it's taken, and a chat
    box where you can say `pause`, `resume`, `set budget 500`, `dry off`, or
    just ask what it's been doing. Bookmark **http://127.0.0.1:8721** — it's
-   your agent's home from now on. The dashboard is login-protected: the
+   your agent's home from now on.
+
+   **Closing the window is fine.** The agent runs in the background, so you
+   can close PowerShell / Terminal and it keeps going (it even restarts
+   itself if it crashes). Leave **"Also start it automatically when I log in"**
+   ticked and it comes back by itself after a restart or reboot. To stop it:
+   type `stop` in the dashboard, or run `python agent.py stop`. Only one copy
+   ever runs — opening it again just takes you to the dashboard.
+
+   The dashboard is login-protected: the
    browser that opened it stays logged in; anywhere else (another browser, a
    remote server), run `python agent.py link` and open the link it prints.
    On a remote server, tunnel first: `ssh -L 8721:127.0.0.1:8721 user@yourserver`.
@@ -200,6 +209,9 @@ your trade password and options approval.
 - [ ] Notifications tested (you got the test message)
 - [ ] You watched at least a few days of dry-run activity and it did what
       you expected
-- [ ] You know how to stop it: Ctrl-C (or `docker stop` / `systemctl stop
-      agentic-trader`) — open positions stay in your account; close them in
-      the Robinhood app if needed
+- [ ] You know how to stop it: `stop` in the dashboard or `python agent.py
+      stop` (Ctrl-C if you ran it in the foreground; `docker stop` /
+      `systemctl stop agentic-trader` on a server) — open positions stay in
+      your account; close them in the Robinhood app if needed
+- [ ] You decided whether it should start at login (`python agent.py
+      autostart on|off`)

@@ -86,6 +86,8 @@ is_desktop() {
 if [ -z "${AGENTIC_TRADER_NO_LAUNCH:-}" ] && is_desktop; then
   echo "Launching the setup wizard in your browser…"
   echo "(read DISCLAIMER.md in the page and accept it yourself; Ctrl-C here to stop)"
+  echo "Keep this window open until you click \"Start my agent now\" — after that"
+  echo "you can close it: the agent keeps running in the background."
   echo
   exec ./.venv/bin/python agent.py setup --web
 else

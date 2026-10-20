@@ -38,7 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/traderhc123/agentic-trader/main/ins
 #   then use .\.venv\Scripts\python.exe wherever ./.venv/bin/python appears
 cd ~/agentic-trader
 ./.venv/bin/python agent.py setup    # follow BOOT.md — written for you
-./.venv/bin/python agent.py run
+./.venv/bin/python agent.py start    # background; `stop` to stop, `autostart on` for login
 ```
 
 Signal sources: `manual` (human's own commands), `url` (any JSON feed), or

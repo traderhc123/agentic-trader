@@ -13,7 +13,11 @@ Robinhood's trading MCP).
     python agent.py run      # heartbeat loop (refuses to run without consent)
     python agent.py app      # same as run, but opens the dashboard as a desktop
                              # app window (chromeless browser; --app on run too)
-    python agent.py status   # config, wallet balance, open positions
+    python agent.py start    # run in the background — closing this window
+                             # doesn't stop it; restarts itself if it crashes
+    python agent.py stop     # stop the background agent
+    python agent.py autostart on|off|status   # start at every login
+    python agent.py status   # running?, config, wallet balance, open positions
     python agent.py doctor   # check EVERYTHING (config, wallet, feed, broker)
                              # and print the exact command to fix each problem
                              # (--json: machine-readable, for AI assistants)
@@ -749,6 +753,16 @@ def _apply_command(text):
         webui.CONTROLS["stop"] = True
         return True, ("Stopping after this cycle. Open positions remain in your "
                       "brokerage account — close them there if needed.")
+    if t in ("autostart on", "autostart off", "start at login on",
+             "start at login off"):
+        import keep_running
+        ok, note = keep_running.set_autostart(t.endswith("on"))
+        return True, (note[0].upper() + note[1:] + ".") if ok else note
+    if t in ("autostart", "start at login"):
+        import keep_running
+        return True, ("Starts at login: "
+                      + ("ON" if keep_running.autostart_enabled() else "off")
+                      + " — say 'autostart on' or 'autostart off'.")
     if t in ("policy off", "disable policy"):
         moved = llm_policy.disable_policy()
         return True, (f"Policy turned off (kept as {llm_policy.policy_path()}.disabled)."
@@ -876,6 +890,18 @@ def _apply_command(text):
 
 
 def cmd_run(app_window=False):
+    import keep_running
+    # One copy only: two heartbeats on the same config would place every
+    # order twice. After an update restart the old process may still be
+    # exiting, so give it a moment.
+    lock = keep_running.InstanceLock()
+    if not lock.acquire(wait=20 if os.environ.get("AGENT_UPDATE_RESTARTED") else 2):
+        print("The agent is already running (another window, the background, "
+              "or start-at-login) — not starting a second copy.")
+        print(f"Dashboard: {_dashboard_link()}")
+        print("Stop it with: python agent.py stop")
+        sys.exit(0)
+    keep_running.clear_stop()
     require_consent_or_exit()
     cfg = _load(CONFIG_PATH)
     from brokers import broker_ready as _broker_ready
@@ -931,6 +957,8 @@ def cmd_run(app_window=False):
                                  else "on" if llm_policy.enabled(c) else "off"),
                 "market": "open" if _market_open_now() else "closed (slow polling)",
                 "open positions": ", ".join(st.get("positions", {})) or "none",
+                "start at login": ("on" if keep_running.autostart_enabled()
+                                   else "off"),
             },
         }
 
@@ -945,7 +973,9 @@ def cmd_run(app_window=False):
     mode = "DRY-RUN (no orders)" if cfg.get("dry_run") else "LIVE"
     print(f"Heartbeat started [{mode}]: source={cfg['source']}, "
           f"{_sizing_desc(cfg)}, policy brain "
-          f"{'ON' if llm_policy.enabled(cfg) else 'off'}. Ctrl-C to stop.")
+          f"{'ON' if llm_policy.enabled(cfg) else 'off'}. "
+          + ("Stop: dashboard or `agent.py stop`."
+             if os.environ.get(keep_running.SUPERVISED_ENV) else "Ctrl-C to stop."))
     if dash_url:
         print(f"Dashboard: {dash_url}  (remote? tunnel: ssh -L 8721:127.0.0.1:8721 user@host)")
         if app_window:
@@ -962,6 +992,12 @@ def cmd_run(app_window=False):
     while True:
         cfg = _load(CONFIG_PATH, cfg) or cfg  # dashboard edits apply live
         poll = max(10, int(cfg.get("poll_seconds", 30)))
+        if keep_running.stop_requested():
+            keep_running.clear_stop()
+            print("Stopped (agent.py stop). Open positions remain in your account:",
+                  list(state["positions"]) or "none")
+            notify(cfg, "agentic-trader stopped")
+            return
         if webui.CONTROLS["stop"]:
             print("Stopped via dashboard. Open positions remain in your account:",
                   list(state["positions"]) or "none")
@@ -1017,9 +1053,27 @@ def cmd_run(app_window=False):
         # Market-hours-aware cadence: fast while the market can move, slow
         # overnight/weekends; snappy while paused so 'resume' feels instant.
         if webui.CONTROLS["paused"]:
-            time.sleep(2)
+            wait = 2
         else:
-            time.sleep(poll if _market_open_now() else max(poll, 300))
+            wait = poll if _market_open_now() else max(poll, 300)
+        try:
+            _sleep_unless_stopped(wait, webui.CONTROLS)
+        except KeyboardInterrupt:
+            print("\nStopped. Open positions remain in your account:",
+                  list(state["positions"]) or "none")
+            return
+
+
+def _sleep_unless_stopped(seconds, controls):
+    """Sleep in 1 s slices so a stop (dashboard button or `agent.py stop`)
+    takes effect within a second, not after a 5-minute overnight poll."""
+    import keep_running
+    end = time.time() + seconds
+    while True:
+        left = end - time.time()
+        if left <= 0 or controls.get("stop") or keep_running.stop_requested():
+            return
+        time.sleep(min(1.0, left))
 
 
 def _agenthc_host():
@@ -1066,6 +1120,13 @@ def cmd_netcheck():
 
 
 def cmd_status():
+    import keep_running
+    pid = keep_running.running_pid()
+    print(f"agent running    : " + (f"yes (pid {pid})" if pid else
+          "yes" if keep_running.is_running() else "no"))
+    auto = keep_running.autostart_status()
+    print(f"start at login   : {'on' if auto['enabled'] else 'off'}"
+          + (f" ({auto['path']})" if auto["enabled"] else ""))
     print(f"consent accepted : {consent_ok()} ({ACCEPTANCE_PATH})")
     cfg = _load(CONFIG_PATH, {}) or {}
     print(f"signal source    : {cfg.get('source', 'unset')}")
@@ -1329,6 +1390,98 @@ def cmd_fund(sats):
     print_funding_invoice(wallet, sats)
 
 
+def _dashboard_link():
+    import webui
+    return f"http://127.0.0.1:{webui.APP_PORT}/dash?k={webui.ui_token()}"
+
+
+def _open_running_dashboard():
+    """If the agent is already running, open its dashboard instead of
+    starting anything (the wizard and a second agent can't share its port).
+    Returns True if it was running."""
+    import keep_running
+    if not keep_running.is_running():
+        return False
+    link = _dashboard_link()
+    print("Your agent is already running. Its dashboard (settings live there "
+          f"too):\n  {link}")
+    try:
+        import webbrowser
+        webbrowser.open(link)
+    except Exception:
+        pass
+    return True
+
+
+def cmd_start():
+    """Start the agent in the background: closing the window doesn't stop
+    it, and it restarts itself after a crash."""
+    import keep_running
+    import webui
+    if keep_running.is_running():
+        print("The agent is already running.")
+        print(f"Dashboard: {_dashboard_link()}")
+        return
+    if not _is_ready():
+        print("Not set up yet — run: python agent.py setup --web")
+        sys.exit(1)
+    proc = keep_running.start_background(port=webui.APP_PORT)
+    print("Starting the agent in the background…")
+    if keep_running.wait_until_running(timeout=40, proc=proc):
+        print("Running. You can close this window — the agent keeps going.")
+        print(f"Dashboard: {_dashboard_link()}")
+        print(f"Log:       {keep_running.log_path()}")
+        print("Stop:      python agent.py stop")
+        if not keep_running.autostart_enabled():
+            print("Start it automatically at login: python agent.py autostart on")
+        return
+    print("It didn't start. Last lines of the log "
+          f"({keep_running.log_path()}):")
+    for line in keep_running.last_log_lines():
+        print("  " + line)
+    sys.exit(1)
+
+
+def cmd_stop():
+    import keep_running
+    sys.exit(0 if keep_running.stop() else 1)
+
+
+def cmd_supervise():
+    import keep_running
+    port = None
+    if "--port" in sys.argv:
+        i = sys.argv.index("--port")
+        if i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit():
+            port = int(sys.argv[i + 1])
+    sys.exit(keep_running.supervise(port=port))
+
+
+def cmd_autostart(action):
+    import keep_running
+    if action == "on":
+        if not _is_ready():
+            print("Finish setup first: python agent.py setup --web")
+            sys.exit(1)
+        where = keep_running.enable_autostart()
+        print(f"On — the agent starts in the background every time you log in.\n"
+              f"  ({where})")
+        if not keep_running.is_running():
+            print("It isn't running right now — start it with: python agent.py start")
+    elif action == "off":
+        removed = keep_running.disable_autostart()
+        print("Off — it won't start at login." if removed
+              else "Start at login was already off.")
+        if keep_running.is_running():
+            print("The agent is still running now; stop it with: python agent.py stop")
+    else:
+        st = keep_running.autostart_status()
+        print(f"Start at login: {'on' if st['enabled'] else 'off'} ({st['how']})")
+        if st["enabled"]:
+            print(f"  {st['path']}")
+        print("Change: python agent.py autostart on|off")
+
+
 def _is_ready():
     """Consent accepted AND a source + broker are configured."""
     if not consent_ok():
@@ -1348,6 +1501,8 @@ def main():
     # the legal agreement is accepted: not set up -> open the browser wizard;
     # set up -> run the agent. So `python agent.py` is the whole thing.
     if len(sys.argv) <= 1:
+        if _open_running_dashboard():
+            return
         if _is_ready():
             cmd_run()
         else:
@@ -1360,6 +1515,8 @@ def main():
     cmd = sys.argv[1]
     if cmd == "setup":
         if "--web" in sys.argv:
+            if _open_running_dashboard():
+                return
             import webui
             webui.run_wizard()
         elif "--from" in sys.argv:
@@ -1375,6 +1532,14 @@ def main():
             cmd_setup()
     elif cmd in ("run", "app"):
         cmd_run(app_window=(cmd == "app" or "--app" in sys.argv))
+    elif cmd == "start":
+        cmd_start()
+    elif cmd == "stop":
+        cmd_stop()
+    elif cmd == "supervise":
+        cmd_supervise()
+    elif cmd == "autostart":
+        cmd_autostart(sys.argv[2] if len(sys.argv) > 2 else "status")
     elif cmd == "status":
         cmd_status()
     elif cmd == "doctor":
@@ -1384,7 +1549,7 @@ def main():
     elif cmd == "link":
         import webui
         print("Dashboard login link (keep it private — it unlocks the dashboard):")
-        print(f"  http://127.0.0.1:{webui.APP_PORT}/dash?k={webui.ui_token()}")
+        print(f"  {_dashboard_link()}")
     elif cmd == "fund":
         amount = sys.argv[2] if len(sys.argv) > 2 else "20000"
         if not amount.isdigit():
