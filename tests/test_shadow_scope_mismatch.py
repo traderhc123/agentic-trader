@@ -35,9 +35,9 @@ def test_chat_command_switches_scope(home):
 
 
 def test_source_step_starts_from_saved_scope():
-    src = open(os.path.join(ROOT, "webui_app/src/wizard/SourceStep.tsx")).read()
+    src = open(os.path.join(ROOT, "webui_app/src/wizard/SourceStep.tsx"), encoding="utf-8").read()
     assert 'useState(st?.include_other_trades ? "all" : "main")' in src
-    web = open(os.path.join(ROOT, "webui.py")).read()
+    web = open(os.path.join(ROOT, "webui.py"), encoding="utf-8").read()
     assert '"include_other_trades": bool(cfg.get("include_other_trades"))' in web
     assert '"/api/source/scope": source_scope' in web
     # classic UI pre-selects it too
