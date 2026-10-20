@@ -1612,11 +1612,12 @@ async function deploy(){
   if(!r.ok){el.innerHTML='<span class="err">'+r.error+'</span>';return;}
   const poll2=async()=>{
     const s=await api('/api/deploy/status');
-    if(s.ip){el.innerHTML='<span class="ok">Your agent is live on its own server at '
-      +s.ip+' ✓</span><br><span class="muted">It started automatically and will send '
-      +'your startup notification shortly. This computer no longer needs to run '
-      +'anything — you can close this window. Dashboard from here: '
-      +'ssh -L 8721:127.0.0.1:8721 trader@'+s.ip
+    if(s.ip){el.innerHTML='<span class="ok">Server created at '+esc(s.ip)
+      +' ✓</span><br><span class="muted">It is installing the agent now (about 5 '
+      +'minutes); you get the "heartbeat started" notification when it is running. '
+      +'No notification after 15 minutes? Log in with the command below and run: '
+      +'sudo tail -50 /var/log/cloud-init-output.log. Dashboard from here: '
+      +esc(s.ssh||('ssh -L 8721:127.0.0.1:8721 trader@'+s.ip))
       +' then open http://127.0.0.1:8721/dash</span>';
       api('/api/finish',{});}
     else{el.textContent='server status: '+s.status+' — waiting…';setTimeout(poll2,5000);}
@@ -2836,7 +2837,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         if not pending.get("deploy"):
             return {"status": "no deploy in progress", "ip": ""}
         token, droplet_id = pending["deploy"]
-        return provision.droplet_status(token, droplet_id)
+        st = provision.droplet_status(token, droplet_id)
+        if st.get("ip"):
+            st["ssh"] = provision.ssh_command(st["ip"])
+        return st
 
     def brokers_list(_h):
         from brokers import key_brokers
