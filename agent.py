@@ -147,6 +147,35 @@ def _stale(ev, cfg):
     return age > float(cfg.get("max_event_age_s", 300))
 
 
+# When this run started receiving each track ("main" / "other"). A stale
+# signal that happened BEFORE then was never catchable — the agent wasn't
+# running yet, or "other trades" was just switched on and the feed handed
+# back the day's earlier entries. That's backlog, not a delay worth an alert.
+_WATCH_SINCE = {}
+
+
+def note_watching(cfg, now=None):
+    """Call after each successful poll: records when each track started."""
+    now = now or datetime.now(timezone.utc)
+    _WATCH_SINCE.setdefault("main", now)
+    if cfg.get("include_other_trades") or cfg.get("source", "agenthc") != "agenthc":
+        _WATCH_SINCE.setdefault("other", now)
+    else:
+        _WATCH_SINCE.pop("other", None)  # switched off: restart the clock if back on
+
+
+def _backlog(ev):
+    """True when the signal happened before this run was watching its track."""
+    track = "main" if str(ev.get("track", "main")) == "main" else "other"
+    since = _WATCH_SINCE.get(track)
+    try:
+        occurred = datetime.fromisoformat(
+            str(ev.get("occurred_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return since is not None and occurred < since
+
+
 def _log_trade(record):
     record["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
@@ -641,6 +670,12 @@ def handle_event(ev, cfg, state, broker, client, save_state):
 
     if not _valid_event(ev):
         print(f"skipped invalid event from source: {str(ev)[:120]}")
+        return None
+    if _stale(ev, cfg) and _backlog(ev):
+        # Quiet: printed for the log, no problem row, no alert.
+        msg = (f"skipped earlier signal ({contract}) — it happened before "
+               "your agent was watching for it")
+        print(msg)
         return None
     if _stale(ev, cfg):
         msg = f"SKIPPED stale ENTERED ({contract}) — older than " \
@@ -1409,6 +1444,7 @@ def cmd_run(app_window=False):
                         or bool(cfg.get("dry_run")) != cash.get("dry")):
                     _refresh_cash(cfg, state, save_state, broker, client, cash)
                 events = source.poll(cfg, state, save_state)
+                note_watching(cfg)
                 for ev in events:
                     if ev.get("event_id") in seen:
                         continue
