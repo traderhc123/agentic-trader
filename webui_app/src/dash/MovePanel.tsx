@@ -93,7 +93,7 @@ export function MovePanel({ onClose }: { onClose: () => void }) {
         <li className="space-y-1">
           <b className="text-fg">On the new computer</b>
           <p className="m-0">
-            Run the same one-line installer. When the setup page opens, choose <b className="text-fg">Moving from another computer?</b>,
+            Run the same one-line installer. When the setup page opens, press <b className="text-fg">Open my move file</b> in the "Moving from another computer?" box at the top,
             pick the file and type your passphrase. It starts in dry-run there; say <code className="font-mono">dry off</code> when
             you're ready.
           </p>
@@ -111,6 +111,14 @@ export function MovePanel({ onClose }: { onClose: () => void }) {
           </div>
         </li>
       </ol>
+
+      <p className="m-0 border-t border-line pt-3 text-sm text-fg2">
+        Bringing a setup <b className="text-fg">to</b> this computer instead?{" "}
+        <a href="/setup" className="text-accent">
+          Open Settings
+        </a>{" "}
+        and press <b className="text-fg">Open my move file</b> at the top.
+      </p>
 
       <ConfirmDialog
         open={confirm}

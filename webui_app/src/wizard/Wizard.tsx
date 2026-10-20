@@ -9,6 +9,7 @@ import { Panel } from "../components/ui/panel";
 import { api, type WizardState } from "../lib/api";
 import { cn } from "../lib/cn";
 import { pluralFix } from "../lib/format";
+import { MoveImport } from "./MoveImport";
 import { SourceStep } from "./SourceStep";
 import { BrokerStep, ConsentStep, LaunchStep, LlmStep, SafetyStep, SizingStep } from "./steps";
 
@@ -167,6 +168,9 @@ export function Wizard() {
               <div className="h-64 animate-pulse rounded-md border border-line bg-panel" />
             ) : (
               <>
+                {/* New computer: bring a whole setup over instead of redoing it.
+                    Works with the agent running too (it pauses and restarts). */}
+                <MoveImport running={!!st.running} />
                 {/* Every step stays mounted (hidden when not current), like the
                     old page: a Robinhood approval wait, a cloud deploy, an invoice
                     or half-filled form keeps going while you look at another step. */}
