@@ -61,6 +61,7 @@ Your human pointed you at this repository to set them up. Follow
 - **Dry-run by default**: watch what it *would* do for days before real orders
 - **Safety rails**: daily entry cap, concurrent open-positions cap, event validation, staleness guard, wallet auto-pay cap ([SECURITY.md](SECURITY.md))
 - **Dollar-budget sizing**: set a per-trade budget (e.g. $500) — the agent quotes the option, buys what fits, and skips trades that would exceed it (or use fixed contract counts)
+- **Stays awake while it runs**: Windows/macOS (and Linux desktops) won't idle-sleep while the agent is running — the OS's own per-process request, no power settings changed, released when the agent stops (`keep awake off` to disable)
 - **Built-in rules (no AI needed)**: only these tickers, never these tickers, calls only / puts only, minimum strike, skip same-day (0DTE) contracts, stop for the day after N losses in a row — plain settings in the wizard's Safety step or the dashboard chat (`rules`, `tickers SPY QQQ`, `calls only`, `loss stop 2`…)
 - **LLM policy brain (optional, needs an AI)**: write plain-English rules in `policy.md` — the agent checks every entry against *your* policy with *your* AI model — any provider: Claude, OpenAI, Grok, Gemini, OpenRouter, local Ollama, … (veto-only; any model error or unclear answer fails safe to skip)
 - **Notifications**: Discord / ntfy / Telegram message on every action, veto, and error + a daily digest after the close

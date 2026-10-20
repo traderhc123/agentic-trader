@@ -2670,6 +2670,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "policy_on": __import__("llm_policy").enabled(cfg),
             # the agent itself is serving this page (vs. the setup wizard)
             "running": get_status is not None,
+            "keep_awake": cfg.get("keep_awake", True) is not False,
         }
 
     def consent(_h, data):
@@ -3172,6 +3173,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         cfg.setdefault("max_event_age_s", 300)
         import rules
         rules.apply_settings(cfg, data)
+        if "keep_awake" in data:
+            cfg["keep_awake"] = bool(data.get("keep_awake"))
         for src_key, cfg_key in (("discord", "discord_webhook_url"),
                                  ("ntfy", "ntfy_topic"),
                                  ("tg_token", "telegram_bot_token"),
@@ -3680,7 +3683,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "exact command (pause, resume, dry on/off, set budget N, "
                 "set contracts N, set percent N, set other budget|contracts|"
                 "percent N, other sizing same, set positions N, "
-                "set cap N, stop, autostart on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N). Never give investment advice; you may "
+                "set cap N, stop, autostart on|off, keep awake on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
             f"STATUS:\n{json.dumps(status_fields, indent=1)}\n\n"

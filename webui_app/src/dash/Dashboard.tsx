@@ -750,6 +750,7 @@ function ConsolePanel({ msgs, send }: { msgs: ChatMsg[]; send: (t: string) => vo
           ["set positions 5", "set positions 5"],
           ["rules", "my rules"],
           ["autostart", "start at login?"],
+          ["keep awake on", "keep awake"],
           ["why did you skip the last signal?", "why the last skip?"],
         ].map(([cmd, label]) => (
           <Button key={label} size="sm" className="font-mono text-fg2" onClick={() => send(cmd)}>
