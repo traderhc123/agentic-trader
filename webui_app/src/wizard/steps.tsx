@@ -688,6 +688,7 @@ export function LaunchStep() {
     reloadState();
   };
   const [startMsg, setStartMsg] = useState<MsgT>(null);
+  const [autostart, setAutostart] = useState(true);
   const [doToken, setDoToken] = useState("");
   const [region, setRegion] = useState("nyc3");
   const [deployMsg, setDeployMsg] = useState<React.ReactNode>(null);
@@ -698,7 +699,7 @@ export function LaunchStep() {
     setStartMsg(info("Starting…"));
     let r;
     try {
-      r = await api("/api/start-local", {});
+      r = await api("/api/start-local", { autostart });
     } catch {
       return setStartMsg(err("Could not reach the setup server."));
     }
@@ -793,8 +794,12 @@ export function LaunchStep() {
           <div className="flex min-w-0 flex-col gap-3 rounded-md border border-line2 bg-panel2 p-4">
             <h3 className="m-0 text-base font-semibold">On this computer</h3>
             <p className="m-0 text-sm text-muted">
-              One click: the agent starts here and this page becomes its dashboard. Keep this computer awake during market hours.
+              One click: the agent starts here in the background and this page becomes its dashboard. You can close the terminal
+              window and it keeps running. Keep this computer awake during market hours.
             </p>
+            <ChoiceRow type="checkbox" id="autostart" checked={autostart} onChange={setAutostart}>
+              Also start it automatically when I log in to this computer
+            </ChoiceRow>
             <div className="mt-auto flex flex-wrap items-center gap-3 pt-2">
               <Button variant="primary" onClick={startLocal} disabled={blocked}>
                 Start my agent now

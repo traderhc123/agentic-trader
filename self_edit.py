@@ -46,6 +46,7 @@ FOUNDATION = frozenset({
     "install.ps1",       # ...and the Windows twin piped into PowerShell
     "LICENSE",
     "webui.py",          # dashboard: dry-run toggle, updates, consent page
+    "keep_running.py",   # one-copy lock (a second copy would double every order)
     "platform_compat.py",  # process launch/restart plumbing
     "llm_client.py",     # carries the AI key; the policy brain's only door
     "setup_plan.py",     # enforces what an assistant may never set (go live…)
@@ -139,7 +140,9 @@ def _repo_files():
                                                           ".yaml", ".service")):
                 continue
             path = os.path.join(root, name)
-            rel = os.path.relpath(path, _repo())
+            # forward slashes on every OS: these names go to the model and
+            # into proposals, and must look the same as on Linux/macOS
+            rel = os.path.relpath(path, _repo()).replace(os.sep, "/")
             try:
                 if os.path.getsize(path) <= MAX_FILE_BYTES:
                     with open(path, encoding="utf-8") as f:
@@ -205,7 +208,7 @@ def propose(cfg, request):
         "FOUNDATION FILES ARE READ-ONLY and any change to them will be "
         "rejected by the apply layer: agent.py, self_edit.py, "
         "llm_policy.py, llm_client.py, lightning_wallet.py, webui.py, "
-        "platform_compat.py, requirements.txt, DISCLAIMER.md, "
+        "platform_compat.py, keep_running.py, requirements.txt, DISCLAIMER.md, "
         "SECURITY.md, install.sh, install.ps1, LICENSE, and every "
         "EXISTING file in brokers/ and sources/ (you may ADD new "
         "adapter files there and register them in __init__.py) "

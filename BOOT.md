@@ -20,7 +20,9 @@ software enforces it.
    number.
 3. **Real money.** Before starting `run`, confirm the human understands the
    agent places real orders in their Robinhood Agentic account and how to stop
-   it (Ctrl-C) — and that stopping leaves any open positions in their account.
+   it (`stop` in the dashboard, or `python agent.py stop`; Ctrl-C only if it
+   runs in the foreground) — and that stopping leaves any open positions in
+   their account.
 
 ## ⚠️ Where to install — read this if your code runs in a sandbox or the cloud
 
@@ -70,8 +72,10 @@ and apply them in one step. Order:
 6. **Verify**: `python agent.py doctor --json` until `"ready": true`. Each
    failing check says `"who": "owner"` or `"who": "agent"` — fix yours,
    hand theirs over. Don't report setup as done before `ready` is true.
-7. **Start** it (wizard "Start my agent now", or `python agent.py run`) and
-   offer to make it start with the computer. It stays in **dry-run**: plans
+7. **Start** it (wizard "Start my agent now", or `python agent.py start` —
+   both run it in the background, so closing the terminal doesn't stop it)
+   and offer to make it start with the computer (`python agent.py autostart
+   on`; ask first — it's their machine). It stays in **dry-run**: plans
    cannot turn dry-run off — the human says `dry off` in the dashboard when
    they decide to go live (rule 3).
 
@@ -156,15 +160,19 @@ points but never invent rules they didn't express.
 ### Step 3 — heartbeat
 
 ```bash
-python agent.py run
+python agent.py start        # background; output in ~/.agentic-trader/agent-run.log
+python agent.py autostart on # optional, with the human's OK: start at every login
+python agent.py stop         # stop it
 ```
 
 Polls the feed every 30s. On new `ENTERED` events it buys the configured
 contracts to open; on matching `EXITED` events it sells to close positions it
-opened. Logs every action. Runs until Ctrl-C.
+opened. Logs every action. `start` keeps it running after the terminal
+closes and restarts it after a crash; `python agent.py run` is the
+foreground version (Ctrl-C stops). Only one copy can run at a time.
 
-For long-running operation, walk the human through GETTING_STARTED.md's
-options (tmux, the `deploy/agentic-trader.service` systemd unit, or Docker) —
+On a server, walk the human through GETTING_STARTED.md's options (the
+`deploy/agentic-trader.service` systemd unit, Docker, or tmux) —
 and remind them autonomous trading software requires human oversight; it
 should not run unwatched for long periods. Keep dry-run ON until they have
 watched several days of activity and explicitly ask to go live.

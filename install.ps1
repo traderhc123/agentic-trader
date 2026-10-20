@@ -93,6 +93,8 @@ Write-Host ""
 if (-not $env:AGENTIC_TRADER_NO_LAUNCH) {
     Write-Host "Launching the setup wizard in your browser..."
     Write-Host "(read DISCLAIMER.md in the page and accept it yourself; Ctrl-C here to stop)"
+    Write-Host "Keep this window open until you click 'Start my agent now' - after that"
+    Write-Host "you can close it: the agent keeps running in the background."
     Write-Host ""
     & $VenvPy agent.py setup --web
 } else {
@@ -102,7 +104,8 @@ if (-not $env:AGENTIC_TRADER_NO_LAUNCH) {
     Write-Host "  cd $Dir"
     Write-Host "  .\.venv\Scripts\python.exe agent.py setup --web   # browser wizard"
     Write-Host "  .\.venv\Scripts\python.exe agent.py doctor        # verify everything is ready"
-    Write-Host "  .\.venv\Scripts\python.exe agent.py run           # heartbeat + dashboard"
+    Write-Host "  .\.venv\Scripts\python.exe agent.py start         # run in the background + dashboard"
+    Write-Host "  .\.venv\Scripts\python.exe agent.py autostart on  # optional: start at every login"
     Write-Host ""
     Write-Host "Not investment advice. You accept all liability - read DISCLAIMER.md."
 }

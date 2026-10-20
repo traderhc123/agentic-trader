@@ -237,4 +237,4 @@ def test_repo_files_skip_node_modules(sandbox):
     (repo / "webui_app" / "README.md").write_text("ui docs\n")
     files = self_edit._repo_files()
     assert not any("node_modules" in k for k in files)
-    assert os.path.join("webui_app", "README.md") in files
+    assert "webui_app/README.md" in files

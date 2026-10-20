@@ -694,6 +694,7 @@ function ConsolePanel({ msgs, send }: { msgs: ChatMsg[]; send: (t: string) => vo
           ["status", "status"],
           ["set cap 3", "set cap 3"],
           ["set positions 5", "set positions 5"],
+          ["autostart", "start at login?"],
           ["why did you skip the last signal?", "why the last skip?"],
         ].map(([cmd, label]) => (
           <Button key={label} size="sm" className="font-mono text-fg2" onClick={() => send(cmd)}>
@@ -708,7 +709,7 @@ function ConsolePanel({ msgs, send }: { msgs: ChatMsg[]; send: (t: string) => vo
         empty={
           <>
             Ask anything, or give a command:{" "}
-            {["pause", "set budget 500", "set percent 2", "set cap 3", "dry off", "stop"].map((c, i) => (
+            {["pause", "set budget 500", "set percent 2", "set cap 3", "dry off", "autostart on", "stop"].map((c, i) => (
               <span key={c}>
                 {i ? ", " : ""}
                 <code className="rounded-sm bg-raise px-1 font-mono text-fg2">{c}</code>

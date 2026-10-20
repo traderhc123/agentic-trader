@@ -48,8 +48,9 @@ Your human pointed you at this repository to set them up. Follow
    state that no party here is an investment advisor and cannot advise
    sizing — the number is their decision.
 3. `python agent.py doctor --json` until `"ready": true`, then start it
-   (`python agent.py run`) and explain how to stop it (Ctrl-C) and that open
-   positions remain in their account afterwards. It stays in dry-run until
+   (`python agent.py start` — background; or `run` in the foreground) and
+   explain how to stop it (dashboard `stop`, or `python agent.py stop`) and
+   that open positions remain in their account afterwards. It stays in dry-run until
    the human says `dry off`.
 
 **New to this / not technical? Start with [GETTING_STARTED.md](GETTING_STARTED.md)** — plain-English instructions for running it on your computer, a home machine, or a $5 cloud server, including how to have Claude set it all up for you.
@@ -89,14 +90,25 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/tra
 (Headless server? It prints the tunnel command instead. Opt out of auto-launch
 with `AGENTIC_TRADER_NO_LAUNCH=1`.)
 
-That single line is the whole thing on a desktop. After setup finishes, start
-the agent (the wizard prints this command; it also runs on boot if you use the
-systemd service or Docker):
+That single line is the whole thing on a desktop. The wizard's last step,
+**"Start my agent now"**, starts the agent in the background — you can close
+the terminal and it keeps running (and restarts itself if it ever crashes).
+Tick "start automatically when I log in" there and it comes back after a
+reboot too. From a terminal:
 
 ```bash
 cd ~/agentic-trader
-./.venv/bin/python agent.py run     # heartbeat + dashboard at http://127.0.0.1:8721
+./.venv/bin/python agent.py start          # background + dashboard at http://127.0.0.1:8721
+./.venv/bin/python agent.py stop           # stop it
+./.venv/bin/python agent.py autostart on   # start at every login (off to undo)
+./.venv/bin/python agent.py status         # running? start at login?
+./.venv/bin/python agent.py run            # foreground instead (Ctrl-C stops)
 ```
+
+Only one copy can run at a time — starting a second one (another window,
+start-at-login, the wizard) just points you at the running one, so orders are
+never placed twice. Background output goes to `~/.agentic-trader/agent-run.log`.
+Servers: use the systemd unit in `deploy/` or Docker instead.
 
 The setup wizard and the live dashboard are one app on **http://127.0.0.1:8721**
 — `/` shows the dashboard once the agent is running, the setup stepper
