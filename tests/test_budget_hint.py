@@ -78,9 +78,8 @@ def test_budget_hint_suggests_a_budget(home, no_policy, quiet):
     (h,) = agent._budget_hints(CFG)
     assert h["book"] == "shadow" and h["budget"] == 100 and h["skipped"] == 4
     assert (h["min_cost"], h["max_cost"]) == (305, 2510)
-    # 3/4 point of [305, 360, 1180, 2510] is 2510 → $2,550 covers all 4
-    assert h["suggest"] % 50 == 0 and h["would_take"] == sum(
-        c <= h["suggest"] for c in (305, 360, 1180, 2510))
+    # lower median of [305, 360, 1180, 2510] is 360 → $400 takes 2 of 4
+    assert (h["suggest"], h["would_take"]) == (400, 2)
     assert h["command"] == f"set other budget {h['suggest']}"
     # the button's command really changes the shadow budget, and only that
     agent._save(agent.CONFIG_PATH, dict(CFG))

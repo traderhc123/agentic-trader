@@ -619,8 +619,9 @@ def _budget_hints(cfg):
             continue  # sizing changed since — the hint no longer applies
         budget = float(bcfg.get("budget_per_trade_usd") or 0)
         vals.sort()
-        # cover ~3 of 4 skipped trades, rounded up to $50
-        pick = vals[min(len(vals) - 1, (len(vals) * 3) // 4)]
+        # the middle cost (lower median), rounded up to $50: catches about
+        # half of them without suggesting a jump to the priciest contract
+        pick = vals[(len(vals) - 1) // 2]
         suggest = int(-(-pick // 50) * 50)
         if suggest <= budget:
             continue
