@@ -37,6 +37,9 @@ SUPERVISED_ENV = platform_compat.SUPERVISED_ENV
 LOG_MAX_BYTES = 5 * 1024 * 1024
 AUTOSTART_NAME = "agentic-trader"
 MAC_LABEL = "com.traderhc.agentic-trader"
+# passed by every start-at-login entry so the supervisor knows to open the
+# dashboard once the agent is up (crash restarts never open it)
+AT_LOGIN_FLAG = "--at-login"
 
 
 def home():
@@ -257,14 +260,75 @@ def _run_child(cmd):
         proc = subprocess.Popen(cmd, cwd=repo_dir(), stdin=subprocess.DEVNULL,
                                 stdout=log, stderr=subprocess.STDOUT, env=env,
                                 **kwargs)
+        started = time.time()
         try:
-            return proc.wait()
+            while True:
+                code = proc.poll()
+                if code is not None:
+                    return code
+                if child_hung(started):
+                    _log(f"agent stopped responding for {HANG_SECONDS // 60} min "
+                         "(stuck network call?) — restarting it")
+                    _end_child(proc)
+                    return HUNG_EXIT
+                time.sleep(2)
         except KeyboardInterrupt:
             proc.terminate()
             return 0
 
 
-def supervise(port=None, cmd=None, sleep=time.sleep, max_runs=None):
+def _end_child(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+# ── "still alive" signal (frozen-agent watchdog) ─────────────────────────────
+# The agent touches HOME/agent.alive every loop and every second while it
+# sleeps. A crash is easy to see (the process exits); a FREEZE is not — e.g. a
+# network call that never returns after Wi-Fi drops or the computer wakes from
+# sleep. If the file goes stale for HANG_SECONDS the supervisor ends that copy
+# and starts a fresh one. Same code on Windows, macOS and Linux.
+HANG_SECONDS = 20 * 60   # longest normal gap is a 5-min overnight sleep
+HUNG_EXIT = 70           # treated as a crash: restarts with backoff
+_last_touch = [0.0]
+
+
+def _alive_path():
+    return _path("agent.alive")
+
+
+def touch_alive(force=False):
+    now = time.time()
+    if not force and now - _last_touch[0] < 30:
+        return
+    _last_touch[0] = now
+    try:
+        os.makedirs(home(), exist_ok=True)
+        with open(_alive_path(), "w", encoding="utf-8") as f:
+            f.write(str(now))
+    except OSError:
+        pass
+
+
+def child_hung(started, now=None):
+    """True if the agent started after `started` has signalled it's alive at
+    least once and then went quiet for HANG_SECONDS. Before the first signal
+    (still starting up, e.g. broker login) it is never judged hung."""
+    try:
+        last = os.path.getmtime(_alive_path())
+    except OSError:
+        return False
+    if last < started - 1:
+        return False   # left over from a previous copy
+    return (now or time.time()) - last > HANG_SECONDS
+
+
+def supervise(port=None, cmd=None, sleep=time.sleep, max_runs=None,
+              on_first_start=None):
     """Keep `agent.py run` alive. Exit 0 from the agent (stopped on purpose,
     or another copy is already running) ends supervision; RESTART_EXIT
     restarts at once; anything else is a crash and restarts with backoff
@@ -273,6 +337,10 @@ def supervise(port=None, cmd=None, sleep=time.sleep, max_runs=None):
     clear_stop()
     backoff, runs = 15, 0
     _log(f"started (pid {os.getpid()})")
+    if on_first_start is not None:
+        # e.g. open the dashboard once at login; runs beside the agent
+        import threading
+        threading.Thread(target=on_first_start, daemon=True).start()
     while True:
         if port:
             platform_compat.wait_port_free(port)
@@ -387,7 +455,7 @@ def _enable_windows():
     ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
           + _ps_quote(lnk) + ");"
           "$s.TargetPath=" + _ps_quote(pyw) + ";"
-          "$s.Arguments=" + _ps_quote(f'"{script}" supervise') + ";"
+          "$s.Arguments=" + _ps_quote(f'"{script}" supervise {AT_LOGIN_FLAG}') + ";"
           "$s.WorkingDirectory=" + _ps_quote(repo_dir()) + ";"
           "$s.Description='Starts agentic-trader in the background';"
           "$s.Save()")
@@ -407,7 +475,7 @@ def _enable_windows():
     with open(cmd_file, "w", encoding="utf-8") as f:
         f.write("@echo off\r\n"
                 f'cd /d "{repo_dir()}"\r\n'
-                f'start "" "{pyw}" "{script}" supervise\r\n')
+                f'start "" "{pyw}" "{script}" supervise {AT_LOGIN_FLAG}\r\n')
     return cmd_file
 
 
@@ -422,7 +490,8 @@ def _enable_mac():
         # whatever launchd started.
         plistlib.dump({
             "Label": MAC_LABEL,
-            "ProgramArguments": [sys.executable, agent_script(), "supervise"],
+            "ProgramArguments": [sys.executable, agent_script(), "supervise",
+                                 AT_LOGIN_FLAG],
             "WorkingDirectory": repo_dir(),
             "RunAtLoad": True,
             "StandardOutPath": os.path.join(home(), "launchd.log"),
@@ -444,7 +513,7 @@ def _enable_linux():
                 "Name=agentic-trader\n"
                 "Comment=Starts agentic-trader in the background\n"
                 f"Exec={_desktop_quote(sys.executable)} "
-                f"{_desktop_quote(agent_script())} supervise\n"
+                f"{_desktop_quote(agent_script())} supervise {AT_LOGIN_FLAG}\n"
                 f"Path={repo_dir()}\n"
                 "Terminal=false\n"
                 "X-GNOME-Autostart-enabled=true\n")
@@ -469,6 +538,38 @@ def disable_autostart():
             os.remove(p)
             removed.append(p)
     return removed
+
+
+def autostart_outdated():
+    """True if start-at-login is on but its entry was written by an older
+    version (no AT_LOGIN_FLAG, or pointing at a different Python/folder,
+    e.g. after the repo moved)."""
+    where = next((p for p in autostart_paths() if os.path.exists(p)), None)
+    if where is None:
+        return False
+    try:
+        with open(where, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return False
+    # .lnk files store their strings as UTF-16; the others are UTF-8
+    def has(text):
+        return text.encode() in raw or text.encode("utf-16-le") in raw
+    script = agent_script()
+    # the XDG .desktop entry escapes backslashes (matters for Windows paths)
+    return not (has(AT_LOGIN_FLAG)
+                and (has(script) or has(_desktop_quote(script)[1:-1])))
+
+
+def refresh_autostart():
+    """Rewrite an outdated start-at-login entry. Never raises; returns the
+    path rewritten, or None."""
+    try:
+        if autostart_outdated():
+            return enable_autostart()
+    except Exception:
+        pass
+    return None
 
 
 def set_autostart(on):

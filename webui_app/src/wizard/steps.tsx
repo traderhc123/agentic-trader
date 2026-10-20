@@ -885,7 +885,7 @@ export function LaunchStep() {
               window and it keeps running. Keep this computer awake during market hours.
             </p>
             <ChoiceRow type="checkbox" id="autostart" checked={autostart} onChange={setAutostart}>
-              Also start it automatically when I log in to this computer
+              Also start it automatically when I log in to this computer, and open this dashboard (already signed in)
             </ChoiceRow>
             <div className="mt-auto flex flex-wrap items-center gap-3 pt-2">
               <Button variant="primary" onClick={startLocal} disabled={blocked}>

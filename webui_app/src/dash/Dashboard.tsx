@@ -750,6 +750,7 @@ function ConsolePanel({ msgs, send }: { msgs: ChatMsg[]; send: (t: string) => vo
           ["set positions 5", "set positions 5"],
           ["rules", "my rules"],
           ["autostart", "start at login?"],
+          ["open at login on", "open dashboard at login"],
           ["keep awake on", "keep awake"],
           ["why did you skip the last signal?", "why the last skip?"],
         ].map(([cmd, label]) => (
