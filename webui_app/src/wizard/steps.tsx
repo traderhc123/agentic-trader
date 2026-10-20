@@ -605,6 +605,7 @@ export function SafetyStep() {
   const [minStrike, setMinStrike] = useState(r0.rule_min_strike ? String(r0.rule_min_strike) : "");
   const [skip0dte, setSkip0dte] = useState(!!r0.rule_skip_0dte);
   const [lossStreak, setLossStreak] = useState(r0.rule_loss_streak ? String(r0.rule_loss_streak) : "");
+  const [keepAwake, setKeepAwake] = useState(st?.keep_awake !== false);
   // Steps mount before /api/state arrives: seed the fields once it does, so
   // re-saving Safety never blanks rules the owner already set.
   const seeded = useRef(!!st?.rules);
@@ -618,6 +619,7 @@ export function SafetyStep() {
     setMinStrike(r.rule_min_strike ? String(r.rule_min_strike) : "");
     setSkip0dte(!!r.rule_skip_0dte);
     setLossStreak(r.rule_loss_streak ? String(r.rule_loss_streak) : "");
+    setKeepAwake(st?.keep_awake !== false);
   }, [st?.rules]);
   const [msg, setMsg] = useState<MsgT>(null);
 
@@ -636,6 +638,7 @@ export function SafetyStep() {
       rule_min_strike: minStrike,
       rule_skip_0dte: skip0dte,
       rule_loss_streak: lossStreak,
+      keep_awake: keepAwake,
     });
     if (r.ok) {
       setNext(r.next || "");
@@ -669,6 +672,12 @@ export function SafetyStep() {
             <b>LIVE mode:</b> the agent will send real orders with real money to your broker. Your decision, not advice.
           </Notice>
         )}
+      </Block>
+      <Block label="This computer" desc="The agent can only trade while the computer is awake.">
+        <ChoiceRow type="checkbox" id="sf-awake" checked={keepAwake} onChange={setKeepAwake}>
+          Keep this computer awake while the agent runs (recommended). The screen can still turn off. Closing a laptop lid
+          still puts it to sleep, so keep it open and plugged in during market hours.
+        </ChoiceRow>
       </Block>
       <Block label="Limits">
         <Field htmlFor="sf-cap" label="Max new entries per day" className="max-w-xs">

@@ -970,6 +970,14 @@ def _apply_command(text):
         import keep_running
         ok, note = keep_running.set_autostart(t.endswith("on"))
         return True, (note[0].upper() + note[1:] + ".") if ok else note
+    if t in ("keep awake on", "keep awake off", "stay awake on", "stay awake off"):
+        cfg["keep_awake"] = t.endswith("on")
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, ("Keep awake ON — this computer won't idle-sleep while the "
+                      "agent runs (closing a laptop lid still sleeps it)."
+                      if cfg["keep_awake"] else
+                      "Keep awake OFF — the computer may sleep; the agent pauses "
+                      "while it does.")
     if t in ("autostart", "start at login"):
         import keep_running
         return True, ("Starts at login: "
@@ -1158,6 +1166,9 @@ def cmd_run(app_window=False):
         _save(STATE_PATH, st, private=True)  # holds the day-pass L402 token
 
     cash = {"at": 0.0, "bp": None, "warning": ""}
+    import keep_awake
+    awake = keep_awake.KeepAwake()
+    awake.apply(cfg)
 
     # The agent serves its OWN dashboard — status, trade log, and a command/
     # chat box — on localhost. No central server involved.
@@ -1182,6 +1193,7 @@ def cmd_run(app_window=False):
                 "open positions": ", ".join(st.get("positions", {})) or "none",
                 "start at login": ("on" if keep_running.autostart_enabled()
                                    else "off"),
+                "keep awake": awake.describe(c),
                 **({"buying power": f"${cash['bp']:,.2f}"}
                    if cash["bp"] is not None else {}),
             },
@@ -1227,6 +1239,7 @@ def cmd_run(app_window=False):
                 + (f" — dashboard {dash_url.split('?')[0]}" if dash_url else ""))
     while True:
         cfg = _load(CONFIG_PATH, cfg) or cfg  # dashboard edits apply live
+        awake.apply(cfg)  # same thread every time (Windows needs that)
         poll = max(10, int(cfg.get("poll_seconds", 30)))
         if keep_running.stop_requested():
             keep_running.clear_stop()
@@ -1475,6 +1488,12 @@ def doctor_checks():
     sized = bool(cfg.get("sizing_mode") or cfg.get("contracts_per_trade"))
     check("sizing", True, "Position sizing",
           _sizing_desc(cfg) + ("" if sized else " (default — only the owner changes it)"),
+          who="owner")
+
+    import keep_awake
+    check("keep_awake", True, "Keep this computer awake while running",
+          "on" if keep_awake.wanted(cfg) else
+          "off — if the computer sleeps, the agent pauses and can miss trades",
           who="owner")
 
     import rules

@@ -46,11 +46,14 @@ Mon–Fri). It sleeps itself outside those hours. Pick one:
 | **An old computer / Mac mini / Raspberry Pi at home** | Set-and-forget, no monthly fee | Free |
 | **A tiny cloud server (VPS)** | Most reliable — always on, survives power cuts | ~$5/month |
 
-**Windows PCs:** fully supported — use the PowerShell line below. Keep the
-PC from sleeping during market hours (Settings → System → Power → Sleep:
-Never while plugged in), same as the laptop caveat.
+**Windows PCs and Macs:** fully supported. While the agent runs it keeps the
+computer from going to sleep by itself (the screen can still turn off) —
+"Keep this computer awake" in the Safety step, on by default; say
+`keep awake off` in the dashboard to turn it off. Nothing in your power
+settings is changed, and it stops when the agent stops.
 
-**Laptop caveat:** if the lid closes or it sleeps, the agent pauses. It
+**Laptop caveat:** closing the lid (or choosing Sleep) still sleeps the
+computer, and the agent pauses. It
 catches up when it wakes (and refuses to act on entries older than 5
 minutes — a safety feature), but exits can be delayed. Fine for dry-run
 trials; not ideal for live money.

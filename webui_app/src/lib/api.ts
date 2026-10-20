@@ -110,4 +110,5 @@ export interface WizardState {
   rules_summary?: string;
   policy_on?: boolean;
   running?: boolean;
+  keep_awake?: boolean;
 }
