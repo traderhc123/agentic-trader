@@ -3687,7 +3687,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "exact command (pause, resume, dry on/off, set budget N, "
                 "set contracts N, set percent N, set other budget|contracts|"
                 "percent N, other sizing same, set positions N, "
-                "set cap N, stop, autostart on|off, open at login on|off, keep awake on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N). Never give investment advice; you may "
+                "set cap N, stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
             f"STATUS:\n{json.dumps(status_fields, indent=1)}\n\n"

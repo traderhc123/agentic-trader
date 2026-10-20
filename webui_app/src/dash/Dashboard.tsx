@@ -7,7 +7,7 @@ import { ConfirmDialog } from "../components/ui/dialog";
 import { Input } from "../components/ui/field";
 import { Count, Panel } from "../components/ui/panel";
 import { ModeTag, RightTag } from "../components/ui/tag";
-import { api, type Problem, type Proposal, type StatusResp, type Trade } from "../lib/api";
+import { api, type Problem, type Proposal, type StatusResp, type Trade, type WouldHave } from "../lib/api";
 import { cn } from "../lib/cn";
 import { copyToClipboard, useInterval } from "../lib/hooks";
 import { cap1, hhmm, isToday, money, parseContract, parsePositions, shortDate, whenShort, type Contract } from "../lib/format";
@@ -182,6 +182,7 @@ export function Dashboard() {
           <div className="flex min-w-0 flex-col gap-4">
             {proposal?.pending && <ProposalPanel p={proposal} onDone={refresh} />}
             <PnlPanel trades={trades} />
+            {conn === "ok" && !live && status?.would_have && <WouldHavePanel p={status.would_have} />}
             <PositionsPanel positions={parsePositions(f["open positions"])} />
             <Blotter trades={trades} />
           </div>
@@ -193,6 +194,85 @@ export function Dashboard() {
         </div>
       </main>
     </>
+  );
+}
+
+// ── dry-run preview: what this setup would have taken ───────────────────────
+function pct(n: number | null) {
+  return n == null ? "—" : `${n > 0 ? "+" : ""}${n.toFixed(1)}%`;
+}
+function pnlTone(n: number | null) {
+  // W/BE/L: 0% to +6% is breakeven
+  return n == null ? "text-faint" : n > 6 ? "text-up" : n < 0 ? "text-down" : "text-fg2";
+}
+function entryWhen(r: { date: string; entry_time?: string }) {
+  const d = r.entry_time ? new Date(r.entry_time) : null;
+  return d && !isNaN(+d) ? `${shortDate(d)} ${hhmm(d)}` : r.date;
+}
+function WouldHavePanel({ p }: { p: WouldHave }) {
+  const rows = p.rows || [];
+  const sub =
+    p.would_take > 0
+      ? `${p.would_take} would take · ${p.wins}W ${p.breakeven}BE ${p.losses}L` +
+        (p.avg_paper_pnl_pct != null ? ` · avg ${pct(p.avg_paper_pnl_pct)}` : "")
+      : "";
+  return (
+    <Panel title={`Would have taken · past ${p.days} days`} right={sub ? <span className="text-xs text-muted">{sub}</span> : <Count n={rows.length} />}>
+      <p className="m-0 border-b border-line px-4 py-2 text-xs leading-5 text-muted">
+        Dry-run preview. AgentHC's closed paper trades, checked against your rules. Free, no pass needed. Trades show up
+        after they close, not live. P&L is AgentHC's paper result, not your fills. Your AI policy, daily caps and budget
+        aren't applied. Hypothetical, not advice. Turn off with <code className="font-mono">preview off</code>.
+      </p>
+      {rows.length === 0 ? (
+        <p className="m-0 px-4 py-6 text-center text-xs text-muted">
+          {p.unavailable
+            ? "The signal server doesn't offer the free preview yet."
+            : p.error
+              ? `Couldn't load the preview yet (${p.error}). It retries every 5 minutes.`
+              : "No closed trades in the past week yet."}
+        </p>
+      ) : (
+        <>
+          <div className="overflow-x-auto max-md:hidden">
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr className="text-left text-xs text-muted">
+                  <Th>Entered</Th>
+                  <Th>Contract</Th>
+                  <Th>Your setup</Th>
+                  <Th>Held</Th>
+                  <Th className="text-right">Paper P&L</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, i) => (
+                  <tr key={i} className="border-t border-line align-top hover:bg-panel2">
+                    <Td className="font-mono text-xs leading-5 text-muted">{entryWhen(r)}</Td>
+                    <Td className="font-mono text-xs leading-5 text-fg">{r.contract}</Td>
+                    <td className="min-w-[180px] max-w-[360px] px-4 py-2 text-xs leading-5 [overflow-wrap:anywhere]">
+                      {r.would_take ? <span className="text-fg">Would take</span> : <span className="text-muted">Skip: {r.skip_reason}</span>}
+                    </td>
+                    <Td className="font-mono text-xs leading-5 text-muted">{r.hold_minutes != null ? `${r.hold_minutes}m` : "—"}</Td>
+                    <Td className={cn("text-right font-mono", r.would_take ? pnlTone(r.paper_pnl_pct) : "text-faint")}>{pct(r.paper_pnl_pct)}</Td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <ul className="m-0 list-none p-0 md:hidden">
+            {rows.map((r, i) => (
+              <li key={i} className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-2.5 gap-y-0.5 border-t border-line px-3 py-2.5 first:border-t-0">
+                <div className="min-w-0 font-mono text-xs text-fg [overflow-wrap:anywhere]">{r.contract}</div>
+                <div className={cn("text-right font-mono text-sm", r.would_take ? pnlTone(r.paper_pnl_pct) : "text-faint")}>{pct(r.paper_pnl_pct)}</div>
+                <div className="col-span-2 text-xs text-muted [overflow-wrap:anywhere]">
+                  {entryWhen(r)} · {r.would_take ? "would take" : `skip: ${r.skip_reason}`}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </Panel>
   );
 }
 

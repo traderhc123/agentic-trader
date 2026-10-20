@@ -991,6 +991,13 @@ def _apply_command(text):
                       "Open at login OFF — the agent still starts at login; open "
                       "the dashboard yourself (bookmark http://127.0.0.1:"
                       "8721/dash — you stay signed in).")
+    if t in ("preview on", "preview off"):
+        cfg["dry_run_preview"] = t.endswith("on")
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, ("Dry-run preview ON — the dashboard lists AgentHC's closed "
+                      "trades from the past week and whether your rules would "
+                      "have taken each one (dry-run only, no orders)."
+                      if cfg["dry_run_preview"] else "Dry-run preview OFF.")
     if t in ("autostart", "start at login"):
         import keep_running
         return True, ("Starts at login: "
@@ -1179,6 +1186,7 @@ def cmd_run(app_window=False):
         _save(STATE_PATH, st, private=True)  # holds the day-pass L402 token
 
     cash = {"at": 0.0, "bp": None, "warning": ""}
+    import dry_run_preview
     import keep_awake
     awake = keep_awake.KeepAwake()
     awake.apply(cfg)
@@ -1214,6 +1222,7 @@ def cmd_run(app_window=False):
             },
             "cash_warning": cash.get("warning", ""),
             "problems": _problems_today(),
+            "would_have": dry_run_preview.summary(c),
         }
 
     def start_dash():
@@ -1350,6 +1359,9 @@ def cmd_run(app_window=False):
             _maybe_daily_digest(cfg, state, save_state)
         except Exception:
             pass
+        if dry_run_preview.wanted(cfg):
+            # free closed-trades list → "would have taken" panel (never raises)
+            dry_run_preview.refresh(cfg, _market_open_now())
         # Market-hours-aware cadence: fast while the market can move, slow
         # overnight/weekends; snappy while paused so 'resume' feels instant.
         if webui.CONTROLS["paused"]:
