@@ -231,6 +231,16 @@ download it from moomoo.com → API, log in once, keep it running, and
 is missing. Paper (SIMULATE) is the default; live orders additionally need
 your trade password and options approval.
 
+## See what it would have done (dry-run, free)
+
+In dry-run with the AgentHC source, the dashboard shows **Would have taken ·
+past 7 days**: AgentHC's closed paper trades from the past week, each checked
+against your rules (tickers, calls/puts, min strike, no 0DTE, loss stop).
+You'll see "would take" or "skip: why", plus AgentHC's paper P&L. No pass is
+needed and nothing is ordered. Trades show up after they close (not live),
+and your AI policy, daily caps and budget aren't applied. Turn it off with
+`preview off`.
+
 ## Checklist before going live (turning dry-run off)
 
 - [ ] You read DISCLAIMER.md and accepted it yourself

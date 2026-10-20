@@ -59,6 +59,30 @@ export interface StatusResp {
   fields: Record<string, string>;
   cash_warning?: string;
   problems?: Problem[];
+  would_have?: WouldHave | null;
+}
+export interface WouldHaveRow {
+  date: string;
+  entry_time?: string;
+  exit_time?: string;
+  contract: string;
+  hold_minutes?: number | null;
+  paper_pnl_pct: number | null;
+  exit_kind?: string;
+  would_take: boolean;
+  skip_reason?: string;
+}
+export interface WouldHave {
+  days: number;
+  rows: WouldHaveRow[];
+  would_take: number;
+  wins: number;
+  breakeven: number;
+  losses: number;
+  avg_paper_pnl_pct: number | null;
+  updated_at?: number | null;
+  error?: string;
+  unavailable?: boolean;
 }
 export interface Problem {
   kind: string;
