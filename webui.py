@@ -46,11 +46,14 @@ def open_app_window(url):
     import sys
     candidates = []
     if sys.platform == "darwin":
-        candidates = [
-            ["open", "-na", "Google Chrome", "--args", f"--app={url}"],
-            ["open", "-na", "Microsoft Edge", "--args", f"--app={url}"],
-            ["open", "-na", "Brave Browser", "--args", f"--app={url}"],
-        ]
+        import os
+        # `open -na <App>` exits non-zero AFTER Popen returns when the app
+        # isn't installed, so check first (like the Windows branch) or a
+        # Safari-only Mac would open nothing at all.
+        for app in ("Google Chrome", "Microsoft Edge", "Brave Browser"):
+            if any(os.path.isdir(os.path.join(d, app + ".app")) for d in
+                   ("/Applications", os.path.expanduser("~/Applications"))):
+                candidates.append(["open", "-na", app, "--args", f"--app={url}"])
     elif sys.platform == "win32":
         import os
         for exe in ("msedge", "chrome", "brave"):  # Edge ships with Windows
@@ -986,7 +989,8 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     page becomes its dashboard. You can close the terminal window; it keeps
     running. Keep this computer awake during market hours.</p>
     <p><label><input type="checkbox" id="autostart" checked> Also start it
-    automatically when I log in to this computer</label></p>
+    automatically when I log in to this computer, and open this dashboard
+    (already signed in)</label></p>
     <p class="cta"><button class="btn-primary" onclick="startLocal()">Start my agent now</button>
     <span id="start-msg" role="status" aria-live="polite" class="muted"></span></p>
    </div>
@@ -3683,7 +3687,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "exact command (pause, resume, dry on/off, set budget N, "
                 "set contracts N, set percent N, set other budget|contracts|"
                 "percent N, other sizing same, set positions N, "
-                "set cap N, stop, autostart on|off, keep awake on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N). Never give investment advice; you may "
+                "set cap N, stop, autostart on|off, open at login on|off, keep awake on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
             f"STATUS:\n{json.dumps(status_fields, indent=1)}\n\n"

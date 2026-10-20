@@ -210,7 +210,8 @@ def test_mac_autostart_plist(home, tmp_path, monkeypatch):
     with open(path, "rb") as f:
         pl = plistlib.load(f)
     assert pl["Label"] == keep_running.MAC_LABEL and pl["RunAtLoad"] is True
-    assert pl["ProgramArguments"][1:] == [keep_running.agent_script(), "supervise"]
+    assert pl["ProgramArguments"][1:] == [keep_running.agent_script(), "supervise",
+                                          keep_running.AT_LOGIN_FLAG]
     keep_running.disable_autostart()
     assert not os.path.exists(path)
 

@@ -978,6 +978,19 @@ def _apply_command(text):
                       if cfg["keep_awake"] else
                       "Keep awake OFF — the computer may sleep; the agent pauses "
                       "while it does.")
+    if t in ("open at login on", "open at login off",
+             "open dashboard at login on", "open dashboard at login off"):
+        cfg["open_dashboard_at_login"] = t.endswith("on")
+        _save(CONFIG_PATH, cfg, private=True)
+        import keep_running
+        tail = ("" if keep_running.autostart_enabled() else
+                " (start at login is off, so nothing opens yet — type: autostart on)")
+        return True, ("Open at login ON — after the computer starts and you log "
+                      "in, the dashboard opens by itself, already signed in." + tail
+                      if cfg["open_dashboard_at_login"] else
+                      "Open at login OFF — the agent still starts at login; open "
+                      "the dashboard yourself (bookmark http://127.0.0.1:"
+                      "8721/dash — you stay signed in).")
     if t in ("autostart", "start at login"):
         import keep_running
         return True, ("Starts at login: "
@@ -1194,6 +1207,8 @@ def cmd_run(app_window=False):
                 "start at login": ("on" if keep_running.autostart_enabled()
                                    else "off"),
                 "keep awake": awake.describe(c),
+                "open dashboard at login": ("on" if _open_at_login_wanted(c)
+                                            else "off"),
                 **({"buying power": f"${cash['bp']:,.2f}"}
                    if cash["bp"] is not None else {}),
             },
@@ -1201,13 +1216,22 @@ def cmd_run(app_window=False):
             "problems": _problems_today(),
         }
 
-    dash_url = None
-    try:
-        dash_url = webui.start_dashboard(
+    def start_dash():
+        return webui.start_dashboard(
             get_status, lambda: list(reversed(_recent_trades(25))),
             _apply_command, lambda: _load(CONFIG_PATH, {}) or {})
+
+    dash_url = None
+    try:
+        dash_url = start_dash()
     except OSError as exc:
-        print(f"dashboard not started ({exc}) — continuing headless")
+        print(f"dashboard not started ({exc}) — trading continues; "
+              "retrying every 5 min")
+    dash = {"at": time.time(), "fails": 0}
+    # older start-at-login entries don't open the dashboard / may point at
+    # an old folder — bring them up to date (no-op when current or off)
+    if keep_running.refresh_autostart():
+        print("Updated the start-at-login entry.")
 
     _refresh_cash(cfg, state, save_state, broker, client, cash)
     mode = "DRY-RUN (no orders)" if cfg.get("dry_run") else "LIVE"
@@ -1238,8 +1262,26 @@ def cmd_run(app_window=False):
                 # never send the login token to a third-party notifier
                 + (f" — dashboard {dash_url.split('?')[0]}" if dash_url else ""))
     while True:
+        keep_running.touch_alive()
         cfg = _load(CONFIG_PATH, cfg) or cfg  # dashboard edits apply live
         awake.apply(cfg)  # same thread every time (Windows needs that)
+        if time.time() - dash["at"] > DASH_CHECK_EVERY_S:
+            dash["at"] = time.time()
+            if dash_url is None:
+                try:
+                    dash_url = start_dash()
+                    print(f"Dashboard is up now: {dash_url.split('?')[0]}")
+                except OSError:
+                    pass
+            elif _dashboard_answers(webui.APP_PORT):
+                dash["fails"] = 0
+            else:
+                dash["fails"] += 1
+                if (dash["fails"] >= 2
+                        and os.environ.get(keep_running.SUPERVISED_ENV)):
+                    print("The dashboard stopped answering — restarting the "
+                          "agent to bring it back.")
+                    sys.exit(DASH_DOWN_EXIT)
         poll = max(10, int(cfg.get("poll_seconds", 30)))
         if keep_running.stop_requested():
             keep_running.clear_stop()
@@ -1322,6 +1364,10 @@ def cmd_run(app_window=False):
             return
 
 
+DASH_CHECK_EVERY_S = 300
+DASH_DOWN_EXIT = 3   # supervisor restarts it (with the crash backoff)
+
+
 def _sleep_unless_stopped(seconds, controls):
     """Sleep in 1 s slices so a stop (dashboard button or `agent.py stop`)
     takes effect within a second, not after a 5-minute overnight poll."""
@@ -1331,6 +1377,7 @@ def _sleep_unless_stopped(seconds, controls):
         left = end - time.time()
         if left <= 0 or controls.get("stop") or keep_running.stop_requested():
             return
+        keep_running.touch_alive()  # throttled to one write per 30 s
         time.sleep(min(1.0, left))
 
 
@@ -1488,6 +1535,13 @@ def doctor_checks():
     sized = bool(cfg.get("sizing_mode") or cfg.get("contracts_per_trade"))
     check("sizing", True, "Position sizing",
           _sizing_desc(cfg) + ("" if sized else " (default — only the owner changes it)"),
+          who="owner")
+
+    import keep_running as _kr
+    check("open_at_login", True, "Open the dashboard at login",
+          ("on" if _open_at_login_wanted(cfg) else "off")
+          + ("" if _kr.autostart_enabled() else
+             " (start at login is off — type: autostart on)"),
           who="owner")
 
     import keep_awake
@@ -1825,7 +1879,51 @@ def cmd_supervise():
         i = sys.argv.index("--port")
         if i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit():
             port = int(sys.argv[i + 1])
-    sys.exit(keep_running.supervise(port=port))
+    on_first = None
+    if keep_running.AT_LOGIN_FLAG in sys.argv and _open_at_login_wanted():
+        on_first = _open_dashboard_when_ready
+    sys.exit(keep_running.supervise(port=port, on_first_start=on_first))
+
+
+def _open_at_login_wanted(cfg=None):
+    if cfg is None:
+        cfg = _load(CONFIG_PATH, {}) or {}
+    return cfg.get("open_dashboard_at_login", True) is not False
+
+
+def _dashboard_answers(port, timeout=10):
+    """True if the dashboard's web server answers HTTP at all (any status).
+    A bare TCP connect isn't enough: the OS accepts connections on a listening
+    socket even when the thread serving it has died."""
+    import http.client
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", int(port), timeout=timeout)
+        try:
+            c.request("GET", "/healthz")
+            c.getresponse().read()
+        finally:
+            c.close()
+        return True
+    except Exception:
+        return False
+
+
+def _open_dashboard_when_ready(timeout=600, sleep=time.sleep):
+    """At login: wait for the agent's dashboard to come up, then open it
+    already signed in (the link carries this install's login token). Same on
+    Windows, macOS and Linux desktops."""
+    import keep_running
+    import webui
+    end = time.time() + timeout
+    while time.time() < end:
+        if keep_running.is_running() and _dashboard_answers(webui.APP_PORT, 3):
+            webui.open_app_window(_dashboard_link())
+            keep_running._log("opened the dashboard (start at login)")
+            return True
+        sleep(2)
+    keep_running._log("dashboard didn't come up within "
+                      f"{timeout // 60} min of login — not opening it")
+    return False
 
 
 def cmd_autostart(action):

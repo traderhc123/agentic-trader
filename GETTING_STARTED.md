@@ -58,6 +58,23 @@ catches up when it wakes (and refuses to act on entries older than 5
 minutes — a safety feature), but exits can be delayed. Fine for dry-run
 trials; not ideal for live money.
 
+**Keeping it (and its dashboard) up 24/7** — works the same on Windows
+and Mac:
+
+| What happens | What the agent does |
+|---|---|
+| Wi-Fi / internet drops | The dashboard keeps working (it runs on your computer, at `http://127.0.0.1:8721/dash`). Trading pauses and picks up again by itself when the connection is back. |
+| The agent crashes | Restarts by itself (15 s, backing off to 10 min if it keeps crashing). |
+| The agent freezes (e.g. a network call that never returns after Wi-Fi drops or the computer wakes up) | Detected after 20 min of silence, then restarted. |
+| The dashboard stops answering but the agent keeps going | The agent restarts itself to bring the dashboard back. |
+| You restart / shut down the computer | With **start at login** on (`autostart on`, or the checkbox on the last setup step), it starts when you log in and **opens the dashboard by itself, already signed in**. Turn just the opening off with `open at login off`. |
+| You bookmark the dashboard | `http://127.0.0.1:8721/dash` stays signed in for a year in that browser. Signed out? Run `python agent.py link`. |
+
+What no setting can fix on a personal computer: nothing runs until someone
+logs in after a restart (a disk-encrypted Mac or PC waits at the password
+screen), a dead battery or closed lid stops it, and the dashboard is only
+reachable from that computer. For truly always-on, use **Option B** below.
+
 **How much terminal is involved, really?** ONE pasted line, once. The
 installer handles everything (it even installs Python itself if your
 computer doesn't have it — no git needed either), opens the setup wizard in
