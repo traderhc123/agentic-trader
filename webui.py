@@ -2076,7 +2076,7 @@ function setMode(kind,live,paused){
   // text actually changes, or screen readers re-announce it on every poll.
   const mb=$('modebar'),main=$('mb-main'),sub=mb.querySelector('.mb-txt>.muted');
   const put=(cls,h)=>{if(mb.className!==cls)mb.className=cls;if(main.innerHTML!==h)main.innerHTML=h;};
-  if(kind==='off'){put('modebar off','<b>Agent not running.</b> Start it: <code>python agent.py run</code>');return;}
+  if(kind==='off'){put('modebar off','<b>Agent not running.</b> Start it: <code>python agent.py start</code>');return;}
   if(kind==='unreachable'){put('modebar off','<b>Can\\'t reach the agent on this computer</b> — is it still running?');return;}
   put('modebar '+(live?'live':'dry')+(paused?' paused':''),
     (live?'<b>LIVE.</b> Real orders with real money are sent to your broker.':
@@ -3373,7 +3373,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         text = str(data.get("text", "")).strip()
         if apply_command is None:
             return {"reply": "The agent isn't running yet — finish setup, then "
-                             "start it with: agent.py run"}
+                             "start it with: agent.py start"}
         handled, reply = apply_command(text)
         if handled:
             return {"reply": reply}

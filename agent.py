@@ -8,11 +8,13 @@ through a BROKER adapter (currently: your own Robinhood Agentic account via
 Robinhood's trading MCP).
 
     python agent.py          # do the right thing: open the setup wizard if not
-                             # set up yet, otherwise run the agent
+                             # set up yet, otherwise start the agent in the
+                             # background and open its dashboard
     python agent.py setup    # explicit setup (add --web for the browser wizard)
-    python agent.py run      # heartbeat loop (refuses to run without consent)
-    python agent.py app      # same as run, but opens the dashboard as a desktop
-                             # app window (chromeless browser; --app on run too)
+    python agent.py run      # heartbeat in the FOREGROUND (servers, Docker, tmux;
+                             # closing the terminal stops it)
+    python agent.py app      # start in the background + open the dashboard as a
+                             # desktop app window (chromeless browser)
     python agent.py start    # run in the background — closing this window
                              # doesn't stop it; restarts itself if it crashes
     python agent.py stop     # stop the background agent
@@ -1208,6 +1210,14 @@ def cmd_run(app_window=False):
             import webui
             webui.open_app_window(dash_url)
     print("Reminder: you are responsible for every order this agent places.")
+    try:
+        interactive = sys.stdout.isatty()
+    except Exception:
+        interactive = False
+    if interactive and not os.environ.get(keep_running.SUPERVISED_ENV):
+        print("NOTE: running in THIS window — closing it stops the agent. To keep "
+              "it running after you close the window: Ctrl-C, then "
+              "`python agent.py start`.")
     if llm_policy.entries_blocked(cfg):
         print("\n" + "!" * 72 + "\nWARNING: " + llm_policy.BLOCKED_MSG
               + "\n" + "!" * 72 + "\n")
@@ -1669,7 +1679,19 @@ def _open_running_dashboard():
     return True
 
 
-def cmd_start():
+def _open_dash(app_window=False):
+    import webui
+    try:
+        if app_window:
+            webui.open_app_window(_dashboard_link())
+        else:
+            import webbrowser
+            webbrowser.open(_dashboard_link())
+    except Exception:
+        pass
+
+
+def cmd_start(open_dashboard=False, app_window=False):
     """Start the agent in the background: closing the window doesn't stop
     it, and it restarts itself after a crash."""
     import keep_running
@@ -1677,6 +1699,8 @@ def cmd_start():
     if keep_running.is_running():
         print("The agent is already running.")
         print(f"Dashboard: {_dashboard_link()}")
+        if open_dashboard:
+            _open_dash(app_window)
         return
     if not _is_ready():
         print("Not set up yet — run: python agent.py setup --web")
@@ -1692,6 +1716,8 @@ def cmd_start():
     if keep_running.wait_until_running(timeout=40, proc=proc):
         print("Running. You can close this window — the agent keeps going.")
         print(f"Dashboard: {_dashboard_link()}")
+        if open_dashboard:
+            _open_dash(app_window)
         print(f"Log:       {keep_running.log_path()}")
         print("Stop:      python agent.py stop")
         if not keep_running.autostart_enabled():
@@ -1830,7 +1856,9 @@ def main():
         if _open_running_dashboard():
             return
         if _is_ready():
-            cmd_run()
+            # Background, like the wizard's Start button: closing this
+            # terminal must not stop the agent. (`run` = foreground.)
+            cmd_start(open_dashboard=True)
         else:
             print("Not set up yet — opening the setup wizard in your browser.")
             print("(Nothing runs or trades until you accept DISCLAIMER.md there.)")
@@ -1856,8 +1884,10 @@ def main():
             print(json.dumps(setup_plan.EXAMPLE_PLAN, indent=2))
         else:
             cmd_setup()
-    elif cmd in ("run", "app"):
-        cmd_run(app_window=(cmd == "app" or "--app" in sys.argv))
+    elif cmd == "app":
+        cmd_start(open_dashboard=True, app_window=True)
+    elif cmd == "run":
+        cmd_run(app_window="--app" in sys.argv)
     elif cmd == "start":
         cmd_start()
     elif cmd == "stop":

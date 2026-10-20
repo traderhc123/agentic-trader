@@ -137,7 +137,7 @@ git clone https://github.com/traderhc123/agentic-trader && cd agentic-trader \
   && ./.venv/bin/python agent.py
 ```
 
-After setup, `./.venv/bin/python agent.py` again just runs the agent (dashboard
+After setup, `./.venv/bin/python agent.py` again starts the agent in the background (dashboard
 at http://127.0.0.1:8721). Prefer terminal prompts to the browser? Use
 `agent.py setup`. Other commands: `status`, `fund <sats>`.
 </details>
