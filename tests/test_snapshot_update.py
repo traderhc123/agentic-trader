@@ -52,8 +52,9 @@ def _zip(files, top=f"agentic-trader-{SHA_NEW}"):
 def install(tmp_path):
     d = tmp_path / "install"
     d.mkdir()
-    (d / "agent.py").write_text("old agent\n")
-    (d / "keep.py").write_text("same\n")
+    # bytes, like a real zip install — write_text would add \r on Windows
+    (d / "agent.py").write_bytes(b"old agent\n")
+    (d / "keep.py").write_bytes(b"same\n")
     return d
 
 

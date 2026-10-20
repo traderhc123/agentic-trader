@@ -30,7 +30,7 @@ def test_served_script_is_valid_js(tmp_path, page):
     assert blocks, f"no <script> block found in {page}"
     for i, js in enumerate(blocks):
         f = tmp_path / f"{page}-{i}.js"
-        f.write_text(js)
+        f.write_text(js, encoding="utf-8")
         r = subprocess.run([node, "--check", str(f)],
                            capture_output=True, text=True)
         assert r.returncode == 0, f"{page} script {i} invalid:\n{r.stderr}"

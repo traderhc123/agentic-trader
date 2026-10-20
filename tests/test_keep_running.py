@@ -192,7 +192,8 @@ def test_linux_autostart_entry(home, tmp_path, monkeypatch):
     path = keep_running.enable_autostart()
     text = open(path).read()
     assert path.endswith(os.path.join("autostart", "agentic-trader.desktop"))
-    assert "supervise" in text and keep_running.agent_script() in text
+    assert "supervise" in text
+    assert keep_running._desktop_quote(keep_running.agent_script()) in text
     assert keep_running.autostart_status()["enabled"]
     assert keep_running.disable_autostart() == [path]
     assert not keep_running.autostart_enabled()

@@ -139,7 +139,9 @@ def _repo_files():
                                                           ".yaml", ".service")):
                 continue
             path = os.path.join(root, name)
-            rel = os.path.relpath(path, _repo())
+            # forward slashes on every OS: these names go to the model and
+            # into proposals, and must look the same as on Linux/macOS
+            rel = os.path.relpath(path, _repo()).replace(os.sep, "/")
             try:
                 if os.path.getsize(path) <= MAX_FILE_BYTES:
                     with open(path, encoding="utf-8") as f:
