@@ -98,4 +98,15 @@ export interface WizardState {
   wallet: { connected: boolean; page: string };
   recurring: boolean;
   pass: boolean;
+  autostart?: boolean;
+  rules?: {
+    rule_tickers?: string[] | null;
+    rule_skip_tickers?: string[] | null;
+    rule_sides?: string | null;
+    rule_min_strike?: number | null;
+    rule_skip_0dte?: boolean | null;
+    rule_loss_streak?: number | null;
+  };
+  rules_summary?: string;
+  policy_on?: boolean;
 }

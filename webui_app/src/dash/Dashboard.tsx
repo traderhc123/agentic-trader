@@ -19,7 +19,8 @@ const SKIPS: Record<string, string> = {
   skip_daily_cap: "daily entry cap reached",
   skip_position_cap: "max open positions reached",
   skip_daily_loss: "daily loss limit reached",
-  policy_veto: "your rules said no",
+  policy_veto: "your plain-English rules said no",
+  skip_rule: "your rules",
   skip_sizing: "couldn't size the trade",
   order_failed: "the broker rejected the order",
   skip_budget: "one contract costs more than your budget",
@@ -329,6 +330,7 @@ function StatusStrip({ conn, f }: { conn: Conn; f: Record<string, string> }) {
   }
   const polOn = f["policy brain"] === "on";
   const polBlocked = f["policy brain"] === "blocked";
+  const rulesOn = !!f["rules"] && f["rules"] !== "none";
 
   return (
     <div className="grid grid-cols-5 divide-x divide-line overflow-hidden rounded-md border border-line bg-panel max-lg:grid-cols-3 max-lg:divide-x-0 max-sm:grid-cols-2 [&>*]:border-line max-lg:[&>*]:border-b max-lg:[&>*]:border-r">
@@ -376,21 +378,21 @@ function StatusStrip({ conn, f }: { conn: Conn; f: Record<string, string> }) {
       <Cell
         k="Your rules"
         bad={ok && polBlocked}
+        wrap
         sub={
           ok
             ? polBlocked
-              ? "no AI connected: every entry is skipped. Connect your AI in Setup"
-              : polOn
-                ? "checked before every entry"
-                : "add rules in Settings → Safety"
+              ? "plain-English rules but no AI: every entry is skipped. Connect an AI in Settings, or say 'policy off'"
+              : (rulesOn ? f["rules"] : "set them in Settings → Safety, or say 'rules'") +
+                (polOn ? " · plus plain-English rules (AI)" : "")
             : ""
         }
         className="max-sm:col-span-2"
       >
         {ok ? (
           <span className="inline-flex items-center gap-2 font-sans text-lg">
-            <span className={cn("h-2 w-2 rounded-full", polBlocked ? "bg-down" : polOn ? "bg-up" : "border border-faint")} />
-            {polBlocked ? "Blocking entries" : polOn ? "On" : "Off"}
+            <span className={cn("h-2 w-2 rounded-full", polBlocked ? "bg-down" : rulesOn || polOn ? "bg-up" : "border border-faint")} />
+            {polBlocked ? "Blocking entries" : rulesOn || polOn ? "On" : "None"}
           </span>
         ) : (
           "–"
@@ -739,6 +741,7 @@ function ConsolePanel({ msgs, send }: { msgs: ChatMsg[]; send: (t: string) => vo
           ["status", "status"],
           ["set cap 3", "set cap 3"],
           ["set positions 5", "set positions 5"],
+          ["rules", "my rules"],
           ["autostart", "start at login?"],
           ["why did you skip the last signal?", "why the last skip?"],
         ].map(([cmd, label]) => (

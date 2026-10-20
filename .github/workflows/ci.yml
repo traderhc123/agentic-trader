@@ -24,6 +24,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
       - name: Compile check
-        run: python -m compileall -q agent.py webui.py self_edit.py platform_compat.py keep_running.py broker_events.py llm_policy.py lightning_wallet.py notifications.py provision.py brokers sources
+        run: python -m compileall -q agent.py webui.py self_edit.py platform_compat.py keep_running.py broker_events.py rules.py llm_policy.py lightning_wallet.py notifications.py provision.py brokers sources
       - name: Tests
         run: pytest

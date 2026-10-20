@@ -25,7 +25,7 @@ import json
 import os
 
 ALLOWED_TOP = {"source", "feed_access", "ai", "broker", "sizing", "safety",
-               "notifications", "policy"}
+               "notifications", "policy", "rules"}
 
 EXAMPLE_PLAN = {
     "source": {"type": "agenthc", "include_other_trades": False},
@@ -36,7 +36,9 @@ EXAMPLE_PLAN = {
     "safety": {"max_entries_per_day": 3, "max_open_positions": 5,
                "max_daily_loss_usd": 0, "max_contracts_per_trade": 10},
     "notifications": {"ntfy_topic": "my-agent-alerts"},
-    "policy": "- Skip puts.\n- Never more than 2 entries a day.",
+    # built-in rules: no AI needed (only what the owner actually asked for)
+    "rules": {"tickers": ["SPY", "QQQ"], "sides": "calls", "skip_0dte": True,
+              "loss_streak": 2},
 }
 
 _FORBIDDEN = {
@@ -235,6 +237,27 @@ def apply(plan, cfg, consent_ok, home):
                        "telegram_chat_id"}
     if extra:
         errors.append(f"unknown notification settings: {', '.join(sorted(extra))}")
+
+    # ── built-in rules (no AI) ──
+    rl = plan.get("rules") or {}
+    if not isinstance(rl, dict):
+        errors.append("rules must be an object")
+        rl = {}
+    names = {"tickers": "rule_tickers", "skip_tickers": "rule_skip_tickers",
+             "sides": "rule_sides", "min_strike": "rule_min_strike",
+             "skip_0dte": "rule_skip_0dte", "loss_streak": "rule_loss_streak"}
+    extra = set(rl) - set(names)
+    if extra:
+        errors.append(f"unknown rules: {', '.join(sorted(extra))} "
+                      f"(allowed: {', '.join(sorted(names))})")
+    if "sides" in rl and str(rl["sides"]).lower() not in ("both", "calls", "puts"):
+        errors.append("rules.sides must be both, calls or puts")
+    if rl and not extra:
+        import rules as _rules
+        _rules.apply_settings(new, {names[k]: v for k, v in rl.items()})
+        desc = _rules.describe(new)
+        if desc:
+            applied.append(f"rules: {desc}")
 
     policy = plan.get("policy")
     if policy is not None and not isinstance(policy, str):

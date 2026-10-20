@@ -115,7 +115,8 @@ interface Provider {
   keys_url?: string;
 }
 export function LlmStep() {
-  const { st, done, isDone, goNext } = useWiz();
+  const { st, done, isDone, goNext, reloadState } = useWiz();
+  const [policy, setPolicy] = useState("");
   const [providers, setProviders] = useState<Record<string, Provider>>({});
   const [key, setKey] = useState("");
   const [provider, setProvider] = useState("");
@@ -165,45 +166,50 @@ export function LlmStep() {
       setMsg(r.ok ? ok(`Connected. ${r.describe || ""}`) : err(r.error));
       if (r.ok) {
         setKey("");
-        done("llm");
+        setModels(null);
+        reloadState(); // stay here: plain-English rules unlock below
       }
     } finally {
       busy.current = false;
     }
   };
 
+  const connected = !!st?.llm;
+  const finish = async () => {
+    if (policy.trim()) {
+      const r = await api("/api/policy", { policy });
+      if (!r.ok) return setMsg(err(r.error));
+    }
+    if (isDone("llm")) goNext();
+    else done("llm");
+  };
+
   return (
     <StepCard
       id="llm"
-      title="Connect your AI (recommended)"
+      title="Optional: connect an AI"
       restored={restored ? st?.notes?.llm || "AI connected" : undefined}
       footer={
         <>
           <Msg m={msg} />
           <Spacer />
           <BackBtn />
-          {models ? (
-            <>
-              <Button onClick={() => (restored ? goNext() : done("llm"))}>{restored ? "Continue" : "Skip for now"}</Button>
-              <Button variant="primary" className="btn-main" onClick={connect}>
-                Connect and continue
-                <ArrowRight className="h-3.5 w-3.5" />
-              </Button>
-            </>
-          ) : (
-            <Button variant={restored ? "primary" : "default"} className="btn-main" onClick={() => (restored ? goNext() : done("llm"))}>
-              {restored ? "Continue" : "Skip for now"}
-              {restored && <ArrowRight className="h-3.5 w-3.5" />}
-            </Button>
+          {models && (
+            <Button onClick={connect}>Connect this model</Button>
           )}
+          <Button variant="primary" className="btn-main" onClick={finish}>
+            {connected || policy.trim() ? "Continue" : "Skip, I don't need AI"}
+            <ArrowRight className="h-3.5 w-3.5" />
+          </Button>
         </>
       }
     >
       <Block>
         <p className="m-0 max-w-[72ch] text-sm leading-relaxed text-fg2">
-          Any model works: Claude, ChatGPT/OpenAI, Grok, Gemini, OpenRouter (hundreds of models with one key), DeepSeek, Mistral,
-          Groq, or a model running on this computer. It powers the help chat, your plain-English trading policy and the dashboard
-          Q&amp;A. It never places trades. You can skip this.
+          <b className="text-fg">Not needed to trade.</b> Your agent already trades with the limits and rules you set in Safety.
+          An AI adds a help chat, questions about your agent on the dashboard, and plain-English rules. Any model works:
+          Claude, ChatGPT/OpenAI, Grok, Gemini, OpenRouter, DeepSeek, Mistral, Groq, or a model running on this computer. It
+          never places trades.
         </p>
       </Block>
       <Block label="API key" desc="Claude, OpenAI, Grok, Gemini, OpenRouter or a local model.">
@@ -288,6 +294,27 @@ export function LlmStep() {
           </Field>
         </Block>
       )}
+      <Block
+        label="Plain-English rules"
+        desc={
+          connected
+            ? "Optional, veto-only: your AI checks these before every entry. Anything it can't decide is skipped."
+            : "Connect an AI above to use these. (Your built-in rules in Safety work without one.)"
+        }
+      >
+        {st?.policy_on && <p className="m-0 text-sm text-fg2">You already have plain-English rules saved. Typing here replaces them.</p>}
+        <Field htmlFor="pol-text" label="My trading policy" help="It can only say no to a trade, never start one.">
+          <Textarea
+            id="pol-text"
+            rows={4}
+            disabled={!connected}
+            value={policy}
+            onChange={(e) => setPolicy(e.target.value)}
+            placeholder={"- Skip entries in the first 15 minutes after the open.\n- Skip earnings-week trades on single stocks."}
+            className="font-mono text-sm"
+          />
+        </Field>
+      </Block>
     </StepCard>
   );
 }
@@ -571,8 +598,27 @@ export function SafetyStep() {
   const [ntfy, setNtfy] = useState("");
   const [tgToken, setTgToken] = useState("");
   const [tgChat, setTgChat] = useState("");
-  const [policy, setPolicy] = useState("");
-  const [polKey, setPolKey] = useState("");
+  const r0 = st?.rules || {};
+  const [tickers, setTickers] = useState((r0.rule_tickers || []).join(", "));
+  const [skipTickers, setSkipTickers] = useState((r0.rule_skip_tickers || []).join(", "));
+  const [sides, setSides] = useState(r0.rule_sides || "both");
+  const [minStrike, setMinStrike] = useState(r0.rule_min_strike ? String(r0.rule_min_strike) : "");
+  const [skip0dte, setSkip0dte] = useState(!!r0.rule_skip_0dte);
+  const [lossStreak, setLossStreak] = useState(r0.rule_loss_streak ? String(r0.rule_loss_streak) : "");
+  // Steps mount before /api/state arrives: seed the fields once it does, so
+  // re-saving Safety never blanks rules the owner already set.
+  const seeded = useRef(!!st?.rules);
+  useEffect(() => {
+    const r = st?.rules;
+    if (!r || seeded.current) return;
+    seeded.current = true;
+    setTickers((r.rule_tickers || []).join(", "));
+    setSkipTickers((r.rule_skip_tickers || []).join(", "));
+    setSides(r.rule_sides || "both");
+    setMinStrike(r.rule_min_strike ? String(r.rule_min_strike) : "");
+    setSkip0dte(!!r.rule_skip_0dte);
+    setLossStreak(r.rule_loss_streak ? String(r.rule_loss_streak) : "");
+  }, [st?.rules]);
   const [msg, setMsg] = useState<MsgT>(null);
 
   const save = async () => {
@@ -584,8 +630,12 @@ export function SafetyStep() {
       ntfy,
       tg_token: tgToken,
       tg_chat: tgChat,
-      policy,
-      anthropic_key: polKey,
+      rule_tickers: tickers,
+      rule_skip_tickers: skipTickers,
+      rule_sides: sides,
+      rule_min_strike: minStrike,
+      rule_skip_0dte: skip0dte,
+      rule_loss_streak: lossStreak,
     });
     if (r.ok) {
       setNext(r.next || "");
@@ -596,7 +646,7 @@ export function SafetyStep() {
   return (
     <StepCard
       id="safety"
-      title="Safety rails and extras"
+      title="Safety rails and your rules"
       restored={isDone("safety") ? st?.notes?.safety || "Safety saved" : undefined}
       footer={
         <>
@@ -633,6 +683,39 @@ export function SafetyStep() {
           <Input id="sf-maxloss" type="number" min={0} placeholder="e.g. 300" value={maxLoss} onChange={(e) => setMaxLoss(e.target.value)} className="font-mono" />
         </Field>
       </Block>
+      <Block
+        label="Your rules"
+        desc="Optional. Plain settings, no AI needed. They can only skip an entry, never start one; exits always run."
+      >
+        <div className="grid grid-cols-2 gap-3 max-sm:grid-cols-1">
+          <Field htmlFor="rl-tickers" label="Only trade these tickers" help="Blank = any ticker. Example: SPY, QQQ, NVDA">
+            <Input id="rl-tickers" placeholder="any" value={tickers} onChange={(e) => setTickers(e.target.value)} className="font-mono" />
+          </Field>
+          <Field htmlFor="rl-skip" label="Never trade these tickers" help="Blank = none. Example: TSLA">
+            <Input id="rl-skip" placeholder="none" value={skipTickers} onChange={(e) => setSkipTickers(e.target.value)} className="font-mono" />
+          </Field>
+          <Field htmlFor="rl-sides" label="Calls, puts or both">
+            <Select id="rl-sides" value={sides} onChange={(e) => setSides(e.target.value)}>
+              <option value="both">Calls and puts</option>
+              <option value="calls">Calls only</option>
+              <option value="puts">Puts only</option>
+            </Select>
+          </Field>
+          <Field htmlFor="rl-minstrike" label="Skip strikes under $" help="Blank or 0 = off. Example: 10 skips very low-priced names.">
+            <Input id="rl-minstrike" type="number" min={0} placeholder="off" value={minStrike} onChange={(e) => setMinStrike(e.target.value)} className="font-mono" />
+          </Field>
+          <Field
+            htmlFor="rl-streak"
+            label="Stop for the day after this many losses in a row"
+            help="Blank or 0 = off. Counts exits with an estimated loss today."
+          >
+            <Input id="rl-streak" type="number" min={0} placeholder="off" value={lossStreak} onChange={(e) => setLossStreak(e.target.value)} className="font-mono" />
+          </Field>
+        </div>
+        <ChoiceRow type="checkbox" id="rl-0dte" checked={skip0dte} onChange={setSkip0dte}>
+          Skip contracts that expire the same day (0DTE)
+        </ChoiceRow>
+      </Block>
       <Block label="Notifications" desc="Any or all, optional.">
         <div className="grid grid-cols-2 gap-3 max-sm:grid-cols-1">
           <Field htmlFor="nt-discord" label="Discord webhook URL">
@@ -648,29 +731,6 @@ export function SafetyStep() {
             <Input id="nt-tg-chat" placeholder="e.g. 123456789" value={tgChat} onChange={(e) => setTgChat(e.target.value)} />
           </Field>
         </div>
-      </Block>
-      <Block label="Trading policy" desc="Optional, veto-only. Needs a connected AI: with rules and no AI, every entry is skipped.">
-        <Field
-          htmlFor="pol-text"
-          label="My trading policy"
-          help="Plain-English rules your AI checks before every entry. It can only say no to a trade, never start one."
-        >
-          <Textarea
-            id="pol-text"
-            rows={5}
-            value={policy}
-            onChange={(e) => setPolicy(e.target.value)}
-            placeholder={"- Never trade more than 2 new entries per day.\n- Skip puts.\n- Only tickers: SPY, QQQ, NVDA."}
-            className="font-mono text-sm"
-          />
-        </Field>
-        <Field
-          htmlFor="pol-key"
-          label="Claude API key, only if you skipped step 2 (Connect your AI)"
-          help="Leave blank if your AI is already connected. Using another provider? Connect it in step 2 instead."
-        >
-          <Input id="pol-key" type="password" placeholder="sk-ant-…" autoComplete="off" value={polKey} onChange={(e) => setPolKey(e.target.value)} />
-        </Field>
       </Block>
     </StepCard>
   );
@@ -778,7 +838,7 @@ export function LaunchStep() {
               AI to check your rules, so without one it skips every entry to stay safe.
             </p>
             <p className="m-0 mt-2">
-              Fix it one of two ways: go back to <b>step 2 (Connect your AI)</b>, or turn the policy off and trade without rules.
+              Fix it one of two ways: go back to the <b>AI step</b> and connect one, or turn the policy off (your built-in rules in Safety still apply).
             </p>
             <div className="mt-3 flex flex-wrap items-center gap-3">
               <Button onClick={turnOffPolicy}>Turn my policy off</Button>

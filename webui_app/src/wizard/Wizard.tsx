@@ -12,13 +12,16 @@ import { pluralFix } from "../lib/format";
 import { SourceStep } from "./SourceStep";
 import { BrokerStep, ConsentStep, LaunchStep, LlmStep, SafetyStep, SizingStep } from "./steps";
 
+// "Your AI" is optional and sits near the end: trading never needs it (the
+// built-in rules in Safety are plain settings). It adds chat, Q&A and
+// plain-English rules for those who want them.
 export const STEPS = [
   ["consent", "Agreement"],
-  ["llm", "Your AI"],
   ["source", "Signal source"],
   ["broker", "Broker"],
   ["sizing", "Sizing"],
-  ["safety", "Safety"],
+  ["safety", "Safety & rules"],
+  ["llm", "AI (optional)"],
   ["done", "Launch"],
 ] as const;
 export type StepId = (typeof STEPS)[number][0];
@@ -63,7 +66,8 @@ export function Wizard() {
       if (!s) return;
       const d = new Set<StepId>();
       if (s.consent) d.add("consent");
-      if (s.llm) d.add("llm");
+      // optional step: once Safety is saved, skipping it counts as done
+      if (s.llm || s.safety) d.add("llm");
       if (s.source) d.add("source");
       if (s.broker) d.add("broker");
       if (s.sizing) d.add("sizing");
@@ -376,8 +380,8 @@ function AssistPanel() {
     setMsgs((m) => m.map((x) => (x.id === id ? { who: "agent", text: reply } : x)));
   };
   return (
-    <Panel title="Ask your agent" right={<span className="text-xs text-muted">uses the AI from step 2</span>} bodyClass="space-y-3 p-4">
-      <p className="m-0 text-xs text-muted">Need help with this step? Ask your agent. Works once your AI is connected in step 2 (any provider).</p>
+    <Panel title="Ask your agent" right={<span className="text-xs text-muted">uses your connected AI</span>} bodyClass="space-y-3 p-4">
+      <p className="m-0 text-xs text-muted">Need help with this step? Ask your agent. Works once you connect an AI in the optional AI step (any provider).</p>
       {msgs.length > 0 && <ChatLog msgs={msgs} label="Conversation with your agent" className="h-44 max-sm:h-56" />}
       <form
         className="flex gap-2"

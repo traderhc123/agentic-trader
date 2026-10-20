@@ -26,8 +26,10 @@ the agreement, and log into Robinhood in your own browser. That's by design.
 > **Does it run "inside" my Claude subscription?** No — Claude helps you set
 > it up and can start it for you, but the agent itself is a small program
 > that runs on a computer you choose (below). It keeps running after you
-> close Claude, and it doesn't consume your Claude subscription. (The
-> optional "policy brain" feature uses an **AI API key** from any provider —
+> close Claude, and it doesn't consume your Claude subscription. **No AI key
+> is needed to trade** — limits and rules are plain settings. (The optional
+> AI step — help chat, dashboard Q&A and plain-English rules — uses an **AI
+> API key** from any provider —
 > Claude, OpenAI, Grok, Gemini, OpenRouter, or a local model. Claude Max and
 > Team plans include monthly API credits you can link to a Claude Console
 > organization; otherwise keys are billed pay-as-you-go by the provider.
@@ -165,9 +167,13 @@ docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trad
 - **Notifications**: set up Discord/ntfy/Telegram during setup — you get a
   message on every action, veto, and error, plus a daily digest after the
   close. Never run it silently.
-- **Your policy, enforced**: optionally write plain-English rules in
-  `~/.agentic-trader/policy.md` ("skip puts", "max 2 trades a day") and the
-  agent checks every entry against them before acting.
+- **Your rules, enforced — no AI needed**: in the Safety step pick which
+  tickers to trade (or never trade), calls only / puts only, a minimum
+  strike, no same-day (0DTE) contracts, and "stop for the day after N losses
+  in a row". Change them any time in the dashboard chat (say `rules`).
+- **Plain-English rules (optional, needs an AI)**: connect an AI in the
+  optional AI step and write rules in your own words; the agent checks every
+  entry against them before acting.
 
 Full details: [SECURITY.md](SECURITY.md).
 

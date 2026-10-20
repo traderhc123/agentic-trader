@@ -59,7 +59,10 @@ and apply them in one step. Order:
 3. **Ask the human** for their choices — signal source, broker (and its API
    keys, if Alpaca/moomoo), an AI key + model (optional, any provider),
    per-trade size (rule 2: *their* number), daily caps, a notification
-   channel, and any plain-English policy rules. Write them to a plan file;
+   channel, and their rules — use the built-in `rules` plan section (tickers,
+   skip_tickers, sides, min_strike, skip_0dte, loss_streak; no AI needed)
+   for anything it covers; plain-English `policy` only for the rest (needs an
+   AI). Write them to a plan file;
    `python agent.py setup --example-plan` prints the format.
 4. **Apply**: `python agent.py setup --from plan.json --json`.
    All-or-nothing — nothing is saved unless every part passes, including a
@@ -150,8 +153,10 @@ Agentic account has options approval and cash in it.
 ### Step 2.5 — safety rails (setup step 4)
 
 The wizard asks about dry-run (default ON — keep it on for new users and say
-why), a daily entry cap, notifications (strongly encourage configuring at
-least one channel), and the optional LLM policy brain (plain-English rules in
+why), a daily entry cap, the built-in rules (tickers, calls/puts, minimum
+strike, no 0DTE, losing-streak stop — no AI needed; prefer these),
+notifications (strongly encourage configuring at least one channel). The
+optional AI step comes after it and adds the LLM policy brain (plain-English rules in
 `~/.agentic-trader/policy.md`, checked with the human's own AI API key — any
 provider, picked in the wizard's "Connect your AI" step; veto-only). Help the human write their policy rules if they enable it —
 the rules are theirs; you may translate their intent into clear bullet

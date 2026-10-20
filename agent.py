@@ -160,6 +160,13 @@ def _recent_trades(limit=50):
         return []
 
 
+def _trades_today():
+    """Today's trade-log rows, oldest first (UTC day, like the entry cap)."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    return [t for t in _recent_trades(500)
+            if str(t.get("ts", "")).startswith(today)]
+
+
 def _entries_today():
     """Count today's entries by scanning the FULL trade log.
 
@@ -615,6 +622,16 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 _log_trade({"action": "skip_daily_loss", "event_id": ev["event_id"],
                             "contract": contract})
                 return msg
+        # Built-in rules (plain settings, no AI): tickers, calls/puts, min
+        # strike, no 0DTE, stop after a losing streak.
+        import rules
+        ok, why = rules.check(cfg, ev, _trades_today())
+        if not ok:
+            msg = f"SKIPPED {contract}: {why} (your rules)"
+            print(msg)
+            _log_trade({"action": "skip_rule", "event_id": ev["event_id"],
+                        "contract": contract, "reason": why})
+            return msg
         # The user's own policy, applied by the LLM policy brain (veto-only).
         verdict = llm_policy.evaluate(cfg, ev, _recent_trades(20))
         if not verdict["act"]:
@@ -875,6 +892,50 @@ def set_book_sizing(cfg, book, mode, value):
     return True, ""
 
 
+def _rule_command(t, cfg):
+    """Dashboard chat commands for the built-in rules. (handled, reply)."""
+    import rules
+
+    def saved(reply):
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, reply + " Rules now: " + (rules.describe(cfg) or "none") + "."
+    if t in ("rules", "my rules", "show rules"):
+        return True, ("Your rules: " + (rules.describe(cfg) or "none") + ". Change "
+                      "with: tickers SPY QQQ / tickers any, skip tickers TSLA / "
+                      "skip tickers none, calls only / puts only / calls and puts, "
+                      "min strike 10, no 0dte on|off, loss stop 2 (0 = off).")
+    m = re.match(r"^(?:set |only )?tickers?\s+(.+)$", t)
+    if m:
+        val = m.group(1).strip()
+        cfg["rule_tickers"] = [] if val in ("any", "all", "none", "off") \
+            else rules.parse_tickers(val)
+        return saved("Ticker list updated.")
+    m = re.match(r"^skip tickers?\s+(.+)$", t)
+    if m:
+        val = m.group(1).strip()
+        cfg["rule_skip_tickers"] = [] if val in ("none", "off") \
+            else rules.parse_tickers(val)
+        return saved("Skip list updated.")
+    if t in ("calls only", "puts only", "calls and puts", "both sides"):
+        cfg["rule_sides"] = t.split()[0] if t.endswith("only") else "both"
+        return saved("Updated.")
+    m = re.match(r"^(?:set )?min(?:imum)? strike\s+\$?([\d.]+)$", t)
+    if m:
+        try:
+            cfg["rule_min_strike"] = float(m.group(1))
+        except ValueError:
+            return True, "Usage: min strike 10  (0 = off)"
+        return saved("Minimum strike updated.")
+    m = re.match(r"^(?:set )?loss stop\s+(\d+)$", t)
+    if m:
+        cfg["rule_loss_streak"] = int(m.group(1))
+        return saved("Losing-streak stop updated.")
+    if t in ("no 0dte on", "no 0dte off", "skip 0dte on", "skip 0dte off"):
+        cfg["rule_skip_0dte"] = t.endswith("on")
+        return saved("Updated.")
+    return False, ""
+
+
 def _apply_command(text):
     """Fixed command allowlist for the dashboard chat. Returns (handled, reply).
 
@@ -895,6 +956,9 @@ def _apply_command(text):
         webui.CONTROLS["stop"] = True
         return True, ("Stopping after this cycle. Open positions remain in your "
                       "brokerage account — close them there if needed.")
+    handled, reply = _rule_command(t, cfg)
+    if handled:
+        return True, reply
     if t in ("autostart on", "autostart off", "start at login on",
              "start at login off"):
         import keep_running
@@ -1067,7 +1131,7 @@ def cmd_run(app_window=False):
                   "your open positions still get their exits.")
         else:
             print("Not starting: " + llm_policy.BLOCKED_MSG
-                  + "\n  Connect your AI:  python agent.py setup --web  (step 2)"
+                  + "\n  Connect your AI:  python agent.py setup --web  (AI step)"
                   + f"\n  or remove:        {llm_policy.policy_path()}")
             today = datetime.now(timezone.utc).date().isoformat()
             if state.get("policy_block_notified") != today:
@@ -1099,6 +1163,7 @@ def cmd_run(app_window=False):
                 "entries today": f"{_entries_today()} / cap {c.get('max_entries_per_day', 5)}",
                 "policy brain": ("blocked" if llm_policy.entries_blocked(c)
                                  else "on" if llm_policy.enabled(c) else "off"),
+                "rules": __import__("rules").describe(c) or "none",
                 "market": "open" if _market_open_now() else "closed (slow polling)",
                 "open positions": ", ".join(st.get("positions", {})) or "none",
                 "start at login": ("on" if keep_running.autostart_enabled()
@@ -1390,12 +1455,17 @@ def doctor_checks():
           _sizing_desc(cfg) + ("" if sized else " (default — only the owner changes it)"),
           who="owner")
 
+    import rules
+    check("rules", True, "Your rules (built in, no AI needed)",
+          rules.describe(cfg) or "none — every signal is eligible (caps still apply)",
+          who="owner")
+
     blocked = llm_policy.entries_blocked(cfg)
     check("policy_ai", not blocked, "Trading policy can be checked",
           "no policy" if not llm_policy.enabled(cfg)
           else "policy + AI connected" if not blocked
           else "policy set but NO AI connected: every entry will be skipped",
-          "the OWNER connects an AI in the wizard (step 2), or removes "
+          "the OWNER connects an AI in the wizard (AI step), or removes "
           + llm_policy.policy_path(), who="owner")
 
     if mod is not None and hasattr(mod, "buying_power"):

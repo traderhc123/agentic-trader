@@ -2593,11 +2593,11 @@ def _policy_save_error(cfg, policy, key):
         return None
     if key:
         return ("That key isn't a Claude key. Connect other AI providers in "
-                "step 2 (Connect your AI), then save this step again.")
+                "the AI step (Settings → AI, optional), then save again.")
     return ("A trading policy needs a connected AI to check it. Without one, "
             "every entry would be skipped and the agent would never trade. "
-            "Connect your AI in step 2, paste a Claude key below, or clear "
-            "the policy box.")
+            "Connect your AI in the AI step first, or clear the rules box. "
+            "(The built-in rules in Safety need no AI.)")
 
 
 def _broker_display(cfg, last4=""):
@@ -2653,6 +2653,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "recurring": bool(cfg.get("day_pass_recurring")),
             "pass": bool(cfg.get("feed_pass") or cfg.get("feed_pass_pending")),
             "autostart": __import__("keep_running").autostart_enabled(),
+            "rules": {k: cfg.get(k) for k in (
+                "rule_tickers", "rule_skip_tickers", "rule_sides",
+                "rule_min_strike", "rule_skip_0dte", "rule_loss_streak")},
+            "rules_summary": __import__("rules").describe(cfg),
+            "policy_on": __import__("llm_policy").enabled(cfg),
         }
 
     def consent(_h, data):
@@ -3153,6 +3158,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             except ValueError:
                 pass
         cfg.setdefault("max_event_age_s", 300)
+        import rules
+        rules.apply_settings(cfg, data)
         for src_key, cfg_key in (("discord", "discord_webhook_url"),
                                  ("ntfy", "ntfy_topic"),
                                  ("tg_token", "telegram_bot_token"),
@@ -3186,6 +3193,25 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                "(start = background; closing the window doesn't stop it. "
                "Servers: the systemd service or Docker — see GETTING_STARTED.md)")
         return {"ok": True, "next": nxt}
+
+    def policy_save(_h, data):
+        """Plain-English rules from the optional AI step. Needs a connected
+        AI (or they'd veto every entry); blank = leave as is."""
+        policy = str(data.get("policy", "")).strip()
+        if not policy:
+            return {"ok": True, "note": "no plain-English rules saved"}
+        perr = _policy_save_error(cfg, policy, "")
+        if perr:
+            return {"ok": False, "error": perr}
+        import os as _os
+        import llm_policy
+        path = llm_policy.policy_path()
+        _os.makedirs(_os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(policy + "\n")
+        cfg.setdefault("llm_fallback", "skip")
+        save()
+        return {"ok": True, "note": "plain-English rules saved"}
 
     def policy_disable(_h, _data):
         import llm_policy
@@ -3289,6 +3315,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/finish": finish, "/api/ask": ask,
                      "/api/policy/disable": policy_disable,
                      "/api/start-local": start_local,
+                     "/api/policy": policy_save,
                      "/api/autostart": autostart_set,
                      "/api/wallet/create": wallet_create,
                      "/api/pass/buy": pass_buy,
@@ -3549,7 +3576,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "exact command (pause, resume, dry on/off, set budget N, "
                 "set contracts N, set percent N, set other budget|contracts|"
                 "percent N, other sizing same, set positions N, "
-                "set cap N, stop, autostart on|off). Never give investment advice; you may "
+                "set cap N, stop, autostart on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
             f"STATUS:\n{json.dumps(status_fields, indent=1)}\n\n"
