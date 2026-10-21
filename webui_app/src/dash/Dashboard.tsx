@@ -31,6 +31,7 @@ const SKIPS: Record<string, string> = {
   exit_failed: "exit order didn't go through (retrying)",
   exit_partial: "exit only partly filled",
   broker_no_order: "the broker didn't place the order",
+  broker_disconnected: "broker connection down (login expired or unreachable)",
 };
 
 /** "$1,250" — whole dollars, no sign (budgets and contract costs). */

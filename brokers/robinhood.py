@@ -520,6 +520,16 @@ def execute(rh, cfg, event, state):
             return False
         option_id = resolve_instrument(rh, event)
         if not option_id:
+            down = getattr(rh, "last_error", None)
+            if down:
+                # The lookup never reached Robinhood (expired login, network)
+                # — not a missing contract. Say so, so the fix is obvious.
+                print(f"  could not look up {contract} — Robinhood connection "
+                      f"is down: {down} — skipped")
+                broker_events.report("broker_disconnected",
+                                     f"couldn't look up {contract}: Robinhood "
+                                     f"connection is down — {down}")
+                return False
             print(f"  could not resolve instrument for {contract} — skipped")
             broker_events.report("skip_no_contract",
                                  f"Robinhood has no tradable contract {contract}")
