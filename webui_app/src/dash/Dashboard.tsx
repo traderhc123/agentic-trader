@@ -21,6 +21,7 @@ const SKIPS: Record<string, string> = {
   skip_position_cap: "max open positions reached",
   skip_daily_loss: "daily loss limit reached",
   policy_veto: "your plain-English rules said no",
+  skip_ai_needed: "entries skipped — your rules need an AI and none is working",
   skip_rule: "your rules",
   skip_sizing: "couldn't size the trade",
   order_failed: "the broker rejected the order",

@@ -192,7 +192,7 @@ def test_ai_problem_veto_alerts_once_per_day(home, monkeypatch):
     for i in range(3):
         out = agent.handle_event(make_event(event_id=f"e{i}"), {}, state,
                                  None, None, lambda s: None)
-        assert out.startswith("POLICY VETO")
+        assert out.startswith("SKIPPED") and "AI needed" in out
     assert len(sent) == 1 and "couldn't be checked" in sent[0]
 
 

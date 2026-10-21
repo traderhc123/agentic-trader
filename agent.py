@@ -643,11 +643,41 @@ _OWN_SKIPS = {"skip_daily_cap", "skip_position_cap", "skip_daily_loss",
               "skip_rule", "policy_veto"}
 
 
+def _ai_block_problem(cfg):
+    """A standing dashboard problem while a policy is set but no AI can
+    check it — shown BEFORE the next signal is skipped, not after. None
+    when entries aren't blocked."""
+    if not llm_policy.entries_blocked(cfg):
+        return None
+    import broker_events
+    return {"kind": "skip_ai_needed", "count": 0, "standing": True,
+            "last": llm_policy.BLOCKED_MSG, "contract": "", "at": "",
+            "hint": broker_events.hint("no AI connected")}
+
+
+def _problems_with_ai_block(cfg):
+    """_problems_today(), with the standing AI-block problem on top (merged
+    into today's skip_ai_needed row if entries were already skipped)."""
+    rows = _problems_today()
+    block = _ai_block_problem(cfg)
+    if not block:
+        return rows
+    for r in rows:
+        if r["kind"] == "skip_ai_needed":
+            r["standing"] = True
+            r.setdefault("hint", block["hint"])
+            if not r.get("hint"):
+                r["hint"] = block["hint"]
+            return [r] + [x for x in rows if x is not r]
+    return [block] + rows
+
+
 def _problems_today():
     """Today's 'trade didn't happen' rows, grouped for the dashboard."""
     import broker_events
     today = datetime.now(timezone.utc).date().isoformat()
-    kinds = set(broker_events.KINDS) | {"skip_stale", "skip_sizing"} | _OWN_SKIPS
+    kinds = (set(broker_events.KINDS) | {"skip_stale", "skip_sizing", "skip_ai_needed"}
+             | _OWN_SKIPS)
     out = {}
     for t in _recent_trades(300):
         if t.get("action") not in kinds or not str(t.get("ts", "")).startswith(today):
@@ -766,14 +796,31 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             return msg
         # The user's own policy, applied by the LLM policy brain (veto-only).
         verdict = llm_policy.evaluate(cfg, ev, _recent_trades(20))
+        if not verdict["act"] and verdict.get("ai_problem"):
+            # NOT the owner's rules saying no: the AI that checks them is
+            # missing or failing, so every entry is being skipped. Log it as
+            # a problem with a fix (the dashboard's "didn't happen" box),
+            # never as an ordinary policy veto.
+            import broker_events
+            reason = verdict["reason"]
+            msg = f"SKIPPED {contract} (AI needed): {reason}"
+            print(msg)
+            rec = {"action": "skip_ai_needed", "book": book,
+                   "event_id": ev["event_id"], "contract": contract,
+                   "reason": reason}
+            hint = broker_events.hint(reason)
+            if hint:
+                rec["hint"] = hint
+            if cfg.get("dry_run"):
+                rec["dry"] = True
+            _log_trade(rec)
+            _notify_ai_problem_once(cfg, state, save_state, contract, reason)
+            return msg
         if not verdict["act"]:
             msg = f"POLICY VETO {contract}: {verdict['reason']}"
             print(msg)
             _log_trade({"action": "policy_veto", "book": book, "event_id": ev["event_id"],
                         "contract": contract, "reason": verdict["reason"]})
-            if verdict.get("ai_problem"):
-                _notify_ai_problem_once(cfg, state, save_state, contract,
-                                        verdict["reason"])
             return msg
         policy_reason = verdict["reason"]
     else:
@@ -1375,7 +1422,7 @@ def cmd_run(app_window=False):
                    if _broker_conn_desc(client) else {}),
             },
             "cash_warning": cash.get("warning", ""),
-            "problems": _problems_today(),
+            "problems": _problems_with_ai_block(c),
             "budget_hints": _budget_hints(c),
             "would_have": dry_run_preview.summary(c),
         }
