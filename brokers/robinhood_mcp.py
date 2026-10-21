@@ -55,6 +55,7 @@ class RobinhoodMCP:
         # plain-English reason. Logged only when the state changes, so a
         # long outage is one line (plus one when it comes back).
         self.last_error = None
+        self.last_ok_at = None
         self._down_since = None
         self._last_status = None
 
@@ -265,6 +266,11 @@ class RobinhoodMCP:
                   f"{self.last_error}).", flush=True)
         self._down_since = None
         self.last_error = None
+        self.last_ok_at = time.time()
+
+    @property
+    def down_since(self):
+        return self._down_since
 
     def _request(self, method, params):
         self._last_status = None

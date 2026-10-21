@@ -580,12 +580,47 @@ def _cash_warning(cfg, bp):
     return ""
 
 
+def _broker_conn_desc(client):
+    """Dashboard line for the broker connection, or None if the broker
+    client doesn't track it."""
+    if client is None or not hasattr(client, "last_error"):
+        return None
+    def hhmm(ts):
+        return datetime.fromtimestamp(ts).strftime("%H:%M")
+    if client.last_error:
+        since = getattr(client, "down_since", None)
+        return ("⚠️ DOWN" + (f" since {hhmm(since)}" if since else "")
+                + f" — {client.last_error}")
+    ok_at = getattr(client, "last_ok_at", None)
+    return f"ok (last answered {hhmm(ok_at)})" if ok_at else "not checked yet"
+
+
+def _alert_if_broker_down(cfg, state, save_state, client):
+    """Notify once a day when the broker connection is down, even if no
+    signal arrived — so a stale login is fixed before the next entry."""
+    down = getattr(client, "last_error", None)
+    if not down:
+        return
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get("broker_down_notified") == today:
+        return
+    state["broker_down_notified"] = today
+    try:
+        save_state(state)
+    except Exception:
+        pass
+    notify(cfg, f"agentic-trader: broker connection is DOWN — {down}. "
+                "Trades can't be placed until it's back. Fix: reconnect it "
+                "in Settings → Broker.")
+
+
 def _refresh_cash(cfg, state, save_state, broker, client, cash):
     """Re-read buying power (every ~10 min) for the dashboard, and warn once
     a day in LIVE mode when it can't cover trades."""
     cash["at"] = time.time()
     cash["dry"] = bool(cfg.get("dry_run"))
     cash["bp"] = _buying_power(broker, client, cfg)
+    _alert_if_broker_down(cfg, state, save_state, client)
     warn = _cash_warning(cfg, cash["bp"])
     cash["warning"] = warn
     if not warn or cfg.get("dry_run"):
@@ -1336,6 +1371,8 @@ def cmd_run(app_window=False):
                                             else "off"),
                 **({"buying power": f"${cash['bp']:,.2f}"}
                    if cash["bp"] is not None else {}),
+                **({"broker connection": _broker_conn_desc(client)}
+                   if _broker_conn_desc(client) else {}),
             },
             "cash_warning": cash.get("warning", ""),
             "problems": _problems_today(),
@@ -1652,8 +1689,15 @@ def doctor_checks():
               "python agent.py setup --from plan.json  (or the wizard)")
     elif hasattr(mod, "verify"):
         ok, msg = mod.verify(cfg)
-        check("broker", ok, f"Broker: {broker_name}", msg,
-              "fix the keys in the plan / wizard broker step")
+        if broker_name == "robinhood":
+            # Live check: an expired login fails here instead of passing as
+            # "authenticated" just because the token file exists.
+            check("broker", ok, f"Broker: {broker_name}", msg,
+                  "the OWNER logs in: wizard → Broker → Connect Robinhood",
+                  who="owner")
+        else:
+            check("broker", ok, f"Broker: {broker_name}", msg,
+                  "fix the keys in the plan / wizard broker step")
     else:
         ok = mod.client(cfg) is not None
         check("broker", ok, f"Broker: {broker_name}",
