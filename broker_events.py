@@ -26,13 +26,16 @@ KINDS = {
     "broker_no_order": "the broker didn't place the order",
     "broker_disconnected": "the broker connection is down (login expired "
                            "or the broker couldn't be reached)",
+    "broker_lookup_failed": "the broker returned an error looking up the "
+                            "contract",
 }
 
 # Problems worth a notification (once per kind per day). Intentional skips —
 # caps, dry-run — are logged only.
 NOTIFY = {"order_failed", "skip_budget", "skip_no_quote", "skip_no_contract",
           "entry_unfilled", "exit_failed", "exit_partial", "broker_no_order",
-          "skip_stale", "skip_sizing", "broker_disconnected"}
+          "skip_stale", "skip_sizing", "broker_disconnected",
+          "broker_lookup_failed"}
 
 
 def report(kind, message):
@@ -65,6 +68,9 @@ _HINTS = (
      "The broker login looks expired — reconnect it in Settings → Broker."),
     (re.compile(r"market.{0,10}closed|outside.{0,20}hours|halt", re.I),
      "The market or this contract wasn't trading at that moment."),
+    (re.compile(r"rate.?limit|throttl|too many requests|\b429\b", re.I),
+     "Robinhood was rate-limiting requests at that moment (usually brief). "
+     "The agent already retried once."),
 )
 
 

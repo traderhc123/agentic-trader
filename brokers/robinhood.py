@@ -115,6 +115,55 @@ def setup(cfg):
     return cfg
 
 
+# Why the last resolve_instrument() came back empty — read by execute() so
+# the skip says what Robinhood actually answered (an error, zero rows, an
+# unrecognized shape) instead of always "no tradable contract".
+_LAST_LOOKUP = {}
+_RESOLVE_RETRY_WAIT_S = 3.0
+
+
+def _result_text(result, limit=300):
+    """Raw text of an MCP tool result, trimmed — for the log only."""
+    try:
+        parts = [str(i.get("text", "")) for i in (result or {}).get("content", [])
+                 if isinstance(i, dict)]
+        text = " ".join(p for p in parts if p).strip()
+    except Exception:
+        text = ""
+    text = " ".join(text.split())
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _count_rows(obj):
+    if isinstance(obj, dict):
+        own = 1 if (obj.get("strike_price") or obj.get("expiration_date")) else 0
+        return own + sum(_count_rows(v) for v in obj.values())
+    if isinstance(obj, list):
+        return sum(_count_rows(v) for v in obj)
+    return 0
+
+
+def _describe_lookup(result, payload):
+    """{'kind': error|no_data|no_rows|no_id|ok, 'detail': str, 'raw': str}."""
+    raw = _result_text(result)
+    if result is None:
+        return {"kind": "no_data", "detail": "no answer from Robinhood", "raw": ""}
+    if isinstance(result, dict) and result.get("isError"):
+        return {"kind": "error", "detail": raw or "Robinhood returned an error",
+                "raw": raw}
+    if payload is None:
+        return {"kind": "no_data",
+                "detail": "Robinhood answered without contract data", "raw": raw}
+    if isinstance(payload, dict) and (payload.get("error") or payload.get("errors")):
+        err = payload.get("error") or payload.get("errors")
+        return {"kind": "error", "detail": str(err)[:200], "raw": raw}
+    rows = _count_rows(payload)
+    if rows == 0:
+        return {"kind": "no_rows", "detail": "Robinhood returned 0 matching contracts",
+                "raw": raw}
+    return {"kind": "ok", "detail": f"{rows} row(s)", "raw": raw}
+
+
 def resolve_instrument(rh, event):
     # NO tradability filter: since ~2026-07-17 the server returns ZERO rows
     # when tradability is passed (even though every row IS tradable) — it
@@ -128,10 +177,13 @@ def resolve_instrument(rh, event):
         "state": "active",
     })
     payload = content_json(result)
+    _LAST_LOOKUP.clear()
+    _LAST_LOOKUP.update(_describe_lookup(result, payload))
 
     def find_id(obj):
         if isinstance(obj, dict):
-            if obj.get("id") and (obj.get("chain_symbol") or obj.get("strike_price")):
+            if obj.get("id") and (obj.get("chain_symbol") or obj.get("strike_price")
+                                  or obj.get("expiration_date")):
                 return str(obj["id"])
             for v in obj.values():
                 f = find_id(v)
@@ -548,7 +600,20 @@ def execute(rh, cfg, event, state):
     if event["event"] == "ENTERED":
         if pos_key in state["positions"]:
             return False
+        _LAST_LOOKUP.clear()
         option_id = resolve_instrument(rh, event)
+        if not option_id and not getattr(rh, "last_error", None):
+            # One retry: a lookup right after the open can hit a brief
+            # Robinhood error or rate limit, and a skip here loses the trade.
+            first = dict(_LAST_LOOKUP)
+            print(f"  contract lookup for {contract} came back empty "
+                  f"({first.get('detail') or 'no detail'}) — retrying in "
+                  f"{_RESOLVE_RETRY_WAIT_S:g}s")
+            time.sleep(_RESOLVE_RETRY_WAIT_S)
+            _LAST_LOOKUP.clear()
+            option_id = resolve_instrument(rh, event)
+            if option_id:
+                print(f"  retry found {contract}")
         if not option_id:
             down = getattr(rh, "last_error", None)
             if down:
@@ -560,9 +625,28 @@ def execute(rh, cfg, event, state):
                                      f"couldn't look up {contract}: Robinhood "
                                      f"connection is down — {down}")
                 return False
-            print(f"  could not resolve instrument for {contract} — skipped")
+            why = dict(_LAST_LOOKUP)
+            kind, detail = why.get("kind", ""), why.get("detail", "")
+            print(f"  could not resolve instrument for {contract} — skipped "
+                  f"[{kind or 'unknown'}: {detail or 'no detail'}]"
+                  + (f" Robinhood said: {why['raw']}" if why.get("raw") else ""))
+            if kind in ("error", "no_data", "ok"):
+                # Robinhood answered, but not with a usable contract row:
+                # an error (rate limit, server problem), an empty/unparsed
+                # body, or rows whose shape we didn't recognize.
+                msg = {"error": f"Robinhood returned an error looking up "
+                                f"{contract} (retried once): {detail}",
+                       "no_data": f"Robinhood answered without contract data "
+                                  f"for {contract} (retried once)",
+                       "ok": f"Robinhood returned {detail} for {contract} but "
+                             "no contract id the agent recognizes — please "
+                             "report this with agent-run.log"}[kind]
+                broker_events.report("broker_lookup_failed", msg)
+                return False
             broker_events.report("skip_no_contract",
-                                 f"Robinhood has no tradable contract {contract}")
+                                 f"Robinhood has no tradable contract {contract}"
+                                 + (" (0 matching contracts, retried once)"
+                                    if kind == "no_rows" else ""))
             return False
         qty, note = size_contracts(rh, cfg, option_id)
         if qty < 1:
