@@ -28,6 +28,8 @@ KINDS = {
                            "or the broker couldn't be reached)",
     "broker_lookup_failed": "the broker returned an error looking up the "
                             "contract",
+    "skip_ai_needed": "your plain-English rules need an AI to check them, "
+                      "and no AI is working — entries are skipped",
 }
 
 # Problems worth a notification (once per kind per day). Intentional skips —
@@ -68,6 +70,11 @@ _HINTS = (
      "The broker login looks expired — reconnect it in Settings → Broker."),
     (re.compile(r"market.{0,10}closed|outside.{0,20}hours|halt", re.I),
      "The market or this contract wasn't trading at that moment."),
+    (re.compile(r"no AI model connected|AI key invalid|policy check|"
+                r"no AI (is )?connected|rules need an AI", re.I),
+     "Connect your AI in Setup → AI step (or fix its key), or turn off your "
+     "plain-English rules in Settings → Safety. Until then EVERY entry is "
+     "skipped and nothing reaches your broker."),
     (re.compile(r"rate.?limit|throttl|too many requests|\b429\b", re.I),
      "Robinhood was rate-limiting requests at that moment (usually brief). "
      "The agent already retried once."),
