@@ -22,6 +22,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
+import broker_events
+
 MCP_URL = "https://agent.robinhood.com/mcp/trading"
 REGISTER_URL = "https://agent.robinhood.com/oauth/trading/register"
 AUTHORIZE_URL = "https://robinhood.com/oauth"
@@ -49,6 +51,13 @@ class RobinhoodMCP:
         self._lock = threading.Lock()
         self._session_id = None
         self._rpc_id = 0
+        # Connection health. last_error is None while calls work, else a
+        # plain-English reason. Logged only when the state changes, so a
+        # long outage is one line (plus one when it comes back).
+        self.last_error = None
+        self.last_ok_at = None
+        self._down_since = None
+        self._last_status = None
 
     # ── OAuth ────────────────────────────────────────────────────────────
 
@@ -128,6 +137,7 @@ class RobinhoodMCP:
             "scope": tokens.get("scope", SCOPE),
         }, headers={"Accept": "application/json"}, timeout=_TIMEOUT_S)
         if resp.status_code != 200:
+            self._last_status = ("refresh", resp.status_code)
             return None
         body = resp.json()
         tokens = dict(tokens)
@@ -194,6 +204,7 @@ class RobinhoodMCP:
             payload["params"] = params
         resp = requests.post(MCP_URL, json=payload,
                              headers=self._headers(access_token), timeout=_TIMEOUT_S)
+        self._last_status = ("rpc", resp.status_code)
         if resp.status_code in (401, 403):
             return resp.status_code, None
         sid = resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id")
@@ -221,32 +232,88 @@ class RobinhoodMCP:
             pass
         return True
 
+    # ── connection health ────────────────────────────────────────────────
+
+    def _why_down(self, fallback):
+        stage, code = self._last_status or (None, None)
+        if not self.is_authenticated():
+            return ("no saved Robinhood login — connect it in Settings → "
+                    "Broker")
+        if stage == "refresh":
+            return (f"Robinhood refused to renew the login (HTTP {code}) — "
+                    "the login has expired; reconnect it in Settings → Broker")
+        if code in (401, 403):
+            return (f"Robinhood rejected the login (HTTP {code}) — the login "
+                    "has expired; reconnect it in Settings → Broker")
+        if code:
+            return f"{fallback} (HTTP {code})"
+        return fallback
+
+    def _mark_down(self, reason):
+        self.last_error = reason
+        if self._down_since is not None:
+            return
+        self._down_since = time.time()
+        msg = (f"Robinhood connection lost: {reason}. Trades can't be "
+               "placed until it's back.")
+        print(f"⚠️  {msg}", flush=True)
+        broker_events.report("broker_disconnected", msg)
+
+    def _mark_ok(self):
+        if self._down_since is not None:
+            mins = (time.time() - self._down_since) / 60.0
+            print(f"✓ Robinhood connection restored (was down {mins:.0f} min: "
+                  f"{self.last_error}).", flush=True)
+        self._down_since = None
+        self.last_error = None
+        self.last_ok_at = time.time()
+
+    @property
+    def down_since(self):
+        return self._down_since
+
     def _request(self, method, params):
+        self._last_status = None
+        try:
+            result, ok = self._request_inner(method, params)
+        except requests.RequestException as exc:
+            self._mark_down(f"can't reach Robinhood ({type(exc).__name__})")
+            raise
+        if ok:
+            self._mark_ok()
+        else:
+            self._mark_down(self._why_down("couldn't open a Robinhood session"))
+        return result
+
+    def _request_inner(self, method, params):
+        """(result, connection_ok). connection_ok is False only when the
+        call never got an answer from Robinhood (login/session failure);
+        a tool-level error is still a working connection."""
         access = self._access_token()
         if not access:
-            return None
+            return None, False
         for attempt in (0, 1):
             if self._session_id is None and not self._initialize(access):
                 if attempt == 0:
                     access = self._access_token(force=True)
                     if not access:
-                        return None
+                        return None, False
                     continue
-                return None
+                return None, False
             status, result = self._rpc(access, method, params)
             if status in (401, 403):
                 if attempt == 0:
                     access = self._access_token(force=True)
                     if not access:
-                        return None
+                        return None, False
                     self._session_id = None
                     continue
-                return None
+                return None, False
             if result is None and status in (400, 404) and attempt == 0:
                 self._session_id = None
                 continue
-            return result
-        return None
+            return result, True
+        return None, False
 
     # ── public API ───────────────────────────────────────────────────────
 

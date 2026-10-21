@@ -50,6 +50,36 @@ def client(cfg):
     return rh if rh.is_authenticated() else None
 
 
+def verify(cfg):
+    """(ok, message) from a LIVE call to Robinhood. A saved login file is
+    not proof the login still works — an expired one looked "connected"
+    while every lookup failed (2026-10-21)."""
+    rh = RobinhoodMCP(_token_path())
+    if not rh.is_authenticated():
+        return False, "not connected — no saved Robinhood login"
+    try:
+        payload = content_json(rh.call_tool("get_accounts", {}))
+    except Exception as exc:
+        return False, f"can't reach Robinhood ({type(exc).__name__})"
+    if payload is None:
+        return False, rh.last_error or "Robinhood didn't answer"
+    want = str(cfg.get("robinhood_account") or "")
+    for acct in ((payload.get("data") or {}).get("accounts") or []):
+        num = str(acct.get("account_number", ""))
+        if want and num != want:
+            continue
+        if not (acct.get("agentic_allowed") and acct.get("state") == "active"):
+            continue
+        note = f"connected ✓ (live check, account ••••{num[-4:]})"
+        if not acct.get("option_level") or acct.get("option_level") == "option_level_0":
+            note += " — ⚠️ options not approved on this account yet"
+        return True, note
+    return False, ("logged in, but the agentic account "
+                   + (f"••••{want[-4:]} " if want else "")
+                   + "isn't active — finish Agentic onboarding in the "
+                   "Robinhood app, then rerun setup")
+
+
 def setup(cfg):
     """Interactive OAuth + Agentic-account discovery + options-level check."""
     rh = RobinhoodMCP(_token_path())
@@ -520,6 +550,16 @@ def execute(rh, cfg, event, state):
             return False
         option_id = resolve_instrument(rh, event)
         if not option_id:
+            down = getattr(rh, "last_error", None)
+            if down:
+                # The lookup never reached Robinhood (expired login, network)
+                # — not a missing contract. Say so, so the fix is obvious.
+                print(f"  could not look up {contract} — Robinhood connection "
+                      f"is down: {down} — skipped")
+                broker_events.report("broker_disconnected",
+                                     f"couldn't look up {contract}: Robinhood "
+                                     f"connection is down — {down}")
+                return False
             print(f"  could not resolve instrument for {contract} — skipped")
             broker_events.report("skip_no_contract",
                                  f"Robinhood has no tradable contract {contract}")

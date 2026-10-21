@@ -24,13 +24,15 @@ KINDS = {
     "exit_failed": "the exit order didn't go through",
     "exit_partial": "the exit only partly filled",
     "broker_no_order": "the broker didn't place the order",
+    "broker_disconnected": "the broker connection is down (login expired "
+                           "or the broker couldn't be reached)",
 }
 
 # Problems worth a notification (once per kind per day). Intentional skips —
 # caps, dry-run — are logged only.
 NOTIFY = {"order_failed", "skip_budget", "skip_no_quote", "skip_no_contract",
           "entry_unfilled", "exit_failed", "exit_partial", "broker_no_order",
-          "skip_stale", "skip_sizing"}
+          "skip_stale", "skip_sizing", "broker_disconnected"}
 
 
 def report(kind, message):
