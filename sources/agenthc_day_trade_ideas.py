@@ -217,6 +217,12 @@ def _pass_notice(cfg, state, save_state, key, text):
         pass
 
 
+def _live_daypass(state):
+    """True while a wallet-paid 24h day-pass token is still running."""
+    tok = (state or {}).get("l402") or {}
+    return bool(tok.get("token") and tok.get("expires_at", 0) > time.time())
+
+
 def _headers(cfg, state):
     if cfg.get("agenthc_api_key"):
         return {"X-API-Key": cfg["agenthc_api_key"]}
@@ -259,8 +265,24 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
     publishes on market days, so a Saturday/Sunday pass is pure wasted sats
     (the 24h token expires before Monday's first event). The API also stops
     selling passes on non-trading days server-side; this check keeps every
-    consumer safe even against an older server."""
+    consumer safe even against an older server.
+
+    One charge per market day when a prepaid pass is set up too: never buys
+    on a day the pass was already charged, and never buys a second day-pass
+    the same day (the owner paid for today once already)."""
     now = now or _now_et()
+    day = now.strftime("%Y-%m-%d")
+    paid_today = (state.get("pass_charged_day") == day
+                  or (_pass_tokens(cfg)
+                      and _autopay_spent_today(state, now)["count"] >= 1))
+    if paid_today:
+        if state.get("pass_day_skip_notified") != day:
+            state["pass_day_skip_notified"] = day
+            save_state(state)
+            print("Day-pass purchase skipped: today is already paid for "
+                  "(prepaid pass or an earlier wallet day-pass) — the wallet "
+                  "will not pay a second time today.")
+        return False
     if now.weekday() >= 5:
         day = now.strftime("%Y-%m-%d")
         if state.get("weekend_skip_notified") != day:
@@ -361,13 +383,24 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     still apply per trade).
     """
     # Prepaid multi-day pass (bought in the dashboard, paid from any wallet):
-    # takes precedence over the per-day wallet auto-pay.
-    if not cfg.get("agenthc_api_key") and _pass_tokens(cfg):
+    # takes precedence over the per-day wallet auto-pay. One charge per day:
+    # a wallet day-pass that is already paid and still running is used up
+    # first (reading with the prepaid pass now would charge a pass day on
+    # top of it), and the wallet never buys while a pass's state is unknown.
+    if (not cfg.get("agenthc_api_key") and _pass_tokens(cfg)
+            and not _live_daypass(state)):
         token = _refresh_pass(cfg, state, save_state)
         if token:
             return _poll_with_pass(cfg, state, save_state, token, _retried)
+        cache = state.get("pass_status") or {}
+        statuses = {(cache.get(_token_id(t)) or {}).get("status")
+                    for t in _pass_tokens(cfg)}
+        if None in statuses:
+            # Status check failed (network/server error): the pass may well
+            # be fine. Wait for the next poll — never pay the wallet on an
+            # unknown, or the owner pays twice for the same day.
+            return []
         if not (cfg.get("lnbits_url") and cfg.get("day_pass_recurring")):
-            statuses = {r.get("status") for r in state.get("pass_status", {}).values()}
             if "pending" in statuses:
                 return []  # invoice shown, not paid yet — nothing to read
             _pass_notice(cfg, state, save_state, "pass_expired_notified",
@@ -385,9 +418,18 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     if not _headers(cfg, state) and not _pass_purchase_allowed(cfg, state, save_state):
         return []
     track = "all" if cfg.get("include_other_trades") else "main"
+    headers = _headers(cfg, state)
     resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
                         params={"limit": 20, "track": track},
-                        headers=_headers(cfg, state), timeout=15)
+                        headers=headers, timeout=15)
+    if (resp.status_code in (401, 402) and not _retried
+            and not cfg.get("agenthc_api_key") and _pass_tokens(cfg)
+            and headers.get("Authorization")):
+        # The running day-pass was refused: drop it and read with the
+        # prepaid pass instead of letting the wallet buy another one.
+        state.pop("l402", None)
+        save_state(state)
+        return poll(cfg, state, save_state, _retried=True)
     if resp.status_code == 402 and not _retried:
         if not _pass_purchase_allowed(cfg, state, save_state):
             return []
@@ -424,6 +466,12 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
         raise RuntimeError(f"403 from feed: {str(detail)[:200]}")
     resp.raise_for_status()
     body = resp.json()
+    if body.get("pass_charged_today"):
+        # The pass paid for today: the wallet must not buy a day-pass today.
+        today = _now_et().strftime("%Y-%m-%d")
+        if state.get("pass_charged_day") != today:
+            state["pass_charged_day"] = today
+            save_state(state)
     left = body.get("pass_days_left", body.get("pass_trading_days_left"))
     exits_only = bool(body.get("pass_exits_only"))
     rec = state.setdefault("pass_status", {}).get(_token_id(token))

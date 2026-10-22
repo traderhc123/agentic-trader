@@ -535,3 +535,143 @@ def test_active_pass_preferred_over_exits_only_one(monkeypatch):
     agenthc.poll(cfg, state, lambda s: None)
     used = [h["Authorization"] for u, h in srv.calls if u.endswith("day-trade-ideas")]
     assert used == [PASS_TOK]
+
+
+# ── one charge per market day: prepaid pass + wallet auto-pay ───────────────
+
+def _wallet_cfg(**kw):
+    return _pass_cfg(lnbits_url="https://lnbits.example", lnbits_admin_key="x",
+                     day_pass_recurring=True, **kw)
+
+
+class _PassAndWalletServer(_PassServer):
+    """Pass status + a feed that 402s requests without a valid token."""
+
+    def __init__(self, status="active", pass_status_error=False, **kw):
+        super().__init__(status=status, **kw)
+        self.pass_status_error = pass_status_error
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        if url.endswith("/pass") and self.pass_status_error:
+            self.calls.append((url, dict(headers or {})))
+            raise ConnectionError("pass status unavailable")
+        if not url.endswith("/pass") and not (headers or {}).get("Authorization"):
+            self.calls.append((url, dict(headers or {})))
+            return FakeResp({"payment": {"payment_request": "lnbc1...",
+                                         "macaroon": "MAC",
+                                         "amount_sats": 12_000}}, status=402)
+        return super().get(url, params, headers, timeout)
+
+
+def test_pass_status_check_failure_never_pays_the_wallet(monkeypatch):
+    """A failed pass-status check must not fall through to the wallet: the
+    pass is probably fine, and buying would charge the owner twice today."""
+    srv = _PassAndWalletServer(pass_status_error=True)
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    state = {}
+    for _ in range(3):
+        assert agenthc.poll(_wallet_cfg(), state, lambda s: None) == []
+    assert wallet.paid == []
+    assert not any(u.endswith("day-trade-ideas") for u, _ in srv.calls)
+
+
+def test_wallet_never_buys_on_a_day_the_pass_was_charged(monkeypatch):
+    """Pass charged today, then ended (e.g. superseded/expired): the wallet
+    must wait for tomorrow instead of paying for today a second time."""
+    srv = _PassAndWalletServer(status="expired")
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    state = {"pass_charged_day": "2026-07-15"}  # the pinned 'today'
+    assert agenthc.poll(_wallet_cfg(), state, lambda s: None) == []
+    assert wallet.paid == []
+    assert state.get("pass_day_skip_notified") == "2026-07-15"
+    # next market day the wallet may buy again
+    state["pass_charged_day"] = "2026-07-14"
+    agenthc.poll(_wallet_cfg(), state, lambda s: None)
+    assert wallet.paid == ["lnbc1..."]
+
+
+def test_ended_pass_still_falls_back_to_wallet(monkeypatch):
+    """Regression: a pass that really ended (and paid nothing today) still
+    hands over to the recurring wallet day-pass."""
+    srv = _PassAndWalletServer(status="expired")
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    state = {}
+    events = agenthc.poll(_wallet_cfg(), state, lambda s: None)
+    assert wallet.paid == ["lnbc1..."]
+    assert len(events) == 1
+
+
+def test_running_wallet_daypass_is_used_before_the_prepaid_pass(monkeypatch):
+    """A day-pass the wallet already paid for is read first; switching to
+    the prepaid pass now would charge a pass day on top of it."""
+    srv = _PassServer()
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    state = {"l402": {"token": "L402 MAC:pre", "expires_at": time.time() + 3600}}
+    events = agenthc.poll(_wallet_cfg(), state, lambda s: None)
+    assert len(events) == 1
+    used = [h.get("Authorization") for u, h in srv.calls if u.endswith("day-trade-ideas")]
+    assert used == ["L402 MAC:pre"]
+    assert not any(u.endswith("/pass") for u, _ in srv.calls)
+    # once the day-pass runs out, the prepaid pass takes over
+    state["l402"]["expires_at"] = time.time() - 1
+    agenthc.poll(_wallet_cfg(), state, lambda s: None)
+    used = [h.get("Authorization") for u, h in srv.calls if u.endswith("day-trade-ideas")]
+    assert used[-1] == PASS_TOK
+
+
+def test_pass_charge_today_is_remembered(monkeypatch):
+    srv = _PassServer()
+    orig = srv.get
+
+    def get(url, params=None, headers=None, timeout=None):
+        r = orig(url, params, headers, timeout)
+        if not url.endswith("/pass"):
+            r._payload = {**r._payload, "pass_charged_today": True}
+        return r
+    monkeypatch.setattr(agenthc.requests, "get", get)
+    state = {}
+    agenthc.poll(_wallet_cfg(), state, lambda s: None)
+    assert state["pass_charged_day"] == "2026-07-15"
+
+
+def test_refused_wallet_daypass_falls_back_to_prepaid_pass(monkeypatch):
+    """Server refuses the running day-pass (402): read with the prepaid pass
+    — don't sit idle until the token's local expiry, don't buy again."""
+    srv = _PassServer()
+    orig = srv.get
+
+    def get(url, params=None, headers=None, timeout=None):
+        if (headers or {}).get("Authorization") == "L402 MAC:pre":
+            srv.calls.append((url, dict(headers)))
+            return FakeResp({"payment": {"payment_request": "lnbc1...",
+                                         "macaroon": "MAC",
+                                         "amount_sats": 12_000}}, status=402)
+        return orig(url, params, headers, timeout)
+    monkeypatch.setattr(agenthc.requests, "get", get)
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    state = {"l402": {"token": "L402 MAC:pre", "expires_at": time.time() + 3600}}
+    events = agenthc.poll(_wallet_cfg(), state, lambda s: None)
+    assert len(events) == 1
+    assert wallet.paid == []
+    assert "l402" not in state
+    used = [h.get("Authorization") for u, h in srv.calls if u.endswith("day-trade-ideas")]
+    assert used == ["L402 MAC:pre", PASS_TOK]
+
+
+def test_wallet_buys_at_most_one_daypass_a_day_with_a_pass_set_up(monkeypatch):
+    """Pass ended, wallet already paid once today (e.g. its token was lost
+    after paying): no second wallet purchase the same day."""
+    srv = _PassAndWalletServer(status="expired")
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    state = {"autopay_spent": {"day": "2026-07-15", "sats": 12_000, "count": 1}}
+    assert agenthc.poll(_wallet_cfg(), state, lambda s: None) == []
+    assert wallet.paid == []
