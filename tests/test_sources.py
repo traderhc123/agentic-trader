@@ -224,6 +224,8 @@ def test_agenthc_402_buys_day_pass_and_retries(monkeypatch):
     assert state["l402"]["token"] == "L402 MAC:preimage-abc"
     assert calls[1]["Authorization"] == "L402 MAC:preimage-abc"
     assert len(events) == 1
+    # the dashboard's pass-day P&L knows today was paid for
+    assert state["paid_days"] == [agenthc._now_et().strftime("%Y-%m-%d")]
 
 
 def test_agenthc_402_respects_autopay_cap(monkeypatch):
@@ -635,9 +637,12 @@ def test_pass_charge_today_is_remembered(monkeypatch):
             r._payload = {**r._payload, "pass_charged_today": True}
         return r
     monkeypatch.setattr(agenthc.requests, "get", get)
-    state = {}
+    state = {"paid_days": ["2026-07-14"]}
     agenthc.poll(_wallet_cfg(), state, lambda s: None)
     assert state["pass_charged_day"] == "2026-07-15"
+    assert state["paid_days"] == ["2026-07-14", "2026-07-15"]
+    agenthc.poll(_wallet_cfg(), state, lambda s: None)  # same day: no duplicate
+    assert state["paid_days"] == ["2026-07-14", "2026-07-15"]
 
 
 def test_refused_wallet_daypass_falls_back_to_prepaid_pass(monkeypatch):

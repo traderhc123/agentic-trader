@@ -1,5 +1,5 @@
 import { AlertTriangle, ArrowDownRight, ArrowUpRight, CircleHelp, Laptop, Minus, Pause, Play, Settings, ShieldCheck, Zap } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AppBar, Pill } from "../components/AppBar";
 import { ChatLog, nextMsgId, type ChatMsg } from "../components/Chat";
 import { Button, LinkButton } from "../components/ui/button";
@@ -7,7 +7,19 @@ import { ConfirmDialog } from "../components/ui/dialog";
 import { Input } from "../components/ui/field";
 import { Count, Panel } from "../components/ui/panel";
 import { ModeTag, RightTag } from "../components/ui/tag";
-import { api, type BudgetHint, type Problem, type Proposal, type StatusResp, type Trade, type WouldHave } from "../lib/api";
+import { Disclosure } from "../components/ui/disclosure";
+import {
+  api,
+  type BudgetHint,
+  type PnlBook,
+  type PnlSummary,
+  type Problem,
+  type Proposal,
+  type StatusResp,
+  type Trade,
+  type TradePage,
+  type WouldHave,
+} from "../lib/api";
 import { cn } from "../lib/cn";
 import { copyToClipboard, useInterval } from "../lib/hooks";
 import { cap1, hhmm, isToday, money, parseContract, parsePositions, shortDate, whenShort, type Contract } from "../lib/format";
@@ -44,6 +56,13 @@ export function Dashboard() {
   const [conn, setConn] = useState<Conn>("loading");
   const [status, setStatus] = useState<StatusResp | null>(null);
   const [trades, setTrades] = useState<Trade[]>([]);
+  const [tradeTotal, setTradeTotal] = useState(0);
+  const [firstNext, setFirstNext] = useState<number | null>(null);
+  const [older, setOlder] = useState<Trade[]>([]);
+  const [olderNext, setOlderNext] = useState<number | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [pnl, setPnl] = useState<PnlSummary | null>(null);
+  const pnlAt = useRef({ top: -2, t: 0 });
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [updateAvail, setUpdateAvail] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -66,13 +85,46 @@ export function Dashboard() {
       } catch {
         /* proposal panel is optional */
       }
-      const t = await api<{ trades: Trade[] }>("/api/trades");
-      setTrades(t.trades || []);
+      const t = await api<TradePage>("/api/trades");
+      const first = t.trades || [];
+      setTrades(first);
+      setTradeTotal(t.total || first.length);
+      setFirstNext(t.next ?? null);
+      // P&L reads the whole log: refetch only when a new row arrived (or every minute)
+      const top = first.length ? first[0].n ?? -1 : -1;
+      if (top !== pnlAt.current.top || Date.now() - pnlAt.current.t > 60_000) {
+        pnlAt.current = { top, t: Date.now() };
+        api<PnlSummary>("/api/pnl")
+          .then(setPnl)
+          .catch(() => {});
+      }
     } catch {
       setConn("unreachable");
     }
   };
   useInterval(refresh, 5000);
+
+  // Older Activity rows, fetched on demand ("Load older"); line numbers keep
+  // them in order and free of duplicates as new rows arrive on top.
+  const loadOlder = async () => {
+    const before = older.length ? olderNext : firstNext;
+    if (before == null || loadingOlder) return;
+    setLoadingOlder(true);
+    try {
+      const r = await api<TradePage>(`/api/trades?before=${before}&limit=100`);
+      setOlder((o) => [...o, ...(r.trades || [])]);
+      setOlderNext(r.next ?? null);
+    } catch {
+      /* keep what is loaded; the button stays for a retry */
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
+  const allTrades = useMemo(() => {
+    if (!older.length) return trades;
+    const floor = Math.min(...trades.map((x) => (typeof x.n === "number" ? x.n : Infinity)));
+    return [...trades, ...older.filter((x) => typeof x.n === "number" && x.n < floor)];
+  }, [trades, older]);
 
   // "update available" badge: one quiet check per page load; never installs.
   useEffect(() => {
@@ -186,10 +238,16 @@ export function Dashboard() {
         <div className="mt-4 grid grid-cols-[minmax(0,1fr)_400px] items-start gap-4 max-xl:grid-cols-1">
           <div className="flex min-w-0 flex-col gap-4">
             {proposal?.pending && <ProposalPanel p={proposal} onDone={refresh} />}
-            <PnlPanel trades={trades} />
+            <PnlPanel pnl={pnl} />
             {conn === "ok" && !live && status?.would_have && <WouldHavePanel p={status.would_have} />}
             <PositionsPanel positions={parsePositions(f["open positions"])} />
-            <Blotter trades={trades} />
+            <Blotter
+              trades={allTrades}
+              total={tradeTotal}
+              canLoadOlder={(older.length ? olderNext : firstNext) != null}
+              loadingOlder={loadingOlder}
+              onLoadOlder={loadOlder}
+            />
           </div>
           <div className="flex min-w-0 flex-col gap-4 xl:sticky xl:top-[68px]">
             {moveOpen && <MovePanel onClose={() => setMoveOpen(false)} />}
@@ -538,38 +596,28 @@ function StatusStrip({ conn, f }: { conn: Conn; f: Record<string, string> }) {
 }
 
 // ── P&L ─────────────────────────────────────────────────────────────────────
-function PnlPanel({ trades }: { trades: Trade[] }) {
-  const { points, cum, wins, losses } = useMemo(() => {
-    let c = 0,
-      w = 0,
-      l = 0;
-    const pts: PnlPoint[] = [];
-    trades
-      .slice()
-      .reverse()
-      .forEach((x) => {
-        if (x.action === "exit" && x.est_pnl_usd != null && isFinite(Number(x.est_pnl_usd))) {
-          const v = Number(x.est_pnl_usd);
-          c += v;
-          if (v > 0) w++;
-          else if (v < 0) l++;
-          pts.push({ ts: String(x.ts || ""), cum: c });
-        }
-      });
-    return { points: pts, cum: c, wins: w, losses: l };
-  }, [trades]);
+const hasExits = (b: PnlBook | null | undefined) => !!b && b.exits + b.unmeasured > 0;
 
-  const n = points.length;
+function PnlPanel({ pnl }: { pnl: PnlSummary | null }) {
+  // Live P&L when there is any; otherwise the dry-run book (paper practice).
+  const showDry = !hasExits(pnl?.live) && hasExits(pnl?.dry);
+  const b = (showDry ? pnl?.dry : pnl?.live) || null;
+  const other = showDry ? null : pnl?.dry;
+  const points: PnlPoint[] = b?.points || [];
+  const n = b?.exits || 0;
+  const cum = b?.total || 0;
+  const passDays = (pnl?.pass_days?.recorded || 0) + (pnl?.pass_days?.estimated || 0);
   const rangeLabel = (ts: string, withTime: boolean) => {
     const d = new Date(ts);
     if (isNaN(d.getTime())) return "";
     return isToday(d) ? hhmm(d) : shortDate(d) + (withTime ? " " + hhmm(d) : "");
   };
+  const tone = (v: number) => (v > 0 ? "text-up" : v < 0 ? "text-down" : "text-fg2");
 
   return (
     <Panel
       title="Estimated P&L"
-      right={<span className="text-xs text-muted">exits in the recent log</span>}
+      right={<span className="text-xs text-muted">{showDry ? "dry-run · all time" : "all time"}</span>}
     >
       <div className="flex flex-wrap items-end gap-x-8 gap-y-2 px-4 pb-1 pt-3">
         <div>
@@ -578,8 +626,18 @@ function PnlPanel({ trades }: { trades: Trade[] }) {
             {n ? money(cum) : "$0.00"}
           </div>
         </div>
+        {pnl?.feed && b && (
+          <div className="pb-1" title="Trades opened on days your AgentHC pass or day-pass was charged">
+            <div className="text-xs text-muted">
+              On pass days{passDays ? ` (${passDays} day${passDays === 1 ? "" : "s"})` : ""}
+            </div>
+            <div className={cn("mt-0.5 font-mono text-sm", b.pass.exits ? tone(b.pass.total) : "text-faint")}>
+              {b.pass.exits ? money(b.pass.total) : "–"}
+            </div>
+          </div>
+        )}
         <Stat k="Exits" v={String(n)} />
-        <Stat k="Won / lost" v={n ? `${wins} / ${losses}` : "–"} />
+        <Stat k="Won / lost" v={n ? `${b!.wins} / ${b!.losses}` : "–"} />
         {n > 0 && <Stat k="Period" v={`${rangeLabel(points[0].ts, false)} → ${rangeLabel(points[n - 1].ts, true)}`} />}
       </div>
       {n >= 1 ? (
@@ -590,6 +648,43 @@ function PnlPanel({ trades }: { trades: Trade[] }) {
         <div className="mx-4 mb-4 mt-3 grid h-[150px] place-items-center rounded border border-dashed border-line2 text-center text-xs text-muted">
           The curve starts after the agent's first exit.
         </div>
+      )}
+      {b && b.days.length > 0 && (
+        <div className="px-4 pb-4">
+          <Disclosure summary={`P&L by day (${b.days.length} day${b.days.length === 1 ? "" : "s"})`}>
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr className="text-left text-xs text-muted">
+                  <th className="py-1 pr-4 font-normal">Opened</th>
+                  <th className="py-1 pr-4 font-normal">Pass</th>
+                  <th className="py-1 pr-4 text-right font-normal">Exits</th>
+                  <th className="py-1 text-right font-normal">Est. P&L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {b.days.map((d) => (
+                  <tr key={d.day} className="border-t border-line">
+                    <td className="py-1 pr-4 font-mono text-xs text-fg2">{d.day}</td>
+                    <td className="py-1 pr-4 text-xs text-muted">{d.pass === "paid" ? "pass" : d.pass === "est" ? "pass (est.)" : "–"}</td>
+                    <td className="py-1 pr-4 text-right font-mono text-xs text-fg2">{d.exits}</td>
+                    <td className={cn("py-1 text-right font-mono", tone(d.pnl))}>{money(d.pnl)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="m-0 text-xs text-muted">
+              Each trade counts on the day it was opened, so an overnight hold closed the next morning stays with the day that
+              delivered it. "pass (est.)" marks days from before this version recorded pass charges: the agent took a trade from
+              the feed that day, so the feed was paid for.
+            </p>
+          </Disclosure>
+        </div>
+      )}
+      {((b?.unmeasured || 0) > 0 || hasExits(other)) && (
+        <p className="m-0 border-t border-line px-4 py-2 text-xs text-muted">
+          {(b?.unmeasured || 0) > 0 ? `${b!.unmeasured} exit${b!.unmeasured === 1 ? "" : "s"} had no price to estimate from and count as $0. ` : ""}
+          {hasExits(other) ? `Dry-run exits are not included (${money(other!.total)} on paper).` : ""}
+        </p>
       )}
     </Panel>
   );
@@ -714,13 +809,25 @@ function ContractCell({ c }: { c: Contract }) {
 }
 
 const BLOTTER_ROWS = 10;
-function Blotter({ trades: all }: { trades: Trade[] }) {
+function Blotter({
+  trades: all,
+  total,
+  canLoadOlder,
+  loadingOlder,
+  onLoadOlder,
+}: {
+  trades: Trade[];
+  total: number;
+  canLoadOlder: boolean;
+  loadingOlder: boolean;
+  onLoadOlder: () => void;
+}) {
   const [showAll, setShowAll] = useState(false);
   const trades = showAll ? all : all.slice(0, BLOTTER_ROWS);
   const rows = trades.map(rowOf);
   const more = all.length - BLOTTER_ROWS;
   return (
-    <Panel title="Activity" right={<Count n={all.length} />}>
+    <Panel title="Activity" right={<Count n={Math.max(total, all.length)} />}>
       {rows.length === 0 ? (
         <p className="m-0 px-4 py-6 text-center text-xs text-muted">Nothing yet. Signals and the agent's decisions show up here.</p>
       ) : (
@@ -785,11 +892,19 @@ function Blotter({ trades: all }: { trades: Trade[] }) {
               </li>
             ))}
           </ul>
-          {more > 0 && (
-            <div className="border-t border-line px-4 py-2">
-              <Button variant="ghost" size="sm" onClick={() => setShowAll((v) => !v)} aria-expanded={showAll}>
-                {showAll ? "Show latest " + BLOTTER_ROWS : `Show all ${all.length} events`}
-              </Button>
+          {(more > 0 || (showAll && canLoadOlder)) && (
+            <div className="flex flex-wrap items-center gap-2 border-t border-line px-4 py-2">
+              {more > 0 && (
+                <Button variant="ghost" size="sm" onClick={() => setShowAll((v) => !v)} aria-expanded={showAll}>
+                  {showAll ? "Show latest " + BLOTTER_ROWS : `Show all ${all.length} loaded events`}
+                </Button>
+              )}
+              {showAll && canLoadOlder && (
+                <Button variant="ghost" size="sm" onClick={onLoadOlder} disabled={loadingOlder}>
+                  {loadingOlder ? "Loading…" : "Load older"}
+                </Button>
+              )}
+              {showAll && <span className="text-xs text-muted">{all.length} of {Math.max(total, all.length)}</span>}
             </div>
           )}
         </>

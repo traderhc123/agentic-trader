@@ -326,6 +326,19 @@ def _daily_autopay_cap(cfg):
     return int(cfg.get("max_autopay_sats_per_day", per_invoice))
 
 
+def _record_paid_day(state, day):
+    """Remember an ET day the feed was paid for (prepaid-pass day charged or
+    wallet day-pass bought) — the dashboard's pass-day P&L reads this list.
+    Returns True when it changed (caller saves)."""
+    days = state.setdefault("paid_days", [])
+    if day in days:
+        return False
+    days.append(day)
+    days.sort()
+    del days[:-2000]  # ~8 years of market days
+    return True
+
+
 def _autopay_spent_today(state, now=None):
     day = (now or _now_et()).strftime("%Y-%m-%d")
     spent = state.get("autopay_spent") or {}
@@ -370,6 +383,7 @@ def _buy_day_pass(cfg, state, body, save_state):
     preimage = wallet.pay_invoice(invoice)
     state["l402"] = {"token": f"L402 {macaroon}:{preimage}",
                      "expires_at": time.time() + 23 * 3600}
+    _record_paid_day(state, _now_et().strftime("%Y-%m-%d"))
     save_state(state)
     print("Day-pass active for ~23h.")
 
@@ -469,8 +483,11 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
     if body.get("pass_charged_today"):
         # The pass paid for today: the wallet must not buy a day-pass today.
         today = _now_et().strftime("%Y-%m-%d")
+        changed = _record_paid_day(state, today)
         if state.get("pass_charged_day") != today:
             state["pass_charged_day"] = today
+            changed = True
+        if changed:
             save_state(state)
     left = body.get("pass_days_left", body.get("pass_trading_days_left"))
     exits_only = bool(body.get("pass_exits_only"))

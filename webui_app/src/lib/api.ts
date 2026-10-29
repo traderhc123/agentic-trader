@@ -110,7 +110,38 @@ export interface Trade {
   dry?: boolean;
   est_pnl_usd?: number | null;
   reason?: string;
+  /** line number in trades.jsonl (stable id; pages go by it) */
+  n?: number;
   [k: string]: unknown;
+}
+export interface TradePage {
+  trades: Trade[];
+  total?: number;
+  /** pass as ?before= for older rows; null when there are none */
+  next?: number | null;
+}
+export interface PnlDay {
+  day: string; // ET day the trades were opened
+  pnl: number;
+  exits: number;
+  pass: "paid" | "est" | null;
+}
+export interface PnlBook {
+  total: number;
+  exits: number;
+  wins: number;
+  losses: number;
+  unmeasured: number;
+  points: { ts: string; cum: number }[];
+  days: PnlDay[];
+  pass: { total: number; exits: number };
+}
+export interface PnlSummary {
+  feed: boolean;
+  tracked_from?: string | null;
+  pass_days?: { recorded: number; estimated: number };
+  live: PnlBook | null;
+  dry: PnlBook | null;
 }
 export interface Proposal {
   pending?: boolean;

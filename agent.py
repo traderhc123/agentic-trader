@@ -257,6 +257,159 @@ def _est_pnl_today():
     return total, unmeasured
 
 
+def _et_day(ts):
+    """'YYYY-MM-DD' market (ET) day of an ISO timestamp; '' if unreadable."""
+    try:
+        d = datetime.fromisoformat(str(ts))
+    except ValueError:
+        return ""
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(MARKET_TZ).date().isoformat()
+
+
+def _read_trade_log():
+    """Every trade-log row, oldest first. Each row gets `n`, its line number
+    in trades.jsonl — stable, because the log is only ever appended to."""
+    rows = []
+    try:
+        with open(TRADES_PATH, encoding="utf-8") as f:
+            for n, line in enumerate(f):
+                if not line.strip():
+                    continue
+                try:
+                    t = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(t, dict):
+                    t["n"] = n
+                    rows.append(t)
+    except OSError:
+        pass
+    return rows
+
+
+def trade_page(before=None, limit=50):
+    """One page of the trade log for the dashboard, newest first.
+
+    `before` is a line number: only older rows are returned. The response's
+    `next` is the value to pass as `before` for the page after this one
+    (None when there is nothing older)."""
+    try:
+        limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        limit = 50
+    rows = _read_trade_log()
+    if before is not None:
+        try:
+            before = int(before)
+            rows = [t for t in rows if t["n"] < before]
+        except (TypeError, ValueError):
+            pass
+    page = rows[-limit:]
+    more = len(rows) > len(page)
+    return {"trades": list(reversed(page)), "total": len(rows),
+            "next": page[0]["n"] if page and more else None}
+
+
+def _paid_days(state):
+    """ET days the AgentHC feed was paid for: prepaid-pass days the feed
+    reported as charged, and days a wallet day-pass was bought. Also reads
+    the single-day markers older versions kept, so the day of an upgrade
+    still counts."""
+    days = {d for d in (state.get("paid_days") or []) if isinstance(d, str)}
+    if isinstance(state.get("pass_charged_day"), str):
+        days.add(state["pass_charged_day"])
+    exp = (state.get("l402") or {}).get("expires_at")
+    if isinstance(exp, (int, float)) and exp > 23 * 3600:
+        # a wallet day-pass is bought 23h before it expires
+        days.add(datetime.fromtimestamp(exp - 23 * 3600, MARKET_TZ)
+                 .date().isoformat())
+    return days
+
+
+def pnl_summary(cfg=None, state=None):
+    """All-time estimated realized P&L from the WHOLE trade log (the
+    dashboard's Activity list only shows recent rows), split into live and
+    dry-run, with a per-day breakdown and the total for pass days.
+
+    Same estimate as _est_pnl_today: brokers don't report fills back, so each
+    exit's P&L is quote-based; exits without an estimate are `unmeasured`.
+
+    Each exit is credited to the ET day its position was OPENED, so an
+    overnight carry closed the morning after still counts toward the pass
+    day that delivered it. A "pass day" is a day the AgentHC feed was paid
+    for (see _paid_days). Older versions didn't record those days, so before
+    the first recorded one, any day the agent took an entry counts as a pass
+    day too — marked "est" (a feed entry needs a paid day)."""
+    cfg = cfg if cfg is not None else (_load(CONFIG_PATH, {}) or {})
+    state = state if state is not None else (_load(STATE_PATH, {}) or {})
+    rows = _read_trade_log()
+    feed = cfg.get("source", "agenthc") == "agenthc"
+    paid = _paid_days(state) if feed else set()
+    tracked_from = min(paid) if paid else None
+    entry_days = {_et_day(t.get("ts")) for t in rows
+                  if t.get("action") == "entry"} - {""}
+    est_days = set()
+    if feed:
+        est_days = {d for d in entry_days
+                    if tracked_from is None or d < tracked_from} - paid
+
+    def kind(day):
+        if day in paid:
+            return "paid"
+        return "est" if day in est_days else None
+
+    def blank():
+        return {"total": 0.0, "exits": 0, "wins": 0, "losses": 0,
+                "unmeasured": 0, "points": [], "days": {},
+                "pass": {"total": 0.0, "exits": 0}}
+
+    books = {"live": blank(), "dry": blank()}
+    opened = {}  # (dry, contract) -> ET day of the latest entry
+    for t in rows:
+        a = t.get("action")
+        dry = bool(t.get("dry"))
+        key = (dry, t.get("contract"))
+        if a == "entry":
+            opened[key] = _et_day(t.get("ts"))
+            continue
+        if a != "exit":
+            continue
+        b = books["dry" if dry else "live"]
+        v = t.get("est_pnl_usd")
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or v != v:
+            b["unmeasured"] += 1
+            continue
+        v = float(v)
+        day = opened.pop(key, "") or _et_day(t.get("ts"))
+        b["total"] += v
+        b["exits"] += 1
+        if v > 0:
+            b["wins"] += 1
+        elif v < 0:
+            b["losses"] += 1
+        b["points"].append({"ts": str(t.get("ts", "")), "cum": round(b["total"], 2)})
+        d = b["days"].setdefault(day, {"day": day, "pnl": 0.0, "exits": 0,
+                                       "pass": kind(day)})
+        d["pnl"] += v
+        d["exits"] += 1
+        if d["pass"]:
+            b["pass"]["total"] += v
+            b["pass"]["exits"] += 1
+
+    for b in books.values():
+        b["total"] = round(b["total"], 2)
+        b["pass"]["total"] = round(b["pass"]["total"], 2)
+        days = sorted(b["days"].values(), key=lambda d: d["day"], reverse=True)
+        for d in days:
+            d["pnl"] = round(d["pnl"], 2)
+        b["days"] = days
+    return {"feed": feed, "tracked_from": tracked_from,
+            "pass_days": {"recorded": len(paid), "estimated": len(est_days)},
+            **books}
+
+
 def _mark(broker, client, cfg, event, side):
     """Best-effort per-share quote for P&L estimates; 0.0 when unavailable."""
     fn = getattr(broker, "mark_price", None) if broker is not None else None

@@ -3390,8 +3390,22 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"mode": "OFFLINE", "paused": False, "fields": {}}
         return get_status()
 
-    def d_trades(_h):
-        return {"trades": get_trades() if get_trades else []}
+    def d_trades(h):
+        """Newest trade-log rows; ?before=<n>&limit=<k> pages back through
+        the whole log (the dashboard's "Load older")."""
+        if not get_trades:
+            return {"trades": [], "total": 0, "next": None}
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(h.path).query)
+        before = (qs.get("before") or [None])[0]
+        limit = (qs.get("limit") or [50])[0]
+        return A.trade_page(before=before, limit=limit)
+
+    def d_pnl(_h):
+        """All-time est. P&L from the whole trade log, incl. pass days."""
+        if not get_trades:
+            return {"feed": False, "live": None, "dry": None}
+        return A.pnl_summary(cfg_getter() if cfg_getter else cfg)
 
     def d_command(_h, data):
         text = str(data.get("text", "")).strip()
@@ -3419,6 +3433,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/pass/status": pass_status_route,
                     "/api/pass/options": pass_options_route,
                     "/api/status": d_status, "/api/trades": d_trades,
+                    "/api/pnl": d_pnl,
                     "/api/proposal": proposal_get,
                     "/api/autostart": autostart_get,
                     "/api/move/download": move_download}
