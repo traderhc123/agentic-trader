@@ -323,6 +323,44 @@ def test_agenthc_live_token_still_polls(monkeypatch):
     assert len(events) == 1
 
 
+def test_running_daypass_records_each_market_day_it_covers(monkeypatch):
+    """A day-pass bought yesterday afternoon still covers this morning: a
+    feed read with it during the session marks today as paid (pass-day
+    P&L). Reads on weekends or outside market hours don't."""
+    monkeypatch.setattr(agenthc.requests, "get",
+                        lambda *a, **kw: FakeResp({"events": [_feed_event()]}))
+    saved = []
+    state = {"l402": {"token": "L402 m:p", "expires_at": time.time() + 3600},
+             "paid_days": ["2026-07-14"]}
+    agenthc.poll({}, state, save_state=saved.append)
+    assert state["paid_days"] == ["2026-07-14", "2026-07-15"]
+    assert saved
+    saved.clear()
+    agenthc.poll({}, state, save_state=saved.append)  # same day: no re-save
+    assert state["paid_days"] == ["2026-07-14", "2026-07-15"] and not saved
+    for when in (datetime(2026, 7, 18, 11, 0),   # Saturday
+                 datetime(2026, 7, 16, 3, 0),    # Thursday, overnight
+                 datetime(2026, 7, 16, 9, 29),   # Thursday, pre-market
+                 datetime(2026, 7, 16, 16, 0)):  # Thursday, after the close
+        monkeypatch.setattr(agenthc, "_now_et",
+                            lambda w=when: w.replace(tzinfo=agenthc.MARKET_TZ))
+        agenthc.poll({}, state, save_state=saved.append)
+        assert state["paid_days"] == ["2026-07-14", "2026-07-15"], when
+    monkeypatch.setattr(agenthc, "_now_et",
+                        lambda: datetime(2026, 7, 16, 9, 30,
+                                         tzinfo=agenthc.MARKET_TZ))  # the open
+    agenthc.poll({}, state, save_state=saved.append)
+    assert state["paid_days"][-1] == "2026-07-16"
+
+
+def test_api_key_reads_record_no_paid_days(monkeypatch):
+    monkeypatch.setattr(agenthc.requests, "get",
+                        lambda *a, **kw: FakeResp({"events": [_feed_event()]}))
+    state = {}
+    agenthc.poll({"agenthc_api_key": "k"}, state, save_state=lambda s: None)
+    assert "paid_days" not in state
+
+
 def test_agenthc_api_key_still_polls(monkeypatch):
     """An API-key consumer is unaffected by the day-pass purchase gate."""
     monkeypatch.setattr(agenthc.requests, "get",

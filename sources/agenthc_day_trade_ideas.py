@@ -462,6 +462,16 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             return []  # feed exists but isn't publishing yet — keep polling
         raise RuntimeError(f"403 from feed: {str(detail)[:200]}")
     resp.raise_for_status()
+    if headers.get("Authorization"):
+        # A wallet day-pass runs 23h, so one bought in the afternoon also
+        # covers the next session: that market day was paid for too. Only
+        # counts while the market is open (09:30-16:00 ET on a weekday) — a
+        # token that just ran into the night or pre-market covered no trading.
+        now = _now_et()
+        minute = now.hour * 60 + now.minute
+        if (now.weekday() < 5 and 9 * 60 + 30 <= minute < 16 * 60
+                and _record_paid_day(state, now.strftime("%Y-%m-%d"))):
+            save_state(state)
     return _parse_events(resp.json())
 
 

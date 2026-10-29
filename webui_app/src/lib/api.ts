@@ -119,6 +119,8 @@ export interface TradePage {
   total?: number;
   /** pass as ?before= for older rows; null when there are none */
   next?: number | null;
+  /** line number of the first readable row in the whole log */
+  oldest?: number | null;
 }
 export interface PnlDay {
   day: string; // ET day the trades were opened
@@ -137,7 +139,8 @@ export interface PnlBook {
   pass: { total: number; exits: number };
 }
 export interface PnlSummary {
-  feed: boolean;
+  /** pass-day split applies: AgentHC source without a Premium API key */
+  passes: boolean;
   tracked_from?: string | null;
   pass_days?: { recorded: number; estimated: number };
   live: PnlBook | null;

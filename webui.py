@@ -3394,7 +3394,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         """Newest trade-log rows; ?before=<n>&limit=<k> pages back through
         the whole log (the dashboard's "Load older")."""
         if not get_trades:
-            return {"trades": [], "total": 0, "next": None}
+            # setup wizard / agent stopped: say so (an empty page would read
+            # as "no older rows" to a dashboard tab left open)
+            return {"ok": False, "error": "the agent isn't running"}
         from urllib.parse import parse_qs, urlparse
         qs = parse_qs(urlparse(h.path).query)
         before = (qs.get("before") or [None])[0]
@@ -3404,7 +3406,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     def d_pnl(_h):
         """All-time est. P&L from the whole trade log, incl. pass days."""
         if not get_trades:
-            return {"feed": False, "live": None, "dry": None}
+            return {"passes": False, "live": None, "dry": None}
         return A.pnl_summary(cfg_getter() if cfg_getter else cfg)
 
     def d_command(_h, data):

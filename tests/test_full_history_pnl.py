@@ -60,7 +60,28 @@ def test_trade_page_skips_bad_lines_and_bad_args(home):
 
 
 def test_trade_page_without_a_log(home):
-    assert agent.trade_page() == {"trades": [], "total": 0, "next": None}
+    assert agent.trade_page() == {"trades": [], "total": 0, "next": None,
+                                  "oldest": None}
+
+
+def test_trade_page_reports_the_first_readable_line(home):
+    """A log whose first line can't be read (e.g. a BOM from a Windows
+    editor): the dashboard must know row 1 is the oldest, not offer to load
+    an older row 0 that doesn't exist."""
+    with open(agent.TRADES_PATH, "w", encoding="utf-8-sig") as f:
+        for i in range(3):
+            f.write(json.dumps({"action": "skip_rule", "i": i}) + "\n")
+    p = agent.trade_page()
+    assert p["oldest"] == 1 and p["total"] == 2
+
+
+def test_one_bad_byte_does_not_break_history_or_pnl(home):
+    with open(agent.TRADES_PATH, "wb") as f:
+        f.write(json.dumps(_entry("2026-10-01")).encode() + b"\n")
+        f.write(b'{"action":"skip_rule","reason":"\xff\xfe"}\n')
+        f.write(json.dumps(_exit("2026-10-01", 7.0)).encode() + b"\n")
+    assert agent.trade_page()["total"] == 3
+    assert agent.pnl_summary({"source": "url"}, {})["live"]["total"] == 7.0
 
 
 # ── all-time P&L ────────────────────────────────────────────────────────────
@@ -130,10 +151,46 @@ def test_older_single_day_markers_count_as_paid(home):
     assert agent._paid_days({}) == set()
 
 
+def test_stale_legacy_marker_does_not_move_the_estimate_cutoff(home):
+    """An old wallet day-pass token / pass_charged_day is never cleared. It
+    must not push the 'before recording began' cutoff back and strip the
+    label from real pass days in between (review finding)."""
+    from datetime import datetime
+    old_buy = datetime(2026, 9, 1, 10, 0, tzinfo=agent.MARKET_TZ).timestamp()
+    _write(home, [
+        _entry("2026-08-20"), _exit("2026-08-20", 100.0),
+        _entry("2026-09-15"), _exit("2026-09-15", 200.0),
+        _entry("2026-10-10"), _exit("2026-10-10", 300.0),
+        _entry("2026-10-28"), _exit("2026-10-28", 400.0),
+    ])
+    st = {"l402": {"expires_at": old_buy + 23 * 3600},
+          "pass_charged_day": "2026-10-28"}
+    s = agent.pnl_summary({"source": "agenthc"}, st)  # just upgraded: nothing recorded
+    assert {d["day"]: d["pass"] for d in s["live"]["days"]} == {
+        "2026-08-20": "est", "2026-09-15": "est", "2026-10-10": "est",
+        "2026-10-28": "paid"}
+    assert s["live"]["pass"] == {"total": 1000.0, "exits": 4}
+    st["paid_days"] = ["2026-10-29"]  # recording has begun
+    s = agent.pnl_summary({"source": "agenthc"}, st)
+    assert s["tracked_from"] == "2026-10-29"
+    assert s["live"]["pass"]["total"] == 1000.0
+
+
+def test_premium_api_key_has_no_pass_days(home):
+    """A subscription has no per-day charges: no 'pass (est.)' on every day."""
+    _write(home, [_entry("2026-11-10"), _exit("2026-11-10", 10.0)])
+    s = agent.pnl_summary({"source": "agenthc", "agenthc_api_key": "k"},
+                          {"pass_charged_day": "2026-09-01"})
+    assert s["passes"] is False
+    assert s["live"]["days"][0]["pass"] is None
+    assert s["live"]["pass"] == {"total": 0.0, "exits": 0}
+    assert s["live"]["total"] == 10.0
+
+
 def test_non_agenthc_source_has_no_pass_days(home):
     _write(home, [_entry("2026-10-01"), _exit("2026-10-01", 10.0)])
     s = agent.pnl_summary({"source": "url"}, {"paid_days": ["2026-10-01"]})
-    assert s["feed"] is False
+    assert s["passes"] is False
     assert s["live"]["pass"] == {"total": 0.0, "exits": 0}
     assert s["live"]["days"][0]["pass"] is None
     assert s["pass_days"] == {"recorded": 0, "estimated": 0}

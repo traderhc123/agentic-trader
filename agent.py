@@ -273,7 +273,9 @@ def _read_trade_log():
     in trades.jsonl — stable, because the log is only ever appended to."""
     rows = []
     try:
-        with open(TRADES_PATH, encoding="utf-8") as f:
+        # errors="replace": one bad byte (a hand edit, a disk hiccup) must not
+        # take the whole history and P&L down — that line just fails to parse
+        with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
             for n, line in enumerate(f):
                 if not line.strip():
                     continue
@@ -294,12 +296,14 @@ def trade_page(before=None, limit=50):
 
     `before` is a line number: only older rows are returned. The response's
     `next` is the value to pass as `before` for the page after this one
-    (None when there is nothing older)."""
+    (None when there is nothing older); `oldest` is the line number of the
+    first readable row in the whole log."""
     try:
         limit = max(1, min(int(limit), 500))
     except (TypeError, ValueError):
         limit = 50
     rows = _read_trade_log()
+    oldest = rows[0]["n"] if rows else None
     if before is not None:
         try:
             before = int(before)
@@ -309,15 +313,20 @@ def trade_page(before=None, limit=50):
     page = rows[-limit:]
     more = len(rows) > len(page)
     return {"trades": list(reversed(page)), "total": len(rows),
-            "next": page[0]["n"] if page and more else None}
+            "next": page[0]["n"] if page and more else None, "oldest": oldest}
+
+
+def _recorded_paid_days(state):
+    """The days the source recorded in state["paid_days"] (this version on)."""
+    return {d for d in (state.get("paid_days") or []) if isinstance(d, str)}
 
 
 def _paid_days(state):
     """ET days the AgentHC feed was paid for: prepaid-pass days the feed
-    reported as charged, and days a wallet day-pass was bought. Also reads
-    the single-day markers older versions kept, so the day of an upgrade
-    still counts."""
-    days = {d for d in (state.get("paid_days") or []) if isinstance(d, str)}
+    reported as charged, and days a wallet day-pass was bought or in use.
+    Also reads the single-day markers older versions kept, so the day of an
+    upgrade still counts."""
+    days = _recorded_paid_days(state)
     if isinstance(state.get("pass_charged_day"), str):
         days.add(state["pass_charged_day"])
     exp = (state.get("l402") or {}).get("expires_at")
@@ -340,18 +349,26 @@ def pnl_summary(cfg=None, state=None):
     overnight carry closed the morning after still counts toward the pass
     day that delivered it. A "pass day" is a day the AgentHC feed was paid
     for (see _paid_days). Older versions didn't record those days, so before
-    the first recorded one, any day the agent took an entry counts as a pass
-    day too — marked "est" (a feed entry needs a paid day)."""
+    the first day in state["paid_days"], any day the agent took an entry
+    counts as a pass day too — marked "est" (a feed entry needs a paid day).
+    Only the recorded list sets that cutoff: the older single-day markers are
+    never cleared, so a stale one would push the cutoff back and un-label
+    real pass days.
+
+    Pass days apply only to the AgentHC source without a Premium API key
+    (`passes`); a subscription has no per-day charges to split by."""
     cfg = cfg if cfg is not None else (_load(CONFIG_PATH, {}) or {})
     state = state if state is not None else (_load(STATE_PATH, {}) or {})
     rows = _read_trade_log()
-    feed = cfg.get("source", "agenthc") == "agenthc"
-    paid = _paid_days(state) if feed else set()
-    tracked_from = min(paid) if paid else None
+    passes = (cfg.get("source", "agenthc") == "agenthc"
+              and not cfg.get("agenthc_api_key"))
+    paid = _paid_days(state) if passes else set()
+    recorded = _recorded_paid_days(state) if passes else set()
+    tracked_from = min(recorded) if recorded else None
     entry_days = {_et_day(t.get("ts")) for t in rows
                   if t.get("action") == "entry"} - {""}
     est_days = set()
-    if feed:
+    if passes:
         est_days = {d for d in entry_days
                     if tracked_from is None or d < tracked_from} - paid
 
@@ -405,7 +422,7 @@ def pnl_summary(cfg=None, state=None):
         for d in days:
             d["pnl"] = round(d["pnl"], 2)
         b["days"] = days
-    return {"feed": feed, "tracked_from": tracked_from,
+    return {"passes": passes, "tracked_from": tracked_from,
             "pass_days": {"recorded": len(paid), "estimated": len(est_days)},
             **books}
 
