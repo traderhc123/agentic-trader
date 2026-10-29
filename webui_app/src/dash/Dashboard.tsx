@@ -1,5 +1,5 @@
 import { AlertTriangle, ArrowDownRight, ArrowUpRight, CircleHelp, Laptop, Minus, Pause, Play, Settings, ShieldCheck, Zap } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AppBar, Pill } from "../components/AppBar";
 import { ChatLog, nextMsgId, type ChatMsg } from "../components/Chat";
 import { Button, LinkButton } from "../components/ui/button";
@@ -7,7 +7,19 @@ import { ConfirmDialog } from "../components/ui/dialog";
 import { Input } from "../components/ui/field";
 import { Count, Panel } from "../components/ui/panel";
 import { ModeTag, RightTag } from "../components/ui/tag";
-import { api, type BudgetHint, type Problem, type Proposal, type StatusResp, type Trade, type WouldHave } from "../lib/api";
+import { Disclosure } from "../components/ui/disclosure";
+import {
+  api,
+  type BudgetHint,
+  type PnlBook,
+  type PnlSummary,
+  type Problem,
+  type Proposal,
+  type StatusResp,
+  type Trade,
+  type TradePage,
+  type WouldHave,
+} from "../lib/api";
 import { cn } from "../lib/cn";
 import { copyToClipboard, useInterval } from "../lib/hooks";
 import { cap1, hhmm, isToday, money, parseContract, parsePositions, shortDate, whenShort, type Contract } from "../lib/format";
@@ -43,7 +55,21 @@ type Conn = "loading" | "ok" | "off" | "unreachable";
 export function Dashboard() {
   const [conn, setConn] = useState<Conn>("loading");
   const [status, setStatus] = useState<StatusResp | null>(null);
+  // Every Activity row fetched this visit, newest first. Rows are kept (by
+  // log line number) as new ones arrive, so loaded history stays contiguous.
   const [trades, setTrades] = useState<Trade[]>([]);
+  const rowsRef = useRef<Trade[]>(trades);
+  rowsRef.current = trades;
+  const [tradeTotal, setTradeTotal] = useState(0);
+  const [olderLoaded, setOlderLoaded] = useState(false);
+  const [olderDone, setOlderDone] = useState(false); // nothing older than what is loaded
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [olderErr, setOlderErr] = useState("");
+  const [oldestN, setOldestN] = useState<number | null>(null); // first readable log line
+  const rowsGen = useRef(0); // bumps when the list restarts; stale "Load older" replies are dropped
+  const [pnl, setPnl] = useState<PnlSummary | null>(null);
+  const [pnlFailed, setPnlFailed] = useState(false);
+  const pnlAt = useRef({ top: -2, t: 0 });
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [updateAvail, setUpdateAvail] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -66,13 +92,94 @@ export function Dashboard() {
       } catch {
         /* proposal panel is optional */
       }
-      const t = await api<{ trades: Trade[] }>("/api/trades");
-      setTrades(t.trades || []);
+      const t = await api<TradePage>("/api/trades");
+      let top = -1;
+      if (Array.isArray(t.trades)) {
+        const first = t.trades;
+        top = first.length ? first[0].n ?? -1 : -1;
+        const more = t.next != null; // rows older than this page exist
+        const prev = rowsRef.current;
+        const prevMax = edgeN(prev, "max");
+        const pageMin = edgeN(first, "min");
+        const pageMax = edgeN(first, "max");
+        const seen = new Map(prev.map((x) => [x.n, x] as const));
+        // The log was swapped underneath us (Settings → Move here): line
+        // numbers now point at different rows.
+        const replaced =
+          (prevMax != null && pageMax != null && pageMax < prevMax) ||
+          first.some((x) => {
+            const o = seen.get(x.n);
+            return !!o && (o.ts !== x.ts || o.action !== x.action);
+          });
+        // More new rows arrived than one page holds since the last refresh:
+        // the rows in between were never fetched.
+        const gap = more && prevMax != null && pageMin != null && pageMin > prevMax + 1;
+        if (replaced || gap) {
+          // Restart from this page ("Load older" walks back from here)
+          // rather than show stale rows or a hidden gap.
+          rowsGen.current++;
+          setTrades(first);
+          setOlderLoaded(false);
+          setOlderDone(!more);
+          setOlderErr("");
+        } else {
+          setTrades((p) => mergeRows(p, first));
+          if (!olderLoaded) setOlderDone(!more);
+        }
+        setTradeTotal(t.total || first.length);
+        setOldestN(typeof t.oldest === "number" ? t.oldest : null);
+      }
+      // P&L reads the whole log: refetch only when a new row arrived (or every minute)
+      if (top !== pnlAt.current.top || Date.now() - pnlAt.current.t > 60_000) {
+        pnlAt.current = { top, t: Date.now() };
+        const retry = () => {
+          pnlAt.current.top = -2; // try again on the next refresh
+          setPnlFailed(true);
+        };
+        api<PnlSummary>("/api/pnl")
+          .then((p) => {
+            if (p && typeof p === "object" && "live" in p && "dry" in p) {
+              setPnl(p);
+              setPnlFailed(false);
+            } else retry();
+          })
+          .catch(retry);
+      }
     } catch {
       setConn("unreachable");
     }
   };
   useInterval(refresh, 5000);
+
+  // Older Activity rows, fetched on demand ("Load older"), from just below
+  // the oldest row on screen.
+  const olderCursor = edgeN(trades, "min");
+  const canLoadOlder = !olderDone && olderCursor != null && olderCursor > (oldestN ?? 0);
+  const loadOlder = async () => {
+    if (!canLoadOlder || loadingOlder) return;
+    if (conn !== "ok") {
+      setOlderErr("The agent isn't running — start it, then try again.");
+      return;
+    }
+    const gen = rowsGen.current;
+    setLoadingOlder(true);
+    setOlderErr("");
+    try {
+      const r = await api<TradePage>(`/api/trades?before=${olderCursor}&limit=100`);
+      if (gen !== rowsGen.current) return; // the list restarted meanwhile
+      if (!Array.isArray(r.trades)) {
+        setOlderErr("Couldn't load older events — try again.");
+        return;
+      }
+      setTrades((prev) => mergeRows(prev, r.trades));
+      setOlderLoaded(true);
+      setOlderDone(r.next == null || r.trades.length === 0);
+    } catch {
+      setOlderErr("Couldn't reach the agent — try again.");
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
 
   // "update available" badge: one quiet check per page load; never installs.
   useEffect(() => {
@@ -186,10 +293,17 @@ export function Dashboard() {
         <div className="mt-4 grid grid-cols-[minmax(0,1fr)_400px] items-start gap-4 max-xl:grid-cols-1">
           <div className="flex min-w-0 flex-col gap-4">
             {proposal?.pending && <ProposalPanel p={proposal} onDone={refresh} />}
-            <PnlPanel trades={trades} />
+            <PnlPanel pnl={pnl} failed={pnlFailed} />
             {conn === "ok" && !live && status?.would_have && <WouldHavePanel p={status.would_have} />}
             <PositionsPanel positions={parsePositions(f["open positions"])} />
-            <Blotter trades={trades} />
+            <Blotter
+              trades={trades}
+              total={tradeTotal}
+              canLoadOlder={canLoadOlder}
+              loadingOlder={loadingOlder}
+              olderErr={olderErr}
+              onLoadOlder={loadOlder}
+            />
           </div>
           <div className="flex min-w-0 flex-col gap-4 xl:sticky xl:top-[68px]">
             {moveOpen && <MovePanel onClose={() => setMoveOpen(false)} />}
@@ -538,48 +652,48 @@ function StatusStrip({ conn, f }: { conn: Conn; f: Record<string, string> }) {
 }
 
 // ── P&L ─────────────────────────────────────────────────────────────────────
-function PnlPanel({ trades }: { trades: Trade[] }) {
-  const { points, cum, wins, losses } = useMemo(() => {
-    let c = 0,
-      w = 0,
-      l = 0;
-    const pts: PnlPoint[] = [];
-    trades
-      .slice()
-      .reverse()
-      .forEach((x) => {
-        if (x.action === "exit" && x.est_pnl_usd != null && isFinite(Number(x.est_pnl_usd))) {
-          const v = Number(x.est_pnl_usd);
-          c += v;
-          if (v > 0) w++;
-          else if (v < 0) l++;
-          pts.push({ ts: String(x.ts || ""), cum: c });
-        }
-      });
-    return { points: pts, cum: c, wins: w, losses: l };
-  }, [trades]);
+const hasExits = (b: PnlBook | null | undefined) => !!b && b.exits + b.unmeasured > 0;
 
-  const n = points.length;
+function PnlPanel({ pnl, failed }: { pnl: PnlSummary | null; failed: boolean }) {
+  // Live P&L when there is any; otherwise the dry-run book (paper practice).
+  const showDry = !hasExits(pnl?.live) && hasExits(pnl?.dry);
+  const b = (showDry ? pnl?.dry : pnl?.live) || null;
+  const other = showDry ? null : pnl?.dry;
+  const points: PnlPoint[] = b?.points || [];
+  const n = b?.exits || 0;
+  const cum = b?.total || 0;
+  const passDays = (pnl?.pass_days?.recorded || 0) + (pnl?.pass_days?.estimated || 0);
   const rangeLabel = (ts: string, withTime: boolean) => {
     const d = new Date(ts);
     if (isNaN(d.getTime())) return "";
     return isToday(d) ? hhmm(d) : shortDate(d) + (withTime ? " " + hhmm(d) : "");
   };
+  const tone = (v: number) => (v > 0 ? "text-up" : v < 0 ? "text-down" : "text-fg2");
 
   return (
     <Panel
       title="Estimated P&L"
-      right={<span className="text-xs text-muted">exits in the recent log</span>}
+      right={<span className="text-xs text-muted">{showDry ? "dry-run · all time" : "all time"}</span>}
     >
       <div className="flex flex-wrap items-end gap-x-8 gap-y-2 px-4 pb-1 pt-3">
         <div>
           <div className="text-xs text-muted">Realized, estimated</div>
           <div className={cn("mt-0.5 font-mono text-2xl font-medium tracking-[-0.02em]", n ? (cum >= 0 ? "text-up" : "text-down") : "text-faint")}>
-            {n ? money(cum) : "$0.00"}
+            {!pnl ? "–" : n ? money(cum) : "$0.00"}
           </div>
         </div>
-        <Stat k="Exits" v={String(n)} />
-        <Stat k="Won / lost" v={n ? `${wins} / ${losses}` : "–"} />
+        {pnl?.passes && b && (
+          <div className="pb-1" title="Trades opened on days your AgentHC pass or day-pass was charged">
+            <div className="text-xs text-muted">
+              On pass days{passDays ? ` (${passDays} day${passDays === 1 ? "" : "s"})` : ""}
+            </div>
+            <div className={cn("mt-0.5 font-mono text-sm", b.pass.exits ? tone(b.pass.total) : "text-faint")}>
+              {b.pass.exits ? money(b.pass.total) : "–"}
+            </div>
+          </div>
+        )}
+        <Stat k="Exits" v={pnl ? String(n) : "–"} />
+        <Stat k="Won / lost" v={n ? `${b!.wins} / ${b!.losses}` : "–"} />
         {n > 0 && <Stat k="Period" v={`${rangeLabel(points[0].ts, false)} → ${rangeLabel(points[n - 1].ts, true)}`} />}
       </div>
       {n >= 1 ? (
@@ -588,8 +702,48 @@ function PnlPanel({ trades }: { trades: Trade[] }) {
         </div>
       ) : (
         <div className="mx-4 mb-4 mt-3 grid h-[150px] place-items-center rounded border border-dashed border-line2 text-center text-xs text-muted">
-          The curve starts after the agent's first exit.
+          {pnl ? "The curve starts after the agent's first exit." : failed ? "Couldn't load the P&L from the agent — retrying." : "Loading P&L…"}
         </div>
+      )}
+      {pnl && failed && (
+        <p className="m-0 border-t border-line px-4 py-2 text-xs text-muted">Couldn't refresh the P&L — showing the last numbers loaded; retrying.</p>
+      )}
+      {b && b.days.length > 0 && (
+        <div className="px-4 pb-4">
+          <Disclosure summary={`P&L by day (${b.days.length} day${b.days.length === 1 ? "" : "s"})`}>
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr className="text-left text-xs text-muted">
+                  <th className="py-1 pr-4 font-normal">Opened</th>
+                  <th className="py-1 pr-4 font-normal">Pass</th>
+                  <th className="py-1 pr-4 text-right font-normal">Exits</th>
+                  <th className="py-1 text-right font-normal">Est. P&L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {b.days.map((d) => (
+                  <tr key={d.day} className="border-t border-line">
+                    <td className="py-1 pr-4 font-mono text-xs text-fg2">{d.day}</td>
+                    <td className="py-1 pr-4 text-xs text-muted">{d.pass === "paid" ? "pass" : d.pass === "est" ? "pass (est.)" : "–"}</td>
+                    <td className="py-1 pr-4 text-right font-mono text-xs text-fg2">{d.exits}</td>
+                    <td className={cn("py-1 text-right font-mono", tone(d.pnl))}>{money(d.pnl)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="m-0 text-xs text-muted">
+              Each trade counts on the day it was opened, so an overnight hold closed the next morning stays with the day that
+              delivered it. "pass (est.)" marks days from before this version recorded pass charges: the agent took a trade from
+              the feed that day, so the feed was paid for.
+            </p>
+          </Disclosure>
+        </div>
+      )}
+      {((b?.unmeasured || 0) > 0 || hasExits(other)) && (
+        <p className="m-0 border-t border-line px-4 py-2 text-xs text-muted">
+          {(b?.unmeasured || 0) > 0 ? `${b!.unmeasured} exit${b!.unmeasured === 1 ? "" : "s"} had no price to estimate from and count as $0. ` : ""}
+          {hasExits(other) ? `Dry-run exits are not included (${money(other!.total)} on paper).` : ""}
+        </p>
       )}
     </Panel>
   );
@@ -713,14 +867,48 @@ function ContractCell({ c }: { c: Contract }) {
   );
 }
 
+/** Lowest or highest log line number among rows (null when none have one). */
+function edgeN(rows: Trade[], which: "min" | "max"): number | null {
+  let out: number | null = null;
+  for (const x of rows) {
+    if (typeof x.n !== "number") continue;
+    if (out == null || (which === "min" ? x.n < out : x.n > out)) out = x.n;
+  }
+  return out;
+}
+
+/** Union of two Activity row lists, newest first, one row per log line `n`
+ *  (the log is append-only, so a line's row never changes). */
+function mergeRows(prev: Trade[], add: Trade[]): Trade[] {
+  if (add.some((x) => typeof x.n !== "number")) return add; // no line ids: replace
+  const by = new Map<number, Trade>();
+  for (const x of prev) if (typeof x.n === "number") by.set(x.n, x);
+  for (const x of add) by.set(x.n as number, x);
+  return [...by.values()].sort((a, b) => (b.n as number) - (a.n as number));
+}
+
 const BLOTTER_ROWS = 10;
-function Blotter({ trades: all }: { trades: Trade[] }) {
+function Blotter({
+  trades: all,
+  total,
+  canLoadOlder,
+  loadingOlder,
+  olderErr,
+  onLoadOlder,
+}: {
+  trades: Trade[];
+  total: number;
+  canLoadOlder: boolean;
+  loadingOlder: boolean;
+  olderErr: string;
+  onLoadOlder: () => void;
+}) {
   const [showAll, setShowAll] = useState(false);
   const trades = showAll ? all : all.slice(0, BLOTTER_ROWS);
   const rows = trades.map(rowOf);
   const more = all.length - BLOTTER_ROWS;
   return (
-    <Panel title="Activity" right={<Count n={all.length} />}>
+    <Panel title="Activity" right={<Count n={Math.max(total, all.length)} />}>
       {rows.length === 0 ? (
         <p className="m-0 px-4 py-6 text-center text-xs text-muted">Nothing yet. Signals and the agent's decisions show up here.</p>
       ) : (
@@ -785,11 +973,20 @@ function Blotter({ trades: all }: { trades: Trade[] }) {
               </li>
             ))}
           </ul>
-          {more > 0 && (
-            <div className="border-t border-line px-4 py-2">
-              <Button variant="ghost" size="sm" onClick={() => setShowAll((v) => !v)} aria-expanded={showAll}>
-                {showAll ? "Show latest " + BLOTTER_ROWS : `Show all ${all.length} events`}
-              </Button>
+          {(more > 0 || (showAll && canLoadOlder)) && (
+            <div className="flex flex-wrap items-center gap-2 border-t border-line px-4 py-2">
+              {more > 0 && (
+                <Button variant="ghost" size="sm" onClick={() => setShowAll((v) => !v)} aria-expanded={showAll}>
+                  {showAll ? "Show latest " + BLOTTER_ROWS : `Show all ${all.length} loaded events`}
+                </Button>
+              )}
+              {showAll && canLoadOlder && (
+                <Button variant="ghost" size="sm" onClick={onLoadOlder} disabled={loadingOlder}>
+                  {loadingOlder ? "Loading…" : "Load older"}
+                </Button>
+              )}
+              {showAll && <span className="text-xs text-muted">{all.length} of {Math.max(total, all.length)}</span>}
+              {showAll && olderErr && <span className="text-xs text-down">{olderErr}</span>}
             </div>
           )}
         </>
