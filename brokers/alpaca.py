@@ -10,11 +10,15 @@ agent's contract: buy-to-open on ENTERED, sell on EXITED for positions this
 agent opened. Requires options approval on the Alpaca account.
 """
 
+import re
+import time
+
 import requests
 
 import broker_events
 
 _TIMEOUT = 15
+_OCC_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
 
 # Wizard descriptor — lets the web setup render this broker's fields generically
 # (any key-based broker adapter can ship one of these).
@@ -276,6 +280,7 @@ def execute(cl, cfg, event, state):
                 return False
             state["positions"][pos_key] = {"option_id": occ, "qty": filled,
                                            "opened_event": event.get("event_id")}
+            _stamp_order(state["positions"][pos_key], oid)
             return True
     elif event["event"] == "EXITED":
         pos = state["positions"].get(pos_key)
@@ -288,6 +293,7 @@ def execute(cl, cfg, event, state):
             remaining = int(pos["qty"]) - sold
             if remaining > 0:
                 pos["qty"] = remaining
+                _stamp_order(pos, oid)
                 print(f"  ⚠️ exit only filled {sold}/{pos['qty'] + sold} — "
                       f"{remaining}x still held; close manually if needed")
                 broker_events.report("exit_partial",
@@ -297,3 +303,120 @@ def execute(cl, cfg, event, state):
                 del state["positions"][pos_key]
             return True
     return False
+
+
+_ORDER_IDS_KEPT = 20
+
+
+def _stamp_order(pos, oid):
+    """Remember the agent's own order (so the owner's sells can be told
+    apart from it) and when it was placed (holdings lag fresh orders)."""
+    if oid and oid != "submitted":
+        ids = [i for i in pos.get("order_ids") or [] if i != str(oid)]
+        pos["order_ids"] = (ids + [str(oid)])[-_ORDER_IDS_KEPT:]
+    pos["last_order_at"] = time.time()
+
+
+# ── what the account holds, and the owner's own sells (read-only) ───────────
+# GET /v2/positions and /v2/orders; option rows carry the same OCC symbol the
+# ledger stores. Anything but a clean 200 with the expected shape reads as
+# "unknown", never as "closed". See brokers/__init__.py for the contract.
+
+def held_option_qty(cl, cfg, option_ids):
+    """{OCC symbol: long contracts held}, or None when unknown. A symbol
+    with a working order (qty_available < qty) is left out."""
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    ids = sorted({str(i) for i in option_ids or () if _OCC_RE.match(str(i))})
+    if not ids:
+        return {}
+    try:
+        resp = requests.get(f"{_base(cfg)}/v2/positions", headers=_headers(cfg),
+                            timeout=_TIMEOUT)
+        rows = resp.json() if resp.status_code == 200 else None
+        if not isinstance(rows, list):
+            return None
+        held, busy = {}, set()
+        for row in rows:
+            if not _count_position(row, set(ids), held, busy):
+                return None
+        return {i: held.get(i, 0) for i in ids if i not in busy}
+    except Exception:
+        return None
+
+
+def _count_position(row, want, held, busy):
+    """Add one /v2/positions row to held/busy; False = unrecognized row."""
+    if not isinstance(row, dict):
+        return False
+    if "asset_class" in row and row["asset_class"] != "us_option":
+        return True
+    sym, qty = row.get("symbol"), row.get("qty")
+    if not sym or qty is None:
+        return False
+    sym = str(sym)
+    if str(row.get("side") or "").lower() == "short":
+        return True
+    try:
+        q = int(round(float(qty)))
+        avail = row.get("qty_available")
+        avail = q if avail is None else int(round(float(avail)))
+    except (TypeError, ValueError, OverflowError):
+        return sym not in want
+    if avail < q:
+        busy.add(sym)  # an order is working on it: count unknown
+    if q > 0:
+        held[sym] = held.get(sym, 0) + q
+    return True
+
+
+def closed_fills(cl, cfg, option_id, since_iso=None, own_order_ids=(),
+                 exclude_agentic=False):
+    """Filled sells of option_id the agent didn't place, newest first, or
+    None when orders can't be read. (Every order here comes through the
+    API, so exclude_agentic doesn't apply.)"""
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    if not _OCC_RE.match(str(option_id or "")):
+        return None
+    params = {"status": "closed", "symbols": option_id, "direction": "desc",
+              "limit": 100}
+    if since_iso:
+        params["after"] = since_iso
+    try:
+        resp = requests.get(f"{_base(cfg)}/v2/orders", params=params,
+                            headers=_headers(cfg), timeout=_TIMEOUT)
+        rows = resp.json() if resp.status_code == 200 else None
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    own = {str(o) for o in own_order_ids or ()}
+    out = []
+    for o in rows:
+        fill = _owner_fill(o, option_id, own)
+        if fill:
+            out.append(fill)
+    return out
+
+
+def _owner_fill(o, option_id, own):
+    if not isinstance(o, dict):
+        return None
+    oid = str(o.get("id") or "")
+    if (not oid or oid in own or o.get("symbol") != option_id
+            or str(o.get("side") or "").lower() != "sell"
+            or str(o.get("position_intent") or "").lower() == "sell_to_open"):
+        return None
+    try:
+        qty = int(round(float(o.get("filled_qty") or 0)))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if qty < 1:
+        return None
+    try:
+        price = float(o["filled_avg_price"])
+    except (KeyError, TypeError, ValueError):
+        price = None
+    if price is not None and not 0 < price < float("inf"):
+        price = None
+    return {"order_id": oid, "qty": qty, "price": price,
+            "at": o.get("filled_at") or o.get("updated_at"), "by": None}

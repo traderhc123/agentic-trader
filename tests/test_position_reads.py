@@ -5,11 +5,13 @@ strings, price "" on market orders). Every unclear answer must read as
 unknown (None or an omitted id), never as "not held". Zero network."""
 
 import json
+import time
 
 import pytest
 
 import broker_events
-from brokers import account_tag, robinhood
+from brokers import account_tag, alpaca, robinhood
+from conftest import make_event
 
 U1 = "14a8e49b-0f10-4d64-9cf9-bd1a68e9da44"
 U2 = "7f9e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b"
@@ -370,3 +372,148 @@ def test_rh_finalize_pending_stamps_and_clears_miss():
     robinhood._finalize_pending(state, "K", 0)
     assert state["positions"] == {}
     broker_events.drain()
+
+
+# ── alpaca ──────────────────────────────────────────────────────────────────
+
+OCC1 = "SPY991218C00752000"
+OCC2 = "QQQ991218P00500000"
+OCC3 = "NVDA991218C01000000"
+ALPACA = {"alpaca_key_id": "k", "alpaca_secret": "s"}
+
+
+class _Resp:
+    text = ""
+
+    def __init__(self, status=200, body=None):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+def _alpaca_get(monkeypatch, *responses):
+    calls, script = [], list(responses)
+
+    def get(url, **kw):
+        calls.append((url, kw))
+        r = script.pop(0) if len(script) > 1 else script[0]
+        if isinstance(r, Exception):
+            raise r
+        return r
+    monkeypatch.setattr(alpaca.requests, "get", get)
+    return calls
+
+
+def _apos(sym, qty="2", **kw):
+    row = {"asset_id": "a1", "symbol": sym, "exchange": "", "asset_class": "us_option",
+           "avg_entry_price": "1.5", "qty": qty, "qty_available": qty,
+           "side": "long", "market_value": "300"}
+    row.update(kw)
+    return row
+
+
+def test_alpaca_positions_parse(monkeypatch):
+    calls = _alpaca_get(monkeypatch, _Resp(200, [
+        _apos(OCC1, "2"),
+        _apos(OCC2, "-1", side="short"),
+        {"symbol": "SPY", "asset_class": "us_equity", "qty": "10"},
+        _apos(OCC3, "1", qty_available="0"),        # a sell is working on it
+    ]))
+    cl = alpaca._Client(ALPACA)
+    assert alpaca.held_option_qty(cl, {}, [OCC1, OCC2, OCC3]) == {OCC1: 2, OCC2: 0}
+    url, kw = calls[0]
+    assert url == "https://paper-api.alpaca.markets/v2/positions"   # paper by default
+    assert kw["headers"]["APCA-API-KEY-ID"] == "k" and kw["timeout"] == alpaca._TIMEOUT
+    # the cfg passed in wins over the client's stored copy, like execute()
+    alpaca.held_option_qty(cl, {"alpaca_paper": False, "alpaca_key_id": "k2"}, [OCC1])
+    assert calls[1][0] == "https://api.alpaca.markets/v2/positions"
+    assert calls[1][1]["headers"]["APCA-API-KEY-ID"] == "k2"
+
+
+@pytest.mark.parametrize("resp", [
+    _Resp(401, []), _Resp(403, []), _Resp(429, []), _Resp(500, []),
+    RuntimeError("network down"), _Resp(200, ValueError("not json")),
+    _Resp(200, {"positions": []}),
+    _Resp(200, [{"qty": "1"}]),                    # no symbol
+    _Resp(200, [{"symbol": OCC1}]),                # no qty
+    _Resp(200, [_apos(OCC1, "abc")]),              # junk on our symbol
+    _Resp(200, ["row"]),
+], ids=["401", "403", "429", "500", "raises", "non-json", "dict", "no-symbol",
+        "no-qty", "junk-qty", "non-dict-row"])
+def test_alpaca_positions_unknown(monkeypatch, resp):
+    _alpaca_get(monkeypatch, resp)
+    assert alpaca.held_option_qty(alpaca._Client(ALPACA), {}, [OCC1]) is None
+
+
+def test_alpaca_positions_non_occ_ids_omitted(monkeypatch):
+    calls = _alpaca_get(monkeypatch, _Resp(200, [_apos(OCC1, "1"), _apos(OCC2, "junk")]))
+    cl = alpaca._Client(ALPACA)
+    assert alpaca.held_option_qty(cl, {}, ["dry", U1, "US.SPY991218C752000"]) == {}
+    assert calls == []
+    assert alpaca.held_option_qty(cl, {}, ["dry", OCC1]) == {OCC1: 1}
+
+
+def _aorder(oid, sym=OCC1, side="sell", filled="2", price="1.80", **kw):
+    o = {"id": oid, "client_order_id": "c", "symbol": sym, "side": side,
+         "qty": filled, "filled_qty": filled, "filled_avg_price": price,
+         "status": "filled", "filled_at": "2026-10-30T15:01:00.123456789Z",
+         "updated_at": "2026-10-30T15:01:01Z", "position_intent": "sell_to_close",
+         "asset_class": "us_option"}
+    o.update(kw)
+    return o
+
+
+def test_alpaca_closed_fills(monkeypatch):
+    calls = _alpaca_get(monkeypatch, _Resp(200, [
+        _aorder("u1"), _aorder("own"), _aorder("sto", position_intent="sell_to_open"),
+        _aorder("buy", side="buy", position_intent="buy_to_open"),
+        _aorder("unfilled", filled="0", price=None, status="canceled"),
+        _aorder("other", sym=OCC2), _aorder("noprice", price=None, filled_at=None),
+        "junk"]))
+    cl = alpaca._Client(ALPACA)
+    got = alpaca.closed_fills(cl, {}, OCC1, since_iso="2026-10-30T14:00:00+00:00",
+                              own_order_ids=["own"])
+    assert got == [{"order_id": "u1", "qty": 2, "price": 1.8,
+                    "at": "2026-10-30T15:01:00.123456789Z", "by": None},
+                   {"order_id": "noprice", "qty": 2, "price": None,
+                    "at": "2026-10-30T15:01:01Z", "by": None}]
+    url, kw = calls[0]
+    assert url == "https://paper-api.alpaca.markets/v2/orders"
+    assert kw["params"] == {"status": "closed", "symbols": OCC1, "direction": "desc",
+                            "limit": 100, "after": "2026-10-30T14:00:00+00:00"}
+    for bad in (_Resp(500, []), _Resp(200, {"orders": []}), RuntimeError("down")):
+        _alpaca_get(monkeypatch, bad)
+        assert alpaca.closed_fills(cl, {}, OCC1) is None
+    calls = _alpaca_get(monkeypatch, _Resp(200, []))
+    assert alpaca.closed_fills(cl, {}, "not-an-occ") is None and calls == []
+
+
+def test_alpaca_execute_stamps_order_ids(monkeypatch):
+    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty: qty)
+    monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty: "oid-1")
+    st = {"positions": {}}
+    cl = alpaca._Client(ALPACA)
+    assert alpaca.execute(cl, {"contracts_per_trade": 3},
+                          make_event(expiry="2099-12-18"), st)
+    pos = st["positions"]["SPY|2099-12-18|752.0|C"]
+    assert pos["order_ids"] == ["oid-1"]
+    assert pos["last_order_at"] == pytest.approx(time.time(), abs=5)
+    # a partial exit keeps the rest of the row: its order is stamped too
+    pos["last_order_at"] = 1.0
+    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty: 1)
+    monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty: "oid-2")
+    broker_events.begin()
+    assert alpaca.execute(cl, {}, make_event(event="EXITED", expiry="2099-12-18"), st)
+    broker_events.drain()
+    assert pos["qty"] == 2 and pos["order_ids"] == ["oid-1", "oid-2"]
+    assert pos["last_order_at"] > 1.0
+    # no order id from Alpaca: nothing to remember, but the time still counts
+    st = {"positions": {}}
+    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty: qty)
+    monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty: "submitted")
+    alpaca.execute(cl, {}, make_event(expiry="2099-12-18"), st)
+    pos = st["positions"]["SPY|2099-12-18|752.0|C"]
+    assert "order_ids" not in pos and pos["last_order_at"] > 1.0
