@@ -10,7 +10,7 @@ import time
 import pytest
 
 import broker_events
-from brokers import account_tag, alpaca, robinhood
+from brokers import account_tag, alpaca, moomoo, robinhood
 from conftest import make_event
 
 U1 = "14a8e49b-0f10-4d64-9cf9-bd1a68e9da44"
@@ -517,3 +517,150 @@ def test_alpaca_execute_stamps_order_ids(monkeypatch):
     alpaca.execute(cl, {}, make_event(expiry="2099-12-18"), st)
     pos = st["positions"]["SPY|2099-12-18|752.0|C"]
     assert "order_ids" not in pos and pos["last_order_at"] > 1.0
+
+
+# ── moomoo ──────────────────────────────────────────────────────────────────
+
+MM1, MM2, MM3, MM4, MM5 = (f"US.SPY991218C75{i}000" for i in range(5))
+
+
+class _FakeDF:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __len__(self):
+        return len(self._rows)
+
+    @property
+    def iloc(self):
+        return self._rows
+
+
+class _MMCtx:
+    def __init__(self, sdk):
+        self.sdk, self.closed, self.queries = sdk, False, []
+
+    def _answer(self, ret, rows):
+        return ret, (None if rows is None else _FakeDF(rows))
+
+    def position_list_query(self, **kw):
+        self.queries.append(("positions", kw))
+        return self._answer(self.sdk.pos_ret, self.sdk.positions)
+
+    def order_list_query(self, **kw):
+        self.queries.append(("orders", kw))
+        return self._answer(self.sdk.ord_ret, self.sdk.orders)
+
+    def place_order(self, **kw):
+        return self.sdk.RET_OK, _FakeDF([{"order_id": "mm-1"}])
+
+    def close(self):
+        self.closed = True
+
+
+class _MMSDK:
+    """Duck-typed moomoo-api stand-in with scripted positions and orders."""
+    RET_OK = 0
+
+    class TrdEnv:
+        SIMULATE, REAL = "SIM", "REAL"
+
+    class TrdSide:
+        BUY, SELL = "BUY", "SELL"
+
+    class OrderType:
+        NORMAL = "NORMAL"
+
+    class TrdMarket:
+        US = "US"
+
+    class SecurityFirm:
+        FUTUINC = "FUTUINC"
+
+    def __init__(self, positions=(), orders=(), pos_ret=0, ord_ret=0):
+        self.positions = None if positions is None else list(positions)
+        self.orders = None if orders is None else list(orders)
+        self.pos_ret, self.ord_ret = pos_ret, ord_ret
+        self.ctxs = []
+
+    def OpenSecTradeContext(self, **kw):
+        self.ctxs.append(_MMCtx(self))
+        return self.ctxs[-1]
+
+    def OpenQuoteContext(self, **kw):
+        sdk = self
+
+        class _Q:
+            def get_market_snapshot(self, codes):
+                return sdk.RET_OK, _FakeDF([{"ask_price": 1.5, "last_price": 1.5}])
+
+            def close(self):
+                pass
+        return _Q()
+
+
+MOOMOO = {"broker": "moomoo", "moomoo_paper": True, "contracts_per_trade": 1}
+
+
+def test_moomoo_positions_parse(monkeypatch):
+    sdk = _MMSDK(
+        positions=[{"code": MM1, "qty": 2.0, "can_sell_qty": 2.0, "position_side": "LONG"},
+                   {"code": MM2, "qty": 1.0, "position_side": "PositionSide.SHORT"},
+                   {"code": MM3, "qty": 1.0},
+                   {"code": MM4, "qty": 3.0}],
+        orders=[{"code": MM3, "order_status": "SUBMITTED"},       # still working
+                {"code": MM1, "order_status": "OrderStatus.FILLED_ALL"},
+                {"code": MM4, "order_status": "CANCELLED_ALL"}])
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    got = moomoo.held_option_qty(moomoo._Client(MOOMOO), {}, [MM1, MM2, MM3, MM4, MM5])
+    assert got == {MM1: 2, MM2: 0, MM4: 3, MM5: 0}
+    (ctx,) = sdk.ctxs
+    assert ctx.closed
+    assert ctx.queries == [("positions", {"trd_env": "SIM"}), ("orders", {"trd_env": "SIM"})]
+
+
+@pytest.mark.parametrize("sdk", [
+    _MMSDK(pos_ret=-1),
+    _MMSDK(ord_ret=-1),
+    _MMSDK(positions=None),
+    _MMSDK(orders=None),
+    _MMSDK(positions=[{"qty": 1.0}]),            # no code
+    _MMSDK(positions=[{"code": MM1}]),           # no qty
+    _MMSDK(positions=[{"code": MM1, "qty": "abc"}]),
+], ids=["pos-ret", "ord-ret", "pos-none", "ord-none", "no-code", "no-qty", "junk"])
+def test_moomoo_positions_unknown(monkeypatch, sdk):
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    assert moomoo.held_option_qty(moomoo._Client(MOOMOO), {}, [MM1]) is None
+    assert all(c.closed for c in sdk.ctxs) and sdk.ctxs
+
+
+def test_moomoo_positions_without_sdk_is_unknown(monkeypatch):
+    def missing():
+        raise RuntimeError("moomoo SDK not installed")
+    monkeypatch.setattr(moomoo, "_sdk", missing)
+    assert moomoo.held_option_qty(moomoo._Client(MOOMOO), {}, [MM1]) is None
+
+
+def test_moomoo_non_us_ids_omitted(monkeypatch):
+    sdk = _MMSDK(positions=[{"code": MM1, "qty": 1.0}])
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    cl = moomoo._Client(MOOMOO)
+    assert moomoo.held_option_qty(cl, {}, ["dry", U1, OCC1]) == {}
+    assert sdk.ctxs == []
+    assert moomoo.held_option_qty(cl, {}, ["dry", MM1]) == {MM1: 1}
+
+
+def test_moomoo_verifies_fills_false_and_no_closed_fills():
+    assert moomoo.VERIFIES_FILLS is False and not hasattr(moomoo, "closed_fills")
+    assert getattr(robinhood, "VERIFIES_FILLS", True) is True
+    assert getattr(alpaca, "VERIFIES_FILLS", True) is True
+
+
+def test_moomoo_execute_stamps_order_ids(monkeypatch):
+    sdk = _MMSDK()
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    st = {"positions": {}}
+    assert moomoo.execute(None, MOOMOO, make_event(expiry="2099-12-18"), st)
+    pos = st["positions"]["SPY|2099-12-18|752.0|C"]
+    assert pos["order_ids"] == ["mm-1"] and pos["qty"] == 1
+    assert pos["last_order_at"] == pytest.approx(time.time(), abs=5)

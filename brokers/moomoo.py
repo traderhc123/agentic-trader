@@ -17,12 +17,18 @@ are not reliably accepted through OpenD), qty from the same budget sizing as
 the other brokers.
 """
 
+import time
+
 import broker_events
 import platform_compat
 
 _TIMEOUT = 15
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 11111
+
+# Entries are booked when OpenD accepts the order, with no fill check — so a
+# position the account never showed may simply never have filled.
+VERIFIES_FILLS = False
 
 WIZARD = {
     "id": "moomoo",
@@ -343,9 +349,14 @@ def execute(cl, cfg, event, state):
                 "skip_no_quote" if "no quote" in note else "skip_sizing", note)
             return False
         print(f"ENTERED event -> buying {qty}x {contract} ({note})")
-        if _order(cfg, sdk, code, "buy", qty, ask):
-            state["positions"][pos_key] = {"option_id": code, "qty": qty,
-                                           "opened_event": event.get("event_id")}
+        oid = _order(cfg, sdk, code, "buy", qty, ask)
+        if oid:
+            row = {"option_id": code, "qty": qty,
+                   "opened_event": event.get("event_id"),
+                   "last_order_at": time.time()}  # holdings lag fresh orders
+            if oid != "submitted":
+                row["order_ids"] = [oid]
+            state["positions"][pos_key] = row
             return True
     elif event["event"] == "EXITED":
         pos = state["positions"].get(pos_key)
@@ -365,3 +376,60 @@ def execute(cl, cfg, event, state):
             del state["positions"][pos_key]
             return True
     return False
+
+
+# ── what the account holds (read-only) ──────────────────────────────────────
+# Column names follow moomoo's API docs and haven't been checked against a
+# live OpenD yet. If they're wrong, no ledger code is ever seen held, the
+# account is never trusted, and nothing is ever dropped (see agent.py).
+
+# order states that leave nothing working
+_MM_DONE = {"FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED",
+            "DELETED", "FILL_CANCELLED", "SUBMIT_FAILED", "TIMEOUT"}
+
+
+def held_option_qty(cl, cfg, option_ids):
+    """{moomoo code: long contracts held}, or None when unknown (see
+    brokers/__init__.py). A code with any working order — the owner's, or
+    the agent's own resting buy — is left out."""
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    ids = sorted({str(i) for i in option_ids or () if str(i).startswith("US.")})
+    if not ids:
+        return {}
+    ctx = None
+    try:
+        sdk = _sdk()
+        ctx = _trade_ctx(cfg, sdk)
+        env = _trd_env(cfg, sdk)
+        ret, data = ctx.position_list_query(trd_env=env)
+        if ret != sdk.RET_OK or data is None:
+            return None
+        held = {}
+        for i in range(len(data)):  # works for pandas and the test fake
+            row = data.iloc[i]
+            code, qty = row.get("code"), row.get("qty")
+            if not code or qty is None:
+                return None
+            if "SHORT" in str(row.get("position_side") or "LONG").upper():
+                continue
+            q = int(float(qty))
+            if q > 0:
+                held[str(code)] = held.get(str(code), 0) + q
+        ret, orders = ctx.order_list_query(trd_env=env)
+        if ret != sdk.RET_OK or orders is None:
+            return None
+        busy = set()
+        for i in range(len(orders)):
+            row = orders.iloc[i]
+            status = str(row.get("order_status")).rsplit(".", 1)[-1].upper()
+            if status not in _MM_DONE:
+                busy.add(str(row.get("code")))
+        return {c: held.get(c, 0) for c in ids if c not in busy}
+    except Exception:
+        return None
+    finally:
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
