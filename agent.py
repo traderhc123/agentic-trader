@@ -20,6 +20,8 @@ Robinhood's trading MCP).
     python agent.py stop     # stop the background agent
     python agent.py autostart on|off|status   # start at every login
     python agent.py status   # running?, config, wallet balance, open positions
+    python agent.py check-positions   # read-only: open positions next to
+                             # what your broker account holds right now
     python agent.py export FILE   # pack this setup into one passphrase-locked
                              # file to move it to another computer
     python agent.py import FILE   # unpack a move file on the new computer
@@ -51,7 +53,7 @@ from zoneinfo import ZoneInfo
 MARKET_TZ = ZoneInfo("America/New_York")
 
 import llm_policy
-from brokers import BROKERS
+from brokers import BROKERS, account_tag
 from lightning_wallet import WalletError, print_funding_invoice, wallet_from_cfg
 from notifications import notify
 from notifications import setup as notifications_setup
@@ -196,10 +198,11 @@ def _recent_trades(limit=50):
 
 
 def _trades_today():
-    """Today's trade-log rows, oldest first (UTC day, like the entry cap)."""
+    """Today's trade-log rows, oldest first (UTC day, like the entry cap).
+    A close found in the account counts on the day its sale filled."""
     today = datetime.now(timezone.utc).date().isoformat()
     return [t for t in _recent_trades(500)
-            if str(t.get("ts", "")).startswith(today)]
+            if str(t.get("closed_at") or t.get("ts", "")).startswith(today)]
 
 
 def _entries_today():
@@ -246,7 +249,9 @@ def _est_pnl_today():
                     t = json.loads(line)
                 except ValueError:
                     continue
-                if t.get("action") != "exit" or not str(t.get("ts", "")).startswith(today):
+                # a close found in the account counts on the day it filled
+                day = str(t.get("closed_at") or t.get("ts", ""))
+                if t.get("action") != "exit" or not day.startswith(today):
                     continue
                 if isinstance(t.get("est_pnl_usd"), (int, float)):
                     total += float(t["est_pnl_usd"])
@@ -399,7 +404,10 @@ def pnl_summary(cfg=None, state=None):
             b["unmeasured"] += 1
             continue
         v = float(v)
-        day = opened.pop(key, "") or _et_day(t.get("ts"))
+        # a partial close leaves the position open: keep its opened day for
+        # the exit that follows
+        day = ((opened.get(key, "") if t.get("partial") else opened.pop(key, ""))
+               or _et_day(t.get("ts")))
         b["total"] += v
         b["exits"] += 1
         if v > 0:
@@ -451,6 +459,14 @@ def _est_exit_pnl(pos, exit_mark, event):
     return None
 
 
+def _now():
+    return time.time()
+
+
+def _et_now():
+    return datetime.now(MARKET_TZ)
+
+
 def _market_open_now():
     """US equity market hours-ish (9:25–16:15 ET, Mon–Fri). Poll slow outside."""
     now = datetime.now(MARKET_TZ)
@@ -470,14 +486,13 @@ def _prune_expired_positions(cfg, state, save_state):
     Bookkeeping only — places no orders. The notify matters: expiry without
     an exit usually means the premium was lost, so check the account.
     """
-    today = datetime.now(MARKET_TZ).date().isoformat()
+    today = _et_now().date().isoformat()
     dropped = []
     for key in list(state.get("positions", {})):
-        parts = key.split("|")
-        if len(parts) == 4 and _EXPIRY_RE.match(parts[1]) and parts[1] < today:
+        if _expired(key, today):
             state["positions"].pop(key)
             dropped.append(key)
-    if dropped:
+    if _prune_tombstones(state, today) or dropped:
         save_state(state)
         for key in dropped:
             msg = (f"pruned expired position {key} — expired without an exit "
@@ -485,6 +500,29 @@ def _prune_expired_positions(cfg, state, save_state):
             print(msg)
             notify(cfg, f"agentic-trader: {msg}")
     return dropped
+
+
+def _expired(key, today):
+    parts = key.split("|")
+    return len(parts) == 4 and bool(_EXPIRY_RE.match(parts[1])) and parts[1] < today
+
+
+def _prune_tombstones(state, today):
+    """Forget closed-outside records once their contract expired, and keep
+    at most _TOMBSTONES_KEPT (oldest dropped). True if any were dropped."""
+    tombs = state.get("closed_outside")
+    if not isinstance(tombs, dict) or not tombs:
+        return False
+    before = len(tombs)
+    for key in [k for k in tombs if _expired(k, today)]:
+        del tombs[key]
+
+    def at(key):
+        t = tombs[key]
+        return str(t.get("at") or "") if isinstance(t, dict) else ""
+    for key in sorted(tombs, key=at)[:max(0, len(tombs) - _TOMBSTONES_KEPT)]:
+        del tombs[key]
+    return len(tombs) != before
 
 
 def _maybe_daily_digest(cfg, state, save_state):
@@ -681,9 +719,11 @@ _problems_logged = set()  # (event_id, kind) already written this run
 
 
 def _report_problem(cfg, state, save_state, kind, contract, message,
-                    event_id=None, dry=False, book=None):
+                    event_id=None, dry=False, book=None, placed=False):
     """Write a 'why this trade didn't happen' row to the trade log (what the
-    dashboard shows) and notify at most once per kind per day."""
+    dashboard shows) and notify at most once per kind per day. placed=True:
+    the order went in and may have filled (broker_events.report), so the
+    alert says "check this trade", not "trade NOT placed"."""
     import broker_events
     key = (event_id, kind)
     if event_id and key in _problems_logged:
@@ -705,16 +745,21 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
         return
     today = datetime.now(timezone.utc).date().isoformat()
     sent = state.setdefault("problem_notified", {})
-    if sent.get(kind) == today:
+    # "check this trade" and "trade NOT placed" alerts never hide each other
+    slot = f"{kind}:placed" if placed else kind
+    if sent.get(slot) == today:
         return
-    sent[kind] = today
+    sent[slot] = today
     try:
         save_state(state)
     except Exception:
         pass
-    label = broker_events.KINDS.get(kind, kind.replace("_", " "))
-    notify(cfg, f"agentic-trader: trade NOT placed ({contract}) — {label}: "
-                f"{message}" + (f"\nFix: {hint}" if hint else "")
+    if placed:  # the message says what happened; the kind's label wouldn't fit
+        head = f"agentic-trader: check this trade ({contract}) — {message}"
+    else:
+        label = broker_events.KINDS.get(kind, kind.replace("_", " "))
+        head = f"agentic-trader: trade NOT placed ({contract}) — {label}: {message}"
+    notify(cfg, head + (f"\nFix: {hint}" if hint else "")
                 + "\n(No more alerts about this today; every case is in the "
                 "dashboard activity log.)")
 
@@ -765,10 +810,10 @@ def _broker_conn_desc(client):
     return f"ok (last answered {hhmm(ok_at)})" if ok_at else "not checked yet"
 
 
-def _alert_if_broker_down(cfg, state, save_state, client):
+def _alert_if_broker_down(cfg, state, save_state, client, why=None):
     """Notify once a day when the broker connection is down, even if no
     signal arrived — so a stale login is fixed before the next entry."""
-    down = getattr(client, "last_error", None)
+    down = getattr(client, "last_error", None) or why
     if not down:
         return
     today = datetime.now(timezone.utc).date().isoformat()
@@ -898,6 +943,739 @@ def _budget_hints(cfg):
     return out
 
 
+# ── positions closed outside the agent ──────────────────────────────────────
+# The owner can sell an agent position in the broker app. The agent notices
+# by reading what the account holds (the adapter's optional held_option_qty
+# hook) and stops tracking what's gone, logged as an exit so the P&L, the
+# open-positions slot and the later exit signal all line up. Only positive
+# evidence counts: an unreadable or unclear answer changes nothing, and the
+# exit signal then behaves exactly as it always did.
+
+POS_GRACE_S = 180          # holdings can lag the agent's own recent orders
+POS_CONFIRM_S = 60         # min gap between two counted reads (periodic)
+POS_EXIT_CONFIRM_S = 20    # the same while an exit signal is waiting
+POS_GONE_READS = 3         # brokers that list sales: reads before acting on
+                           # an absence no sale explains
+POS_MISS_FRESH_S = 600     # an exit waits this long on an unconfirmed shortfall
+POS_FILLS_RECHECK_S = 900  # unproven: ask for the owner's sells this often
+POS_FILL_SLACK_S = 600     # clock slack when matching sells to the open time
+POS_SYNC_CLOSED_S = 1800   # check interval outside market hours
+_TOMBSTONES_KEPT = 100
+_STALE_EXITS_KEPT = 50
+_HELD_EXITS_KEPT = 10
+_FILL_IDS_KEPT = 20
+_FILLS_USED_KEPT = 100
+_BROKER_NAMES = {"robinhood": "Robinhood", "alpaca": "Alpaca", "moomoo": "moomoo"}
+_POS_SYNC = {"next_at": 0.0}
+
+
+def _float0(v):
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _int0(v):
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_count(v):
+    """A contract count a read hook may answer with (bools are not)."""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _iso_at(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds")
+
+
+_FRACTION_RE = re.compile(r"^(.*[T ]\d{2}:\d{2}:\d{2})\.(\d+)(.*)$")
+
+
+def _utc_iso(s):
+    """A broker timestamp as 'YYYY-MM-DDTHH:MM:SS+00:00' (UTC), or None.
+    Python 3.10's fromisoformat rejects a 'Z' suffix and fractions other
+    than 3 or 6 digits (Alpaca sends 9), so normalize first."""
+    if not s:
+        return None
+    text = str(s).strip()
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    m = _FRACTION_RE.match(text)
+    if m:
+        text = f"{m.group(1)}.{m.group(2)[:6].ljust(6, '0')}{m.group(3)}"
+    try:
+        d = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _in_open_rush():
+    """9:28–9:40 ET on weekdays, when Robinhood throttles requests."""
+    n = _et_now()
+    return n.weekday() < 5 and (9, 28) <= (n.hour, n.minute) < (9, 40)
+
+
+def _contract_of(key):
+    """The trade-log contract for a ledger key: the same string handle_event
+    writes on entry, so the P&L pairs a close with its entry."""
+    t, e, s, ty = key.split("|")
+    return f"{t} {e} ${s} {ty}"
+
+
+def _broker_name(cfg, broker=None):
+    """The registry name of the adapter that's running. `run` picks the
+    adapter and its client once at startup and reloads config.json every
+    loop, so cfg["broker"] can name another broker after a dashboard
+    change while the running adapter still trades the old one."""
+    for name, mod in BROKERS.items():
+        if mod is broker:
+            return name
+    return str(cfg.get("broker") or "robinhood")
+
+
+def _account_tag(cfg, broker=None, client=None):
+    """account_tag() of the account the running adapter trades. moomoo
+    orders and reads with its client's startup copy of the config (a
+    paper/real switch in the dashboard applies after a restart), so its
+    tag comes from that copy too."""
+    name = _broker_name(cfg, broker)
+    own = getattr(client, "cfg", None)
+    if name == "moomoo" and isinstance(own, dict):
+        return account_tag({**own, "broker": name})
+    return account_tag({**cfg, "broker": name})
+
+
+def _gate_on(cfg, broker, client):
+    """True when the agent can read what the account holds."""
+    return (hasattr(broker, "held_option_qty") and client is not None
+            and cfg.get("position_sync", True) is not False)
+
+
+def _trusted(state, tag):
+    """True once the read hook has seen one of the agent's own positions
+    held in this account: proof it reads this account correctly."""
+    sync = state.get("position_sync")
+    proven = sync.get("proven") if isinstance(sync, dict) else None
+    return isinstance(proven, dict) and tag in proven
+
+
+def _grace_anchor(pos):
+    """When the agent last placed an order for this row (epoch)."""
+    return max(_float0(pos.get("last_order_at")), _float0(pos.get("opened_at")),
+               _float0((pos.get("pending") or {}).get("placed_at")))
+
+
+def _past_expiry_close(key):
+    """From 4 PM ET on expiry day, expiry and exercise move holdings."""
+    expiry = key.split("|")[1]
+    now = _et_now()
+    today = now.date().isoformat()
+    return expiry < today or (expiry == today and now.hour >= 16)
+
+
+def _tombstones(state):
+    t = state.get("closed_outside")
+    return t if isinstance(t, dict) else {}
+
+
+def _sync_candidates(state, tag, now):
+    """({pos_key: option_id} to ask the broker about, changed). Only settled
+    live rows of this account, past the grace period after the agent's own
+    orders and before 4 PM ET on expiry day. Rows sharing a contract are
+    left out (one holding can't be split between them)."""
+    cand, owners, changed = {}, {}, False
+    for key, pos in (state.get("positions") or {}).items():
+        if not isinstance(pos, dict) or pos.get("dry"):
+            continue
+        oid = pos.get("option_id")
+        if not isinstance(oid, str) or not oid or oid == "dry":
+            continue
+        owners.setdefault(oid, []).append(key)
+        parts = key.split("|")
+        if ("pending" in pos or _int0(pos.get("qty")) < 1 or len(parts) != 4
+                or not _EXPIRY_RE.match(parts[1]) or _past_expiry_close(key)
+                or pos.get("acct") not in (None, tag)):
+            continue
+        if now - _grace_anchor(pos) < POS_GRACE_S:
+            if pos.pop("miss", None) is not None:
+                changed = True
+            continue
+        cand[key] = oid
+    for keys in owners.values():
+        if len(keys) > 1:
+            for k in keys:
+                cand.pop(k, None)
+    return cand, changed
+
+
+def _sync_positions(cfg, state, save_state, broker, client, keys=None,
+                    confirm_s=POS_CONFIRM_S, event_id=None, detected_by="sync"):
+    """Compare the ledger with what the broker account holds and stop
+    tracking contracts confirmed gone. Read-only toward the broker.
+
+    Returns {pos_key: {"held": n, "status": ok|miss|unproven|reduced|closed}}
+    for rows in scope (`keys`, default all) that the read positively
+    answered. A missing key means unknown."""
+    fn = getattr(broker, "held_option_qty", None)
+    if not _gate_on(cfg, broker, client) or getattr(client, "last_error", None):
+        return {}
+    import broker_events
+    broker_events.begin()
+    try:
+        return _sync_read(cfg, state, save_state, broker, client, fn, keys,
+                          confirm_s, event_id, detected_by)
+    finally:
+        _read_problems(cfg, state, save_state, client, broker_events.drain())
+
+
+def _read_problems(cfg, state, save_state, client, events):
+    """What a holdings read reported (e.g. Robinhood's one-time "connection
+    lost"). No trade was attempted, so a lost connection is the daily
+    "broker connection is DOWN" alert, never a "trade NOT placed" row —
+    the exit that follows reports its own problems if it fails."""
+    for r in events:
+        print(f"position check: {r['message']}")
+        if r["kind"] == "broker_disconnected":
+            _alert_if_broker_down(cfg, state, save_state, client, r["message"])
+        else:
+            _report_problem(cfg, state, save_state, r["kind"], "", r["message"],
+                            placed=r.get("placed", False))
+
+
+def _sync_read(cfg, state, save_state, broker, client, fn, keys, confirm_s,
+               event_id, detected_by):
+    now = _now()
+    tag = _account_tag(cfg, broker, client)
+    cand, changed = _sync_candidates(state, tag, now)
+    held = None
+    if cand:
+        try:
+            held = fn(client, cfg, sorted(set(cand.values())))
+        except Exception:
+            held = None
+    if not isinstance(held, dict) or getattr(client, "last_error", None):
+        if changed:
+            save_state(state)
+        return {}
+    vals = {k: held[o] for k, o in cand.items() if _is_count(held.get(o))}
+    if any(v >= 1 for v in vals.values()) and not _trusted(state, tag):
+        state.setdefault("position_sync", {}).setdefault("proven", {})[tag] = _iso_at(now)
+        changed = True
+    run = {"broker": broker, "client": client, "now": now,
+           "confirm_s": confirm_s, "event_id": event_id,
+           "detected_by": detected_by, "trusted": _trusted(state, tag),
+           "has_fills": hasattr(broker, "closed_fills"),
+           # every row read at once shows nothing held: maybe a bad listing
+           "mass": len(vals) >= 2 and all(v == 0 for v in vals.values())}
+    out = {}
+    for key, h in vals.items():
+        if keys is not None and key not in keys:
+            continue
+        pos = state["positions"][key]
+        if pos.get("acct") is None:
+            pos["acct"] = tag
+            changed = True
+        if h >= 1 and not pos.get("held_seen"):
+            pos["held_seen"] = True
+            changed = True
+        if h >= max(1, _int0(pos.get("qty"))) and not pos.get("full_seen"):
+            pos["full_seen"] = True  # the whole entry showed up at least once
+            changed = True
+        if h >= _int0(pos.get("qty")):
+            if pos.pop("miss", None) is not None:
+                changed = True
+            status = "ok"  # the owner holds at least as many: never raise qty
+        elif not (run["trusted"] or run["has_fills"]):
+            status = "unproven"  # no way to prove it: change nothing
+        else:
+            changed = True
+            status = _shortfall(cfg, state, save_state, run, key, h)
+        out[key] = {"held": h, "status": status}
+    if changed:
+        save_state(state)
+    return out
+
+
+def _shortfall(cfg, state, save_state, run, key, h):
+    """One read showed fewer contracts than the ledger. Count it, and once
+    it's confirmed and provable stop tracking the missing contracts.
+    Returns the row's status."""
+    pos = state["positions"][key]
+    now = run["now"]
+    need = 3 if run["mass"] else 2
+    miss = pos.get("miss")
+    if not isinstance(miss, dict):
+        pos["miss"] = _new_miss(h, need, now, run["mass"])
+        return "miss"
+    miss["held"] = max(_int0(miss.get("held")), h)  # never below any read
+    miss["need"] = max(_int0(miss.get("need")), need)
+    if run["mass"]:
+        miss["mass"] = True
+    if now - _float0(miss.get("last_at")) >= run["confirm_s"]:
+        miss["reads"] = _int0(miss.get("reads")) + 1
+        miss["last_at"] = now
+    reads = _int0(miss.get("reads"))
+    if reads < miss["need"]:
+        return "miss"
+    target = _int0(miss.get("held"))
+    k = _int0(pos.get("qty")) - target
+    if k < 1:
+        pos.pop("miss", None)
+        return "ok"
+    fills = _foreign_fills(run, cfg, state, pos, miss)
+    used = _ids(pos.get("fill_ids_used")) + _ids(_sync_state(state).get("fills_used"))
+    got, px, closed_at, ids = _pick_fills(fills or [], k, used, pos.get("opened_at"))
+    # an absence no sale explains takes as many reads, over as long, as the
+    # periodic check needs (the exit check reads every 20 s), and isn't
+    # trusted while the broker's sales can't be read
+    gone_reads = POS_GONE_READS if run["has_fills"] else miss["need"]
+    span = now - _float0(miss.get("first_at"))
+    if got >= k:
+        cause = "sold"
+    elif (miss.get("mass") and run["has_fills"]) or not run["trusted"]:
+        # Not provable: a shortfall seen in an all-zero read needs its own
+        # sale (the listing itself may be wrong), and so does any shortfall
+        # on an untrusted read. Keep the row; exits work as before.
+        if not miss.get("noted"):
+            miss["noted"] = True
+            print(f"position check: your broker shows fewer {_contract_of(key)} "
+                  "than the agent bought, but no sale proves it — still "
+                  "tracking it; the exit signal sells as usual")
+        return "unproven"
+    elif (reads < gone_reads or span < (gone_reads - 1) * POS_CONFIRM_S
+          or (run["has_fills"] and fills is None and span < POS_MISS_FRESH_S)):
+        return "miss"
+    else:
+        cause, px, closed_at, ids = "gone", None, None, []
+    _close_outside(cfg, state, save_state, run["broker"], key, target, px,
+                   closed_at, ids, cause, run["detected_by"], run["event_id"])
+    row = state["positions"].get(key)
+    if row is None:
+        return "closed"
+    if h < target:
+        row["miss"] = _new_miss(h, need, now, run["mass"])
+    return "reduced"
+
+
+def _new_miss(h, need, now, mass):
+    miss = {"held": h, "reads": 1, "need": need, "first_at": now, "last_at": now}
+    if mass:
+        miss["mass"] = True
+    return miss
+
+
+def _foreign_fills(run, cfg, state, pos, miss):
+    """The owner's sells of this contract since the agent opened it, or
+    None. While only a sale can prove the shortfall (an untrusted account,
+    or an all-zero read), asked at most every 15 min."""
+    fn = getattr(run["broker"], "closed_fills", None)
+    if fn is None:
+        return None
+    if ((not run["trusted"] or miss.get("mass"))
+            and run["now"] - _float0(miss.get("fills_at")) < POS_FILLS_RECHECK_S):
+        return None
+    miss["fills_at"] = run["now"]
+    opened = _float0(pos.get("opened_at"))
+    try:
+        return fn(run["client"], cfg, pos["option_id"],
+                  # the same clock slack _pick_fills allows
+                  since_iso=_iso_at(opened - POS_FILL_SLACK_S) if opened else None,
+                  # the agent's earlier orders in this contract too: its
+                  # sell of a previous position is never the owner's sale
+                  own_order_ids=(_ids(pos.get("order_ids"))
+                                 + _ids(state.get("agent_order_ids"))),
+                  # rows from before the agent kept its order ids
+                  exclude_agentic="opened_at" not in pos)
+    except Exception:
+        return None
+
+
+def _ids(v):
+    """A stored list of order ids, as strings ([] when missing or junk)."""
+    return [str(i) for i in v] if isinstance(v, list) else []
+
+
+def _sync_state(state):
+    sync = state.get("position_sync")
+    return sync if isinstance(sync, dict) else {}
+
+
+def _pick_fills(fills, k, used, opened_at=None):
+    """Attribute up to k contracts to the owner's sells, newest first.
+    (contracts covered, avg per-share price or None, latest fill time or
+    None, order ids). Sells from before the agent opened the position
+    can't have closed it and don't count."""
+    def at(f):
+        return _utc_iso(f.get("at")) or ""
+    floor = _iso_at(_float0(opened_at) - POS_FILL_SLACK_S) if opened_at else ""
+    got, notional, priced, times, ids = 0, 0.0, True, [], []
+    for f in sorted((f for f in fills if isinstance(f, dict)), key=at, reverse=True):
+        oid, q = str(f.get("order_id") or ""), f.get("qty")
+        if not oid or oid in used or oid in ids or not _is_count(q) or q < 1:
+            continue
+        if floor and not at(f) >= floor:
+            continue
+        take = min(q, k - got)
+        price = f.get("price")
+        if (isinstance(price, (int, float)) and not isinstance(price, bool)
+                and 0 < price < float("inf")):
+            notional += take * price
+        else:
+            priced = False
+        got += take
+        if at(f):
+            times.append(at(f))
+        ids.append(oid)
+        if got >= k:
+            break
+    px = notional / got if got and priced else None
+    return got, px, (max(times) if times else None), ids
+
+
+def _close_outside(cfg, state, save_state, broker, key, target, px, closed_at,
+                   ids, cause, detected_by, event_id=None):
+    """Stop tracking contracts the account no longer holds: drop the row
+    (target 0) or shrink it to `target`, log the close as an exit and
+    notify once. cause is "sold" (the owner's sale was found) or "gone"."""
+    pos = state["positions"][key]
+    snap = dict(pos)
+    q = _int0(snap.get("qty"))
+    k = q - target
+    logged = _int0(snap.get("exit_logged"))
+    already = min(k, logged)  # counted by an agent exit still working
+    unlogged = k - already
+    name = _BROKER_NAMES.get(_broker_name(cfg, broker), "broker")
+    contract = _contract_of(key)
+    if (cause == "gone" and not snap.get("full_seen")
+            and not getattr(broker, "VERIFIES_FILLS", True)
+            and (target > 0 or not snap.get("held_seen"))):
+        # An adapter that books entries unverified, and the account never
+        # showed all of this entry: the missing part most likely never
+        # filled (a partly filled limit buy) — not an exit.
+        if target == 0:
+            state["positions"].pop(key)
+            _bury(state, key, snap, q, cause)
+            msg = (f"your {name} buy for {contract} never showed up in the "
+                   "account — it probably didn't fill; removed from open "
+                   "positions")
+        else:
+            pos.update(qty=target, full_seen=True)
+            pos.pop("miss", None)
+            msg = (f"only {target} of {q} {contract} showed up in your {name} "
+                   "account — the buy probably only partly filled; the agent "
+                   f"now tracks {target}")
+        save_state(state)
+        print(msg)
+        # a partly filled buy is a real position: "check this trade"
+        _report_problem(cfg, state, save_state, "entry_unfilled", contract, msg,
+                        placed=target > 0)
+        return
+    if ids:  # the owner's sales this close used: never proof for another
+        sync = state.setdefault("position_sync", {})
+        sync["fills_used"] = (_ids(sync.get("fills_used")) + list(ids))[-_FILLS_USED_KEPT:]
+    if target == 0:
+        state["positions"].pop(key)
+        _bury(state, key, snap, q, cause)
+    else:
+        pos["qty"] = target
+        pos.pop("miss", None)
+        left = min(target, max(0, logged - already))
+        if left:
+            pos["exit_logged"] = left
+        else:
+            pos.pop("exit_logged", None)
+        if ids:
+            pos["fill_ids_used"] = (list(snap.get("fill_ids_used") or [])
+                                    + list(ids))[-_FILL_IDS_KEPT:]
+    save_state(state)  # before the log row: a crash can't log it twice
+    est = None
+    if unlogged >= 1:
+        rec = {"action": "exit", "manual": True, "cause": cause,
+               "event_id": event_id or f"outside|{key}|{snap.get('opened_event') or ''}",
+               "contract": contract, "dry": False, "qty": unlogged,
+               "reason": _outside_reason(cause, name, k, q, target, px),
+               "detected_by": detected_by}
+        if target > 0:
+            rec.update(partial=True, remaining=target)
+        if px:
+            est = _est_exit_pnl({"qty": unlogged,
+                                 "entry_mark": snap.get("entry_mark")}, px, {})
+            rec["exit_price"] = round(px, 4)
+        if est is not None:
+            rec["est_pnl_usd"] = est
+        if closed_at:
+            rec["closed_at"] = closed_at
+        if ids:
+            rec["broker_order_ids"] = list(ids)[:5]
+        _log_trade(rec)
+    msg = _outside_message(cause, name, contract, k, target, unlogged, px, est)
+    print(msg)
+    notify(cfg, "agentic-trader: " + msg)
+
+
+def _bury(state, key, snap, q, cause):
+    """Remember a position closed outside the agent: a replay of the signal
+    that opened it must not buy again, and an exit signal it kept for
+    another poll must never sell a new position in this contract
+    (handle_event)."""
+    tomb = {"option_id": snap.get("option_id"), "opened_event": snap.get("opened_event"),
+            "acct": snap.get("acct"), "qty": q, "cause": cause, "at": _iso_at(_now())}
+    if _ids(snap.get("held_exits")):
+        tomb["held_exits"] = _ids(snap.get("held_exits"))
+    state.setdefault("closed_outside", {})[key] = tomb
+
+
+def _outside_reason(cause, name, k, q, target, px):
+    """The Activity line for a close found in the account (≤120 chars)."""
+    at = f" @ ${px:.2f}" if px else ""
+    if cause == "sold":
+        if target == 0:
+            return (f"Closed outside the agent (sold in your {name} account{at})"
+                    " — no longer tracked")
+        return f"{k} of {q} sold outside the agent{at} — the agent still tracks {target}"
+    if target == 0:
+        return f"Not in your {name} account anymore and no sale found — no longer tracked"
+    return f"{k} of {q} no longer in your {name} account — the agent still tracks {target}"
+
+
+def _outside_message(cause, name, contract, k, target, unlogged, px, est):
+    if unlogged < 1:
+        return (f"{contract}: the rest of this position was closed outside the "
+                "agent; its P&L was already counted with the agent's exit.")
+    keeps = (f"The agent still tracks {target}x and will sell only those on the "
+             "exit signal.")
+    if cause == "sold":
+        where = f"in your {name} account" + (f" @ ~${px:.2f}" if px else "")
+        pnl = f", est. P&L ${est:+,.2f}" if est is not None else ""
+        then = ("It's no longer tracked; its exit signal will be ignored."
+                if target == 0 else keeps)
+        return f"{k}x {contract} was closed outside the agent ({where}){pnl}. {then}"
+    msg = (f"your {name} account no longer holds {k}x {contract} and no sale "
+           "was found (closed elsewhere, exercised or assigned?). ")
+    if target == 0:
+        return msg + "The agent stopped tracking it — check your account."
+    return msg + "The agent stopped tracking those — check your account. " + keeps
+
+
+def _position_upkeep(cfg, state, save_state, broker, client, now=None):
+    """Once per heartbeat: check holdings every position_sync_seconds while
+    the market is open (default 120 s), every 30 min otherwise, sooner while
+    a shortfall waits for confirmation. Never raises."""
+    if not _gate_on(cfg, broker, client):
+        return
+    now = _now() if now is None else now
+    if now < _POS_SYNC["next_at"]:
+        return
+    if _market_open_now():
+        if _in_open_rush():
+            return  # don't advance: Robinhood throttles at the open
+        try:
+            every = min(3600, max(60, int(cfg.get("position_sync_seconds", 120))))
+        except (TypeError, ValueError):
+            every = 120
+    else:
+        every = POS_SYNC_CLOSED_S
+    _POS_SYNC["next_at"] = now + every
+    try:
+        _sync_positions(cfg, state, save_state, broker, client)
+    except Exception as exc:
+        print(f"position check error (non-fatal): {str(exc)[:150]}")
+    # sooner only while a shortfall is still being confirmed — not for one
+    # already noted as unprovable, which may never clear
+    if any(isinstance(p, dict) and isinstance(p.get("miss"), dict)
+           and not p["miss"].get("noted")
+           for p in (state.get("positions") or {}).values()):
+        _POS_SYNC["next_at"] = min(_POS_SYNC["next_at"], now + POS_CONFIRM_S)
+
+
+def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev):
+    """Right before selling on an exit signal: "go" (sell as usual),
+    "closed" (closed outside the agent — nothing to sell), "gone" (just
+    dropped with no sale on record — nothing to sell, but look once more
+    next poll), "blocked" (the row belongs to another account or mode) or
+    "wait" (the account shows fewer contracts than the ledger, or the
+    last sell filled nothing and no read shows the contracts still held —
+    re-check before selling)."""
+    pos = state["positions"].get(pos_key) or {}
+    tag = _account_tag(cfg, broker, client)
+    if pos.get("acct") and pos["acct"] != tag:
+        return "blocked"  # needs no read: never sell from another account
+    if (not _gate_on(cfg, broker, client) or pos.get("pending")
+            or _int0(pos.get("qty")) < 1 or getattr(client, "last_error", None)):
+        return "go"
+    # The agent's last sell filled nothing: holdings haven't moved, so
+    # there's no grace period — read first, and sell again only once a
+    # read shows the contracts still held (unclear reads wait a while).
+    unfilled_at = _float0(pos.get("exit_unfilled_at"))
+    if _past_expiry_close(pos_key):
+        if not _resell_needs_read(pos, broker):
+            return "go"
+        # Holdings aren't read from 4 PM ET on expiry day, so the read
+        # this sell waits for can't come: hold it and tell the owner.
+        _warn_exit_stuck(cfg, state, save_state, broker, pos_key, pos,
+                         expiring=True)
+        return "wait"
+    if not unfilled_at and _now() - _grace_anchor(pos) < POS_GRACE_S:
+        return "go"
+    # Past that while, only an adapter whose exits can't open a position
+    # goes back to the usual rules. Elsewhere the dead sell may have filled
+    # late, and a plain sell on a flat account opens a short: keep waiting
+    # for such a read, and read at most once a minute meanwhile.
+    stuck = (_resell_needs_read(pos, broker)
+             and _now() - unfilled_at >= POS_MISS_FRESH_S)
+    if stuck:
+        if _now() - _float0(pos.get("exit_read_at")) < POS_CONFIRM_S:
+            return "wait"
+        pos["exit_read_at"] = _now()
+    r = _sync_positions(cfg, state, save_state, broker, client, keys={pos_key},
+                        confirm_s=POS_EXIT_CONFIRM_S, event_id=ev["event_id"],
+                        detected_by="exit_check")
+    row = state["positions"].get(pos_key)
+    if row is None:
+        tomb = _tombstones(state).get(pos_key) or {}
+        if tomb.get("cause") != "gone":
+            return "closed"
+        # handle_event keeps this signal one more poll: if a new position
+        # in this contract opens meanwhile, the signal must not sell it
+        _keep_exit(tomb, ev["event_id"])
+        return "gone"
+    res = r.get(pos_key)
+    if unfilled_at:
+        if (res is not None and res["status"] in ("ok", "reduced")
+                and res["held"] >= _int0(row.get("qty"))):
+            return "go"  # every contract the agent tracks is still held
+        if _now() - unfilled_at < POS_MISS_FRESH_S:
+            return "wait"
+        if stuck:
+            _warn_exit_stuck(cfg, state, save_state, broker, pos_key, row)
+            return "wait"
+    if res is None:  # unknown: wait only on a fresh, trusted shortfall
+        miss = row.get("miss")
+        fresh = (isinstance(miss, dict)
+                 and _now() - _float0(miss.get("last_at")) <= POS_MISS_FRESH_S)
+        return "wait" if fresh and _trusted(state, tag) else "go"
+    if res["status"] in ("ok", "unproven"):
+        return "go"
+    if res["status"] == "reduced" and res["held"] >= _int0(row.get("qty")):
+        return "go"
+    return "wait"
+
+
+def _resell_needs_read(pos, broker):
+    """True when the row's last sell filled nothing and this adapter's
+    sells aren't close-only: that sell may still fill late, and a plain
+    sell on a flat account opens a short. Selling again needs a read
+    showing the contracts still held."""
+    return bool(_float0((pos or {}).get("exit_unfilled_at"))
+                and not getattr(broker, "CLOSE_ONLY_EXITS", False))
+
+
+def _warn_exit_stuck(cfg, state, save_state, broker, pos_key, row, expiring=False):
+    """Once per row: an exit waits on a read that may never come."""
+    if row.get("exit_stuck_warned"):
+        return
+    row["exit_stuck_warned"] = True
+    try:
+        save_state(state)
+    except Exception:
+        pass  # the alert matters more; the flag is saved with the next change
+    name = _BROKER_NAMES.get(_broker_name(cfg, broker), "broker")
+    if expiring:
+        why = (f"the agent doesn't check your {name} account for it after 4 PM "
+               "ET on its expiry day, so it won't sell again")
+    else:
+        why = (f"your {name} account doesn't clearly show the contracts are "
+               "still held. The agent won't sell again until a holdings check "
+               "shows them")
+    msg = (f"the exit for {_contract_of(pos_key)} is on hold. The agent's sell "
+           f"order filled nothing, and {why} — check your broker app and "
+           "close it yourself if you still hold it.")
+    print(msg)
+    notify(cfg, "agentic-trader: " + msg)
+
+
+def _warn_if_reheld(cfg, state, save_state, broker, client, pos_key, contract):
+    """An exit signal for a position recorded as closed outside the agent:
+    if the account holds that contract again, say so once. The agent never
+    sells it — it only sells what it bought."""
+    tomb = _tombstones(state).get(pos_key)
+    fn = getattr(broker, "held_option_qty", None)
+    if (not isinstance(tomb, dict) or tomb.get("warned")
+            or not _gate_on(cfg, broker, client)
+            or getattr(client, "last_error", None) or not tomb.get("option_id")
+            or tomb.get("acct") not in (None, _account_tag(cfg, broker, client))):
+        return
+    import broker_events
+    broker_events.begin()
+    try:
+        held = fn(client, cfg, [tomb["option_id"]])
+    except Exception:
+        held = None
+    _read_problems(cfg, state, save_state, client, broker_events.drain())
+    n = held.get(tomb["option_id"]) if isinstance(held, dict) else None
+    if not _is_count(n) or n < 1:
+        return
+    notify(cfg, f"agentic-trader: the exit signal for {contract} arrived. The "
+                "agent recorded this position as closed outside it, but your "
+                f"account holds {n} now. The agent did NOT sell them (it only "
+                "sells what it bought) — check your account.")
+    tomb["warned"] = True
+    save_state(state)
+
+
+def _contracts_sold(state, pos_key, prior_pos):
+    """Contracts an accepted exit sold, or is still selling. A sale still
+    working is marked as already counted (exit_logged), so a close found
+    in the account later isn't counted twice."""
+    after = state["positions"].get(pos_key)
+    if after is None:
+        return _int0((prior_pos or {}).get("qty"))
+    pend = after.get("pending") or {}
+    if pend.get("side") == "sell":
+        sold = _int0(pend.get("requested"))
+        after["exit_logged"] = min(_int0(after.get("qty")),
+                                   _int0(after.get("exit_logged")) + sold)
+        return sold
+    return _int0((prior_pos or {}).get("qty")) - _int0(after.get("qty"))
+
+
+def _note_unfilled_exit(pos, prior_pos):
+    """An exit the broker accepted sold nothing, so holdings didn't move.
+    The dead order mustn't restart the grace period the adapter stamped
+    (the retry would then sell without reading the account), and the
+    retry waits for a read showing the contracts still held."""
+    if "last_order_at" in (prior_pos or {}):
+        pos["last_order_at"] = prior_pos["last_order_at"]
+    else:
+        pos.pop("last_order_at", None)
+    pos["exit_unfilled_at"] = _now()
+
+
+def _keep_exit(rec, event_id):
+    """An exit signal kept unseen for another poll (waiting on a read, or
+    not done yet), noted on its row, or on the tombstone of a row the exit
+    check just dropped. If the row is found closed outside the agent — by
+    the exit check or the periodic one — its tombstone carries the note
+    (_bury), so the signal never sells a new position in this contract."""
+    ids = [i for i in _ids(rec.get("held_exits")) if i != str(event_id)]
+    rec["held_exits"] = (ids + [str(event_id)])[-_HELD_EXITS_KEPT:]
+
+
+def _note_stale_exit(state, event_id):
+    """A new position opened in a contract whose old exit signal was kept
+    for another poll (_keep_exit): that signal belongs to the old position
+    and must never sell the new one (handle_event)."""
+    ids = [i for i in _ids(state.get("stale_exits")) if i != str(event_id)]
+    state["stale_exits"] = (ids + [str(event_id)])[-_STALE_EXITS_KEPT:]
+
+
 def handle_event(ev, cfg, state, broker, client, save_state):
     """Run one new event through the safety pipeline. Returns a log line or None."""
     contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
@@ -921,6 +1699,23 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                         "when the agent saw it (computer asleep or offline?)",
                         event_id=ev["event_id"], book=book)
         return msg
+
+    pos_key = f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
+    tomb = _tombstones(state).get(pos_key)
+    if (ev["event"] == "ENTERED" and pos_key not in state["positions"]
+            and isinstance(tomb, dict) and tomb.get("opened_event")
+            and tomb.get("opened_event") == ev["event_id"]):
+        # the feed re-sent the signal that opened a position the owner closed
+        print(f"ignored a replay of the signal that opened {contract}; that "
+              "position was closed outside the agent")
+        return None
+    if (ev["event"] == "EXITED"
+            and str(ev["event_id"]) in _ids(state.get("stale_exits"))):
+        # kept one more poll after its position was found gone, and a new
+        # position in this contract opened meanwhile (_note_stale_exit)
+        print(f"EXITED {contract}: this signal was for an earlier position that "
+              "had already left your account — no order placed")
+        return None
 
     if ev["event"] == "ENTERED":
         # Hard mechanical caps — independent of (and checked before) the LLM.
@@ -997,9 +1792,14 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         policy_reason = "exits always close what was opened"
 
     # Never place a real order against a dry-run position.
-    pos_key = f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
     existing = state["positions"].get(pos_key)
     dry = bool(cfg.get("dry_run")) or bool(existing and existing.get("dry"))
+    if ev["event"] == "EXITED" and not existing and not dry:
+        try:
+            _warn_if_reheld(cfg, state, save_state, broker, client, pos_key,
+                            contract)
+        except Exception as exc:
+            print(f"position check failed (non-fatal): {str(exc)[:150]}")
 
     ecfg = _sizing_cfg(cfg, ev)  # per-track sizing (main vs "other trades")
     if ev["event"] == "ENTERED" and not existing:
@@ -1010,7 +1810,57 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             _report_problem(cfg, state, save_state, "skip_sizing", contract, skip,
                             event_id=ev["event_id"], dry=dry, book=book)
             return msg
+    if ev["event"] == "EXITED" and existing and not dry:
+        if (existing.get("pending") or {}).get("side") == "sell":
+            print(f"EXITED {contract}: the agent's sell is already working — "
+                  "nothing more to send")
+            return None
+        verdict = "go"
+        try:
+            verdict = _check_before_exit(cfg, state, save_state, broker, client,
+                                         pos_key, ev)
+        except Exception as exc:
+            print(f"position check before exit failed (non-fatal): {str(exc)[:150]}")
+            row = state["positions"].get(pos_key)
+            if _resell_needs_read(row, broker):
+                verdict = "wait"  # never sell again unchecked after a dead sell
+                if _now() - _float0(row.get("exit_unfilled_at")) >= POS_MISS_FRESH_S:
+                    try:  # a check that keeps failing mustn't hold it silently
+                        _warn_exit_stuck(cfg, state, save_state, broker, pos_key, row)
+                    except Exception:
+                        pass
+        if verdict == "closed":
+            print(f"EXITED {contract}: already closed outside the agent — no "
+                  "order placed")
+            return None
+        if verdict == "gone":
+            # No sale explains it, so it may be a listing glitch: keep the
+            # signal one more poll. The row is gone by then, and the
+            # re-held check above reads the account once more and warns
+            # if the contracts are back.
+            save_state(state)
+            raise ExitNotDone(f"exit for {contract}: your account no longer "
+                              "holds it and no sale was found — no order "
+                              "placed; checking once more next poll")
+        if verdict == "blocked":
+            _report_problem(cfg, state, save_state, "exit_failed", contract,
+                            "this position was opened in a different broker "
+                            "account or mode than the agent uses now — the agent "
+                            "did not sell it; close it there yourself",
+                            event_id=ev["event_id"], book=book)
+            return None
+        if verdict == "wait":
+            if pos_key in state["positions"]:
+                _keep_exit(state["positions"][pos_key], ev["event_id"])
+            save_state(state)
+            raise ExitNotDone(f"exit for {contract}: your broker doesn't clearly "
+                              "show the contracts still held — re-checking "
+                              "next poll before selling")
+        existing = state["positions"].get(pos_key)
+        if not existing:
+            return None
     prior_pos = dict(existing) if existing else None  # qty/entry mark for P&L
+    sold = None  # contracts a live exit sold
     if dry:
         action = _execute_dry(
             ecfg, ev, state, broker, client,
@@ -1025,6 +1875,20 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         reported = broker_events.drain()
         action = ("entry" if ev["event"] == "ENTERED" else "exit") if changed else None
         prefix = ""
+        if ev["event"] == "EXITED" and changed:
+            sold = _contracts_sold(state, pos_key, prior_pos)
+            after = state["positions"].get(pos_key)
+            if after is not None and sold >= 1:
+                for k in ("exit_unfilled_at", "exit_read_at", "exit_stuck_warned"):
+                    after.pop(k, None)
+            if (after is not None and not after.get("pending") and sold < 1
+                    and _gate_on(cfg, broker, client)):
+                # accepted but nothing sold (an order that died unfilled):
+                # retried below, never logged as an exit. Only where the
+                # account can be read, so a close by the owner meanwhile
+                # stops the retries; elsewhere it's logged as before.
+                action = None
+                _note_unfilled_exit(after, prior_pos)
         for r in reported:
             msg = r["message"]
             if r["kind"] == "order_failed" and broker_events.is_cash_problem(msg):
@@ -1032,7 +1896,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 if bp is not None:
                     msg += f" (buying power now ${bp:,.2f})"
             _report_problem(cfg, state, save_state, r["kind"], contract, msg,
-                            event_id=ev["event_id"], book=book)
+                            event_id=ev["event_id"], book=book,
+                            placed=r.get("placed", False))
         if not action and ev["event"] == "ENTERED" and not existing and not reported:
             _report_problem(cfg, state, save_state, "broker_no_order", contract,
                             "the broker adapter didn't place the order and gave "
@@ -1043,8 +1908,13 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             if held and not held.get("pending"):
                 if not reported:
                     _report_problem(cfg, state, save_state, "exit_failed",
-                                    contract, "the exit order wasn't placed",
+                                    contract,
+                                    "the broker accepted the exit order but "
+                                    "nothing sold — retrying" if changed else
+                                    "the exit order wasn't placed",
                                     event_id=ev["event_id"])
+                _keep_exit(held, ev["event_id"])
+                save_state(state)  # with the dead-sell mark, if any
                 raise ExitNotDone(f"exit for {contract} not done — retrying "
                                   "next poll")
 
@@ -1052,13 +1922,37 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         record = {"action": action, "event_id": ev["event_id"],
                   "contract": contract, "dry": dry, "reason": policy_reason}
         if action == "entry" and pos_key in state["positions"]:
+            row = state["positions"][pos_key]
             mark = _mark(broker, client, ecfg, ev, "buy")
             if mark > 0:
-                state["positions"][pos_key]["entry_mark"] = mark
-        elif action == "exit":
+                row["entry_mark"] = mark
+            if not dry:  # holdings checks: grace period + which account
+                row.setdefault("opened_at", _now())
+                row["last_order_at"] = max(_float0(row.get("last_order_at")), _now())
+                row.setdefault("acct", _account_tag(cfg, broker, client))
+        elif action == "exit" and sold is None:  # dry run
             est = _est_exit_pnl(prior_pos, _mark(broker, client, ecfg, ev, "sell"), ev)
             if est is not None:
                 record["est_pnl_usd"] = est
+        elif action == "exit":
+            if sold >= 1:
+                record["qty"] = sold
+                left = state["positions"].get(pos_key)
+                if left is not None and not left.get("pending"):
+                    # the rest is still open: the P&L keeps its opened day
+                    record.update(partial=True, remaining=_int0(left.get("qty")))
+            # contracts an earlier exit row already counted get no estimate
+            counted = sold - min(sold, _int0((prior_pos or {}).get("exit_logged")))
+            est = (_est_exit_pnl({**(prior_pos or {}), "qty": counted},
+                                 _mark(broker, client, ecfg, ev, "sell"), ev)
+                   if counted >= 1 else None)
+            if est is not None:
+                record["est_pnl_usd"] = est
+        if action == "entry":
+            buried = _tombstones(state).pop(pos_key, None)
+            for old in _ids((buried if isinstance(buried, dict) else {})
+                            .get("held_exits")):
+                _note_stale_exit(state, old)
         _log_trade(record)
         save_state(state)
         return f"{prefix}{action.upper()}: {contract}"
@@ -1692,7 +2586,10 @@ def cmd_run(app_window=False):
                         print(f"order reconcile error (non-fatal): {str(exc)[:150]}")
                     for r in broker_events.drain():
                         _report_problem(cfg, state, save_state, r["kind"],
-                                        "", r["message"])
+                                        "", r["message"],
+                                        placed=r.get("placed", False))
+                # positions the owner closed in the broker app (throttled)
+                _position_upkeep(cfg, state, save_state, broker, client)
                 # every 10 min, and right away when the owner goes live
                 if (time.time() - cash["at"] > 600
                         or bool(cfg.get("dry_run")) != cash.get("dry")):
@@ -1848,6 +2745,69 @@ def cmd_status():
     print(f"daily entry cap  : {cfg.get('max_entries_per_day', 5)}")
     print(f"entries today    : {_entries_today()}")
     print(f"open positions   : {list(state.get('positions', {})) or 'none'}")
+
+
+def cmd_check_positions():
+    """Read-only: the live positions the agent tracks next to what the
+    broker account holds right now. Places no orders and never changes
+    state.json — a way to see the holdings check works on your account."""
+    cfg = _load(CONFIG_PATH, {}) or {}
+    state = _load(STATE_PATH, {}) or {}
+    name = cfg.get("broker", "robinhood")
+    broker = BROKERS.get(name)
+    rows = {k: p for k, p in (state.get("positions") or {}).items()
+            if isinstance(p, dict) and not p.get("dry")
+            and p.get("option_id") not in (None, "", "dry")}
+    print(f"broker           : {name}"
+          + (" (holdings check turned off: position_sync false)"
+             if cfg.get("position_sync", True) is False else ""))
+    fn = getattr(broker, "held_option_qty", None) if broker is not None else None
+    client = broker.client(cfg) if rows and fn is not None else None
+    tag = _account_tag(cfg, broker, client)
+    print("holdings check   : " + ("proven on this account" if _trusted(state, tag)
+                                   else "not proven on this account yet"))
+    if not rows:
+        print("open positions   : none (live)")
+        return
+    held, why = _read_holdings_once(fn, client, cfg, rows)
+    if why:
+        print(f"broker answer    : unknown — {why}")
+    for key in sorted(rows):
+        pos = rows[key]
+        n = held.get(pos["option_id"]) if isinstance(held, dict) else None
+        acct = pos.get("acct")
+        same = ("not recorded yet (older position)" if acct is None
+                else "yes" if acct == tag else "NO — opened in another account or mode")
+        line = (f"{key.replace('|', ' ')}: agent tracks {pos.get('qty')}, broker "
+                f"shows {n if _is_count(n) else 'unknown'}, same account: {same}")
+        if pos.get("pending"):
+            line += ", agent order still working"
+        miss = pos.get("miss")
+        if isinstance(miss, dict):
+            line += (f", the account showed fewer on {miss.get('reads')} "
+                     f"check(s) (at most {miss.get('held')})")
+        print(line)
+
+
+def _read_holdings_once(fn, client, cfg, rows):
+    """(held dict or None, why unknown) for the check-positions command."""
+    if fn is None:
+        return None, "this broker can't report holdings"
+    if client is None:
+        return None, "broker not connected — run: python agent.py setup"
+    import broker_events
+    broker_events.begin()
+    try:
+        held = fn(client, cfg, sorted({p["option_id"] for p in rows.values()}))
+    except Exception as exc:
+        held = None
+        print(f"read failed      : {str(exc)[:150]}")
+    for r in broker_events.drain():
+        print(f"broker said      : {r['message']}")
+    if isinstance(held, dict):
+        return held, ""
+    return None, (getattr(client, "last_error", None)
+                  or "the answer wasn't clear, so the agent would change nothing")
 
 
 def doctor_checks():
@@ -2416,6 +3376,8 @@ def main():
         cmd_autostart(sys.argv[2] if len(sys.argv) > 2 else "status")
     elif cmd == "status":
         cmd_status()
+    elif cmd == "check-positions":
+        cmd_check_positions()
     elif cmd == "doctor":
         cmd_doctor(as_json="--json" in sys.argv)
     elif cmd == "netcheck":

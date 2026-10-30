@@ -40,10 +40,15 @@ NOTIFY = {"order_failed", "skip_budget", "skip_no_quote", "skip_no_contract",
           "broker_lookup_failed"}
 
 
-def report(kind, message):
-    """Called by broker adapters. Never raises."""
+def report(kind, message, placed=False):
+    """Called by broker adapters. Never raises. placed=True for a problem
+    with an order that went in and may have filled (the alert then says
+    "check this trade" instead of "trade NOT placed")."""
     try:
-        _events.append({"kind": str(kind), "message": str(message)[:400]})
+        ev = {"kind": str(kind), "message": str(message)[:400]}
+        if placed:
+            ev["placed"] = True
+        _events.append(ev)
     except Exception:
         pass
 
@@ -58,8 +63,17 @@ def drain():
     return out
 
 
+_CASH_RX = re.compile(r"buying.?power|insufficient|not enough|funds|cash", re.I)
+# selling more contracts than the account holds — not a cash problem
+_POSITION_RX = re.compile(
+    r"(not enough|insufficient)\s+(contracts?|shares|positions?|quantity|qty)\b|"
+    r"position\s+(does not exist|not found)|no\s+(such\s+)?position", re.I)
+
 _HINTS = (
-    (re.compile(r"buying.?power|insufficient|not enough|funds|cash", re.I),
+    (_POSITION_RX,
+     "The account may hold fewer contracts than the agent tracks (closed "
+     "it yourself?) — check your broker app."),
+    (_CASH_RX,
      "Not enough buying power — add cash to the broker account or lower your "
      "per-trade budget."),
     (re.compile(r"option.{0,40}(approv|level|enabled|permission|not allowed)|"
@@ -90,4 +104,5 @@ def hint(message):
 
 
 def is_cash_problem(message):
-    return bool(_HINTS[0][0].search(message or ""))
+    message = message or ""
+    return bool(_CASH_RX.search(message)) and not _POSITION_RX.search(message)

@@ -103,7 +103,7 @@ def test_expiration_date_only_row_resolves():
 
 
 def test_cash_hint_still_first():
-    # is_cash_problem() relies on the buying-power hint being _HINTS[0]
+    # is_cash_problem() has its own pattern, independent of the hint order
     assert broker_events.is_cash_problem("insufficient buying power")
     assert not broker_events.is_cash_problem("429 too many requests")
 

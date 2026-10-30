@@ -60,6 +60,57 @@ def test_rejected_order_is_logged_with_fix_and_notified_once(home, no_policy, no
     assert "trade NOT placed" in notes[0] and "Fix:" in notes[0]
 
 
+class PlacedButUnclearBroker:
+    """The order went in, but whether it filled is unclear (like Alpaca
+    when the cancel of a slow order can't be confirmed)."""
+
+    def execute(self, client, cfg, event, state):
+        key = f"{event['ticker']}|{event['expiry']}|{event['strike']}|{event['type']}"
+        state["positions"][key] = {"option_id": "x", "qty": 1}
+        broker_events.report("order_failed", "couldn't confirm the buy filled — "
+                             "check your broker", placed=True)
+        return True
+
+
+def test_problem_with_a_placed_order_says_check_this_trade(home, no_policy, notes):
+    state = {"positions": {}, "seen": []}
+    out = agent.handle_event(make_event(), CFG, state, PlacedButUnclearBroker(),
+                             object(), lambda s: None)
+    assert out.startswith("ENTRY")
+    (problem, entry) = _log(home)
+    assert problem["action"] == "order_failed" and entry["action"] == "entry"
+    assert notes == ["agentic-trader: check this trade (SPY 2026-07-10 $752.0 C) — "
+                     "couldn't confirm the buy filled — check your broker\n(No more "
+                     "alerts about this today; every case is in the dashboard "
+                     "activity log.)"]
+
+
+@pytest.mark.parametrize("first", ["rejected", "placed"])
+def test_placed_and_not_placed_alerts_never_hide_each_other(home, no_policy, notes,
+                                                            first):
+    """One alert per kind per day, but "check this trade" (the order went
+    in and may have filled) and "trade NOT placed" are separate: neither
+    hides the other, in either order."""
+    state = {"positions": {}, "seen": []}
+    brokers = {"rejected": RejectingBroker(), "placed": PlacedButUnclearBroker()}
+    other = "placed" if first == "rejected" else "rejected"
+    for i, name in enumerate([first, other, first, other]):
+        ev = make_event(event_id=f"e{i}", ticker="QQQ" if name == "rejected" else "SPY")
+        agent.handle_event(ev, CFG, state, brokers[name], object(), lambda s: None)
+    heads = sorted(n.split(" — ")[0] for n in notes)
+    assert heads == ["agentic-trader: check this trade (SPY 2026-07-10 $752.0 C)",
+                     "agentic-trader: trade NOT placed (QQQ 2026-07-10 $752.0 C)"]
+
+
+def test_report_marks_placed_orders_only_when_asked():
+    broker_events.begin()
+    broker_events.report("order_failed", "rejected")
+    broker_events.report("order_failed", "unclear", placed=True)
+    assert broker_events.drain() == [
+        {"kind": "order_failed", "message": "rejected"},
+        {"kind": "order_failed", "message": "unclear", "placed": True}]
+
+
 def test_budget_skip_is_visible(home, no_policy, notes):
     state = {"positions": {}, "seen": []}
     b = RejectingBroker("skip_budget",
@@ -110,10 +161,21 @@ def test_dry_run_never_reports_broker_problems(home, no_policy, notes):
     ("Options trading is not enabled on this account", "Options trading"),
     ("HTTP 401 unauthorized: token expired", "reconnect"),
     ("something odd", ""),
+    ("not enough contracts to close", "closed it yourself"),
+    ("insufficient qty available for order (requested: 2, available: 0)",
+     "closed it yourself"),
+    ("position does not exist", "closed it yourself"),
 ])
 def test_hints(msg, want):
     h = broker_events.hint(msg)
     assert (want in h) if want else h == ""
+
+
+def test_selling_more_than_held_is_not_a_cash_problem():
+    assert not broker_events.is_cash_problem("insufficient qty available")
+    assert not broker_events.is_cash_problem("Not enough contracts to close")
+    assert broker_events.is_cash_problem("Not enough buying power")
+    assert broker_events.is_cash_problem("insufficient funds")
 
 
 def test_cash_warning_thresholds():

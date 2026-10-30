@@ -17,12 +17,18 @@ are not reliably accepted through OpenD), qty from the same budget sizing as
 the other brokers.
 """
 
+import time
+
 import broker_events
 import platform_compat
 
 _TIMEOUT = 15
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 11111
+
+# Entries are booked when OpenD accepts the order, with no fill check — so a
+# position the account never showed may simply never have filled.
+VERIFIES_FILLS = False
 
 WIZARD = {
     "id": "moomoo",
@@ -83,7 +89,11 @@ def connect(cfg, values):
 
 
 class _Client:
-    """Thin holder so broker.client(cfg) has the same shape as the others."""
+    """Thin holder so broker.client(cfg) has the same shape as the others.
+
+    Orders, quotes and holdings reads use this startup copy of the config,
+    so a paper/real switch in the dashboard applies after a restart (the
+    agent tags positions from it too: agent._account_tag)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -343,9 +353,15 @@ def execute(cl, cfg, event, state):
                 "skip_no_quote" if "no quote" in note else "skip_sizing", note)
             return False
         print(f"ENTERED event -> buying {qty}x {contract} ({note})")
-        if _order(cfg, sdk, code, "buy", qty, ask):
-            state["positions"][pos_key] = {"option_id": code, "qty": qty,
-                                           "opened_event": event.get("event_id")}
+        oid = _order(cfg, sdk, code, "buy", qty, ask)
+        if oid:
+            _remember_order(state, oid)
+            row = {"option_id": code, "qty": qty,
+                   "opened_event": event.get("event_id"),
+                   "last_order_at": time.time()}  # holdings lag fresh orders
+            if oid != "submitted":
+                row["order_ids"] = [oid]
+            state["positions"][pos_key] = row
             return True
     elif event["event"] == "EXITED":
         pos = state["positions"].get(pos_key)
@@ -361,7 +377,104 @@ def execute(cl, cfg, event, state):
                                  f"no quote from OpenD to exit {contract}")
             return False
         print(f"EXITED event -> selling {pos['qty']}x {contract}")
-        if _order(cfg, sdk, code, "sell", pos["qty"], price):
+        oid = _order(cfg, sdk, code, "sell", pos["qty"], price)
+        if oid:
+            _remember_order(state, oid)
             del state["positions"][pos_key]
             return True
     return False
+
+
+_AGENT_ORDERS_KEPT = 200
+
+
+def _remember_order(state, oid):
+    """Every order the agent places, kept after its position is gone: the
+    agent's sell of an earlier position in the same contract must never
+    pass for the owner's sale (brokers/__init__.py)."""
+    if oid and oid != "submitted":
+        ids = [i for i in state.get("agent_order_ids") or [] if i != str(oid)]
+        state["agent_order_ids"] = (ids + [str(oid)])[-_AGENT_ORDERS_KEPT:]
+
+
+# ── what the account holds (read-only) ──────────────────────────────────────
+# Column names follow moomoo's API docs and haven't been checked against a
+# live OpenD yet. If they're wrong, no ledger code is ever seen held, the
+# account is never trusted, and nothing is ever dropped (see agent.py).
+
+# order states that leave nothing working
+_MM_DONE = {"FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED",
+            "DELETED", "FILL_CANCELLED", "SUBMIT_FAILED", "TIMEOUT"}
+
+
+def held_option_qty(cl, cfg, option_ids):
+    """{moomoo code: long contracts held}, or None when unknown (see
+    brokers/__init__.py). A code with any working order — the owner's, or
+    the agent's own resting buy — is left out, and so is one that holds
+    fewer than today's filled buys minus filled sells (the position list
+    lagging a fill)."""
+    # the copy execute orders with: reads and orders always look at the
+    # same paper/real account
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    ids = sorted({str(i) for i in option_ids or () if str(i).startswith("US.")})
+    if not ids:
+        return {}
+    ctx = None
+    try:
+        sdk = _sdk()
+        ctx = _trade_ctx(cfg, sdk)
+        env = _trd_env(cfg, sdk)
+        # fresh from the broker, not OpenD's cache (an error reads as unknown)
+        ret, data = ctx.position_list_query(trd_env=env, refresh_cache=True)
+        if ret != sdk.RET_OK or data is None:
+            return None
+        held = {}
+        for i in range(len(data)):  # works for pandas and the test fake
+            row = data.iloc[i]
+            code, qty = row.get("code"), row.get("qty")
+            if not code or qty is None:
+                return None
+            if "SHORT" in str(row.get("position_side") or "LONG").upper():
+                continue
+            q = int(float(qty))
+            if q > 0:
+                held[str(code)] = held.get(str(code), 0) + q
+        ret, orders = ctx.order_list_query(trd_env=env, refresh_cache=True)
+        if ret != sdk.RET_OK or orders is None:
+            return None
+        busy, net = set(), {}
+        for i in range(len(orders)):
+            row = orders.iloc[i]
+            code = str(row.get("code"))
+            status = str(row.get("order_status")).rsplit(".", 1)[-1].upper()
+            if status not in _MM_DONE:
+                busy.add(code)
+            elif code in ids and not _net_fill(row, net):
+                busy.add(code)
+        return {c: held.get(c, 0) for c in ids
+                if c not in busy and held.get(c, 0) >= net.get(c, 0)}
+    except Exception:
+        return None
+    finally:
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
+def _net_fill(row, net):
+    """Add one finished order's filled buys (+) or sells (-) to net[code].
+    False when its side or filled quantity can't be read."""
+    side = str(row.get("trd_side") or "").rsplit(".", 1)[-1].upper()
+    try:
+        dealt = int(float(row.get("dealt_qty") or 0))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if dealt < 1:
+        return True
+    if side not in ("BUY", "SELL"):
+        return False
+    code = str(row.get("code"))
+    net[code] = net.get(code, 0) + (dealt if side == "BUY" else -dealt)
+    return True

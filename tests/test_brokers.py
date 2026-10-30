@@ -95,7 +95,7 @@ def test_alpaca_size_contracts_mode():
 @pytest.fixture(autouse=True)
 def instant_fills(monkeypatch):
     """Fill-confirmation polls assume full immediate fills in unit tests."""
-    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty: qty)
+    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": qty)
 
 
 def test_alpaca_execute_entry_places_buy(monkeypatch):
@@ -676,6 +676,51 @@ def test_alpaca_confirm_timeout_cancels_and_settles(monkeypatch):
                         type("R", (), {"status_code": 200})())
     assert _REAL_CONFIRM_FILL({}, "o1", 3) == 1
     assert cancels and cancels[0].endswith("/v2/orders/o1")
+
+
+def _confirm_after_cancel(monkeypatch, delete_status, after_cancel):
+    """Run _confirm_fill on an order still 'accepted' after the polls; the
+    cancel answers delete_status (or raises) and the re-read after_cancel."""
+    import broker_events
+    _no_waits(monkeypatch)
+    states = iter([("accepted", 0)] * alpaca._CONFIRM_TRIES + [after_cancel])
+    monkeypatch.setattr(alpaca, "_order_state", lambda cfg, oid: next(states))
+
+    def delete(url, **kw):
+        if isinstance(delete_status, Exception):
+            raise delete_status
+        return type("R", (), {"status_code": delete_status})()
+    monkeypatch.setattr(alpaca.requests, "delete", delete)
+    broker_events.begin()
+    got = _REAL_CONFIRM_FILL({}, "o1", 2, side="sell")
+    return got, broker_events.drain()
+
+
+@pytest.mark.parametrize("delete_status, after_cancel", [
+    (204, ("canceled", 0)),
+    (204, ("pending_cancel", 0)),     # cancel accepted: it won't fill
+    (422, ("expired", 0)),
+])
+def test_alpaca_confirm_dead_order_reports_what_filled(monkeypatch, delete_status,
+                                                        after_cancel):
+    got, events = _confirm_after_cancel(monkeypatch, delete_status, after_cancel)
+    assert got == 0 and events == []
+
+
+@pytest.mark.parametrize("delete_status, after_cancel", [
+    (500, ("new", 0)),                # cancel refused, order still working
+    (422, ("", 0)),                   # status unreadable (e.g. it filled)
+    (204, ("", 0)),
+    (RuntimeError("network"), ("", 0)),
+], ids=["cancel-refused", "422-unreadable", "204-unreadable", "cancel-raises"])
+def test_alpaca_confirm_unproven_cancel_assumes_filled_and_says_so(
+        monkeypatch, delete_status, after_cancel):
+    """Never report a sell as unfilled while it may still fill: the agent
+    would sell again, and a plain sell on a flat account can open a short."""
+    got, events = _confirm_after_cancel(monkeypatch, delete_status, after_cancel)
+    assert got == 2
+    assert [e["kind"] for e in events] == ["exit_failed"]
+    assert "check your Alpaca dashboard" in events[0]["message"]
 
 
 @pytest.mark.parametrize("mod", ["alpaca", "moomoo"])

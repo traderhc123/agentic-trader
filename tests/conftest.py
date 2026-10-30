@@ -39,6 +39,21 @@ def no_policy(monkeypatch):
         lambda cfg, ev, log: {"act": True, "reason": "test: mechanical"})
 
 
+@pytest.fixture
+def frozen_now(monkeypatch):
+    """agent's datetime.now() pinned to 2026-10-30 15:00 UTC (returned), so
+    a test that reads 'today' more than once can't straddle midnight."""
+    from datetime import datetime, timezone
+    fixed = datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc)
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+    monkeypatch.setattr(agent, "datetime", Frozen)
+    return fixed
+
+
 class StubBroker:
     """Records execute() calls; behaves like a real adapter for state."""
 

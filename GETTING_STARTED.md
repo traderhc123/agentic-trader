@@ -202,6 +202,12 @@ docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trad
 - **No weekend spend**: the recurring day-pass never auto-buys on Saturday or
   Sunday — the feed only publishes on market days, so a weekend pass would be
   wasted sats.
+- **Closing a trade yourself is fine**: sell in your broker's app and the
+  agent notices within a few minutes (after checking more than once), logs
+  it (with its P&L when the sale price is known), frees the slot and
+  ignores that trade's exit signal. If
+  you sold only some contracts, the exit signal sells just the rest. When
+  the broker can't be read clearly, nothing changes.
 - **Notifications**: set up Discord/ntfy/Telegram during setup — you get a
   message on every action, veto, and error, plus a daily digest after the
   close. Never run it silently.

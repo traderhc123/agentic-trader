@@ -11,7 +11,7 @@ import os
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import broker_events
@@ -27,6 +27,11 @@ _DEAD = ("cancelled", "canceled", "rejected", "failed", "expired", "voided")
 _SETTLE_TRIES = 3           # quick inline polls right after placing
 _SETTLE_WAIT_S = 5.0
 _PENDING_GIVEUP_S = 30 * 60  # cancel + settle any order still working after this
+
+# Every exit sells with position_effect "close" (execute, and the orders
+# reconcile re-places), so a repeat sell can never open a position
+# (brokers/__init__.py).
+CLOSE_ONLY_EXITS = True
 
 # Robinhood rejects market option orders outside 9:35 AM-4:00 PM ET. Feed
 # events consumed just after the open can land inside the 9:30-9:35 window,
@@ -371,10 +376,20 @@ def _extract_order_id(result):
 def _order_status(rh, account, order_id):
     """(state, filled_qty) for order_id via get_option_orders; (None, 0) when
     it can't be found / the call fails — caller keeps polling. Orders carry
-    `state` + string-decimal `processed_quantity`."""
+    `state` + string-decimal `processed_quantity`.
+
+    Asks for the one order by id: the unfiltered list is a single page,
+    newest first, so once the owner also trades in the app the agent's own
+    order can drop off it. Falls back to the unfiltered list if Robinhood
+    rejects the filter or answers without the order."""
     try:
-        body = content_json(rh.call_tool("get_option_orders",
-                                         {"account_number": account})) or {}
+        result = rh.call_tool("get_option_orders", {
+            "account_number": account, "order_id": str(order_id)})
+        filtered = tool_ok(result)
+        if not filtered and not getattr(rh, "last_error", None):
+            result = rh.call_tool("get_option_orders",
+                                  {"account_number": account})
+        body = content_json(result) or {}
 
         def _find(obj):
             if isinstance(obj, dict):
@@ -392,6 +407,11 @@ def _order_status(rh, account, order_id):
             return None
 
         order = _find(body)
+        if not order and filtered and not getattr(rh, "last_error", None):
+            # the filter was accepted but the order isn't in the answer:
+            # look in the plain list before calling it unfindable
+            order = _find(content_json(rh.call_tool(
+                "get_option_orders", {"account_number": account})) or {})
         if not order:
             return None, 0
         st = str(order.get("state") or order.get("status") or "").lower()
@@ -467,6 +487,7 @@ def _finalize_pending(state, pos_key, filled_total, report_unfilled=True):
         total = int(pos.get("qty", 0)) + filled_total
         if total > 0:
             pos["qty"] = total
+            _order_settled(pos)
             print(f"  fill verified: bought {total}x ({pos_key})")
         else:
             del state["positions"][pos_key]
@@ -483,6 +504,7 @@ def _finalize_pending(state, pos_key, filled_total, report_unfilled=True):
             print(f"  fill verified: sold {filled_total}x ({pos_key})")
         else:
             pos["qty"] = remaining
+            _order_settled(pos)
             print(f"  ⚠️ exit only filled {filled_total}/{pend['requested']} — "
                   f"{remaining}x still held ({pos_key}); reconcile keeps working "
                   "it, or close manually in the app")
@@ -494,11 +516,43 @@ def _finalize_pending(state, pos_key, filled_total, report_unfilled=True):
 
 
 def _record_pending(state, pos_key, placed, side, qty):
-    state["positions"][pos_key]["pending"] = {
+    pos = state["positions"][pos_key]
+    pos["pending"] = {
         "order_id": placed["order_id"], "side": side, "requested": int(qty),
         "filled": 0, "was_limit": bool(placed["was_limit"]),
         "placed_at": time.time(),
     }
+    _stamp_order(pos, placed["order_id"])
+    _remember_order(state, placed["order_id"])
+
+
+_ORDER_IDS_KEPT = 20
+_AGENT_ORDERS_KEPT = 200
+
+
+def _remember_order(state, order_id):
+    """Every order the agent places, kept after its position is gone: the
+    agent's sell of an earlier position in the same contract must never
+    pass for the owner's sale (brokers/__init__.py)."""
+    if order_id:
+        ids = [i for i in state.get("agent_order_ids") or [] if i != str(order_id)]
+        state["agent_order_ids"] = (ids + [str(order_id)])[-_AGENT_ORDERS_KEPT:]
+
+
+def _stamp_order(pos, order_id):
+    """Remember the agent's own order (so the owner's sells can be told
+    apart from it) and when it was placed (holdings lag fresh orders)."""
+    if order_id:
+        ids = [i for i in pos.get("order_ids") or [] if i != str(order_id)]
+        pos["order_ids"] = (ids + [str(order_id)])[-_ORDER_IDS_KEPT:]
+    pos["last_order_at"] = time.time()
+
+
+def _order_settled(pos):
+    """The row survived an order: restart the holdings grace period and
+    forget any shortfall seen while the order was working."""
+    pos["last_order_at"] = time.time()
+    pos.pop("miss", None)
 
 
 def _settle_fast(rh, cfg, state, pos_key):
@@ -688,3 +742,256 @@ def execute(rh, cfg, event, state):
             _settle_fast(rh, cfg, state, pos_key)
             return True
     return False
+
+
+# ── what the account holds, and the owner's own sells (read-only) ───────────
+# Shapes from Robinhood's MCP schema (tools/list, 2026-10-12) and live
+# captures: get_option_positions -> {"data": {"positions": [...], "next"?}}
+# with rows keyed by `option_id` (the instrument UUID the ledger stores) and
+# decimal-string `quantity`; get_option_orders -> {"data": {"orders": [...],
+# "next"?}}, newest first. Anything else reads as "unknown", never "closed".
+
+_POS_MAX_PAGES = 5
+_FILLS_MAX_PAGES = 3
+_PENDING_KEYS = ("pending_sell_quantity", "pending_expiration_quantity",
+                 "pending_exercise_quantity", "pending_assignment_quantity",
+                 "pending_expired_quantity")
+
+
+def _is_uuid(s):
+    try:
+        uuid.UUID(str(s))
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _last_seg(v):
+    """Last path segment — REST rows name the instrument by URL."""
+    return str(v or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def _dec(v):
+    """Robinhood decimal string -> float. '' and None are 0; junk raises."""
+    return 0.0 if v is None or v == "" else float(v)
+
+
+def _price(v):
+    """A usable per-share price, or None."""
+    return v if v is not None and 0 < v < float("inf") else None
+
+
+def _page(body, key):
+    """(rows, next cursor) of one listing page; (None, None) when the body
+    isn't a listing we recognize. A null list is unknown, not empty."""
+    if not isinstance(body, dict):
+        return None, None
+    data = body.get("data", body)
+    if not isinstance(data, dict):
+        return None, None
+    rows = data.get(key, data.get("results"))
+    if not isinstance(rows, list):
+        return None, None
+    return rows, data.get("next") or None
+
+
+def held_option_qty(rh, cfg, option_ids):
+    """{option_id: long contracts held}, or None when the account can't be
+    read with certainty (see brokers/__init__.py).
+
+    Lists every open position instead of filtering by id: a filter Robinhood
+    read differently would return [] and make every row look closed. An
+    agentic account only holds a few positions."""
+    ids = sorted({str(i) for i in option_ids or () if _is_uuid(i)})
+    if not ids:
+        return {}
+    acct = (cfg or {}).get("robinhood_account")
+    if not acct or getattr(rh, "last_error", None):
+        return None
+    try:
+        return _read_positions(rh, str(acct), ids)
+    except Exception:
+        return None
+
+
+def _read_positions(rh, acct, ids):
+    want = set(ids)
+    held, busy = {}, set()
+    args = {"account_number": acct, "nonzero": True}
+    first, pages = True, 0
+    while pages < _POS_MAX_PAGES:
+        result = rh.call_tool("get_option_positions", dict(args))
+        if getattr(rh, "last_error", None):
+            return None
+        if not tool_ok(result):
+            if first and "nonzero" in args:
+                # filter not accepted? retry once without it (zero-quantity
+                # rows then come back too, and are skipped below)
+                del args["nonzero"]
+                first = False
+                continue
+            return None
+        first = False
+        rows, nxt = _page(content_json(result), "positions")
+        if rows is None:
+            return None
+        pages += 1
+        for row in rows:
+            if row is not None and not _count_position(row, want, held, busy):
+                return None
+        if not nxt:
+            return {i: held.get(i, 0) for i in ids if i not in busy}
+        if str(nxt).startswith("http"):
+            return None  # a REST page URL: not the MCP cursor we know
+        args["cursor"] = str(nxt)
+    return None  # still more pages: never answer from part of the list
+
+
+def _count_position(row, want, held, busy):
+    """Add one position row to held/busy. False when the row isn't one we
+    recognize, which makes the whole read unknown."""
+    if not isinstance(row, dict):
+        return False
+    # Never row["id"]: on REST rows that's the POSITION id, not the contract.
+    oid = str(row.get("option_id") or _last_seg(row.get("option")))
+    qkey = "quantity" if "quantity" in row else "qty" if "qty" in row else None
+    if not oid or qkey is None:
+        return False
+    if str(row.get("type") or "").lower() == "short":
+        return True
+    try:
+        q = int(round(_dec(row[qkey])))
+    except (TypeError, ValueError, OverflowError):
+        return oid not in want
+    try:
+        pending = sum(_dec(row.get(k)) for k in _PENDING_KEYS)
+    except (TypeError, ValueError):
+        pending = 1  # can't tell: treat as busy
+    if not pending <= 0:
+        busy.add(oid)  # a sale/expiry/exercise in flight: count unknown
+    if q > 0:
+        held[oid] = held.get(oid, 0) + q
+    return True
+
+
+def closed_fills(rh, cfg, option_id, since_iso=None, own_order_ids=(),
+                 exclude_agentic=False):
+    """Filled sell-to-close orders on option_id that the agent didn't place,
+    newest first, or None when orders can't be read (brokers/__init__.py).
+    exclude_agentic also skips orders placed through the agentic API — for
+    positions from before the agent kept its own order ids."""
+    acct = (cfg or {}).get("robinhood_account")
+    if not acct or not _is_uuid(option_id) or getattr(rh, "last_error", None):
+        return None
+    own = {str(o) for o in own_order_ids or ()}
+    try:
+        return _read_fills(rh, str(acct), str(option_id), since_iso, own,
+                           exclude_agentic)
+    except Exception:
+        return None
+
+
+def _day_before(since_iso):
+    """'YYYY-MM-DD' of the day before since_iso (a UTC ISO time) — the
+    order filter's slack for time zones. '' when unreadable."""
+    try:
+        day = date.fromisoformat(str(since_iso)[:10])
+    except (TypeError, ValueError):
+        return ""
+    return (day - timedelta(days=1)).isoformat()
+
+
+def _read_fills(rh, acct, option_id, since_iso, own, exclude_agentic):
+    args = {"account_number": acct}
+    since = _day_before(since_iso)
+    if since:
+        args["created_at_gte"] = since
+    out, pages, first = [], 0, True
+    while pages < _FILLS_MAX_PAGES:
+        result = rh.call_tool("get_option_orders", dict(args))
+        down = getattr(rh, "last_error", None)
+        orders, nxt = ((None, None) if down or not tool_ok(result)
+                       else _page(content_json(result), "orders"))
+        if orders is None:
+            if first and not down and "created_at_gte" in args:
+                del args["created_at_gte"]  # filter not accepted: retry once
+                first = False
+                continue
+            return out if pages else None  # a partial list only under-covers
+        first = False
+        pages += 1
+        for o in orders:
+            fill = _owner_fill(o, option_id, own, exclude_agentic)
+            if fill:
+                out.append(fill)
+        if not nxt or str(nxt).startswith("http"):
+            break
+        args["cursor"] = str(nxt)
+    return out
+
+
+def _owner_fill(o, option_id, own, exclude_agentic):
+    """One order -> {order_id, qty, price, at, by} when it sold-to-close
+    option_id and isn't the agent's own; None otherwise."""
+    if not isinstance(o, dict):
+        return None
+    oid = str(o.get("id") or "")
+    if not oid or oid in own:
+        return None
+    # an agent order the owner approved in the app reads placed_agent
+    # "user" with agent_initiated true
+    if exclude_agentic and (str(o.get("placed_agent") or "").lower() == "agentic"
+                            or o.get("agent_initiated") is True):
+        return None
+    legs = o.get("legs") if isinstance(o.get("legs"), list) else []
+    leg = next((g for g in legs if _sells_to_close(g, option_id)), None)
+    if leg is None:
+        return None
+    try:
+        filled = _leg_fill(o, leg, len(legs))
+        qty = int(round(filled[0])) if filled else 0
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return None
+    if qty < 1:
+        return None
+    return {"order_id": oid, "qty": qty, "price": _price(filled[1]),
+            "at": filled[2] or o.get("updated_at"), "by": o.get("placed_agent")}
+
+
+def _sells_to_close(leg, option_id):
+    if not isinstance(leg, dict):
+        return False
+    leg_id = str(leg.get("option_id") or _last_seg(leg.get("option")))
+    return (leg_id == option_id and str(leg.get("side")).lower() == "sell"
+            and str(leg.get("position_effect") or "close").lower() == "close")
+
+
+def _leg_fill(o, leg, n_legs):
+    """(contracts, per-share price or None, time) filled on this leg, or None
+    when it can't be told. Market orders carry price "" — never parse it."""
+    execs = leg.get("executions")
+    if isinstance(execs, list) and execs:
+        qty = notional = 0.0
+        priced, at = True, None
+        for e in execs:
+            try:
+                q, p = _dec(e.get("quantity")), _dec(e.get("price"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if not q > 0:
+                continue
+            qty += q
+            notional += p * q
+            priced = priced and p > 0
+            ts = e.get("timestamp")
+            if ts and (at is None or str(ts) > at):
+                at = str(ts)
+        return qty, (notional / qty if qty > 0 and priced else None), at
+    if n_legs != 1:
+        return None
+    # no executions listed: order totals (processed_premium is total dollars)
+    q = _dec(o.get("processed_quantity"))
+    premium = _dec(o.get("processed_premium"))
+    mult = _dec(o.get("trade_value_multiplier")) or 100.0
+    price = premium / (q * mult) if q > 0 and premium > 0 else None
+    return q, price, o.get("updated_at")

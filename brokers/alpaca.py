@@ -10,11 +10,15 @@ agent's contract: buy-to-open on ENTERED, sell on EXITED for positions this
 agent opened. Requires options approval on the Alpaca account.
 """
 
+import re
+import time
+
 import requests
 
 import broker_events
 
 _TIMEOUT = 15
+_OCC_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
 
 # Wizard descriptor — lets the web setup render this broker's fields generically
 # (any key-based broker adapter can ship one of these).
@@ -207,7 +211,10 @@ def _order_state(cfg, oid):
             int(float(o.get("filled_qty") or 0)))
 
 
-def _confirm_fill(cfg, oid, qty):
+_DONE = ("rejected", "canceled", "cancelled", "expired")
+
+
+def _confirm_fill(cfg, oid, qty, side="buy"):
     """Poll the order briefly; returns the filled quantity.
 
     Market DAY orders on options nearly always fill in seconds (paper mode
@@ -215,8 +222,11 @@ def _confirm_fill(cfg, oid, qty):
     phantom position recorded). An order still working after the polls is
     CANCELLED and settled with what actually filled — assuming the requested
     qty is how ledger/broker divergence starts (with a post-cancel recheck
-    for the fill-vs-cancel race)."""
-    import time
+    for the fill-vs-cancel race).
+
+    Less than qty only when the order is known to be dead: a sell reported
+    as unfilled is sold again on the next poll, and if the first one fills
+    after all, a plain sell on a flat account can open a short."""
     if oid == "submitted":
         return qty
     for _ in range(_CONFIRM_TRIES):
@@ -224,25 +234,34 @@ def _confirm_fill(cfg, oid, qty):
         status, filled = _order_state(cfg, oid)
         if status == "filled":
             return filled or qty
-        if status in ("rejected", "canceled", "cancelled", "expired"):
+        if status in _DONE:
             print(f"  order {status} — filled {filled}/{qty}")
             return filled
     try:
-        requests.delete(f"{_base(cfg)}/v2/orders/{oid}",
-                        headers=_headers(cfg), timeout=_TIMEOUT)
+        resp = requests.delete(f"{_base(cfg)}/v2/orders/{oid}",
+                               headers=_headers(cfg), timeout=_TIMEOUT)
+        cancelled = 200 <= int(getattr(resp, "status_code", 0) or 0) < 300
         time.sleep(2)  # let the cancel settle; catch a fill-vs-cancel race
         status, filled = _order_state(cfg, oid)
-        if status == "filled":
-            return filled or qty
+    except Exception:
+        cancelled, status, filled = False, "", 0
+    if status == "filled":
+        return filled or qty
+    if status in _DONE or (cancelled and status):
         print(f"  order didn't fill in "
               f"{_CONFIRM_TRIES * _CONFIRM_WAIT_S:.0f}s — cancelled; "
               f"filled {filled}/{qty}")
         return filled
-    except Exception:
-        # cancel path itself failed — fall back to the optimistic assumption
-        print(f"  order still working and cancel failed — assuming {qty}x "
-              "(check your Alpaca dashboard)")
-        return qty
+    # the cancel didn't take or can't be confirmed: the order may still
+    # fill — fall back to the optimistic assumption, and say so
+    print(f"  order still working and the cancel couldn't be confirmed — "
+          f"assuming {qty}x (check your Alpaca dashboard)")
+    broker_events.report(
+        "order_failed" if side == "buy" else "exit_failed",
+        f"Alpaca couldn't confirm whether the {side} order for {qty}x filled "
+        "(the cancel didn't go through) — the agent assumes it did; check "
+        "your Alpaca dashboard", placed=True)
+    return qty
 
 
 def execute(cl, cfg, event, state):
@@ -267,6 +286,7 @@ def execute(cl, cfg, event, state):
         print(f"ENTERED event -> buying {qty}x {contract} ({note})")
         oid = _order(cfg, occ, "buy", qty)
         if oid:
+            _remember_order(state, oid)
             filled = _confirm_fill(cfg, oid, qty)
             if filled < 1:
                 print(f"  entry never filled — no position recorded ({contract})")
@@ -276,6 +296,7 @@ def execute(cl, cfg, event, state):
                 return False
             state["positions"][pos_key] = {"option_id": occ, "qty": filled,
                                            "opened_event": event.get("event_id")}
+            _stamp_order(state["positions"][pos_key], oid)
             return True
     elif event["event"] == "EXITED":
         pos = state["positions"].get(pos_key)
@@ -284,10 +305,12 @@ def execute(cl, cfg, event, state):
         print(f"EXITED event -> selling {pos['qty']}x {contract}")
         oid = _order(cfg, pos.get("option_id", occ), "sell", pos["qty"])
         if oid:
-            sold = _confirm_fill(cfg, oid, pos["qty"])
+            _remember_order(state, oid)
+            sold = _confirm_fill(cfg, oid, pos["qty"], side="sell")
             remaining = int(pos["qty"]) - sold
             if remaining > 0:
                 pos["qty"] = remaining
+                _stamp_order(pos, oid)
                 print(f"  ⚠️ exit only filled {sold}/{pos['qty'] + sold} — "
                       f"{remaining}x still held; close manually if needed")
                 broker_events.report("exit_partial",
@@ -297,3 +320,130 @@ def execute(cl, cfg, event, state):
                 del state["positions"][pos_key]
             return True
     return False
+
+
+_ORDER_IDS_KEPT = 20
+_AGENT_ORDERS_KEPT = 200
+
+
+def _stamp_order(pos, oid):
+    """Remember the agent's own order (so the owner's sells can be told
+    apart from it) and when it was placed (holdings lag fresh orders)."""
+    if oid and oid != "submitted":
+        ids = [i for i in pos.get("order_ids") or [] if i != str(oid)]
+        pos["order_ids"] = (ids + [str(oid)])[-_ORDER_IDS_KEPT:]
+    pos["last_order_at"] = time.time()
+
+
+def _remember_order(state, oid):
+    """Every order the agent places, kept after its position is gone: the
+    agent's sell of an earlier position in the same contract must never
+    pass for the owner's sale (brokers/__init__.py)."""
+    if oid and oid != "submitted":
+        ids = [i for i in state.get("agent_order_ids") or [] if i != str(oid)]
+        state["agent_order_ids"] = (ids + [str(oid)])[-_AGENT_ORDERS_KEPT:]
+
+
+# ── what the account holds, and the owner's own sells (read-only) ───────────
+# GET /v2/positions and /v2/orders; option rows carry the same OCC symbol the
+# ledger stores. Anything but a clean 200 with the expected shape reads as
+# "unknown", never as "closed". See brokers/__init__.py for the contract.
+
+def held_option_qty(cl, cfg, option_ids):
+    """{OCC symbol: long contracts held}, or None when unknown. A symbol
+    with a working order (qty_available < qty) is left out."""
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    ids = sorted({str(i) for i in option_ids or () if _OCC_RE.match(str(i))})
+    if not ids:
+        return {}
+    try:
+        resp = requests.get(f"{_base(cfg)}/v2/positions", headers=_headers(cfg),
+                            timeout=_TIMEOUT)
+        rows = resp.json() if resp.status_code == 200 else None
+        if not isinstance(rows, list):
+            return None
+        held, busy = {}, set()
+        for row in rows:
+            if not _count_position(row, set(ids), held, busy):
+                return None
+        return {i: held.get(i, 0) for i in ids if i not in busy}
+    except Exception:
+        return None
+
+
+def _count_position(row, want, held, busy):
+    """Add one /v2/positions row to held/busy; False = unrecognized row."""
+    if not isinstance(row, dict):
+        return False
+    if "asset_class" in row and row["asset_class"] != "us_option":
+        return True
+    sym, qty = row.get("symbol"), row.get("qty")
+    if not sym or qty is None:
+        return False
+    sym = str(sym)
+    if str(row.get("side") or "").lower() == "short":
+        return True
+    try:
+        q = int(round(float(qty)))
+        avail = row.get("qty_available")
+        avail = q if avail is None else int(round(float(avail)))
+    except (TypeError, ValueError, OverflowError):
+        return sym not in want
+    if avail < q:
+        busy.add(sym)  # an order is working on it: count unknown
+    if q > 0:
+        held[sym] = held.get(sym, 0) + q
+    return True
+
+
+def closed_fills(cl, cfg, option_id, since_iso=None, own_order_ids=(),
+                 exclude_agentic=False):
+    """Filled sells of option_id the agent didn't place, newest first, or
+    None when orders can't be read. (Every order here comes through the
+    API, so exclude_agentic doesn't apply.)"""
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    if not _OCC_RE.match(str(option_id or "")):
+        return None
+    params = {"status": "closed", "symbols": option_id, "direction": "desc",
+              "limit": 100}
+    if since_iso:
+        params["after"] = since_iso
+    try:
+        resp = requests.get(f"{_base(cfg)}/v2/orders", params=params,
+                            headers=_headers(cfg), timeout=_TIMEOUT)
+        rows = resp.json() if resp.status_code == 200 else None
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    own = {str(o) for o in own_order_ids or ()}
+    out = []
+    for o in rows:
+        fill = _owner_fill(o, option_id, own)
+        if fill:
+            out.append(fill)
+    return out
+
+
+def _owner_fill(o, option_id, own):
+    if not isinstance(o, dict):
+        return None
+    oid = str(o.get("id") or "")
+    if (not oid or oid in own or o.get("symbol") != option_id
+            or str(o.get("side") or "").lower() != "sell"
+            or str(o.get("position_intent") or "").lower() == "sell_to_open"):
+        return None
+    try:
+        qty = int(round(float(o.get("filled_qty") or 0)))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if qty < 1:
+        return None
+    try:
+        price = float(o["filled_avg_price"])
+    except (KeyError, TypeError, ValueError):
+        price = None
+    if price is not None and not 0 < price < float("inf"):
+        price = None
+    return {"order_id": oid, "qty": qty, "price": price,
+            "at": o.get("filled_at") or o.get("updated_at"), "by": None}
