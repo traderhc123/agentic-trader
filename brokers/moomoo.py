@@ -191,13 +191,13 @@ def _ask_price(cfg, sdk, code):
 
 def mark_price(cl, cfg, event, side="buy"):
     """Per-share quote for the agent's P&L estimate (0.0 when unavailable)."""
-    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
     return _ask_price(cfg, _sdk(), _moomoo_code(event))
 
 
 def account_value(cl, cfg):
     """Total assets for %-of-account sizing (0.0 when unavailable)."""
-    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
     ctx = None
     try:
         sdk = _sdk()
@@ -219,7 +219,7 @@ def account_value(cl, cfg):
 
 def buying_power(cl, cfg):
     """Cash available for new orders, or None when unreadable."""
-    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
     ctx = None
     try:
         sdk = _sdk()
@@ -319,7 +319,11 @@ def _order(cfg, sdk, code, side, qty, price):
 
 def execute(cl, cfg, event, state):
     """Act on one normalized event. Returns True if state changed."""
-    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    # Prefer the cfg the caller passed (the live config, with per-track
+    # sizing), like alpaca: orders, holdings reads and the account tag the
+    # agent stamps on each position then all use the same paper/real mode,
+    # even after the owner flips it in the dashboard.
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
     try:
         sdk = _sdk()
     except RuntimeError as exc:
@@ -391,8 +395,10 @@ _MM_DONE = {"FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED
 def held_option_qty(cl, cfg, option_ids):
     """{moomoo code: long contracts held}, or None when unknown (see
     brokers/__init__.py). A code with any working order — the owner's, or
-    the agent's own resting buy — is left out."""
-    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    the agent's own resting buy — is left out, and so is one that holds
+    fewer than today's filled buys minus filled sells (the position list
+    lagging a fill)."""
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
     ids = sorted({str(i) for i in option_ids or () if str(i).startswith("US.")})
     if not ids:
         return {}
@@ -401,7 +407,8 @@ def held_option_qty(cl, cfg, option_ids):
         sdk = _sdk()
         ctx = _trade_ctx(cfg, sdk)
         env = _trd_env(cfg, sdk)
-        ret, data = ctx.position_list_query(trd_env=env)
+        # fresh from the broker, not OpenD's cache (an error reads as unknown)
+        ret, data = ctx.position_list_query(trd_env=env, refresh_cache=True)
         if ret != sdk.RET_OK or data is None:
             return None
         held = {}
@@ -415,16 +422,20 @@ def held_option_qty(cl, cfg, option_ids):
             q = int(float(qty))
             if q > 0:
                 held[str(code)] = held.get(str(code), 0) + q
-        ret, orders = ctx.order_list_query(trd_env=env)
+        ret, orders = ctx.order_list_query(trd_env=env, refresh_cache=True)
         if ret != sdk.RET_OK or orders is None:
             return None
-        busy = set()
+        busy, net = set(), {}
         for i in range(len(orders)):
             row = orders.iloc[i]
+            code = str(row.get("code"))
             status = str(row.get("order_status")).rsplit(".", 1)[-1].upper()
             if status not in _MM_DONE:
-                busy.add(str(row.get("code")))
-        return {c: held.get(c, 0) for c in ids if c not in busy}
+                busy.add(code)
+            elif code in ids and not _net_fill(row, net):
+                busy.add(code)
+        return {c: held.get(c, 0) for c in ids
+                if c not in busy and held.get(c, 0) >= net.get(c, 0)}
     except Exception:
         return None
     finally:
@@ -433,3 +444,20 @@ def held_option_qty(cl, cfg, option_ids):
                 ctx.close()
             except Exception:
                 pass
+
+
+def _net_fill(row, net):
+    """Add one finished order's filled buys (+) or sells (-) to net[code].
+    False when its side or filled quantity can't be read."""
+    side = str(row.get("trd_side") or "").rsplit(".", 1)[-1].upper()
+    try:
+        dealt = int(float(row.get("dealt_qty") or 0))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if dealt < 1:
+        return True
+    if side not in ("BUY", "SELL"):
+        return False
+    code = str(row.get("code"))
+    net[code] = net.get(code, 0) + (dealt if side == "BUY" else -dealt)
+    return True

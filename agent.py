@@ -1019,6 +1019,22 @@ def _contract_of(key):
     return f"{t} {e} ${s} {ty}"
 
 
+def _broker_name(cfg, broker=None):
+    """The registry name of the adapter that's running. `run` picks the
+    adapter and its client once at startup and reloads config.json every
+    loop, so cfg["broker"] can name another broker after a dashboard
+    change while the running adapter still trades the old one."""
+    for name, mod in BROKERS.items():
+        if mod is broker:
+            return name
+    return str(cfg.get("broker") or "robinhood")
+
+
+def _account_tag(cfg, broker=None):
+    """account_tag() of the account the running adapter trades."""
+    return account_tag({**cfg, "broker": _broker_name(cfg, broker)})
+
+
 def _gate_on(cfg, broker, client):
     """True when the agent can read what the account holds."""
     return (hasattr(broker, "held_option_qty") and client is not None
@@ -1109,7 +1125,7 @@ def _sync_positions(cfg, state, save_state, broker, client, keys=None,
 def _sync_read(cfg, state, save_state, broker, client, fn, keys, confirm_s,
                event_id, detected_by):
     now = _now()
-    tag = account_tag(cfg)
+    tag = _account_tag(cfg, broker)
     cand, changed = _sync_candidates(state, tag, now)
     held = None
     if cand:
@@ -1141,6 +1157,9 @@ def _sync_read(cfg, state, save_state, broker, client, fn, keys, confirm_s,
             changed = True
         if h >= 1 and not pos.get("held_seen"):
             pos["held_seen"] = True
+            changed = True
+        if h >= max(1, _int0(pos.get("qty"))) and not pos.get("full_seen"):
+            pos["full_seen"] = True  # the whole entry showed up at least once
             changed = True
         if h >= _int0(pos.get("qty")):
             if pos.pop("miss", None) is not None:
@@ -1284,17 +1303,27 @@ def _close_outside(cfg, state, save_state, broker, key, target, px, closed_at,
     logged = _int0(snap.get("exit_logged"))
     already = min(k, logged)  # counted by an agent exit still working
     unlogged = k - already
-    name = _BROKER_NAMES.get(str(cfg.get("broker") or "robinhood"), "broker")
+    name = _BROKER_NAMES.get(_broker_name(cfg, broker), "broker")
     contract = _contract_of(key)
-    if (target == 0 and cause == "gone" and not snap.get("held_seen")
-            and not getattr(broker, "VERIFIES_FILLS", True)):
-        # an adapter that books entries unverified, and the account never
-        # showed this one: the buy most likely never filled — not an exit
-        state["positions"].pop(key)
-        _bury(state, key, snap, q)
+    if (cause == "gone" and not snap.get("full_seen")
+            and not getattr(broker, "VERIFIES_FILLS", True)
+            and (target > 0 or not snap.get("held_seen"))):
+        # An adapter that books entries unverified, and the account never
+        # showed all of this entry: the missing part most likely never
+        # filled (a partly filled limit buy) — not an exit.
+        if target == 0:
+            state["positions"].pop(key)
+            _bury(state, key, snap, q)
+            msg = (f"your {name} buy for {contract} never showed up in the "
+                   "account — it probably didn't fill; removed from open "
+                   "positions")
+        else:
+            pos.update(qty=target, full_seen=True)
+            pos.pop("miss", None)
+            msg = (f"only {target} of {q} {contract} showed up in your {name} "
+                   "account — the buy probably only partly filled; the agent "
+                   f"now tracks {target}")
         save_state(state)
-        msg = (f"your {name} buy for {contract} never showed up in the account "
-               "— it probably didn't fill; removed from open positions")
         print(msg)
         _report_problem(cfg, state, save_state, "entry_unfilled", contract, msg)
         return
@@ -1413,7 +1442,7 @@ def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev,
     row belongs to another account or mode) or "wait" (the account shows
     fewer contracts than the ledger — re-check before selling)."""
     pos = state["positions"].get(pos_key) or {}
-    tag = account_tag(cfg)
+    tag = _account_tag(cfg, broker)
     if pos.get("acct") and pos["acct"] != tag:
         return "blocked"  # needs no read: never sell from another account
     if (not _gate_on(cfg, broker, client) or pos.get("pending")
@@ -1458,7 +1487,7 @@ def _warn_if_reheld(cfg, state, save_state, broker, client, pos_key, ev, contrac
     if (not isinstance(tomb, dict) or tomb.get("warned")
             or not _gate_on(cfg, broker, client)
             or getattr(client, "last_error", None) or not tomb.get("option_id")
-            or tomb.get("acct") not in (None, account_tag(cfg))):
+            or tomb.get("acct") not in (None, _account_tag(cfg, broker))):
         return
     import broker_events
     broker_events.begin()
@@ -1731,7 +1760,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             if not dry:  # holdings checks: grace period + which account
                 row.setdefault("opened_at", _now())
                 row["last_order_at"] = max(_float0(row.get("last_order_at")), _now())
-                row.setdefault("acct", account_tag(cfg))
+                row.setdefault("acct", _account_tag(cfg, broker))
         elif action == "exit" and sold is None:  # dry run
             est = _est_exit_pnl(prior_pos, _mark(broker, client, ecfg, ev, "sell"), ev)
             if est is not None:

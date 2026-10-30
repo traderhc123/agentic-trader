@@ -552,7 +552,11 @@ class _MMCtx:
         return self._answer(self.sdk.ord_ret, self.sdk.orders)
 
     def place_order(self, **kw):
+        self.sdk.placed.append(kw)
         return self.sdk.RET_OK, _FakeDF([{"order_id": "mm-1"}])
+
+    def unlock_trade(self, pwd):
+        return self.sdk.RET_OK, None
 
     def close(self):
         self.closed = True
@@ -581,7 +585,7 @@ class _MMSDK:
         self.positions = None if positions is None else list(positions)
         self.orders = None if orders is None else list(orders)
         self.pos_ret, self.ord_ret = pos_ret, ord_ret
-        self.ctxs = []
+        self.ctxs, self.placed = [], []
 
     def OpenSecTradeContext(self, **kw):
         self.ctxs.append(_MMCtx(self))
@@ -616,7 +620,59 @@ def test_moomoo_positions_parse(monkeypatch):
     assert got == {MM1: 2, MM2: 0, MM4: 3, MM5: 0}
     (ctx,) = sdk.ctxs
     assert ctx.closed
-    assert ctx.queries == [("positions", {"trd_env": "SIM"}), ("orders", {"trd_env": "SIM"})]
+    # fresh from the broker, not OpenD's cache
+    assert ctx.queries == [("positions", {"trd_env": "SIM", "refresh_cache": True}),
+                           ("orders", {"trd_env": "SIM", "refresh_cache": True})]
+
+
+def _mm_order(code, side, dealt, status="FILLED_ALL"):
+    return {"code": code, "order_status": f"OrderStatus.{status}",
+            "trd_side": f"TrdSide.{side}", "qty": 2.0, "dealt_qty": dealt}
+
+
+@pytest.mark.parametrize("positions, orders, want", [
+    # the agent's buy filled today but the position list doesn't show it yet
+    ([], [_mm_order(MM1, "BUY", 1.0)], {}),
+    ([{"code": MM1, "qty": 1.0}], [_mm_order(MM1, "BUY", 2.0)], {}),
+    ([{"code": MM1, "qty": 2.0}], [_mm_order(MM1, "BUY", 2.0)], {MM1: 2}),
+    # bought 2, sold 1 in the app: 1 held is consistent
+    ([{"code": MM1, "qty": 1.0}],
+     [_mm_order(MM1, "BUY", 2.0), _mm_order(MM1, "SELL", 1.0)], {MM1: 1}),
+    ([], [_mm_order(MM1, "BUY", 2.0), _mm_order(MM1, "SELL", 2.0)], {MM1: 0}),
+    # a partly filled buy counts what filled
+    ([{"code": MM1, "qty": 1.0}], [_mm_order(MM1, "BUY", 1.0, "CANCELLED_PART")],
+     {MM1: 1}),
+    ([], [_mm_order(MM1, "BUY", 0.0, "CANCELLED_ALL")], {MM1: 0}),
+    # a filled order that can't be read makes that code unknown
+    ([], [_mm_order(MM1, "", 1.0)], {}),
+    ([], [_mm_order(MM1, "BUY", "junk")], {}),
+    ([], [_mm_order(MM2, "BUY", 1.0)], {MM1: 0}),     # another contract
+], ids=["unlisted-buy", "short-of-buy", "matches-buy", "owner-sold-1",
+        "owner-sold-all", "partial-buy", "unfilled-buy", "no-side", "junk-qty",
+        "other-code"])
+def test_moomoo_positions_cross_checked_with_todays_fills(monkeypatch, positions,
+                                                          orders, want):
+    sdk = _MMSDK(positions=positions, orders=orders)
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    assert moomoo.held_option_qty(moomoo._Client(MOOMOO), {}, [MM1]) == want
+
+
+def test_moomoo_uses_the_live_cfg_over_the_clients_startup_copy(monkeypatch):
+    """`run` keeps its startup client while config.json reloads: after the
+    owner flips paper/real in the dashboard, orders and reads follow the
+    live config — the one the agent tags positions with."""
+    sdk = _MMSDK()
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    startup = moomoo._Client({"broker": "moomoo", "moomoo_paper": False,
+                              "moomoo_trade_pwd": "x"})
+    assert moomoo.held_option_qty(startup, MOOMOO, [MM1]) == {MM1: 0}
+    assert [kw["trd_env"] for _, kw in sdk.ctxs[0].queries] == ["SIM", "SIM"]
+    st = {"positions": {}}
+    assert moomoo.execute(startup, MOOMOO, make_event(expiry="2099-12-18"), st)
+    assert sdk.placed[-1]["trd_env"] == "SIM"
+    # with no cfg passed, the client's copy still works
+    moomoo.held_option_qty(startup, {}, [MM1])
+    assert [kw["trd_env"] for _, kw in sdk.ctxs[-1].queries] == ["REAL", "REAL"]
 
 
 @pytest.mark.parametrize("sdk", [

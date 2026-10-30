@@ -537,6 +537,30 @@ def test_moomoo_never_held_seen_zero_is_entry_unfilled_not_exit(home, clock, not
     assert _log(home)[-1]["action"] == "exit"
 
 
+def test_moomoo_partly_filled_entry_shrinks_without_an_exit(home, clock, notes):
+    """moomoo books the requested qty when the limit buy is accepted. If the
+    account never shows all of it, the rest never filled: not a manual
+    close, no P&L row, no 'exercised or assigned?' alert."""
+    st = _state(qty=3)
+    b = UnverifiedBroker({U1: 1})
+    sync(st, b)
+    clock.tick(60)
+    assert sync(st, b) == {KEY: {"held": 1, "status": "reduced"}}
+    pos = st["positions"][KEY]
+    assert pos["qty"] == 1 and pos["full_seen"] is True and "miss" not in pos
+    (row,) = _log(home)
+    assert row["action"] == "entry_unfilled"
+    assert row["reason"].startswith(f"only 1 of 3 {CONTRACT} showed up")
+    assert len(notes) == 1 and "exercised" not in notes[0]
+    # the contract it did buy is a real position: a later absence is a close
+    b.held = [{U1: 0}]
+    for _ in range(2):
+        clock.tick(60)
+        sync(st, b)
+    assert KEY not in st["positions"]
+    assert _log(home)[-1]["action"] == "exit" and _log(home)[-1]["qty"] == 1
+
+
 def test_exit_logged_prevents_double_count(home, clock, notes):
     st = _state(exit_logged=2)
     b = FillsBroker({U1: 0}, fills=[_fill()])
@@ -848,6 +872,21 @@ def test_gate_account_mismatch_blocks_without_holdings_reads(home, hooks):
     assert handle(st, b, cfg=cfg) is None
     assert [r["action"] for r in _log(home)] == ["exit_failed"]
     assert KEY in st["positions"]
+
+
+def test_account_tag_follows_the_running_adapter(home, monkeypatch, no_policy):
+    """`run` keeps the adapter it started with while config.json reloads:
+    switching broker in the dashboard mustn't block the running adapter's
+    exits, or tag its new entries with the other broker."""
+    b = FillsBroker({U1: 2})
+    monkeypatch.setitem(agent.BROKERS, "robinhood", b)
+    cfg = {**CFG, "broker": "alpaca", "alpaca_paper": True}
+    st = _state()
+    assert handle(st, b, cfg=cfg).startswith("EXIT")
+    assert b.executed == [("EXITED", 2)]
+    ev = make_event(expiry="2099-12-18", event_id="open-2")
+    assert handle(st, b, ev=ev, cfg=cfg).startswith("ENTRY")
+    assert st["positions"][KEY]["acct"] == TAG
 
 
 def test_exit_while_agent_sell_pending_is_noop(home):
