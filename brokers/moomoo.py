@@ -355,6 +355,7 @@ def execute(cl, cfg, event, state):
         print(f"ENTERED event -> buying {qty}x {contract} ({note})")
         oid = _order(cfg, sdk, code, "buy", qty, ask)
         if oid:
+            _remember_order(state, oid)
             row = {"option_id": code, "qty": qty,
                    "opened_event": event.get("event_id"),
                    "last_order_at": time.time()}  # holdings lag fresh orders
@@ -376,10 +377,24 @@ def execute(cl, cfg, event, state):
                                  f"no quote from OpenD to exit {contract}")
             return False
         print(f"EXITED event -> selling {pos['qty']}x {contract}")
-        if _order(cfg, sdk, code, "sell", pos["qty"], price):
+        oid = _order(cfg, sdk, code, "sell", pos["qty"], price)
+        if oid:
+            _remember_order(state, oid)
             del state["positions"][pos_key]
             return True
     return False
+
+
+_AGENT_ORDERS_KEPT = 200
+
+
+def _remember_order(state, oid):
+    """Every order the agent places, kept after its position is gone: the
+    agent's sell of an earlier position in the same contract must never
+    pass for the owner's sale (brokers/__init__.py)."""
+    if oid and oid != "submitted":
+        ids = [i for i in state.get("agent_order_ids") or [] if i != str(oid)]
+        state["agent_order_ids"] = (ids + [str(oid)])[-_AGENT_ORDERS_KEPT:]
 
 
 # ── what the account holds (read-only) ──────────────────────────────────────

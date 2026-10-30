@@ -286,6 +286,7 @@ def execute(cl, cfg, event, state):
         print(f"ENTERED event -> buying {qty}x {contract} ({note})")
         oid = _order(cfg, occ, "buy", qty)
         if oid:
+            _remember_order(state, oid)
             filled = _confirm_fill(cfg, oid, qty)
             if filled < 1:
                 print(f"  entry never filled — no position recorded ({contract})")
@@ -304,6 +305,7 @@ def execute(cl, cfg, event, state):
         print(f"EXITED event -> selling {pos['qty']}x {contract}")
         oid = _order(cfg, pos.get("option_id", occ), "sell", pos["qty"])
         if oid:
+            _remember_order(state, oid)
             sold = _confirm_fill(cfg, oid, pos["qty"], side="sell")
             remaining = int(pos["qty"]) - sold
             if remaining > 0:
@@ -321,6 +323,7 @@ def execute(cl, cfg, event, state):
 
 
 _ORDER_IDS_KEPT = 20
+_AGENT_ORDERS_KEPT = 200
 
 
 def _stamp_order(pos, oid):
@@ -330,6 +333,15 @@ def _stamp_order(pos, oid):
         ids = [i for i in pos.get("order_ids") or [] if i != str(oid)]
         pos["order_ids"] = (ids + [str(oid)])[-_ORDER_IDS_KEPT:]
     pos["last_order_at"] = time.time()
+
+
+def _remember_order(state, oid):
+    """Every order the agent places, kept after its position is gone: the
+    agent's sell of an earlier position in the same contract must never
+    pass for the owner's sale (brokers/__init__.py)."""
+    if oid and oid != "submitted":
+        ids = [i for i in state.get("agent_order_ids") or [] if i != str(oid)]
+        state["agent_order_ids"] = (ids + [str(oid)])[-_AGENT_ORDERS_KEPT:]
 
 
 # ── what the account holds, and the owner's own sells (read-only) ───────────

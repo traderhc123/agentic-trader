@@ -288,9 +288,13 @@ def test_rh_closed_fills_filters():
 
 
 def test_rh_closed_fills_legacy_excludes_agentic():
-    rh = FakeRH(_orders(_stc(oid="o-a", placed_agent="agentic"), _stc(oid="o-u")))
-    got = robinhood.closed_fills(rh, CFG, U1, exclude_agentic=True)
+    orders = _orders(_stc(oid="o-a", placed_agent="agentic"), _stc(oid="o-u"),
+                     # an agent order the owner approved in the app
+                     _stc(oid="o-approved", placed_agent="user", agent_initiated=True))
+    got = robinhood.closed_fills(FakeRH(orders), CFG, U1, exclude_agentic=True)
     assert [f["order_id"] for f in got] == ["o-u"]
+    got = robinhood.closed_fills(FakeRH(orders), CFG, U1)
+    assert [f["order_id"] for f in got] == ["o-a", "o-u", "o-approved"]
 
 
 def test_rh_closed_fills_errors():
@@ -326,6 +330,15 @@ def test_rh_order_status_sends_order_id_and_falls_back():
     rh = FakeRH(_err("unknown order_id"), live)
     assert robinhood._order_status(rh, "A1", "o-7") == ("filled", 2)
     assert rh.calls[1][1] == {"account_number": "A1"}
+    # the filter is accepted but the answer lacks the order: look in the
+    # plain list before calling it unfindable (30 min of that would settle
+    # a filled buy as unfilled)
+    rh = FakeRH(_orders(), live)
+    assert robinhood._order_status(rh, "A1", "o-7") == ("filled", 2)
+    assert [args for _, args in rh.calls] == [
+        {"account_number": "A1", "order_id": "o-7"}, {"account_number": "A1"}]
+    rh = FakeRH(_orders(), _orders())
+    assert robinhood._order_status(rh, "A1", "o-7") == (None, 0)
     legacy = _mcp({"data": {"results": [{"id": "o-7", "state": "cancelled",
                                          "processed_quantity": "1"}]}})
     assert robinhood._order_status(FakeRH(legacy), "A1", "o-7") == ("cancelled", 1)
@@ -349,6 +362,8 @@ def test_rh_record_pending_stamps_order_ids_and_last_order_at():
     robinhood._record_pending(state, key, {"order_id": "", "was_limit": False},
                               "buy", 1)
     assert "" not in pos["order_ids"]
+    # kept for the account too, after the row is gone
+    assert state["agent_order_ids"] == ["o-1"]
 
 
 def test_rh_finalize_pending_stamps_and_clears_miss():
@@ -510,13 +525,19 @@ def test_alpaca_execute_stamps_order_ids(monkeypatch):
     broker_events.drain()
     assert pos["qty"] == 2 and pos["order_ids"] == ["oid-1", "oid-2"]
     assert pos["last_order_at"] > 1.0
+    # the full exit deletes the row; the account keeps every id
+    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": qty)
+    monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty: "oid-3")
+    assert alpaca.execute(cl, {}, make_event(event="EXITED", expiry="2099-12-18"), st)
+    assert st["positions"] == {}
+    assert st["agent_order_ids"] == ["oid-1", "oid-2", "oid-3"]
     # no order id from Alpaca: nothing to remember, but the time still counts
     st = {"positions": {}}
-    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": qty)
     monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty: "submitted")
     alpaca.execute(cl, {}, make_event(expiry="2099-12-18"), st)
     pos = st["positions"]["SPY|2099-12-18|752.0|C"]
     assert "order_ids" not in pos and pos["last_order_at"] > 1.0
+    assert "agent_order_ids" not in st
 
 
 # ── moomoo ──────────────────────────────────────────────────────────────────
@@ -553,7 +574,7 @@ class _MMCtx:
 
     def place_order(self, **kw):
         self.sdk.placed.append(kw)
-        return self.sdk.RET_OK, _FakeDF([{"order_id": "mm-1"}])
+        return self.sdk.RET_OK, _FakeDF([{"order_id": f"mm-{len(self.sdk.placed)}"}])
 
     def unlock_trade(self, pwd):
         return self.sdk.RET_OK, None
@@ -720,3 +741,6 @@ def test_moomoo_execute_stamps_order_ids(monkeypatch):
     pos = st["positions"]["SPY|2099-12-18|752.0|C"]
     assert pos["order_ids"] == ["mm-1"] and pos["qty"] == 1
     assert pos["last_order_at"] == pytest.approx(time.time(), abs=5)
+    assert moomoo.execute(None, MOOMOO, make_event(event="EXITED", expiry="2099-12-18"),
+                          st)
+    assert st["positions"] == {} and st["agent_order_ids"] == ["mm-1", "mm-2"]

@@ -376,11 +376,12 @@ def _order_status(rh, account, order_id):
     Asks for the one order by id: the unfiltered list is a single page,
     newest first, so once the owner also trades in the app the agent's own
     order can drop off it. Falls back to the unfiltered list if Robinhood
-    rejects the filter."""
+    rejects the filter or answers without the order."""
     try:
         result = rh.call_tool("get_option_orders", {
             "account_number": account, "order_id": str(order_id)})
-        if not tool_ok(result) and not getattr(rh, "last_error", None):
+        filtered = tool_ok(result)
+        if not filtered and not getattr(rh, "last_error", None):
             result = rh.call_tool("get_option_orders",
                                   {"account_number": account})
         body = content_json(result) or {}
@@ -401,6 +402,11 @@ def _order_status(rh, account, order_id):
             return None
 
         order = _find(body)
+        if not order and filtered and not getattr(rh, "last_error", None):
+            # the filter was accepted but the order isn't in the answer:
+            # look in the plain list before calling it unfindable
+            order = _find(content_json(rh.call_tool(
+                "get_option_orders", {"account_number": account})) or {})
         if not order:
             return None, 0
         st = str(order.get("state") or order.get("status") or "").lower()
@@ -512,9 +518,20 @@ def _record_pending(state, pos_key, placed, side, qty):
         "placed_at": time.time(),
     }
     _stamp_order(pos, placed["order_id"])
+    _remember_order(state, placed["order_id"])
 
 
 _ORDER_IDS_KEPT = 20
+_AGENT_ORDERS_KEPT = 200
+
+
+def _remember_order(state, order_id):
+    """Every order the agent places, kept after its position is gone: the
+    agent's sell of an earlier position in the same contract must never
+    pass for the owner's sale (brokers/__init__.py)."""
+    if order_id:
+        ids = [i for i in state.get("agent_order_ids") or [] if i != str(order_id)]
+        state["agent_order_ids"] = (ids + [str(order_id)])[-_AGENT_ORDERS_KEPT:]
 
 
 def _stamp_order(pos, order_id):
@@ -916,7 +933,10 @@ def _owner_fill(o, option_id, own, exclude_agentic):
     oid = str(o.get("id") or "")
     if not oid or oid in own:
         return None
-    if exclude_agentic and str(o.get("placed_agent") or "").lower() == "agentic":
+    # an agent order the owner approved in the app reads placed_agent
+    # "user" with agent_initiated true
+    if exclude_agentic and (str(o.get("placed_agent") or "").lower() == "agentic"
+                            or o.get("agent_initiated") is True):
         return None
     legs = o.get("legs") if isinstance(o.get("legs"), list) else []
     leg = next((g for g in legs if _sells_to_close(g, option_id)), None)

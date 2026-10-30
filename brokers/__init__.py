@@ -34,6 +34,10 @@ reported as "not held":
         NOT in own_order_ids, newest first: {"order_id": str, "qty": int >= 1,
         "price": float | None (per share), "at": str | None, "by": str | None}.
         None means it couldn't be read; a partial list is allowed.
+        own_order_ids is the row's "order_ids" plus state["agent_order_ids"]:
+        an adapter with this hook appends the id of every order it places to
+        that list (last 200), so the agent's sell of an earlier position in
+        the same contract never passes for the owner's.
 
     VERIFIES_FILLS = False          module constant for adapters that book an
                                     entry when the order is accepted, without

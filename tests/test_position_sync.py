@@ -72,7 +72,8 @@ class HoldBroker:
 class FillsBroker(HoldBroker):
     """Also reports the owner's sells (like Robinhood and Alpaca). `fills`
     is a list for every contract, a {option_id: list} dict, or None
-    (can't read)."""
+    (can't read). Like the real adapters it leaves out own_order_ids and,
+    with exclude_agentic, orders placed through the agentic API."""
 
     def __init__(self, *held, fills=(), mark=0.0):
         super().__init__(*held, mark=mark)
@@ -87,7 +88,10 @@ class FillsBroker(HoldBroker):
         fills = self.fills
         if isinstance(fills, dict):
             fills = fills.get(option_id, [])
-        return None if fills is None else [dict(f) for f in fills]
+        if fills is None:
+            return None
+        return [dict(f) for f in fills if f["order_id"] not in own_order_ids
+                and not (exclude_agentic and f.get("by") == "agentic")]
 
 
 class UnverifiedBroker(HoldBroker):
@@ -219,8 +223,10 @@ def test_second_read_after_gap_closes_full(home, notes, clock):
     assert len(notes) == 1 and "closed outside the agent" in notes[0]
     assert "$+60.00" in notes[0] and "exit signal will be ignored" in notes[0]
     assert (False, 0) in saves  # ledger saved before the P&L row was written
-    assert b.fill_calls == [{"option_id": U1, "since_iso": "2026-10-30T14:00:00+00:00",
+    # sales since the open, with the same 10 min clock slack _pick_fills uses
+    assert b.fill_calls == [{"option_id": U1, "since_iso": "2026-10-30T13:50:00+00:00",
                              "own": ["o-agent"], "exclude_agentic": False}]
+    assert st["position_sync"]["fills_used"] == ["u1"]
 
 
 def test_read_inside_confirm_gap_not_counted(home, clock):
@@ -466,6 +472,51 @@ def test_mass_guard(home, clock):
     assert st["positions"][KEY2]["qty"] == 2
 
 
+def test_unprovable_shortfall_is_rechecked_slowly(home, clock):
+    """Only a sale could prove a shortfall every row showed at once. Once
+    that's noted, sales are asked for at most every 15 min (trusted or not)
+    and the periodic check goes back to its normal pace."""
+    st = _state()
+    st["positions"][KEY2] = _row(option_id=U2)
+    b = FillsBroker({U1: 0, U2: 0}, fills=[])
+
+    def upkeep():
+        agent._position_upkeep(CFG, st, lambda s: None, b, object())
+        return agent._POS_SYNC["next_at"] - clock.t
+    assert upkeep() == 60               # confirming: 60 s
+    clock.tick(60)
+    assert upkeep() == 60
+    clock.tick(60)
+    assert upkeep() == 120              # 3rd read: unprovable, noted
+    assert all(p["miss"]["noted"] for p in st["positions"].values())
+    assert len(b.fill_calls) == 2
+    for _ in range(6):                  # 12 more minutes
+        clock.tick(120)
+        upkeep()
+    assert len(b.fill_calls) == 2 and len(b.asked) == 9
+    clock.tick(240)                     # 15 min after the last ask
+    upkeep()
+    assert len(b.fill_calls) == 4
+    assert all(p["qty"] == 2 for p in st["positions"].values())
+
+
+def test_agents_earlier_orders_and_used_sales_never_prove_a_shortfall(home, clock):
+    """Re-entry in a contract sold minutes earlier (inside the open-time
+    slack): the agent's own earlier sell, and an owner's sale an earlier
+    close already used, must not explain the new position's shortfall."""
+    st = _state(trusted=False)
+    st["agent_order_ids"] = ["prev-agent-sell"]
+    st["position_sync"] = {"fills_used": ["prev-owner-sell"]}
+    early = agent._iso_at(T0 - 3600 - 300)      # 5 min before this entry
+    b = FillsBroker({U1: 0}, fills=[_fill("prev-agent-sell", at=early),
+                                    _fill("prev-owner-sell", at=early)])
+    sync(st, b)
+    clock.tick(60)
+    assert _status(sync(st, b)) == "unproven"
+    assert b.fill_calls[0]["own"] == ["o-agent", "prev-agent-sell"]
+    assert st["positions"][KEY]["qty"] == 2 and _log(home) == []
+
+
 def test_absence_only_trusted_is_gone_unmeasured(home, clock, notes):
     st = _state()
     b = HoldBroker({U1: 0})
@@ -664,32 +715,55 @@ def test_upkeep_swallows_errors(capsys):
     assert "position check error (non-fatal): disk full" in capsys.readouterr().out
 
 
-def test_disconnect_event_reported_once_with_blank_contract_periodic(home):
-    def lost():
+class Flaky:
+    """A client whose login drops during a read, like RobinhoodMCP (sets
+    last_error, then reports broker_disconnected once)."""
+    last_error = None
+
+    def lose(self):
+        self.last_error = "can't reach Robinhood (ReadTimeout)"
         broker_events.report("broker_disconnected", "Robinhood connection lost")
-        return None
+
+
+def test_disconnect_during_a_read_is_the_broker_down_alert(home, notes):
+    """No trade was attempted: a dropped login during a holdings read is the
+    once-a-day 'connection is DOWN' alert, not a 'trade NOT placed ()' row."""
+    client = Flaky()
     st = _state()
-    sync(st, HoldBroker(lost))
-    (row,) = _log(home)
-    assert row["action"] == "broker_disconnected" and row["contract"] == ""
-    assert "event_id" not in row
+    sync(st, HoldBroker(lambda: client.lose()), client=client)
+    assert _log(home) == [] and agent._problems_today() == []
+    assert len(notes) == 1 and "broker connection is DOWN" in notes[0]
+    client.last_error = None
+    sync(st, HoldBroker(lambda: client.lose()), client=client)
+    assert len(notes) == 1   # once a day
 
 
-def test_disconnect_event_reported_with_contract_and_event_id_at_gate(home, notes):
-    def lost():
-        broker_events.report("broker_disconnected", "Robinhood connection lost")
-        return None
+def test_gate_read_failure_then_exit_goes_through_no_trade_problem(home, notes):
+    """The pre-exit read fails, the sell itself gets through: no 'trade NOT
+    placed' alert or problem row for an exit that happened."""
+    class Recovers(HoldBroker):
+        def execute(self, client, cfg, event, state):
+            client.last_error = None  # the order call reconnected
+            return super().execute(client, cfg, event, state)
+    client = Flaky()
+    st = _state()
+    b = Recovers(lambda: client.lose())
+    assert handle(st, b, client=client).startswith("EXIT")
+    assert b.executed == [("EXITED", 2)] and len(b.asked) == 1
+    assert [r["action"] for r in _log(home)] == ["exit"]
+    assert not any("NOT placed" in n for n in notes)
+
+
+def test_gate_waits_on_fresh_shortfall_while_reads_fail(home, notes):
     # a fresh trusted shortfall + unknown reads: the exit waits, twice
     st = _state(miss={"held": 0, "reads": 1, "need": 2, "first_at": T0,
                       "last_at": T0})
-    b = HoldBroker(lost)
+    b = HoldBroker(lambda: broker_events.report("broker_disconnected", "lost"))
     for _ in range(2):
         with pytest.raises(agent.ExitNotDone):
             handle(st, b)
-    rows = [r for r in _log(home) if r["action"] == "broker_disconnected"]
-    assert len(rows) == 1 and len(b.asked) == 2
-    assert rows[0]["contract"] == CONTRACT and rows[0]["event_id"] == "x1"
-    assert b.executed == []
+    assert len(b.asked) == 2 and b.executed == []
+    assert not [r for r in _log(home) if r["action"] == "broker_disconnected"]
 
 
 def test_manual_close_never_uses_problem_rows_or_trade_not_placed_alerts(home, clock, notes):
@@ -737,18 +811,51 @@ def test_gate_zero_two_polls_closes_without_order(home, clock, notes):
     assert len(notes) == 1
 
 
-def test_gate_gone_needs_three_polls_when_broker_reports_sales(home, clock, notes):
+def test_gate_gone_takes_as_long_as_the_periodic_check(home, clock, notes):
+    """With no sale on record, the exit check (reads 20 s apart) drops a row
+    only after 3 reads spanning 2 minutes, like the periodic check — and
+    keeps the signal one more poll for the re-held check."""
     st = _state()
     b = FillsBroker({U1: 0}, fills=[])
-    for _ in range(2):
-        with pytest.raises(agent.ExitNotDone):
+    for _ in range(6):                  # 0 … 100 s
+        with pytest.raises(agent.ExitNotDone, match="re-checking"):
             handle(st, b)
-        clock.tick(21)
-    assert b.executed == [] and _log(home) == [] and notes == []
-    assert handle(st, b) is None
+        clock.tick(20)
+    assert KEY in st["positions"] and _log(home) == [] and notes == []
+    with pytest.raises(agent.ExitNotDone, match="no sale was found"):
+        handle(st, b)                   # 120 s: dropped, no order
     assert KEY not in st["positions"] and b.executed == []
     (row,) = _log(home)
     assert row["cause"] == "gone" and row["event_id"] == "x1"
+    assert st["closed_outside"][KEY]["cause"] == "gone"
+    clock.tick(20)
+    assert handle(st, b) is None        # still not held: the signal is done
+    assert b.executed == [] and len(notes) == 1 and len(b.asked) == 8
+
+
+def test_gate_gone_then_contracts_back_warns_on_next_poll(home, clock, notes):
+    st = _state()
+    b = FillsBroker({U1: 0}, fills=[])
+    while KEY in st["positions"]:
+        with pytest.raises(agent.ExitNotDone):
+            handle(st, b)
+        clock.tick(20)
+    b.held = [{U1: 2}]                  # the listing glitch is over
+    assert handle(st, b) is None
+    assert b.executed == [] and "holds 2 now" in notes[-1]
+
+
+def test_unreadable_sales_dont_count_toward_gone(home, clock):
+    """'Gone with no sale' needs the sales list: while it can't be read,
+    the shortfall waits (up to 10 min)."""
+    st = _state()
+    b = FillsBroker({U1: 0}, fills=None)
+    for _ in range(10):                 # 0 … 540 s
+        assert _status(sync(st, b)) == "miss"
+        clock.tick(60)
+    assert st["positions"][KEY]["qty"] == 2 and _log(home) == []
+    assert _status(sync(st, b)) == "closed"     # 600 s
+    assert _log(home)[0]["cause"] == "gone"
 
 
 def test_gate_reduced_below_new_qty_waits(home, clock):
