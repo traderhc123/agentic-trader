@@ -1004,7 +1004,7 @@ def test_kept_exit_signal_never_sells_a_new_position(home, clock, notes, no_poli
         clock.tick(20)
         with pytest.raises(agent.ExitNotDone):
             handle(st, b)
-    assert st["closed_outside"][KEY]["exit_event"] == "x1"
+    assert st["closed_outside"][KEY]["held_exits"] == ["x1"]
     b.held = [{U1: 2}]                  # the new entry fills
     if when == "next_poll":
         clock.tick(30)
@@ -1016,6 +1016,45 @@ def test_kept_exit_signal_never_sells_a_new_position(home, clock, notes, no_poli
     assert b.executed == [] and st["positions"][KEY]["qty"] == 2
     assert st["stale_exits"] == ["x1"] and len(notes) == 1   # the "gone" note
     assert [r["action"] for r in _log(home)] == ["exit", "entry"]
+    clock.tick(300)
+    assert handle(st, b, ev=_exit("x2")).startswith("EXIT")
+    assert b.executed == [("EXITED", 2)] and KEY not in st["positions"]
+
+
+@pytest.mark.parametrize("why_kept", ["wait", "refused"])
+def test_kept_exit_never_sells_a_new_position_after_the_periodic_check(
+        home, clock, notes, no_policy, why_kept):
+    """An exit signal kept for another poll (the check waits on a read, or
+    the sell was refused), and then the periodic holdings check — not the
+    exit check — finds the position closed. A new entry in that contract
+    handled before the kept signal (a newest-first batch) must not be
+    sold by it; the new position's own exit sells as usual."""
+    st = _state()
+    if why_kept == "wait":
+        b = FillsBroker({U1: 0}, fills=[_fill()])   # one read of the sale
+    else:
+        class Refuses(FillsBroker):
+            def execute(self, client, cfg, event, state):
+                if event["event_id"] == "x1":
+                    broker_events.report("exit_failed", "market closed")
+                    return False
+                return super().execute(client, cfg, event, state)
+        b = Refuses({U1: 2}, fills=[_fill()])
+    with pytest.raises(agent.ExitNotDone):
+        handle(st, b)
+    b.held = [{U1: 0}]                  # the owner sold in the app
+    for _ in range(3):
+        clock.tick(61)
+        agent._position_upkeep(CFG, st, lambda s: None, b, object())
+        if KEY not in st["positions"]:
+            break
+    assert st["closed_outside"][KEY]["held_exits"] == ["x1"]
+    b.held = [{U1: 2}]                  # the new entry fills
+    ev = make_event(expiry="2099-12-18", event_id="open-2")
+    assert handle(st, b, ev=ev).startswith("ENTRY")
+    assert handle(st, b) is None        # the kept signal comes back
+    assert b.executed == [] and st["positions"][KEY]["qty"] == 2
+    assert st["stale_exits"] == ["x1"]
     clock.tick(300)
     assert handle(st, b, ev=_exit("x2")).startswith("EXIT")
     assert b.executed == [("EXITED", 2)] and KEY not in st["positions"]
@@ -1203,6 +1242,35 @@ def test_gate_inside_grace_and_expiry_close_go_without_read(monkeypatch):
     assert b.executed == [("EXITED", 2)] and b.asked == []
 
 
+@pytest.mark.parametrize("close_only", [True, False], ids=["close-only", "plain-sell"])
+def test_dead_exit_from_4pm_on_expiry_day(home, notes, monkeypatch, close_only):
+    """Holdings aren't read from 4 PM ET on expiry day, so a sell that
+    waits for a read can't get one. After a sell that filled nothing, only
+    an adapter whose sells can't open a position sells again; elsewhere
+    the exit waits (no read, no order) and the owner is told once."""
+    monkeypatch.setattr(agent, "_et_now",
+                        lambda: datetime(2026, 10, 30, 16, 1, tzinfo=agent.MARKET_TZ))
+    key = "SPY|2026-10-30|752.0|C"
+    st = {"positions": {key: _row(exit_unfilled_at=T0 - 30)}, "seen": [],
+          "position_sync": {"proven": {TAG: "2026-10-29T15:00:00+00:00"}}}
+    b = FillsBroker({U1: 2})
+    b.CLOSE_ONLY_EXITS = close_only
+    ev = make_event(event="EXITED", expiry="2026-10-30", event_id="x1")
+    if close_only:
+        assert handle(st, b, ev=ev).startswith("EXIT")
+        assert b.executed == [("EXITED", 2)] and _on_hold(notes) == []
+        return
+    for _ in range(3):
+        with pytest.raises(agent.ExitNotDone):
+            handle(st, b, ev=ev)
+    assert b.executed == [] and b.asked == [] and st["positions"][key]["qty"] == 2
+    (note,) = _on_hold(notes)
+    assert note.startswith("agentic-trader: the exit for SPY 2026-10-30 $752.0 C "
+                           "is on hold")
+    assert "after 4 PM ET on its expiry day, so it won't sell again" in note
+    assert "close it yourself if you still hold it" in note
+
+
 def test_gate_last_error_goes_without_read():
     st = _state()
     b = FillsBroker({U1: 0})
@@ -1281,6 +1349,27 @@ def test_gate_exception_falls_back_to_go(monkeypatch):
     b = FillsBroker({U1: 0})
     handle(st, b)
     assert b.executed == [("EXITED", 2)]
+
+
+@pytest.mark.parametrize("close_only", [True, False], ids=["close-only", "plain-sell"])
+def test_gate_exception_after_a_dead_exit_waits_unless_close_only(monkeypatch,
+                                                                  close_only):
+    """A failed check falls back to selling, except after a sell that
+    filled nothing on an adapter whose sells aren't close-only: that sell
+    may still fill late, and selling again unchecked could open a short."""
+    def boom(*a, **k):
+        raise PermissionError(13, "state.json is open in another program")
+    monkeypatch.setattr(agent, "_sync_positions", boom)
+    st = _state(exit_unfilled_at=T0 - 30)
+    b = FillsBroker({U1: 0})
+    b.CLOSE_ONLY_EXITS = close_only
+    if close_only:
+        handle(st, b)
+        assert b.executed == [("EXITED", 2)]
+    else:
+        with pytest.raises(agent.ExitNotDone):
+            handle(st, b)
+        assert b.executed == [] and st["positions"][KEY]["qty"] == 2
 
 
 # ── exits the broker accepted but didn't sell ───────────────────────────────
@@ -1396,6 +1485,21 @@ def test_dead_exit_then_unclear_reads_wait_before_selling_again(home, clock, not
         assert st["positions"][KEY]["exit_stuck_warned"] is True
 
 
+def test_stuck_exit_alert_names_the_running_adapter(home, clock, notes, monkeypatch):
+    """The dashboard switched broker after `run` started: the on-hold alert
+    names the account the running adapter trades."""
+    b = DeadSell({U1: 2}, None)
+    monkeypatch.setitem(agent.BROKERS, "robinhood", b)
+    cfg = {**CFG, "broker": "alpaca", "alpaca_paper": True}
+    st = _state()
+    for _ in range(25):                 # 12 min of 30 s polls
+        with pytest.raises(agent.ExitNotDone):
+            handle(st, b, cfg=cfg)
+        clock.tick(30)
+    (note,) = _on_hold(notes)
+    assert "your Robinhood account" in note and b.sells == 1
+
+
 class SellsLater(DeadSell):
     """The first exit dies unfilled; each later one sells one contract."""
 
@@ -1470,6 +1574,19 @@ def test_dead_exit_sells_again_only_when_every_contract_is_held(home, clock):
     assert b.executed == [] and pos["qty"] == 2 and pos["miss"]["held"] == 1
 
 
+def test_dead_exit_owner_sold_part_rest_held_sells_the_rest_at_once(home, clock):
+    """After a dead exit a read proves the owner sold 1 of 3 and shows the
+    other 2 still held: the row shrinks to 2 and the exit sells those 2 on
+    this poll, not a poll later."""
+    st = _state(qty=3, exit_unfilled_at=T0 - 30,
+                miss={"held": 2, "reads": 1, "need": 2, "first_at": T0 - 60,
+                      "last_at": T0 - 60})
+    b = FillsBroker({U1: 2}, fills=[_fill("owner-1", qty=1)])
+    assert handle(st, b).startswith("EXIT")
+    assert b.executed == [("EXITED", 2)]
+    assert [(r["action"], r["qty"]) for r in _log(home)] == [("exit", 1), ("exit", 2)]
+
+
 def test_dead_exit_then_refused_sells_close_after_reads(home, clock):
     """Later sells refused when placed (no order, no stamp): the gate keeps
     reading and closes the row once the owner's sale shows up."""
@@ -1523,16 +1640,23 @@ ALPACA = {"broker": "alpaca", "alpaca_paper": False, "alpaca_key_id": "k",
           "alpaca_secret": "s"}
 
 
-def _alpaca(monkeypatch, clock, after_cancel=("pending_cancel", "0")):
+class FakeAlpaca0DTE(FakeAlpaca):
+    OCC = "SPY261030C00752000"     # expires on the test day, 2026-10-30
+    KEY = "SPY|2026-10-30|752.0|C"
+
+
+def _alpaca(monkeypatch, clock, after_cancel=("pending_cancel", "0"),
+            fake=FakeAlpaca):
     """The real Alpaca adapter on a FakeAlpaca, one trusted row."""
     import types
     from brokers import alpaca
-    http = FakeAlpaca(after_cancel=after_cancel)
+    http = fake(after_cancel=after_cancel)
     monkeypatch.setattr(alpaca, "requests", http)
     monkeypatch.setattr(alpaca, "time", types.SimpleNamespace(time=clock,
                                                               sleep=lambda s: None))
     tag = account_tag(ALPACA)
-    st = {"positions": {KEY: _row(option_id=FakeAlpaca.OCC, acct=tag)}, "seen": [],
+    key = getattr(fake, "KEY", KEY)
+    st = {"positions": {key: _row(option_id=fake.OCC, acct=tag)}, "seen": [],
           "position_sync": {"proven": {tag: "2026-10-29T15:00:00+00:00"}}}
     return alpaca, http, st, alpaca.client(ALPACA)
 
@@ -1586,6 +1710,89 @@ def test_alpaca_dead_exit_that_fills_late_never_sells_again(home, clock, monkeyp
     assert len(http.posts) == 1 and st["positions"][KEY]["qty"] == 2
     assert len(_on_hold(notes)) == 1 and "your Alpaca account" in _on_hold(notes)[0]
     assert http.position_reads == 1 + 19 + 6   # once a minute after 10 min
+
+
+@pytest.mark.parametrize("then", ["owner_sells", "first_sell_fills_late"])
+def test_alpaca_0dte_dead_exit_never_resells_blind_after_4pm(home, clock, monkeypatch,
+                                                              notes, then):
+    """Real Alpaca adapter, a contract expiring today: the exit sell dies at
+    3:59 PM ET and the account goes flat. Holdings aren't read from 4 PM ET
+    on expiry day, so no read can clear a second plain sell: through 4:15 PM
+    the agent sends just the one sell and alerts once."""
+    key = FakeAlpaca0DTE.KEY
+    alpaca, http, st, client = _alpaca(monkeypatch, clock, fake=FakeAlpaca0DTE)
+    clock.t = datetime(2026, 10, 30, 15, 59, 25, tzinfo=agent.MARKET_TZ).timestamp()
+    monkeypatch.setattr(agent, "_et_now",
+                        lambda: datetime.fromtimestamp(clock(), agent.MARKET_TZ))
+    ev = make_event(event="EXITED", expiry="2026-10-30", event_id="x1")
+    with pytest.raises(agent.ExitNotDone):
+        handle(st, alpaca, ev=ev, cfg=ALPACA, client=client)
+    assert len(http.posts) == 1
+    http.held = 0
+    if then == "owner_sells":
+        http.closed_orders = [{"id": "owner-1", "symbol": FakeAlpaca0DTE.OCC,
+                               "side": "sell", "filled_qty": "2",
+                               "filled_avg_price": "0.40", "status": "filled",
+                               "filled_at": "2026-10-30T19:59:50Z"}]
+    end = datetime(2026, 10, 30, 16, 15, tzinfo=agent.MARKET_TZ)
+    while agent._et_now() < end:        # 30 s polls past 4 PM
+        clock.tick(30)
+        with pytest.raises(agent.ExitNotDone):
+            handle(st, alpaca, ev=ev, cfg=ALPACA, client=client)
+    assert len(http.posts) == 1 and st["positions"][key]["qty"] == 2
+    (note,) = _on_hold(notes)
+    assert "your Alpaca account for it after 4 PM ET on its expiry day" in note
+
+
+def test_alpaca_state_save_failure_after_dead_exit_never_resells_blind(
+        home, clock, monkeypatch):
+    """Real Alpaca adapter: the exit sell dies, then fills late (account
+    flat). On the next poll state.json can't be written once (on Windows
+    another program can hold it open), so the exit check fails part-way.
+    The agent must not fall back to a second plain sell."""
+    alpaca, http, st, client = _alpaca(monkeypatch, clock)
+    with pytest.raises(agent.ExitNotDone):
+        handle(st, alpaca, cfg=ALPACA, client=client)
+    http.held = 0
+    saves = []
+
+    def locked_once(s):
+        saves.append(1)
+        if len(saves) == 1:
+            raise PermissionError(13, "The process cannot access the file")
+    clock.tick(30)
+    with pytest.raises(agent.ExitNotDone):
+        agent.handle_event(_exit(), ALPACA, st, alpaca, client, locked_once)
+    assert len(saves) == 2 and len(http.posts) == 1
+    assert st["positions"][KEY]["qty"] == 2
+
+
+def test_alpaca_paper_row_blocked_after_switch_to_live_with_startup_client(
+        home, clock, monkeypatch, notes, no_policy):
+    """`run` keeps the Alpaca client built from the paper config; the owner
+    switches to live in the dashboard and Alpaca orders follow the live
+    config. A row opened in paper is blocked, never sold in the live
+    account, and a new entry is tagged live."""
+    import types
+    from brokers import alpaca
+    http = FakeAlpaca()
+    monkeypatch.setattr(alpaca, "requests", http)
+    monkeypatch.setattr(alpaca, "time", types.SimpleNamespace(time=clock,
+                                                              sleep=lambda s: None))
+    paper = {**ALPACA, "alpaca_paper": True}
+    client = alpaca.client(paper)       # the startup copy: paper
+    ptag = account_tag(paper)
+    st = {"positions": {KEY: _row(option_id=FakeAlpaca.OCC, acct=ptag)}, "seen": [],
+          "position_sync": {"proven": {ptag: "2026-10-29T15:00:00+00:00"}}}
+    assert handle(st, alpaca, cfg=ALPACA, client=client) is None
+    assert http.posts == [] and KEY in st["positions"]
+    assert [r["action"] for r in _log(home)] == ["exit_failed"]
+    st2 = {"positions": {}, "seen": []}
+    monkeypatch.setattr(alpaca, "_size", lambda cfg, occ: (1, "test"))
+    http.after_cancel = ("filled", "1")
+    ev = make_event(expiry="2099-12-18", event_id="open-9")
+    assert handle(st2, alpaca, ev=ev, cfg=ALPACA, client=client).startswith("ENTRY")
+    assert st2["positions"][KEY]["acct"] == "alpaca:live"
 
 
 def test_alpaca_exit_with_unconfirmed_cancel_says_check_this_trade(home, clock,
@@ -1803,6 +2010,22 @@ def test_check_positions_cli_never_writes_state(home, monkeypatch, capsys):
     agent.cmd_check_positions()
     assert "broker answer    : unknown" in capsys.readouterr().out
     assert (home / "state.json").read_bytes() == before
+
+
+def test_check_positions_with_the_broker_disconnected_says_so(home, monkeypatch,
+                                                             capsys):
+    import types
+    agent._save(agent.STATE_PATH, _state())
+    agent._save(agent.CONFIG_PATH, CFG)
+    fake = types.SimpleNamespace(
+        client=lambda cfg: None,        # e.g. an expired Robinhood login
+        held_option_qty=lambda client, cfg, ids: pytest.fail("no read without a client"))
+    monkeypatch.setitem(agent.BROKERS, "robinhood", fake)
+    agent.cmd_check_positions()
+    out = capsys.readouterr().out
+    assert ("broker answer    : unknown — broker not connected — run: "
+            "python agent.py setup") in out
+    assert "agent tracks 2, broker shows unknown" in out
 
 
 def test_check_positions_is_in_the_help_text():

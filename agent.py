@@ -960,6 +960,7 @@ POS_FILL_SLACK_S = 600     # clock slack when matching sells to the open time
 POS_SYNC_CLOSED_S = 1800   # check interval outside market hours
 _TOMBSTONES_KEPT = 100
 _STALE_EXITS_KEPT = 50
+_HELD_EXITS_KEPT = 10
 _FILL_IDS_KEPT = 20
 _FILLS_USED_KEPT = 100
 _BROKER_NAMES = {"robinhood": "Robinhood", "alpaca": "Alpaca", "moomoo": "moomoo"}
@@ -1419,10 +1420,14 @@ def _close_outside(cfg, state, save_state, broker, key, target, px, closed_at,
 
 def _bury(state, key, snap, q, cause):
     """Remember a position closed outside the agent: a replay of the signal
-    that opened it must not buy again (handle_event)."""
-    state.setdefault("closed_outside", {})[key] = {
-        "option_id": snap.get("option_id"), "opened_event": snap.get("opened_event"),
-        "acct": snap.get("acct"), "qty": q, "cause": cause, "at": _iso_at(_now())}
+    that opened it must not buy again, and an exit signal it kept for
+    another poll must never sell a new position in this contract
+    (handle_event)."""
+    tomb = {"option_id": snap.get("option_id"), "opened_event": snap.get("opened_event"),
+            "acct": snap.get("acct"), "qty": q, "cause": cause, "at": _iso_at(_now())}
+    if _ids(snap.get("held_exits")):
+        tomb["held_exits"] = _ids(snap.get("held_exits"))
+    state.setdefault("closed_outside", {})[key] = tomb
 
 
 def _outside_reason(cause, name, k, q, target, px):
@@ -1493,8 +1498,9 @@ def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev):
     "closed" (closed outside the agent — nothing to sell), "gone" (just
     dropped with no sale on record — nothing to sell, but look once more
     next poll), "blocked" (the row belongs to another account or mode) or
-    "wait" (the account shows fewer contracts than the ledger — re-check
-    before selling)."""
+    "wait" (the account shows fewer contracts than the ledger, or the
+    last sell filled nothing and no read shows the contracts still held —
+    re-check before selling)."""
     pos = state["positions"].get(pos_key) or {}
     tag = _account_tag(cfg, broker, client)
     if pos.get("acct") and pos["acct"] != tag:
@@ -1506,15 +1512,22 @@ def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev):
     # there's no grace period — read first, and sell again only once a
     # read shows the contracts still held (unclear reads wait a while).
     unfilled_at = _float0(pos.get("exit_unfilled_at"))
-    if _past_expiry_close(pos_key) or (
-            not unfilled_at and _now() - _grace_anchor(pos) < POS_GRACE_S):
+    if _past_expiry_close(pos_key):
+        if not _resell_needs_read(pos, broker):
+            return "go"
+        # Holdings aren't read from 4 PM ET on expiry day, so the read
+        # this sell waits for can't come: hold it and tell the owner.
+        _warn_exit_stuck(cfg, state, save_state, broker, pos_key, pos,
+                         expiring=True)
+        return "wait"
+    if not unfilled_at and _now() - _grace_anchor(pos) < POS_GRACE_S:
         return "go"
     # Past that while, only an adapter whose exits can't open a position
     # goes back to the usual rules. Elsewhere the dead sell may have filled
     # late, and a plain sell on a flat account opens a short: keep waiting
     # for such a read, and read at most once a minute meanwhile.
-    stuck = (unfilled_at and _now() - unfilled_at >= POS_MISS_FRESH_S
-             and not getattr(broker, "CLOSE_ONLY_EXITS", False))
+    stuck = (_resell_needs_read(pos, broker)
+             and _now() - unfilled_at >= POS_MISS_FRESH_S)
     if stuck:
         if _now() - _float0(pos.get("exit_read_at")) < POS_CONFIRM_S:
             return "wait"
@@ -1529,7 +1542,7 @@ def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev):
             return "closed"
         # handle_event keeps this signal one more poll: if a new position
         # in this contract opens meanwhile, the signal must not sell it
-        tomb["exit_event"] = ev["event_id"]
+        _keep_exit(tomb, ev["event_id"])
         return "gone"
     res = r.get(pos_key)
     if unfilled_at:
@@ -1553,17 +1566,34 @@ def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev):
     return "wait"
 
 
-def _warn_exit_stuck(cfg, state, save_state, broker, pos_key, row):
+def _resell_needs_read(pos, broker):
+    """True when the row's last sell filled nothing and this adapter's
+    sells aren't close-only: that sell may still fill late, and a plain
+    sell on a flat account opens a short. Selling again needs a read
+    showing the contracts still held."""
+    return bool(_float0((pos or {}).get("exit_unfilled_at"))
+                and not getattr(broker, "CLOSE_ONLY_EXITS", False))
+
+
+def _warn_exit_stuck(cfg, state, save_state, broker, pos_key, row, expiring=False):
     """Once per row: an exit waits on a read that may never come."""
     if row.get("exit_stuck_warned"):
         return
     row["exit_stuck_warned"] = True
-    save_state(state)
+    try:
+        save_state(state)
+    except Exception:
+        pass  # the alert matters more; the flag is saved with the next change
     name = _BROKER_NAMES.get(_broker_name(cfg, broker), "broker")
+    if expiring:
+        why = (f"the agent doesn't check your {name} account for it after 4 PM "
+               "ET on its expiry day, so it won't sell again")
+    else:
+        why = (f"your {name} account doesn't clearly show the contracts are "
+               "still held. The agent won't sell again until a holdings check "
+               "shows them")
     msg = (f"the exit for {_contract_of(pos_key)} is on hold. The agent's sell "
-           f"order filled nothing, and your {name} account doesn't clearly "
-           "show the contracts are still held. The agent won't sell again "
-           "until a holdings check shows them — check your broker app and "
+           f"order filled nothing, and {why} — check your broker app and "
            "close it yourself if you still hold it.")
     print(msg)
     notify(cfg, "agentic-trader: " + msg)
@@ -1626,10 +1656,20 @@ def _note_unfilled_exit(pos, prior_pos):
     pos["exit_unfilled_at"] = _now()
 
 
+def _keep_exit(rec, event_id):
+    """An exit signal kept unseen for another poll (waiting on a read, or
+    not done yet), noted on its row, or on the tombstone of a row the exit
+    check just dropped. If the row is found closed outside the agent — by
+    the exit check or the periodic one — its tombstone carries the note
+    (_bury), so the signal never sells a new position in this contract."""
+    ids = [i for i in _ids(rec.get("held_exits")) if i != str(event_id)]
+    rec["held_exits"] = (ids + [str(event_id)])[-_HELD_EXITS_KEPT:]
+
+
 def _note_stale_exit(state, event_id):
-    """A new position opened in a contract whose old exit signal is still
-    waiting for one more look (verdict "gone"): that signal belongs to the
-    old position and must never sell the new one (handle_event)."""
+    """A new position opened in a contract whose old exit signal was kept
+    for another poll (_keep_exit): that signal belongs to the old position
+    and must never sell the new one (handle_event)."""
     ids = [i for i in _ids(state.get("stale_exits")) if i != str(event_id)]
     state["stale_exits"] = (ids + [str(event_id)])[-_STALE_EXITS_KEPT:]
 
@@ -1779,6 +1819,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                                          pos_key, ev)
         except Exception as exc:
             print(f"position check before exit failed (non-fatal): {str(exc)[:150]}")
+            if _resell_needs_read(state["positions"].get(pos_key), broker):
+                verdict = "wait"  # never sell again unchecked after a dead sell
         if verdict == "closed":
             print(f"EXITED {contract}: already closed outside the agent — no "
                   "order placed")
@@ -1800,6 +1842,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                             event_id=ev["event_id"], book=book)
             return None
         if verdict == "wait":
+            if pos_key in state["positions"]:
+                _keep_exit(state["positions"][pos_key], ev["event_id"])
             save_state(state)
             raise ExitNotDone(f"exit for {contract}: your broker doesn't clearly "
                               "show the contracts still held — re-checking "
@@ -1861,6 +1905,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                                     "nothing sold — retrying" if changed else
                                     "the exit order wasn't placed",
                                     event_id=ev["event_id"])
+                _keep_exit(held, ev["event_id"])
+                save_state(state)  # with the dead-sell mark, if any
                 raise ExitNotDone(f"exit for {contract} not done — retrying "
                                   "next poll")
 
@@ -1896,8 +1942,9 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 record["est_pnl_usd"] = est
         if action == "entry":
             buried = _tombstones(state).pop(pos_key, None)
-            if isinstance(buried, dict) and buried.get("exit_event"):
-                _note_stale_exit(state, buried["exit_event"])
+            for old in _ids((buried if isinstance(buried, dict) else {})
+                            .get("held_exits")):
+                _note_stale_exit(state, old)
         _log_trade(record)
         save_state(state)
         return f"{prefix}{action.upper()}: {contract}"
