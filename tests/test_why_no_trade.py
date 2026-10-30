@@ -85,6 +85,23 @@ def test_problem_with_a_placed_order_says_check_this_trade(home, no_policy, note
                      "activity log.)"]
 
 
+@pytest.mark.parametrize("first", ["rejected", "placed"])
+def test_placed_and_not_placed_alerts_never_hide_each_other(home, no_policy, notes,
+                                                            first):
+    """One alert per kind per day, but "check this trade" (the order went
+    in and may have filled) and "trade NOT placed" are separate: neither
+    hides the other, in either order."""
+    state = {"positions": {}, "seen": []}
+    brokers = {"rejected": RejectingBroker(), "placed": PlacedButUnclearBroker()}
+    other = "placed" if first == "rejected" else "rejected"
+    for i, name in enumerate([first, other, first, other]):
+        ev = make_event(event_id=f"e{i}", ticker="QQQ" if name == "rejected" else "SPY")
+        agent.handle_event(ev, CFG, state, brokers[name], object(), lambda s: None)
+    heads = sorted(n.split(" — ")[0] for n in notes)
+    assert heads == ["agentic-trader: check this trade (SPY 2026-07-10 $752.0 C)",
+                     "agentic-trader: trade NOT placed (QQQ 2026-07-10 $752.0 C)"]
+
+
 def test_report_marks_placed_orders_only_when_asked():
     broker_events.begin()
     broker_events.report("order_failed", "rejected")

@@ -745,9 +745,11 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
         return
     today = datetime.now(timezone.utc).date().isoformat()
     sent = state.setdefault("problem_notified", {})
-    if sent.get(kind) == today:
+    # "check this trade" and "trade NOT placed" alerts never hide each other
+    slot = f"{kind}:placed" if placed else kind
+    if sent.get(slot) == today:
         return
-    sent[kind] = today
+    sent[slot] = today
     try:
         save_state(state)
     except Exception:
