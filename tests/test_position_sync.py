@@ -4,7 +4,8 @@ gone — logged as an exit (P&L, slot, later exit signal all line up). An
 unreadable or unclear answer must never change anything. Zero network."""
 
 import json
-from datetime import datetime, timedelta, timezone
+import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -989,3 +990,41 @@ def test_prune_drops_expired_tombstones_and_caps_100():
     saved.clear()
     agent._prune_expired_positions({}, st, lambda s: saved.append(1))
     assert not saved and KEY in st["closed_outside"]
+
+
+# ── python agent.py check-positions (read-only) ─────────────────────────────
+
+def test_check_positions_cli_never_writes_state(home, monkeypatch, capsys):
+    import types
+    st = _state(qty=2, miss={"held": 1, "reads": 1, "need": 2, "first_at": T0,
+                             "last_at": T0})
+    st["positions"]["QQQ|2099-12-18|500.0|P"] = _row(option_id=U2, acct="alpaca:paper")
+    st["positions"]["DRY|2099-12-18|1.0|C"] = {"option_id": "dry", "qty": 1, "dry": True}
+    agent._save(agent.STATE_PATH, st)
+    agent._save(agent.CONFIG_PATH, CFG)
+    before = (home / "state.json").read_bytes()
+    asked = []
+    fake = types.SimpleNamespace(
+        client=lambda cfg: object(),
+        held_option_qty=lambda client, cfg, ids: asked.append(ids) or {U1: 1})
+    monkeypatch.setitem(agent.BROKERS, "robinhood", fake)
+    monkeypatch.setattr(agent, "_save", lambda *a, **k: pytest.fail("must not write"))
+    monkeypatch.setattr(sys, "argv", ["agent.py", "check-positions"])
+    agent.main()
+    out = capsys.readouterr().out
+    assert asked == [[U1, U2]]                       # live rows only
+    assert "SPY 2099-12-18 752.0 C: agent tracks 2, broker shows 1, same account: yes" in out
+    assert "showed fewer on 1 check(s)" in out
+    assert "QQQ 2099-12-18 500.0 P: agent tracks 2, broker shows unknown" in out
+    assert "NO — opened in another account" in out and "DRY" not in out
+    assert "holdings check   : proven on this account\n" in out
+    assert (home / "state.json").read_bytes() == before
+    # an unclear answer says so, and still writes nothing
+    fake.held_option_qty = lambda client, cfg, ids: None
+    agent.cmd_check_positions()
+    assert "broker answer    : unknown" in capsys.readouterr().out
+    assert (home / "state.json").read_bytes() == before
+
+
+def test_check_positions_is_in_the_help_text():
+    assert "check-positions" in agent.__doc__

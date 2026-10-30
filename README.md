@@ -140,7 +140,7 @@ git clone https://github.com/traderhc123/agentic-trader && cd agentic-trader \
 
 After setup, `./.venv/bin/python agent.py` again starts the agent in the background (dashboard
 at http://127.0.0.1:8721). Prefer terminal prompts to the browser? Use
-`agent.py setup`. Other commands: `status`, `fund <sats>`.
+`agent.py setup`. Other commands: `status`, `check-positions`, `fund <sats>`.
 </details>
 
 **Prerequisites:** Python 3.10+; a Robinhood account with an **Agentic
@@ -192,6 +192,16 @@ A Premium AgentHC API key also works (*Advanced* in the wizard).
 - `ENTERED` → resolves the option on Robinhood and buys **your configured
   number of contracts** to open (market, day) in your Agentic account.
 - `EXITED` → sells to close **only positions this agent opened**.
+- **If you close a trade yourself** in your broker's app, the agent notices
+  within a few minutes (Robinhood and Alpaca, plus moomoo once it has seen
+  your positions there). It checks your account more than once before
+  believing it, then stops tracking what you sold: one Activity row with
+  the P&L when your sale price is known, one notification, the open slot
+  freed, and the later exit signal is ignored. Sold only some? It keeps
+  the rest and the exit signal sells just those. If your broker can't be
+  read clearly, nothing changes and exits work as before. Check it any
+  time with `python agent.py check-positions` (read-only); turn it off
+  with `"position_sync": false` in config.json.
 - State lives in `~/.agentic-trader/` (consent record, config, broker tokens
   `0600`, seen-events + positions).
 - Deliberately simple by design: no stop-losses, no retries on rejected

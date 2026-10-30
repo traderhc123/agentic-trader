@@ -20,6 +20,8 @@ Robinhood's trading MCP).
     python agent.py stop     # stop the background agent
     python agent.py autostart on|off|status   # start at every login
     python agent.py status   # running?, config, wallet balance, open positions
+    python agent.py check-positions   # read-only: open positions next to
+                             # what your broker account holds right now
     python agent.py export FILE   # pack this setup into one passphrase-locked
                              # file to move it to another computer
     python agent.py import FILE   # unpack a move file on the new computer
@@ -2507,6 +2509,69 @@ def cmd_status():
     print(f"open positions   : {list(state.get('positions', {})) or 'none'}")
 
 
+def cmd_check_positions():
+    """Read-only: the live positions the agent tracks next to what the
+    broker account holds right now. Places no orders and never changes
+    state.json — a way to see the holdings check works on your account."""
+    cfg = _load(CONFIG_PATH, {}) or {}
+    state = _load(STATE_PATH, {}) or {}
+    name = cfg.get("broker", "robinhood")
+    broker = BROKERS.get(name)
+    tag = account_tag(cfg)
+    rows = {k: p for k, p in (state.get("positions") or {}).items()
+            if isinstance(p, dict) and not p.get("dry")
+            and p.get("option_id") not in (None, "", "dry")}
+    print(f"broker           : {name}"
+          + (" (holdings check turned off: position_sync false)"
+             if cfg.get("position_sync", True) is False else ""))
+    print("holdings check   : " + ("proven on this account" if _trusted(state, tag)
+                                   else "not proven on this account yet"))
+    if not rows:
+        print("open positions   : none (live)")
+        return
+    held, why = _read_holdings_once(broker, cfg, rows)
+    if why:
+        print(f"broker answer    : unknown — {why}")
+    for key in sorted(rows):
+        pos = rows[key]
+        n = held.get(pos["option_id"]) if isinstance(held, dict) else None
+        acct = pos.get("acct")
+        same = ("not recorded yet (older position)" if acct is None
+                else "yes" if acct == tag else "NO — opened in another account or mode")
+        line = (f"{key.replace('|', ' ')}: agent tracks {pos.get('qty')}, broker "
+                f"shows {n if _is_count(n) else 'unknown'}, same account: {same}")
+        if pos.get("pending"):
+            line += ", agent order still working"
+        miss = pos.get("miss")
+        if isinstance(miss, dict):
+            line += (f", the account showed fewer on {miss.get('reads')} "
+                     f"check(s) (at most {miss.get('held')})")
+        print(line)
+
+
+def _read_holdings_once(broker, cfg, rows):
+    """(held dict or None, why unknown) for the check-positions command."""
+    fn = getattr(broker, "held_option_qty", None) if broker is not None else None
+    if fn is None:
+        return None, "this broker can't report holdings"
+    client = broker.client(cfg)
+    if client is None:
+        return None, "broker not connected — run: python agent.py setup"
+    import broker_events
+    broker_events.begin()
+    try:
+        held = fn(client, cfg, sorted({p["option_id"] for p in rows.values()}))
+    except Exception as exc:
+        held = None
+        print(f"read failed      : {str(exc)[:150]}")
+    for r in broker_events.drain():
+        print(f"broker said      : {r['message']}")
+    if isinstance(held, dict):
+        return held, ""
+    return None, (getattr(client, "last_error", None)
+                  or "the answer wasn't clear, so the agent would change nothing")
+
+
 def doctor_checks():
     """Every readiness check as data: [{id, label, ok, detail, fix, who}].
     who = "owner" for steps only the human can do (agreement, Robinhood
@@ -3073,6 +3138,8 @@ def main():
         cmd_autostart(sys.argv[2] if len(sys.argv) > 2 else "status")
     elif cmd == "status":
         cmd_status()
+    elif cmd == "check-positions":
+        cmd_check_positions()
     elif cmd == "doctor":
         cmd_doctor(as_json="--json" in sys.argv)
     elif cmd == "netcheck":
