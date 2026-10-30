@@ -492,7 +492,7 @@ def test_alpaca_closed_fills(monkeypatch):
 
 
 def test_alpaca_execute_stamps_order_ids(monkeypatch):
-    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty: qty)
+    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": qty)
     monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty: "oid-1")
     st = {"positions": {}}
     cl = alpaca._Client(ALPACA)
@@ -503,7 +503,7 @@ def test_alpaca_execute_stamps_order_ids(monkeypatch):
     assert pos["last_order_at"] == pytest.approx(time.time(), abs=5)
     # a partial exit keeps the rest of the row: its order is stamped too
     pos["last_order_at"] = 1.0
-    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty: 1)
+    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": 1)
     monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty: "oid-2")
     broker_events.begin()
     assert alpaca.execute(cl, {}, make_event(event="EXITED", expiry="2099-12-18"), st)
@@ -512,7 +512,7 @@ def test_alpaca_execute_stamps_order_ids(monkeypatch):
     assert pos["last_order_at"] > 1.0
     # no order id from Alpaca: nothing to remember, but the time still counts
     st = {"positions": {}}
-    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty: qty)
+    monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": qty)
     monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty: "submitted")
     alpaca.execute(cl, {}, make_event(expiry="2099-12-18"), st)
     pos = st["positions"]["SPY|2099-12-18|752.0|C"]

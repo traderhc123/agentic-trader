@@ -10,6 +10,12 @@ A broker module exposes:
     client(cfg)                     authenticated client or None
     execute(client, cfg, event, state) -> bool   act on one normalized event
 
+On an EXITED that sold, execute pops the row, lowers its qty, or (sale
+still working) sets row["pending"] = {"side": "sell", "requested": n, ...}.
+With the read hooks below, a True return that leaves the row unchanged
+means "accepted but nothing sold": the agent re-reads the account and
+retries on the next poll instead of logging an exit.
+
 Optional read-only hooks, used to notice trades the owner closed in the
 broker app (the agent looks them up with getattr, so adapters without them
 behave exactly as before). Neither ever raises, and "unknown" is never

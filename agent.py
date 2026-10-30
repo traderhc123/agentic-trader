@@ -1019,6 +1019,12 @@ def _contract_of(key):
     return f"{t} {e} ${s} {ty}"
 
 
+def _gate_on(cfg, broker, client):
+    """True when the agent can read what the account holds."""
+    return (hasattr(broker, "held_option_qty") and client is not None
+            and cfg.get("position_sync", True) is not False)
+
+
 def _trusted(state, tag):
     """True once the read hook has seen one of the agent's own positions
     held in this account: proof it reads this account correctly."""
@@ -1086,8 +1092,7 @@ def _sync_positions(cfg, state, save_state, broker, client, keys=None,
     for rows in scope (`keys`, default all) that the read positively
     answered. A missing key means unknown."""
     fn = getattr(broker, "held_option_qty", None)
-    if (fn is None or client is None or cfg.get("position_sync", True) is False
-            or getattr(client, "last_error", None)):
+    if not _gate_on(cfg, broker, client) or getattr(client, "last_error", None):
         return {}
     import broker_events
     broker_events.begin()
@@ -1377,8 +1382,7 @@ def _position_upkeep(cfg, state, save_state, broker, client, now=None):
     """Once per heartbeat: check holdings every position_sync_seconds while
     the market is open (default 120 s), every 30 min otherwise, sooner while
     a shortfall waits for confirmation. Never raises."""
-    if (client is None or not hasattr(broker, "held_option_qty")
-            or cfg.get("position_sync", True) is False):
+    if not _gate_on(cfg, broker, client):
         return
     now = _now() if now is None else now
     if now < _POS_SYNC["next_at"]:
@@ -1409,14 +1413,18 @@ def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev,
     row belongs to another account or mode) or "wait" (the account shows
     fewer contracts than the ledger — re-check before selling)."""
     pos = state["positions"].get(pos_key) or {}
-    if (not hasattr(broker, "held_option_qty") or client is None
-            or cfg.get("position_sync", True) is False or pos.get("pending")
-            or _int0(pos.get("qty")) < 1 or getattr(client, "last_error", None)):
-        return "go"
     tag = account_tag(cfg)
     if pos.get("acct") and pos["acct"] != tag:
-        return "blocked"
-    if _now() - _grace_anchor(pos) < POS_GRACE_S or _past_expiry_close(pos_key):
+        return "blocked"  # needs no read: never sell from another account
+    if (not _gate_on(cfg, broker, client) or pos.get("pending")
+            or _int0(pos.get("qty")) < 1 or getattr(client, "last_error", None)):
+        return "go"
+    # The agent's last sell filled nothing: holdings haven't moved, so
+    # there's no grace period — read first, and sell again only once a
+    # read shows the contracts still held (unclear reads wait a while).
+    unfilled_at = _float0(pos.get("exit_unfilled_at"))
+    if _past_expiry_close(pos_key) or (
+            not unfilled_at and _now() - _grace_anchor(pos) < POS_GRACE_S):
         return "go"
     r = _sync_positions(cfg, state, save_state, broker, client, keys={pos_key},
                         confirm_s=POS_EXIT_CONFIRM_S, contract=contract,
@@ -1425,6 +1433,10 @@ def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev,
     if row is None:
         return "closed"
     res = r.get(pos_key)
+    held_all = (res is not None and res["status"] in ("ok", "reduced")
+                and res["held"] >= _int0(row.get("qty")))
+    if unfilled_at and not held_all and _now() - unfilled_at < POS_MISS_FRESH_S:
+        return "wait"
     if res is None:  # unknown: wait only on a fresh, trusted shortfall
         miss = row.get("miss")
         fresh = (isinstance(miss, dict)
@@ -1443,8 +1455,8 @@ def _warn_if_reheld(cfg, state, save_state, broker, client, pos_key, ev, contrac
     sells it — it only sells what it bought."""
     tomb = _tombstones(state).get(pos_key)
     fn = getattr(broker, "held_option_qty", None)
-    if (not isinstance(tomb, dict) or tomb.get("warned") or fn is None
-            or client is None or cfg.get("position_sync", True) is False
+    if (not isinstance(tomb, dict) or tomb.get("warned")
+            or not _gate_on(cfg, broker, client)
             or getattr(client, "last_error", None) or not tomb.get("option_id")
             or tomb.get("acct") not in (None, account_tag(cfg))):
         return
@@ -1482,6 +1494,18 @@ def _contracts_sold(state, pos_key, prior_pos):
                                    _int0(after.get("exit_logged")) + sold)
         return sold
     return _int0((prior_pos or {}).get("qty")) - _int0(after.get("qty"))
+
+
+def _note_unfilled_exit(pos, prior_pos):
+    """An exit the broker accepted sold nothing, so holdings didn't move.
+    The dead order mustn't restart the grace period the adapter stamped
+    (the retry would then sell without reading the account), and the
+    retry waits for a read showing the contracts still held."""
+    if "last_order_at" in (prior_pos or {}):
+        pos["last_order_at"] = prior_pos["last_order_at"]
+    else:
+        pos.pop("last_order_at", None)
+    pos["exit_unfilled_at"] = _now()
 
 
 def handle_event(ev, cfg, state, broker, client, save_state):
@@ -1635,8 +1659,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             return None
         if verdict == "wait":
             save_state(state)
-            raise ExitNotDone(f"exit for {contract}: your broker shows fewer "
-                              "contracts than the agent bought — re-checking "
+            raise ExitNotDone(f"exit for {contract}: your broker doesn't clearly "
+                              "show the contracts still held — re-checking "
                               "next poll before selling")
         existing = state["positions"].get(pos_key)
         if not existing:
@@ -1660,11 +1684,16 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         if ev["event"] == "EXITED" and changed:
             sold = _contracts_sold(state, pos_key, prior_pos)
             after = state["positions"].get(pos_key)
-            if after is not None and not after.get("pending") and sold < 1:
+            if after is not None and sold >= 1:
+                after.pop("exit_unfilled_at", None)
+            if (after is not None and not after.get("pending") and sold < 1
+                    and _gate_on(cfg, broker, client)):
                 # accepted but nothing sold (an order that died unfilled):
-                # the row is still held, so it's retried below — never
-                # logged as an exit
+                # retried below, never logged as an exit. Only where the
+                # account can be read, so a close by the owner meanwhile
+                # stops the retries; elsewhere it's logged as before.
                 action = None
+                _note_unfilled_exit(after, prior_pos)
         for r in reported:
             msg = r["message"]
             if r["kind"] == "order_failed" and broker_events.is_cash_problem(msg):
@@ -1683,7 +1712,10 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             if held and not held.get("pending"):
                 if not reported:
                     _report_problem(cfg, state, save_state, "exit_failed",
-                                    contract, "the exit order wasn't placed",
+                                    contract,
+                                    "the broker accepted the exit order but "
+                                    "nothing sold — retrying" if changed else
+                                    "the exit order wasn't placed",
                                     event_id=ev["event_id"])
                 raise ExitNotDone(f"exit for {contract} not done — retrying "
                                   "next poll")
@@ -1707,6 +1739,10 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         elif action == "exit":
             if sold >= 1:
                 record["qty"] = sold
+                left = state["positions"].get(pos_key)
+                if left is not None and not left.get("pending"):
+                    # the rest is still open: the P&L keeps its opened day
+                    record.update(partial=True, remaining=_int0(left.get("qty")))
             # contracts an earlier exit row already counted get no estimate
             counted = sold - min(sold, _int0((prior_pos or {}).get("exit_logged")))
             est = (_est_exit_pnl({**(prior_pos or {}), "qty": counted},

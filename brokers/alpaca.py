@@ -211,7 +211,10 @@ def _order_state(cfg, oid):
             int(float(o.get("filled_qty") or 0)))
 
 
-def _confirm_fill(cfg, oid, qty):
+_DONE = ("rejected", "canceled", "cancelled", "expired")
+
+
+def _confirm_fill(cfg, oid, qty, side="buy"):
     """Poll the order briefly; returns the filled quantity.
 
     Market DAY orders on options nearly always fill in seconds (paper mode
@@ -219,8 +222,11 @@ def _confirm_fill(cfg, oid, qty):
     phantom position recorded). An order still working after the polls is
     CANCELLED and settled with what actually filled — assuming the requested
     qty is how ledger/broker divergence starts (with a post-cancel recheck
-    for the fill-vs-cancel race)."""
-    import time
+    for the fill-vs-cancel race).
+
+    Less than qty only when the order is known to be dead: a sell reported
+    as unfilled is sold again on the next poll, and if the first one fills
+    after all, a plain sell on a flat account can open a short."""
     if oid == "submitted":
         return qty
     for _ in range(_CONFIRM_TRIES):
@@ -228,25 +234,34 @@ def _confirm_fill(cfg, oid, qty):
         status, filled = _order_state(cfg, oid)
         if status == "filled":
             return filled or qty
-        if status in ("rejected", "canceled", "cancelled", "expired"):
+        if status in _DONE:
             print(f"  order {status} — filled {filled}/{qty}")
             return filled
     try:
-        requests.delete(f"{_base(cfg)}/v2/orders/{oid}",
-                        headers=_headers(cfg), timeout=_TIMEOUT)
+        resp = requests.delete(f"{_base(cfg)}/v2/orders/{oid}",
+                               headers=_headers(cfg), timeout=_TIMEOUT)
+        cancelled = 200 <= int(getattr(resp, "status_code", 0) or 0) < 300
         time.sleep(2)  # let the cancel settle; catch a fill-vs-cancel race
         status, filled = _order_state(cfg, oid)
-        if status == "filled":
-            return filled or qty
+    except Exception:
+        cancelled, status, filled = False, "", 0
+    if status == "filled":
+        return filled or qty
+    if status in _DONE or (cancelled and status):
         print(f"  order didn't fill in "
               f"{_CONFIRM_TRIES * _CONFIRM_WAIT_S:.0f}s — cancelled; "
               f"filled {filled}/{qty}")
         return filled
-    except Exception:
-        # cancel path itself failed — fall back to the optimistic assumption
-        print(f"  order still working and cancel failed — assuming {qty}x "
-              "(check your Alpaca dashboard)")
-        return qty
+    # the cancel didn't take or can't be confirmed: the order may still
+    # fill — fall back to the optimistic assumption, and say so
+    print(f"  order still working and the cancel couldn't be confirmed — "
+          f"assuming {qty}x (check your Alpaca dashboard)")
+    broker_events.report(
+        "order_failed" if side == "buy" else "exit_failed",
+        f"Alpaca couldn't confirm whether the {side} order for {qty}x filled "
+        "(the cancel didn't go through) — the agent assumes it did; check "
+        "your Alpaca dashboard")
+    return qty
 
 
 def execute(cl, cfg, event, state):
@@ -289,7 +304,7 @@ def execute(cl, cfg, event, state):
         print(f"EXITED event -> selling {pos['qty']}x {contract}")
         oid = _order(cfg, pos.get("option_id", occ), "sell", pos["qty"])
         if oid:
-            sold = _confirm_fill(cfg, oid, pos["qty"])
+            sold = _confirm_fill(cfg, oid, pos["qty"], side="sell")
             remaining = int(pos["qty"]) - sold
             if remaining > 0:
                 pos["qty"] = remaining

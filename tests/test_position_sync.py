@@ -833,6 +833,23 @@ def test_gate_account_mismatch_blocks(home, notes):
     assert len(_log(home)) == 1 and KEY in st["positions"]
 
 
+@pytest.mark.parametrize("hooks", [True, False], ids=["sync-off", "no-hooks"])
+def test_gate_account_mismatch_blocks_without_holdings_reads(home, hooks):
+    """The account check needs no read: it holds with position_sync off and
+    for adapters without the hooks (a live sell of a paper row could open a
+    short on Alpaca)."""
+    st = _state(acct="alpaca:paper")
+    cfg = {"broker": "alpaca", "alpaca_paper": False}
+    if hooks:
+        b = FillsBroker({U1: 2})
+        cfg["position_sync"] = False
+    else:
+        b = ScriptedExit(lambda pos, state: pytest.fail("must not sell"))
+    assert handle(st, b, cfg=cfg) is None
+    assert [r["action"] for r in _log(home)] == ["exit_failed"]
+    assert KEY in st["positions"]
+
+
 def test_exit_while_agent_sell_pending_is_noop(home):
     st = _state(pending={"order_id": "o-9", "side": "sell", "requested": 2})
     b = FillsBroker({U1: 0})
@@ -877,17 +894,198 @@ class ScriptedExit:
         return self.mark
 
 
-def test_accepted_but_unsold_exit_retries(home, notes):
-    def dead(pos, state):  # Robinhood async reject / Alpaca 0 fill
+class DeadSell(FillsBroker):
+    """Every exit is accepted and then dies with nothing filled, like a
+    Robinhood async reject or an Alpaca 0-fill cancel. Like those adapters,
+    it records the order and stamps last_order_at (holdings lag orders)."""
+
+    def __init__(self, *held, fills=(), refuse_after=None):
+        super().__init__(*held, fills=fills)
+        self.sells, self.refuse_after = 0, refuse_after
+
+    def execute(self, client, cfg, event, state):
+        pos = state["positions"].get(KEY)
+        if not pos:
+            return False
+        self.sells += 1
+        if self.refuse_after is not None and self.sells > self.refuse_after:
+            broker_events.report("exit_failed", "not enough contracts to close")
+            return False  # refused when placed: nothing recorded
+        pos["last_order_at"] = agent._now()
+        pos["order_ids"] = pos.get("order_ids", []) + [f"dead-{self.sells}"]
+        pos.pop("miss", None)
         broker_events.report("exit_partial", f"exit filled 0/{pos['qty']}")
         return True
+
+
+def _poll(st, b, clock, times, every=30):
+    """Up to `times` polls of the same exit signal, `every` s apart, until
+    one is done (returns its outcome) — like the heartbeat."""
+    for _ in range(times):
+        try:
+            return handle(st, b)
+        except agent.ExitNotDone:
+            clock.tick(every)
+    return "not done"
+
+
+def test_accepted_but_unsold_exit_retries_after_reading_holdings(home, notes, clock):
     st = _state()
-    b = ScriptedExit(dead)
+    b = DeadSell({U1: 2})
     for _ in range(3):
         with pytest.raises(agent.ExitNotDone):
             handle(st, b)
-    assert b.calls == 3 and st["positions"][KEY]["qty"] == 2
+        clock.tick(30)
+    pos = st["positions"][KEY]
+    assert b.sells == 3 and len(b.asked) == 3 and pos["qty"] == 2
+    # the dead order doesn't restart the grace period: every retry read first
+    assert pos["last_order_at"] == T0 - 3600 and pos["exit_unfilled_at"] == T0 + 60
+    assert pos["order_ids"] == ["o-agent", "dead-1", "dead-2", "dead-3"]
     assert [r["action"] for r in _log(home)] == ["exit_partial"]
+
+
+def test_owner_closes_after_dead_exit_no_second_sell(home, notes, clock):
+    """The exit_partial alert says 'close it yourself'; the owner does. The
+    retry reads the account first and closes the row — never sells again."""
+    st = _state()
+    b = DeadSell({U1: 2}, {U1: 0}, fills=[_fill("owner-1", at="2026-10-30T15:00:20Z")])
+    assert _poll(st, b, clock, 10) is None
+    assert b.sells == 1 and KEY not in st["positions"]
+    row = [r for r in _log(home) if r["action"] == "exit"][0]
+    assert row["manual"] is True and row["cause"] == "sold"
+    assert row["broker_order_ids"] == ["owner-1"]
+
+
+def test_dead_exit_then_unclear_reads_wait_before_selling_again(home, clock):
+    st = _state()
+    b = DeadSell({U1: 2}, None)
+    with pytest.raises(agent.ExitNotDone):
+        handle(st, b)
+    for _ in range(19):                 # unknown for 9.5 min: no sale
+        clock.tick(30)
+        with pytest.raises(agent.ExitNotDone):
+            handle(st, b)
+    assert b.sells == 1 and len(b.asked) == 20
+    clock.tick(30)                      # 10 min on: back to "unknown goes"
+    with pytest.raises(agent.ExitNotDone):
+        handle(st, b)
+    assert b.sells == 2
+
+
+def test_dead_exit_then_refused_sells_close_after_reads(home, clock):
+    """Later sells refused when placed (no order, no stamp): the gate keeps
+    reading and closes the row once the owner's sale shows up."""
+    st = _state()
+    b = DeadSell({U1: 2}, {U1: 2}, {U1: 2}, {U1: 0}, fills=[_fill("owner-1")],
+                 refuse_after=1)
+    assert _poll(st, b, clock, 10) is None
+    assert KEY not in st["positions"] and b.sells == 3 and len(b.asked) == 5
+
+
+class _AResp:
+    def __init__(self, status, body):
+        self.status_code, self._body, self.text = status, body, json.dumps(body)
+
+    def json(self):
+        return self._body
+
+
+class FakeAlpaca:
+    """Alpaca's REST API for one contract: every order stays 'accepted',
+    then the cancel leaves it `after_cancel`; positions; closed orders."""
+    OCC = "SPY991218C00752000"
+
+    def __init__(self, after_cancel=("canceled", "0")):
+        self.held, self.posts, self.position_reads = 2, [], 0
+        self.after_cancel, self.cancelled, self.closed_orders = after_cancel, set(), []
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.posts.append(dict(json))
+        return _AResp(200, {"id": f"o{len(self.posts)}"})
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        if url.endswith("/v2/positions"):
+            self.position_reads += 1
+            return _AResp(200, [{"symbol": self.OCC, "qty": str(self.held),
+                                 "qty_available": str(self.held), "side": "long",
+                                 "asset_class": "us_option"}] if self.held else [])
+        if "/v2/orders/" in url:
+            oid = url.rsplit("/", 1)[1]
+            status, filled = (self.after_cancel if oid in self.cancelled
+                              else ("accepted", "0"))
+            return _AResp(200, {"id": oid, "status": status, "filled_qty": filled})
+        return _AResp(200, list(self.closed_orders))
+
+    def delete(self, url, headers=None, timeout=None):
+        self.cancelled.add(url.rsplit("/", 1)[1])
+        return _AResp(204, None)
+
+
+@pytest.mark.parametrize("then", ["owner_sells", "first_sell_fills_late"])
+def test_alpaca_exit_that_filled_nothing_never_resells_blind(home, clock, monkeypatch,
+                                                             then):
+    """Real Alpaca adapter: an exit sell cancelled with nothing filled. The
+    owner then sells in the app, or the cancelled order fills after all —
+    either way the account is flat and the retry must not sell again."""
+    import types
+    from brokers import alpaca
+    http = FakeAlpaca(after_cancel=("pending_cancel", "0"))
+    monkeypatch.setattr(alpaca, "requests", http)
+    monkeypatch.setattr(alpaca, "time", types.SimpleNamespace(time=clock,
+                                                              sleep=lambda s: None))
+    cfg = {"broker": "alpaca", "alpaca_paper": False, "alpaca_key_id": "k",
+           "alpaca_secret": "s"}
+    tag = account_tag(cfg)
+    st = {"positions": {KEY: _row(option_id=FakeAlpaca.OCC, acct=tag)}, "seen": [],
+          "position_sync": {"proven": {tag: "2026-10-29T15:00:00+00:00"}}}
+    client = alpaca.client(cfg)
+    with pytest.raises(agent.ExitNotDone):
+        handle(st, alpaca, cfg=cfg, client=client)
+    assert len(http.posts) == 1 and KEY in st["positions"]
+    http.held = 0
+    if then == "owner_sells":
+        http.closed_orders = [{"id": "owner-1", "symbol": FakeAlpaca.OCC,
+                               "side": "sell", "filled_qty": "2",
+                               "filled_avg_price": "1.90", "status": "filled",
+                               "filled_at": "2026-10-30T15:00:20Z"}]
+    for _ in range(12):
+        clock.tick(30)
+        try:
+            handle(st, alpaca, cfg=cfg, client=client)
+        except agent.ExitNotDone:
+            continue
+        break
+    assert len(http.posts) == 1 and KEY not in st["positions"]
+    assert http.position_reads >= 3
+    manual = [r for r in _log(home) if r.get("manual")]
+    assert manual[0]["cause"] == ("sold" if then == "owner_sells" else "gone")
+
+
+def test_unfilled_exit_without_holdings_reads_is_logged_as_before(home):
+    """Adapters without the read hooks (or position_sync off) keep the old
+    behaviour: no retry loop that no read could ever stop."""
+    def dead(pos, state):
+        broker_events.report("exit_partial", f"exit filled 0/{pos['qty']}")
+        return True
+    st = _state()
+    assert handle(st, ScriptedExit(dead)).startswith("EXIT")
+    assert [r["action"] for r in _log(home)] == ["exit_partial", "exit"]
+    b = DeadSell({U1: 2})
+    st = _state()
+    assert handle(st, b, cfg={**CFG, "position_sync": False}).startswith("EXIT")
+    assert b.sells == 1 and b.asked == []
+
+
+def test_unfilled_exit_with_nothing_reported_says_so(home):
+    class Silent(DeadSell):
+        def execute(self, client, cfg, event, state):
+            self.sells += 1
+            return True
+    with pytest.raises(agent.ExitNotDone):
+        handle(_state(), Silent({U1: 2}))
+    (row,) = _log(home)
+    assert row["action"] == "exit_failed"
+    assert row["reason"] == "the broker accepted the exit order but nothing sold — retrying"
 
 
 def test_pending_sell_exit_logs_requested_and_marks_exit_logged(home):
@@ -910,6 +1108,28 @@ def test_partial_fill_exit_row_qty_is_sold(home):
     handle(st, ScriptedExit(partial, mark=2.0))
     row = [r for r in _log(home) if r["action"] == "exit"][0]
     assert row["qty"] == 2 and row["est_pnl_usd"] == 100.0
+    assert row["partial"] is True and row["remaining"] == 1
+
+
+def test_owner_closes_the_rest_after_partial_agent_exit_same_pnl_day(home, clock):
+    with open(agent.TRADES_PATH, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"action": "entry", "contract": CONTRACT, "dry": False,
+                            "ts": "2026-10-28T15:00:00+00:00"}) + "\n")
+
+    def partial(pos, state):
+        pos["qty"] = 1
+        broker_events.report("exit_partial", "exit filled 1/2")
+        return True
+    st = _state()
+    handle(st, ScriptedExit(partial, mark=2.0))
+    b = FillsBroker({U1: 0}, fills=[_fill(qty=1)])
+    sync(st, b)
+    clock.tick(60)
+    sync(st, b)
+    assert KEY not in st["positions"]
+    s = agent.pnl_summary({"source": "url"}, {})
+    assert [(d["day"], d["pnl"], d["exits"]) for d in s["live"]["days"]] == [
+        ("2026-10-28", 80.0, 2)]   # (2.00-1.50) x 1 + (1.80-1.50) x 1
 
 
 def test_exit_with_prior_exit_logged_has_no_estimate(home):
