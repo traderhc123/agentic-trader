@@ -1821,8 +1821,14 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                                          pos_key, ev)
         except Exception as exc:
             print(f"position check before exit failed (non-fatal): {str(exc)[:150]}")
-            if _resell_needs_read(state["positions"].get(pos_key), broker):
+            row = state["positions"].get(pos_key)
+            if _resell_needs_read(row, broker):
                 verdict = "wait"  # never sell again unchecked after a dead sell
+                if _now() - _float0(row.get("exit_unfilled_at")) >= POS_MISS_FRESH_S:
+                    try:  # a check that keeps failing mustn't hold it silently
+                        _warn_exit_stuck(cfg, state, save_state, broker, pos_key, row)
+                    except Exception:
+                        pass
         if verdict == "closed":
             print(f"EXITED {contract}: already closed outside the agent — no "
                   "order placed")

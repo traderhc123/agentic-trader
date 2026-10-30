@@ -2030,3 +2030,87 @@ def test_check_positions_with_the_broker_disconnected_says_so(home, monkeypatch,
 
 def test_check_positions_is_in_the_help_text():
     assert "check-positions" in agent.__doc__
+
+
+# ── kept exits and dead sells: saves, alerts, first-seen "gone" ─────────────
+
+def test_exit_first_seen_on_the_gone_read_never_sells_a_reentry(home, clock, notes,
+                                                                no_policy):
+    """The periodic check already counted 2 of 3 "gone" reads; the exit
+    signal arrives for the first time and its own read confirms "gone". The
+    row never held that signal, so only the gate's note on the tombstone
+    keeps it from selling a re-entry of the same contract."""
+    st = _state(miss={"held": 0, "reads": 2, "need": 2, "first_at": T0 - 150,
+                      "last_at": T0 - 60})
+    b = FillsBroker({U1: 0}, fills=[])
+    with pytest.raises(agent.ExitNotDone):
+        handle(st, b)
+    assert KEY not in st["positions"]
+    assert st["closed_outside"][KEY]["held_exits"] == ["x1"]
+    b.held = [{U1: 2}]
+    handle(st, b, ev=make_event(expiry="2099-12-18", event_id="open-2"))
+    assert KEY in st["positions"]
+    assert handle(st, b) is None
+    assert b.executed == [] and st["stale_exits"] == ["x1"]
+    assert st["positions"][KEY]["opened_event"] == "open-2"
+
+
+def test_dead_exit_mark_and_kept_exit_are_saved_before_retrying(home, clock, notes,
+                                                                frozen_now):
+    """With today's alert slots already used (no save from an alert), the
+    state saved before the retry still carries the dead-sell mark and the
+    kept exit, so a restart can't lose them."""
+    import copy
+    saved = []
+    st = _state()
+    today = frozen_now.date().isoformat()
+    st["problem_notified"] = {k: today for k in (
+        "exit_failed", "exit_partial", "exit_failed:placed", "exit_partial:placed")}
+    b = DeadSell({U1: 2}, None)
+    with pytest.raises(agent.ExitNotDone):
+        agent.handle_event(_exit(), CFG, st, b, object(),
+                           lambda s: saved.append(copy.deepcopy(s)))
+    last = saved[-1]["positions"][KEY]
+    assert last.get("exit_unfilled_at") and last.get("held_exits") == ["x1"]
+
+
+def test_on_hold_alert_survives_a_failed_save(home, clock, notes):
+    st = _state()
+    b = DeadSell({U1: 2}, None)
+    failed = []
+
+    def save(s):
+        row = s["positions"].get(KEY) or {}
+        if row.get("exit_stuck_warned") and not failed:
+            failed.append(1)
+            raise PermissionError(13, "state.json is open in another program")
+    for _ in range(30):
+        try:
+            agent.handle_event(_exit(), CFG, st, b, object(), save)
+        except agent.ExitNotDone:
+            pass
+        clock.tick(30)
+    assert failed and len(_on_hold(notes)) == 1 and b.sells == 1
+
+
+def test_failing_check_after_a_dead_exit_alerts_once_and_never_sells(home, clock,
+                                                                    notes, monkeypatch):
+    """The check before the exit keeps raising after a sell that filled
+    nothing (plain-sell adapter): the exit waits, and after 10 minutes the
+    owner hears once that it's on hold."""
+    def boom(*a, **k):
+        raise PermissionError(13, "state.json is open in another program")
+    monkeypatch.setattr(agent, "_sync_positions", boom)
+    st = _state(exit_unfilled_at=T0 - 30)
+    b = FillsBroker({U1: 2})
+    waits = 0
+    for i in range(40):                 # 20 min of 30 s polls
+        try:
+            handle(st, b)
+        except agent.ExitNotDone:
+            waits += 1
+        if i == 15:                     # 8 min in: not yet
+            assert _on_hold(notes) == []
+        clock.tick(30)
+    assert waits == 40 and b.executed == []
+    assert len(_on_hold(notes)) == 1
