@@ -57,6 +57,23 @@ def test_loss_streak():
     assert rules.check(cfg, make_event(), [ex(-1), ex(0)])[0]
 
 
+def test_loss_streak_counts_closes_outside_the_agent():
+    ex = lambda p, **kw: {"action": "exit", "est_pnl_usd": p, **kw}  # noqa: E731
+    gone = {"action": "exit", "manual": True, "cause": "gone"}  # no sale found
+    assert rules.loss_streak([ex(-5), ex(-3, manual=True)]) == 2
+    assert rules.loss_streak([ex(-5), ex(3, manual=True), ex(-1)]) == 1
+    assert rules.loss_streak([ex(-5), gone, ex(-1)]) == 2
+
+
+def test_trades_today_uses_the_day_a_sale_filled(home):
+    from datetime import timedelta, timezone
+    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    agent._log_trade({"action": "exit", "manual": True, "est_pnl_usd": -9.0,
+                      "closed_at": yesterday.isoformat(timespec="seconds")})
+    agent._log_trade({"action": "exit", "est_pnl_usd": -1.0})
+    assert [t["est_pnl_usd"] for t in agent._trades_today()] == [-1.0]
+
+
 def test_describe():
     cfg = {"rule_tickers": ["SPY"], "rule_sides": "calls", "rule_min_strike": 10,
            "rule_skip_0dte": True, "rule_loss_streak": 2}

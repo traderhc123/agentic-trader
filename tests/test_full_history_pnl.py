@@ -117,6 +117,36 @@ def test_overnight_exit_counts_on_the_day_it_was_opened(home):
     assert s["live"]["pass"] == {"total": 50.0, "exits": 1}
 
 
+def test_closes_outside_the_agent_count_and_keep_the_opened_day(home):
+    """The owner sold 2 of 3 in the app (a partial row), the agent's exit
+    sold the last one the next day: both credit the day it was opened. A
+    close with no sale found has no price and counts as unmeasured."""
+    c = "SPY 2099-12-18 $752.0 C"
+    _write(home, [
+        _entry("2026-10-01", contract=c),
+        dict(_exit("2026-10-02", 60.0, contract=c), manual=True, partial=True,
+             remaining=1, qty=2),
+        _exit("2026-10-03", -20.0, contract=c),
+        _entry("2026-10-05", contract="QQQ"),
+        dict(_exit("2026-10-06", None, contract="QQQ"), manual=True, cause="gone"),
+    ])
+    s = agent.pnl_summary({"source": "url"}, {})
+    assert s["live"]["days"] == [{"day": "2026-10-01", "pnl": 40.0, "exits": 2,
+                                  "pass": None}]
+    assert s["live"]["total"] == 40.0 and s["live"]["unmeasured"] == 1
+
+
+def test_loss_cap_counts_a_close_on_the_day_its_sale_filled(home):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    yesterday = now - timedelta(days=1)
+    agent._log_trade({"action": "exit", "manual": True, "est_pnl_usd": -40.0,
+                      "closed_at": now.isoformat(timespec="seconds")})
+    agent._log_trade({"action": "exit", "manual": True, "est_pnl_usd": -500.0,
+                      "closed_at": yesterday.isoformat(timespec="seconds")})
+    assert agent._est_pnl_today() == (-40.0, 0)
+
+
 def test_trade_day_is_the_market_day_not_utc(home):
     # 01:00 UTC on the 2nd is 21:00 ET on the 1st
     _write(home, [_entry("2026-10-02", hhmm="01:00"), _exit("2026-10-02", 5.0)])
