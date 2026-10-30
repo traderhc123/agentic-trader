@@ -58,8 +58,17 @@ def drain():
     return out
 
 
+_CASH_RX = re.compile(r"buying.?power|insufficient|not enough|funds|cash", re.I)
+# selling more contracts than the account holds — not a cash problem
+_POSITION_RX = re.compile(
+    r"(not enough|insufficient)\s+(contracts?|shares|positions?|quantity|qty)\b|"
+    r"position\s+(does not exist|not found)|no\s+(such\s+)?position", re.I)
+
 _HINTS = (
-    (re.compile(r"buying.?power|insufficient|not enough|funds|cash", re.I),
+    (_POSITION_RX,
+     "You may have already closed this position yourself — the agent "
+     "re-checks your broker account and stops retrying once it confirms."),
+    (_CASH_RX,
      "Not enough buying power — add cash to the broker account or lower your "
      "per-trade budget."),
     (re.compile(r"option.{0,40}(approv|level|enabled|permission|not allowed)|"
@@ -90,4 +99,5 @@ def hint(message):
 
 
 def is_cash_problem(message):
-    return bool(_HINTS[0][0].search(message or ""))
+    message = message or ""
+    return bool(_CASH_RX.search(message)) and not _POSITION_RX.search(message)
