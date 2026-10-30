@@ -110,10 +110,10 @@ def test_dry_run_never_reports_broker_problems(home, no_policy, notes):
     ("Options trading is not enabled on this account", "Options trading"),
     ("HTTP 401 unauthorized: token expired", "reconnect"),
     ("something odd", ""),
-    ("not enough contracts to close", "already closed this position yourself"),
+    ("not enough contracts to close", "closed it yourself"),
     ("insufficient qty available for order (requested: 2, available: 0)",
-     "already closed this position yourself"),
-    ("position does not exist", "already closed this position yourself"),
+     "closed it yourself"),
+    ("position does not exist", "closed it yourself"),
 ])
 def test_hints(msg, want):
     h = broker_events.hint(msg)

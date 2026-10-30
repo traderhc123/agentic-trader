@@ -204,7 +204,8 @@ docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trad
   wasted sats.
 - **Closing a trade yourself is fine**: sell in your broker's app and the
   agent notices within a few minutes (after checking more than once), logs
-  it with its P&L, frees the slot and ignores that trade's exit signal. If
+  it (with its P&L when the sale price is known), frees the slot and
+  ignores that trade's exit signal. If
   you sold only some contracts, the exit signal sells just the rest. When
   the broker can't be read clearly, nothing changes.
 - **Notifications**: set up Discord/ntfy/Telegram during setup — you get a

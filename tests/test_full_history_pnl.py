@@ -136,9 +136,9 @@ def test_closes_outside_the_agent_count_and_keep_the_opened_day(home):
     assert s["live"]["total"] == 40.0 and s["live"]["unmeasured"] == 1
 
 
-def test_loss_cap_counts_a_close_on_the_day_its_sale_filled(home):
-    from datetime import datetime, timedelta, timezone
-    now = datetime.now(timezone.utc)
+def test_loss_cap_counts_a_close_on_the_day_its_sale_filled(home, frozen_now):
+    from datetime import timedelta
+    now = frozen_now  # one clock for the rows and for "today"
     yesterday = now - timedelta(days=1)
     agent._log_trade({"action": "exit", "manual": True, "est_pnl_usd": -40.0,
                       "closed_at": now.isoformat(timespec="seconds")})

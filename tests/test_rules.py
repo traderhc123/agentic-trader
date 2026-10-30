@@ -65,9 +65,9 @@ def test_loss_streak_counts_closes_outside_the_agent():
     assert rules.loss_streak([ex(-5), gone, ex(-1)]) == 2
 
 
-def test_trades_today_uses_the_day_a_sale_filled(home):
-    from datetime import timedelta, timezone
-    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+def test_trades_today_uses_the_day_a_sale_filled(home, frozen_now):
+    from datetime import timedelta
+    yesterday = frozen_now - timedelta(days=1)  # one clock for rows and "today"
     agent._log_trade({"action": "exit", "manual": True, "est_pnl_usd": -9.0,
                       "closed_at": yesterday.isoformat(timespec="seconds")})
     agent._log_trade({"action": "exit", "est_pnl_usd": -1.0})

@@ -569,6 +569,70 @@ def test_sale_before_the_agent_opened_does_not_count(home, clock):
     assert st["positions"][KEY]["qty"] == 2 and _log(home) == []
 
 
+@pytest.mark.parametrize("cfg, oid", [
+    ({"broker": "moomoo", "moomoo_paper": True}, "US.SPY991218C752000"),
+    ({**CFG, "robinhood_account": "B2"}, U1),
+], ids=["moomoo", "other-rh-account"])
+def test_trust_is_per_account(home, clock, cfg, oid):
+    """Proof that reads work in one account says nothing about another: a
+    wrong id format there reads as an explicit 0 for every row."""
+    st = {"positions": {KEY: _row(option_id=oid, acct=account_tag(cfg))},
+          "seen": [], "position_sync": {"proven": {TAG: "2026-10-29T15:00:00+00:00"}}}
+    b = UnverifiedBroker({oid: 0})
+    for _ in range(4):
+        r = agent._sync_positions(cfg, st, lambda s: None, b, object())
+        assert r[KEY]["status"] == "unproven"
+        clock.tick(60)
+    assert st["positions"][KEY]["qty"] == 2 and _log(home) == []
+
+
+def test_legacy_row_excludes_agent_sells(home, clock):
+    """A row from before the agent kept its order ids: nothing but
+    exclude_agentic keeps the agent's own earlier sells out."""
+    st = {"positions": {KEY: {"option_id": U1, "qty": 2, "opened_event": "open-1",
+                              "entry_mark": 1.5}}, "seen": []}     # untrusted
+    old = dict(_fill("agent-old", 2, 2.5, "2026-10-20T15:00:00Z"), by="agentic")
+    b = FillsBroker({U1: 0}, fills=[old])
+    sync(st, b)
+    clock.tick(60)
+    assert _status(sync(st, b)) == "unproven"
+    assert b.fill_calls[0]["exclude_agentic"] is True
+    assert b.fill_calls[0]["since_iso"] is None
+    assert st["positions"][KEY]["qty"] == 2 and _log(home) == []
+
+
+def test_mixed_priced_and_unpriced_sales_have_no_price(home, clock):
+    st = _state()
+    b = FillsBroker({U1: 0}, fills=[_fill("u1", 1, 1.8, "2026-10-30T15:01:00Z"),
+                                    _fill("u2", 1, None, "2026-10-30T15:02:00Z")])
+    sync(st, b)
+    clock.tick(60)
+    sync(st, b)
+    (row,) = _log(home)
+    assert row["cause"] == "sold" and row["qty"] == 2
+    assert "est_pnl_usd" not in row and "exit_price" not in row
+    assert agent._pick_fills(b.fills, 2, [])[:2] == (2, None)
+
+
+def test_mass_flag_sticks_when_a_later_read_is_all_zero(home, clock):
+    st = _state()
+    st["positions"][KEY2] = _row(option_id=U2)
+    b = FillsBroker({U1: 0, U2: 2}, {U1: 0, U2: 0}, fills=[])
+    for _ in range(3):
+        r = sync(st, b)
+        clock.tick(60)
+    assert r[KEY]["status"] == "unproven" and st["positions"][KEY]["qty"] == 2
+    assert st["positions"][KEY]["miss"]["mass"] is True
+
+
+def test_sales_count_from_ten_minutes_before_the_open():
+    def fill(offset):
+        return {"order_id": "a", "qty": 1, "price": 1.0, "at": agent._iso_at(T0 + offset)}
+    assert agent._pick_fills([fill(-599)], 1, [], T0)[0] == 1
+    assert agent._pick_fills([fill(-601)], 1, [], T0)[0] == 0
+    assert agent._pick_fills([fill(60)], 1, [], T0)[0] == 1
+
+
 def test_moomoo_never_held_seen_zero_is_entry_unfilled_not_exit(home, clock, notes):
     st = _state()
     b = UnverifiedBroker({U1: 0})
@@ -692,6 +756,67 @@ def test_upkeep_throttle(monkeypatch, clock):
     up({**CFG, "position_sync": False}, st, lambda s: None, b, object(), now=T0 + 600)
     up(CFG, st, lambda s: None, StubBroker(), object(), now=T0 + 600)
     assert len(b.asked) == n + 1
+
+
+def _run_one_loop(home, monkeypatch, paused):
+    """One pass of `agent.py run` with stub broker/source; returns the order
+    of the calls that matter here."""
+    import brokers
+    import keep_running
+    import webui
+    calls = []
+
+    class Broker:
+        @staticmethod
+        def client(cfg):
+            return object()
+
+        @staticmethod
+        def reconcile(client, cfg, state, save_state):
+            calls.append("reconcile")
+
+        @staticmethod
+        def held_option_qty(client, cfg, ids):
+            return {}
+
+    class Source:
+        @staticmethod
+        def poll(cfg, state, save_state):
+            calls.append("poll")
+            return []
+
+    def no_dashboard(*a, **k):
+        raise OSError("no dashboard in tests")
+
+    def stop(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(agent, "require_consent_or_exit", lambda: None)
+    monkeypatch.setattr(brokers, "broker_ready", lambda c: True)
+    monkeypatch.setitem(agent.BROKERS, "stub", Broker)
+    monkeypatch.setitem(agent.SOURCES, "stub", Source)
+    monkeypatch.setattr(webui, "start_dashboard", no_dashboard)
+    monkeypatch.setattr(keep_running, "refresh_autostart", lambda: False)
+    monkeypatch.setattr(agent, "_refresh_cash", lambda *a, **k: calls.append("cash"))
+    monkeypatch.setattr(agent, "_position_upkeep",
+                        lambda *a, **k: calls.append("upkeep"))
+    monkeypatch.setitem(webui.CONTROLS, "paused", paused)
+    monkeypatch.setitem(webui.CONTROLS, "stop", False)
+    monkeypatch.setattr(agent, "_sleep_unless_stopped", stop)
+    (home / "config.json").write_text(json.dumps({"source": "stub", "broker": "stub"}))
+    agent.cmd_run()
+    return calls
+
+
+def test_run_loop_checks_holdings_after_reconcile_before_events(home, monkeypatch):
+    calls = _run_one_loop(home, monkeypatch, paused=False)
+    assert calls.count("upkeep") == 1
+    assert calls.index("reconcile") < calls.index("upkeep") < calls.index("poll")
+    assert calls.index("upkeep") < len(calls) - 1 - calls[::-1].index("cash")
+
+
+def test_run_loop_paused_skips_holdings_check(home, monkeypatch):
+    calls = _run_one_loop(home, monkeypatch, paused=True)
+    assert "upkeep" not in calls and "reconcile" not in calls
 
 
 def test_open_rush_window(monkeypatch):
@@ -898,6 +1023,58 @@ def test_gate_partial_then_sells_remainder(home, clock):
     assert final["qty"] == 1 and final["est_pnl_usd"] == 50.0  # (2.00-1.50) x 1
     s = agent.pnl_summary({"source": "url"}, {})
     assert [(d["day"], d["exits"]) for d in s["live"]["days"]] == [("2026-10-28", 2)]
+
+
+def test_gate_mass_guard_counts_every_row_read(home, clock):
+    """The exit check reads only its own row's shortfall, but an all-zero
+    listing across every row still needs a sale before it drops anything."""
+    st = _state()
+    st["positions"][KEY2] = _row(option_id=U2)
+    b = FillsBroker({U1: 0, U2: 0}, fills=[])
+    for _ in range(2):
+        with pytest.raises(agent.ExitNotDone):
+            handle(st, b)
+        clock.tick(21)
+    assert handle(st, b).startswith("EXIT")     # unproven: sells as before
+    assert b.executed == [("EXITED", 2)]
+    assert not [r for r in _log(home) if r.get("manual")]
+
+
+@pytest.mark.parametrize("answer", [None, {U1: 2}], ids=["unknown", "held"])
+def test_gate_legacy_row_without_acct_sells(home, answer):
+    st = _state()
+    del st["positions"][KEY]["acct"]
+    b = FillsBroker(answer)
+    assert handle(st, b).startswith("EXIT")
+    assert b.executed == [("EXITED", 2)]
+    assert not [r for r in _log(home) if r["action"] == "exit_failed"]
+
+
+def test_gate_reads_under_20s_apart_dont_count(home, clock):
+    st = _state()
+    b = FillsBroker({U1: 0}, fills=[_fill()])
+    with pytest.raises(agent.ExitNotDone):
+        handle(st, b)
+    clock.tick(10)
+    with pytest.raises(agent.ExitNotDone):
+        handle(st, b)
+    assert st["positions"][KEY]["miss"]["reads"] == 1
+    assert st["positions"][KEY]["qty"] == 2
+    clock.tick(10)
+    assert handle(st, b) is None
+    assert KEY not in st["positions"] and b.executed == []
+
+
+def test_gate_touches_only_its_row(home, clock):
+    st = _state()
+    miss = {"held": 0, "reads": 1, "need": 2, "first_at": T0 - 20,
+            "last_at": T0 - 20}
+    st["positions"][KEY2] = _row(option_id=U2, miss=dict(miss))
+    b = FillsBroker({U1: 2, U2: 0}, fills={U2: [_fill("q1")]})
+    handle(st, b)
+    assert b.executed == [("EXITED", 2)]
+    assert KEY2 in st["positions"] and st["positions"][KEY2]["miss"] == miss
+    assert not [r for r in _log(home) if r.get("manual")]
 
 
 def test_gate_unknown_read_goes_today_path():
@@ -1318,6 +1495,21 @@ def test_reheld_warning_once(home, notes):
         assert handle(st, FillsBroker(answer)) is None
         assert "warned" not in st["closed_outside"][KEY]
     assert len(notes) == 1 and _log(home) == []
+
+
+@pytest.mark.parametrize("variant", ["other_acct", "sync_off"])
+def test_reheld_check_only_for_this_account_and_when_enabled(home, notes, variant):
+    st = _closed_state()
+    cfg = CFG
+    if variant == "other_acct":
+        st["closed_outside"][KEY]["acct"] = account_tag(
+            {"broker": "robinhood", "robinhood_account": "OTHER"})
+    else:
+        cfg = {**CFG, "position_sync": False}
+    b = FillsBroker({U1: 2})
+    assert handle(st, b, cfg=cfg) is None
+    assert b.asked == [] and b.executed == []
+    assert not [n for n in notes if "holds" in n]
 
 
 def test_replayed_opening_entry_ignored(home, no_policy):

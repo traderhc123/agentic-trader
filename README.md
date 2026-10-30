@@ -204,9 +204,11 @@ A Premium AgentHC API key also works (*Advanced* in the wizard).
   with `"position_sync": false` in config.json.
 - State lives in `~/.agentic-trader/` (consent record, config, broker tokens
   `0600`, seen-events + positions).
-- Deliberately simple by design: no stop-losses, no retries on rejected
-  orders, no margin logic. Read the code (~700 lines total) before trusting
-  it. Human oversight required — don't run unattended for long periods.
+- Deliberately simple by design: no stop-losses, no margin logic, and
+  entries are never retried (an exit is retried each poll until the
+  position is sold or found closed). Read the code (~700 lines total)
+  before trusting it. Human oversight required — don't run unattended for
+  long periods.
 
 ## Repo layout
 

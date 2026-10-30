@@ -66,8 +66,8 @@ _POSITION_RX = re.compile(
 
 _HINTS = (
     (_POSITION_RX,
-     "You may have already closed this position yourself — the agent "
-     "re-checks your broker account and stops retrying once it confirms."),
+     "The account may hold fewer contracts than the agent tracks (closed "
+     "it yourself?) — check your broker app."),
     (_CASH_RX,
      "Not enough buying power — add cash to the broker account or lower your "
      "per-trade budget."),
