@@ -42,6 +42,15 @@ reported as "not held":
     VERIFIES_FILLS = False          module constant for adapters that book an
                                     entry when the order is accepted, without
                                     checking that it filled (default True).
+
+    CLOSE_ONLY_EXITS = True         module constant; set it ONLY when the
+                                    adapter's exit orders can never open a
+                                    new position (Robinhood sells with
+                                    position_effect "close"). After an exit
+                                    that sold nothing, the agent sells again
+                                    only once a read shows the contracts
+                                    still held; with this set, unclear reads
+                                    stop holding the exit back after 10 min.
 """
 
 import hashlib

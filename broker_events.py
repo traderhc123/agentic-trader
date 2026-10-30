@@ -40,10 +40,15 @@ NOTIFY = {"order_failed", "skip_budget", "skip_no_quote", "skip_no_contract",
           "broker_lookup_failed"}
 
 
-def report(kind, message):
-    """Called by broker adapters. Never raises."""
+def report(kind, message, placed=False):
+    """Called by broker adapters. Never raises. placed=True for a problem
+    with an order that went in and may have filled (the alert then says
+    "check this trade" instead of "trade NOT placed")."""
     try:
-        _events.append({"kind": str(kind), "message": str(message)[:400]})
+        ev = {"kind": str(kind), "message": str(message)[:400]}
+        if placed:
+            ev["placed"] = True
+        _events.append(ev)
     except Exception:
         pass
 

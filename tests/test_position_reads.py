@@ -813,6 +813,14 @@ def test_moomoo_verifies_fills_false_and_no_closed_fills():
     assert getattr(alpaca, "VERIFIES_FILLS", True) is True
 
 
+def test_robinhood_exits_are_close_only():
+    """Only Robinhood's exits (position_effect "close") can't open a short;
+    Alpaca's and moomoo's are plain sells."""
+    assert robinhood.CLOSE_ONLY_EXITS is True
+    assert not getattr(alpaca, "CLOSE_ONLY_EXITS", False)
+    assert not getattr(moomoo, "CLOSE_ONLY_EXITS", False)
+
+
 def test_moomoo_execute_stamps_order_ids(monkeypatch):
     sdk = _MMSDK()
     monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)

@@ -60,6 +60,40 @@ def test_rejected_order_is_logged_with_fix_and_notified_once(home, no_policy, no
     assert "trade NOT placed" in notes[0] and "Fix:" in notes[0]
 
 
+class PlacedButUnclearBroker:
+    """The order went in, but whether it filled is unclear (like Alpaca
+    when the cancel of a slow order can't be confirmed)."""
+
+    def execute(self, client, cfg, event, state):
+        key = f"{event['ticker']}|{event['expiry']}|{event['strike']}|{event['type']}"
+        state["positions"][key] = {"option_id": "x", "qty": 1}
+        broker_events.report("order_failed", "couldn't confirm the buy filled — "
+                             "check your broker", placed=True)
+        return True
+
+
+def test_problem_with_a_placed_order_says_check_this_trade(home, no_policy, notes):
+    state = {"positions": {}, "seen": []}
+    out = agent.handle_event(make_event(), CFG, state, PlacedButUnclearBroker(),
+                             object(), lambda s: None)
+    assert out.startswith("ENTRY")
+    (problem, entry) = _log(home)
+    assert problem["action"] == "order_failed" and entry["action"] == "entry"
+    assert notes == ["agentic-trader: check this trade (SPY 2026-07-10 $752.0 C) — "
+                     "couldn't confirm the buy filled — check your broker\n(No more "
+                     "alerts about this today; every case is in the dashboard "
+                     "activity log.)"]
+
+
+def test_report_marks_placed_orders_only_when_asked():
+    broker_events.begin()
+    broker_events.report("order_failed", "rejected")
+    broker_events.report("order_failed", "unclear", placed=True)
+    assert broker_events.drain() == [
+        {"kind": "order_failed", "message": "rejected"},
+        {"kind": "order_failed", "message": "unclear", "placed": True}]
+
+
 def test_budget_skip_is_visible(home, no_policy, notes):
     state = {"positions": {}, "seen": []}
     b = RejectingBroker("skip_budget",

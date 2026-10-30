@@ -260,7 +260,7 @@ def _confirm_fill(cfg, oid, qty, side="buy"):
         "order_failed" if side == "buy" else "exit_failed",
         f"Alpaca couldn't confirm whether the {side} order for {qty}x filled "
         "(the cancel didn't go through) — the agent assumes it did; check "
-        "your Alpaca dashboard")
+        "your Alpaca dashboard", placed=True)
     return qty
 
 

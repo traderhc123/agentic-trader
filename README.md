@@ -205,10 +205,11 @@ A Premium AgentHC API key also works (*Advanced* in the wizard).
 - State lives in `~/.agentic-trader/` (consent record, config, broker tokens
   `0600`, seen-events + positions).
 - Deliberately simple by design: no stop-losses, no margin logic, and
-  entries are never retried (an exit is retried each poll until the
-  position is sold or found closed). Read the code (~700 lines total)
-  before trusting it. Human oversight required — don't run unattended for
-  long periods.
+  entries are never retried. An exit the broker refuses is retried each
+  poll; an accepted exit is sent again only when the broker reports right
+  away that it filled nothing and the agent can read your holdings. Read
+  the code (~700 lines total) before trusting it. Human oversight required
+  — don't run unattended for long periods.
 
 ## Repo layout
 

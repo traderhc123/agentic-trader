@@ -28,6 +28,11 @@ _SETTLE_TRIES = 3           # quick inline polls right after placing
 _SETTLE_WAIT_S = 5.0
 _PENDING_GIVEUP_S = 30 * 60  # cancel + settle any order still working after this
 
+# Every exit sells with position_effect "close" (execute, and the orders
+# reconcile re-places), so a repeat sell can never open a position
+# (brokers/__init__.py).
+CLOSE_ONLY_EXITS = True
+
 # Robinhood rejects market option orders outside 9:35 AM-4:00 PM ET. Feed
 # events consumed just after the open can land inside the 9:30-9:35 window,
 # so orders firing before this cutoff go out as marketable limit orders

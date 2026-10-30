@@ -719,9 +719,11 @@ _problems_logged = set()  # (event_id, kind) already written this run
 
 
 def _report_problem(cfg, state, save_state, kind, contract, message,
-                    event_id=None, dry=False, book=None):
+                    event_id=None, dry=False, book=None, placed=False):
     """Write a 'why this trade didn't happen' row to the trade log (what the
-    dashboard shows) and notify at most once per kind per day."""
+    dashboard shows) and notify at most once per kind per day. placed=True:
+    the order went in and may have filled (broker_events.report), so the
+    alert says "check this trade", not "trade NOT placed"."""
     import broker_events
     key = (event_id, kind)
     if event_id and key in _problems_logged:
@@ -750,9 +752,12 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
         save_state(state)
     except Exception:
         pass
-    label = broker_events.KINDS.get(kind, kind.replace("_", " "))
-    notify(cfg, f"agentic-trader: trade NOT placed ({contract}) — {label}: "
-                f"{message}" + (f"\nFix: {hint}" if hint else "")
+    if placed:  # the message says what happened; the kind's label wouldn't fit
+        head = f"agentic-trader: check this trade ({contract}) — {message}"
+    else:
+        label = broker_events.KINDS.get(kind, kind.replace("_", " "))
+        head = f"agentic-trader: trade NOT placed ({contract}) — {label}: {message}"
+    notify(cfg, head + (f"\nFix: {hint}" if hint else "")
                 + "\n(No more alerts about this today; every case is in the "
                 "dashboard activity log.)")
 
@@ -954,6 +959,7 @@ POS_FILLS_RECHECK_S = 900  # unproven: ask for the owner's sells this often
 POS_FILL_SLACK_S = 600     # clock slack when matching sells to the open time
 POS_SYNC_CLOSED_S = 1800   # check interval outside market hours
 _TOMBSTONES_KEPT = 100
+_STALE_EXITS_KEPT = 50
 _FILL_IDS_KEPT = 20
 _FILLS_USED_KEPT = 100
 _BROKER_NAMES = {"robinhood": "Robinhood", "alpaca": "Alpaca", "moomoo": "moomoo"}
@@ -1136,7 +1142,8 @@ def _read_problems(cfg, state, save_state, client, events):
         if r["kind"] == "broker_disconnected":
             _alert_if_broker_down(cfg, state, save_state, client, r["message"])
         else:
-            _report_problem(cfg, state, save_state, r["kind"], "", r["message"])
+            _report_problem(cfg, state, save_state, r["kind"], "", r["message"],
+                            placed=r.get("placed", False))
 
 
 def _sync_read(cfg, state, save_state, broker, client, fn, keys, confirm_s,
@@ -1363,7 +1370,9 @@ def _close_outside(cfg, state, save_state, broker, key, target, px, closed_at,
                    f"now tracks {target}")
         save_state(state)
         print(msg)
-        _report_problem(cfg, state, save_state, "entry_unfilled", contract, msg)
+        # a partly filled buy is a real position: "check this trade"
+        _report_problem(cfg, state, save_state, "entry_unfilled", contract, msg,
+                        placed=target > 0)
         return
     if ids:  # the owner's sales this close used: never proof for another
         sync = state.setdefault("position_sync", {})
@@ -1500,18 +1509,38 @@ def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev):
     if _past_expiry_close(pos_key) or (
             not unfilled_at and _now() - _grace_anchor(pos) < POS_GRACE_S):
         return "go"
+    # Past that while, only an adapter whose exits can't open a position
+    # goes back to the usual rules. Elsewhere the dead sell may have filled
+    # late, and a plain sell on a flat account opens a short: keep waiting
+    # for such a read, and read at most once a minute meanwhile.
+    stuck = (unfilled_at and _now() - unfilled_at >= POS_MISS_FRESH_S
+             and not getattr(broker, "CLOSE_ONLY_EXITS", False))
+    if stuck:
+        if _now() - _float0(pos.get("exit_read_at")) < POS_CONFIRM_S:
+            return "wait"
+        pos["exit_read_at"] = _now()
     r = _sync_positions(cfg, state, save_state, broker, client, keys={pos_key},
                         confirm_s=POS_EXIT_CONFIRM_S, event_id=ev["event_id"],
                         detected_by="exit_check")
     row = state["positions"].get(pos_key)
     if row is None:
         tomb = _tombstones(state).get(pos_key) or {}
-        return "gone" if tomb.get("cause") == "gone" else "closed"
+        if tomb.get("cause") != "gone":
+            return "closed"
+        # handle_event keeps this signal one more poll: if a new position
+        # in this contract opens meanwhile, the signal must not sell it
+        tomb["exit_event"] = ev["event_id"]
+        return "gone"
     res = r.get(pos_key)
-    held_all = (res is not None and res["status"] in ("ok", "reduced")
-                and res["held"] >= _int0(row.get("qty")))
-    if unfilled_at and not held_all and _now() - unfilled_at < POS_MISS_FRESH_S:
-        return "wait"
+    if unfilled_at:
+        if (res is not None and res["status"] in ("ok", "reduced")
+                and res["held"] >= _int0(row.get("qty"))):
+            return "go"  # every contract the agent tracks is still held
+        if _now() - unfilled_at < POS_MISS_FRESH_S:
+            return "wait"
+        if stuck:
+            _warn_exit_stuck(cfg, state, save_state, broker, pos_key, row)
+            return "wait"
     if res is None:  # unknown: wait only on a fresh, trusted shortfall
         miss = row.get("miss")
         fresh = (isinstance(miss, dict)
@@ -1522,6 +1551,22 @@ def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev):
     if res["status"] == "reduced" and res["held"] >= _int0(row.get("qty")):
         return "go"
     return "wait"
+
+
+def _warn_exit_stuck(cfg, state, save_state, broker, pos_key, row):
+    """Once per row: an exit waits on a read that may never come."""
+    if row.get("exit_stuck_warned"):
+        return
+    row["exit_stuck_warned"] = True
+    save_state(state)
+    name = _BROKER_NAMES.get(_broker_name(cfg, broker), "broker")
+    msg = (f"the exit for {_contract_of(pos_key)} is on hold. The agent's sell "
+           f"order filled nothing, and your {name} account doesn't clearly "
+           "show the contracts are still held. The agent won't sell again "
+           "until a holdings check shows them — check your broker app and "
+           "close it yourself if you still hold it.")
+    print(msg)
+    notify(cfg, "agentic-trader: " + msg)
 
 
 def _warn_if_reheld(cfg, state, save_state, broker, client, pos_key, contract):
@@ -1581,6 +1626,14 @@ def _note_unfilled_exit(pos, prior_pos):
     pos["exit_unfilled_at"] = _now()
 
 
+def _note_stale_exit(state, event_id):
+    """A new position opened in a contract whose old exit signal is still
+    waiting for one more look (verdict "gone"): that signal belongs to the
+    old position and must never sell the new one (handle_event)."""
+    ids = [i for i in _ids(state.get("stale_exits")) if i != str(event_id)]
+    state["stale_exits"] = (ids + [str(event_id)])[-_STALE_EXITS_KEPT:]
+
+
 def handle_event(ev, cfg, state, broker, client, save_state):
     """Run one new event through the safety pipeline. Returns a log line or None."""
     contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
@@ -1613,6 +1666,13 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # the feed re-sent the signal that opened a position the owner closed
         print(f"ignored a replay of the signal that opened {contract}; that "
               "position was closed outside the agent")
+        return None
+    if (ev["event"] == "EXITED"
+            and str(ev["event_id"]) in _ids(state.get("stale_exits"))):
+        # kept one more poll after its position was found gone, and a new
+        # position in this contract opened meanwhile (_note_stale_exit)
+        print(f"EXITED {contract}: this signal was for an earlier position that "
+              "had already left your account — no order placed")
         return None
 
     if ev["event"] == "ENTERED":
@@ -1767,7 +1827,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             sold = _contracts_sold(state, pos_key, prior_pos)
             after = state["positions"].get(pos_key)
             if after is not None and sold >= 1:
-                after.pop("exit_unfilled_at", None)
+                for k in ("exit_unfilled_at", "exit_read_at", "exit_stuck_warned"):
+                    after.pop(k, None)
             if (after is not None and not after.get("pending") and sold < 1
                     and _gate_on(cfg, broker, client)):
                 # accepted but nothing sold (an order that died unfilled):
@@ -1783,7 +1844,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 if bp is not None:
                     msg += f" (buying power now ${bp:,.2f})"
             _report_problem(cfg, state, save_state, r["kind"], contract, msg,
-                            event_id=ev["event_id"], book=book)
+                            event_id=ev["event_id"], book=book,
+                            placed=r.get("placed", False))
         if not action and ev["event"] == "ENTERED" and not existing and not reported:
             _report_problem(cfg, state, save_state, "broker_no_order", contract,
                             "the broker adapter didn't place the order and gave "
@@ -1833,7 +1895,9 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             if est is not None:
                 record["est_pnl_usd"] = est
         if action == "entry":
-            _tombstones(state).pop(pos_key, None)
+            buried = _tombstones(state).pop(pos_key, None)
+            if isinstance(buried, dict) and buried.get("exit_event"):
+                _note_stale_exit(state, buried["exit_event"])
         _log_trade(record)
         save_state(state)
         return f"{prefix}{action.upper()}: {contract}"
@@ -2467,7 +2531,8 @@ def cmd_run(app_window=False):
                         print(f"order reconcile error (non-fatal): {str(exc)[:150]}")
                     for r in broker_events.drain():
                         _report_problem(cfg, state, save_state, r["kind"],
-                                        "", r["message"])
+                                        "", r["message"],
+                                        placed=r.get("placed", False))
                 # positions the owner closed in the broker app (throttled)
                 _position_upkeep(cfg, state, save_state, broker, client)
                 # every 10 min, and right away when the owner goes live
