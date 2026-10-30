@@ -89,7 +89,11 @@ def connect(cfg, values):
 
 
 class _Client:
-    """Thin holder so broker.client(cfg) has the same shape as the others."""
+    """Thin holder so broker.client(cfg) has the same shape as the others.
+
+    Orders, quotes and holdings reads use this startup copy of the config,
+    so a paper/real switch in the dashboard applies after a restart (the
+    agent tags positions from it too: agent._account_tag)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -191,13 +195,13 @@ def _ask_price(cfg, sdk, code):
 
 def mark_price(cl, cfg, event, side="buy"):
     """Per-share quote for the agent's P&L estimate (0.0 when unavailable)."""
-    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
     return _ask_price(cfg, _sdk(), _moomoo_code(event))
 
 
 def account_value(cl, cfg):
     """Total assets for %-of-account sizing (0.0 when unavailable)."""
-    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
     ctx = None
     try:
         sdk = _sdk()
@@ -219,7 +223,7 @@ def account_value(cl, cfg):
 
 def buying_power(cl, cfg):
     """Cash available for new orders, or None when unreadable."""
-    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
     ctx = None
     try:
         sdk = _sdk()
@@ -319,11 +323,7 @@ def _order(cfg, sdk, code, side, qty, price):
 
 def execute(cl, cfg, event, state):
     """Act on one normalized event. Returns True if state changed."""
-    # Prefer the cfg the caller passed (the live config, with per-track
-    # sizing), like alpaca: orders, holdings reads and the account tag the
-    # agent stamps on each position then all use the same paper/real mode,
-    # even after the owner flips it in the dashboard.
-    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
     try:
         sdk = _sdk()
     except RuntimeError as exc:
@@ -413,7 +413,9 @@ def held_option_qty(cl, cfg, option_ids):
     the agent's own resting buy — is left out, and so is one that holds
     fewer than today's filled buys minus filled sells (the position list
     lagging a fill)."""
-    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    # the copy execute orders with: reads and orders always look at the
+    # same paper/real account
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
     ids = sorted({str(i) for i in option_ids or () if str(i).startswith("US.")})
     if not ids:
         return {}

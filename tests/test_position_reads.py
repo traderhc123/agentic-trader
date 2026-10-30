@@ -572,6 +572,10 @@ class _MMCtx:
         self.queries.append(("orders", kw))
         return self._answer(self.sdk.ord_ret, self.sdk.orders)
 
+    def accinfo_query(self, **kw):
+        self.queries.append(("accinfo", kw))
+        return self.sdk.RET_OK, _FakeDF([{"total_assets": 900.0, "power": 500.0}])
+
     def place_order(self, **kw):
         self.sdk.placed.append(kw)
         return self.sdk.RET_OK, _FakeDF([{"order_id": f"mm-{len(self.sdk.placed)}"}])
@@ -678,22 +682,98 @@ def test_moomoo_positions_cross_checked_with_todays_fills(monkeypatch, positions
     assert moomoo.held_option_qty(moomoo._Client(MOOMOO), {}, [MM1]) == want
 
 
-def test_moomoo_uses_the_live_cfg_over_the_clients_startup_copy(monkeypatch):
-    """`run` keeps its startup client while config.json reloads: after the
-    owner flips paper/real in the dashboard, orders and reads follow the
-    live config — the one the agent tags positions with."""
+# `run` keeps the client it started with while config.json reloads. A moomoo
+# paper/real switch in the dashboard applies after a restart: until then the
+# client's startup copy decides where orders go, so holdings reads and the
+# account tag on every position follow that copy too.
+MM_REAL = {"broker": "moomoo", "moomoo_paper": False, "moomoo_trade_pwd": "x",
+           "contracts_per_trade": 1}
+MM_FLIPPED = {**MM_REAL, "moomoo_paper": True}    # live config after the switch
+MM_SPY = "US.SPY991218C752000"
+MM_KEY = "SPY|2099-12-18|752.0|C"
+
+
+def test_moomoo_trades_and_reads_with_the_clients_startup_cfg(monkeypatch):
     sdk = _MMSDK()
     monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
-    startup = moomoo._Client({"broker": "moomoo", "moomoo_paper": False,
-                              "moomoo_trade_pwd": "x"})
-    assert moomoo.held_option_qty(startup, MOOMOO, [MM1]) == {MM1: 0}
-    assert [kw["trd_env"] for _, kw in sdk.ctxs[0].queries] == ["SIM", "SIM"]
+    startup = moomoo._Client(MM_REAL)
+    assert moomoo.held_option_qty(startup, MM_FLIPPED, [MM1]) == {MM1: 0}
+    assert [kw["trd_env"] for _, kw in sdk.ctxs[0].queries] == ["REAL", "REAL"]
     st = {"positions": {}}
-    assert moomoo.execute(startup, MOOMOO, make_event(expiry="2099-12-18"), st)
-    assert sdk.placed[-1]["trd_env"] == "SIM"
-    # with no cfg passed, the client's copy still works
-    moomoo.held_option_qty(startup, {}, [MM1])
+    assert moomoo.execute(startup, MM_FLIPPED, make_event(expiry="2099-12-18"), st)
+    assert sdk.placed[-1]["trd_env"] == "REAL"
+    assert moomoo.account_value(startup, MM_FLIPPED) == 900.0
+    assert moomoo.buying_power(startup, MM_FLIPPED) == 500.0
+    assert [q for c in sdk.ctxs for q in c.queries if q[0] == "accinfo"] == [
+        ("accinfo", {"trd_env": "REAL"})] * 2
+    # without a moomoo client, the passed config
+    moomoo.held_option_qty(None, MM_FLIPPED, [MM1])
+    assert [kw["trd_env"] for _, kw in sdk.ctxs[-1].queries] == ["SIM", "SIM"]
+
+
+def _mm_agent(monkeypatch, positions=()):
+    import agent
+    sdk = _MMSDK(positions=positions)
+    monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
+    monkeypatch.setattr(agent, "notify", lambda cfg, msg: None)
+    monkeypatch.setattr(agent, "_problems_logged", set())
+    return agent, sdk
+
+
+def test_moomoo_rows_and_trust_carry_the_clients_account_tag(home, monkeypatch,
+                                                             no_policy):
+    agent, sdk = _mm_agent(monkeypatch, [{"code": MM_SPY, "qty": 1.0}])
+    st = {"positions": {}, "seen": []}
+    startup = moomoo._Client(MM_REAL)
+    ev = make_event(expiry="2099-12-18", event_id="open-1")
+    assert agent.handle_event(ev, MM_FLIPPED, st, moomoo, startup,
+                              lambda s: None).startswith("ENTRY")
+    assert sdk.placed[-1]["trd_env"] == "REAL"
+    assert st["positions"][MM_KEY]["acct"] == "moomoo:real"
+    later = time.time() + 3600                      # past the grace period
+    monkeypatch.setattr(agent, "_now", lambda: later)
+    r = agent._sync_positions(MM_FLIPPED, st, lambda s: None, moomoo, startup)
+    assert r == {MM_KEY: {"held": 1, "status": "ok"}}
     assert [kw["trd_env"] for _, kw in sdk.ctxs[-1].queries] == ["REAL", "REAL"]
+    assert list(st["position_sync"]["proven"]) == ["moomoo:real"]
+    assert agent._account_tag(MM_FLIPPED, moomoo, startup) == "moomoo:real"
+    assert agent._account_tag(MM_FLIPPED, moomoo) == "moomoo:paper"
+
+
+def test_moomoo_real_row_still_sells_after_a_switch_to_paper(home, monkeypatch):
+    """The dashboard now says paper, but the running client still trades
+    REAL: the REAL row's exit is sold there, not blocked as 'opened in a
+    different account'."""
+    agent, sdk = _mm_agent(monkeypatch, [{"code": MM_SPY, "qty": 2.0}])
+    then = time.time() - 3600
+    st = {"positions": {MM_KEY: {"option_id": MM_SPY, "qty": 2, "acct": "moomoo:real",
+                                 "opened_event": "open-1", "opened_at": then,
+                                 "last_order_at": then}},
+          "seen": [], "position_sync": {"proven": {"moomoo:real": "2026-10-29"}}}
+    ev = make_event(event="EXITED", expiry="2099-12-18", event_id="x1")
+    out = agent.handle_event(ev, MM_FLIPPED, st, moomoo, moomoo._Client(MM_REAL),
+                             lambda s: None)
+    assert out.startswith("EXIT") and st["positions"] == {}
+    assert [(p["trd_side"], p["trd_env"], p["qty"]) for p in sdk.placed] == [
+        ("SELL", "REAL", 2)]
+    rows = [json.loads(x) for x in (home / "trades.jsonl").read_text().splitlines()]
+    assert [r["action"] for r in rows] == ["exit"]
+    # every read went to the REAL account
+    assert {kw["trd_env"] for c in sdk.ctxs for _, kw in c.queries} == {"REAL"}
+
+
+def test_moomoo_reheld_check_reads_the_clients_account(home, monkeypatch):
+    agent, sdk = _mm_agent(monkeypatch, [{"code": MM_SPY, "qty": 2.0}])
+    sent = []
+    monkeypatch.setattr(agent, "notify", lambda cfg, msg: sent.append(msg))
+    st = {"positions": {}, "seen": [],
+          "closed_outside": {MM_KEY: {"option_id": MM_SPY, "opened_event": "open-1",
+                                      "acct": "moomoo:real", "qty": 2,
+                                      "cause": "sold", "at": "2026-10-30"}}}
+    ev = make_event(event="EXITED", expiry="2099-12-18", event_id="x1")
+    assert agent.handle_event(ev, MM_FLIPPED, st, moomoo, moomoo._Client(MM_REAL),
+                              lambda s: None) is None
+    assert sdk.placed == [] and len(sent) == 1 and "holds 2 now" in sent[0]
 
 
 @pytest.mark.parametrize("sdk", [

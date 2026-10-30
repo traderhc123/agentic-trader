@@ -1031,9 +1031,16 @@ def _broker_name(cfg, broker=None):
     return str(cfg.get("broker") or "robinhood")
 
 
-def _account_tag(cfg, broker=None):
-    """account_tag() of the account the running adapter trades."""
-    return account_tag({**cfg, "broker": _broker_name(cfg, broker)})
+def _account_tag(cfg, broker=None, client=None):
+    """account_tag() of the account the running adapter trades. moomoo
+    orders and reads with its client's startup copy of the config (a
+    paper/real switch in the dashboard applies after a restart), so its
+    tag comes from that copy too."""
+    name = _broker_name(cfg, broker)
+    own = getattr(client, "cfg", None)
+    if name == "moomoo" and isinstance(own, dict):
+        return account_tag({**own, "broker": name})
+    return account_tag({**cfg, "broker": name})
 
 
 def _gate_on(cfg, broker, client):
@@ -1135,7 +1142,7 @@ def _read_problems(cfg, state, save_state, client, events):
 def _sync_read(cfg, state, save_state, broker, client, fn, keys, confirm_s,
                event_id, detected_by):
     now = _now()
-    tag = _account_tag(cfg, broker)
+    tag = _account_tag(cfg, broker, client)
     cand, changed = _sync_candidates(state, tag, now)
     held = None
     if cand:
@@ -1480,7 +1487,7 @@ def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev):
     "wait" (the account shows fewer contracts than the ledger — re-check
     before selling)."""
     pos = state["positions"].get(pos_key) or {}
-    tag = _account_tag(cfg, broker)
+    tag = _account_tag(cfg, broker, client)
     if pos.get("acct") and pos["acct"] != tag:
         return "blocked"  # needs no read: never sell from another account
     if (not _gate_on(cfg, broker, client) or pos.get("pending")
@@ -1526,7 +1533,7 @@ def _warn_if_reheld(cfg, state, save_state, broker, client, pos_key, contract):
     if (not isinstance(tomb, dict) or tomb.get("warned")
             or not _gate_on(cfg, broker, client)
             or getattr(client, "last_error", None) or not tomb.get("option_id")
-            or tomb.get("acct") not in (None, _account_tag(cfg, broker))):
+            or tomb.get("acct") not in (None, _account_tag(cfg, broker, client))):
         return
     import broker_events
     broker_events.begin()
@@ -1806,7 +1813,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             if not dry:  # holdings checks: grace period + which account
                 row.setdefault("opened_at", _now())
                 row["last_order_at"] = max(_float0(row.get("last_order_at")), _now())
-                row.setdefault("acct", _account_tag(cfg, broker))
+                row.setdefault("acct", _account_tag(cfg, broker, client))
         elif action == "exit" and sold is None:  # dry run
             est = _est_exit_pnl(prior_pos, _mark(broker, client, ecfg, ev, "sell"), ev)
             if est is not None:
@@ -2628,19 +2635,21 @@ def cmd_check_positions():
     state = _load(STATE_PATH, {}) or {}
     name = cfg.get("broker", "robinhood")
     broker = BROKERS.get(name)
-    tag = account_tag(cfg)
     rows = {k: p for k, p in (state.get("positions") or {}).items()
             if isinstance(p, dict) and not p.get("dry")
             and p.get("option_id") not in (None, "", "dry")}
     print(f"broker           : {name}"
           + (" (holdings check turned off: position_sync false)"
              if cfg.get("position_sync", True) is False else ""))
+    fn = getattr(broker, "held_option_qty", None) if broker is not None else None
+    client = broker.client(cfg) if rows and fn is not None else None
+    tag = _account_tag(cfg, broker, client)
     print("holdings check   : " + ("proven on this account" if _trusted(state, tag)
                                    else "not proven on this account yet"))
     if not rows:
         print("open positions   : none (live)")
         return
-    held, why = _read_holdings_once(broker, cfg, rows)
+    held, why = _read_holdings_once(fn, client, cfg, rows)
     if why:
         print(f"broker answer    : unknown — {why}")
     for key in sorted(rows):
@@ -2660,12 +2669,10 @@ def cmd_check_positions():
         print(line)
 
 
-def _read_holdings_once(broker, cfg, rows):
+def _read_holdings_once(fn, client, cfg, rows):
     """(held dict or None, why unknown) for the check-positions command."""
-    fn = getattr(broker, "held_option_qty", None) if broker is not None else None
     if fn is None:
         return None, "this broker can't report holdings"
-    client = broker.client(cfg)
     if client is None:
         return None, "broker not connected — run: python agent.py setup"
     import broker_events
