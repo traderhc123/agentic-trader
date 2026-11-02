@@ -2582,6 +2582,10 @@ def _tip_status_route(_h, data):
         return {"ok": False, "error": "That invoice id doesn't look right."}
     try:
         st = hc.tip_status(h)
+    except hc.TipStatusUnknown:
+        # Never "expired" here: the invoice may still be payable.
+        return {"ok": False, "retry": True, "unknown": True,
+                "error": hc.TIP_STATUS_UNKNOWN}
     except Exception as exc:
         return {"ok": False, "retry": True, "error": _net_error_text(exc, cache_s=60)}
     status = st.get("status") if isinstance(st, dict) else None

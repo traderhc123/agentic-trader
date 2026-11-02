@@ -177,6 +177,7 @@ export interface TipStatus {
   ok: boolean;
   status?: "pending" | "paid" | "expired";
   retry?: boolean;
+  unknown?: boolean;
   error?: string;
 }
 export interface Proposal {

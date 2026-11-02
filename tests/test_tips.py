@@ -190,13 +190,36 @@ def test_tip_status_checks_the_id_before_asking(fake_http):
 
 
 def test_tip_status_answers(fake_http):
-    h = fake_http(_R(404), _R(200, {"status": "paid"}), _R(503))
+    h = fake_http(_R(200, {"status": "expired"}), _R(200, {"status": "paid"}), _R(503))
     assert hc.tip_status(HASH) == {"status": "expired"}
     assert hc.tip_status(HASH)["status"] == "paid"
     with pytest.raises(RuntimeError):
         hc.tip_status(HASH)
     assert h.calls[0][1] == f"{hc.AGENTHC_API}{hc.TIP_PATH}/{HASH}"
     assert all(set(kw) == {"timeout"} for _, _, kw in h.calls)
+
+
+@pytest.mark.parametrize("body", [
+    {"detail": {"error": "tips_disabled", "message": "Tips are turned off right now."}},
+    {"detail": {"error": "tip_not_found", "message": "No tip invoice with that id."}},
+    {"detail": "Not Found"},
+    ValueError("not json"),
+])
+def test_tip_status_404_is_never_expired(fake_http, body):
+    """Turning tips off (or losing the tip row, or an older server) doesn't
+    cancel the Lightning invoice: it may still be paid, so a 404 must never
+    be read as "expired … nothing was charged"."""
+    fake_http(_R(404, body))
+    with pytest.raises(hc.TipStatusUnknown):
+        hc.tip_status(HASH)
+
+
+def test_status_route_404_keeps_polling_with_a_neutral_note(fake_http):
+    fake_http(_R(404, {"detail": {"error": "tips_disabled"}}))
+    r = webui._tip_status_route(None, {"payment_hash": HASH})
+    assert r == {"ok": False, "retry": True, "unknown": True,
+                 "error": hc.TIP_STATUS_UNKNOWN}
+    assert "status" not in r and "charged" not in r["error"]
 
 
 # ── local dashboard routes ──────────────────────────────────────────────────

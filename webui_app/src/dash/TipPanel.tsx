@@ -12,7 +12,10 @@ import { copyToClipboard } from "../lib/hooks";
 // from their own Lightning wallet (QR / copy / lightning: link), like a
 // prepaid pass. The agent's wallet never pays it; nothing is saved.
 
-type View = "loading" | "tiers" | "invoice" | "paid" | "expired" | "unavailable" | "error";
+// "expired" = AgentHC said the invoice expired unpaid. "lapsed" = it is past
+// its validity locally but AgentHC never confirmed either way (e.g. tips were
+// turned off mid-invoice), so we can't promise nothing was charged.
+type View = "loading" | "tiers" | "invoice" | "paid" | "expired" | "lapsed" | "unavailable" | "error";
 
 interface Inv {
   bolt11: string;
@@ -40,8 +43,13 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
   const [inv, setInv] = useState<Inv | null>(null);
   const [copied, setCopied] = useState("");
   const [showHelp, setShowHelp] = useState(false);
+  const [unconfirmed, setUnconfirmed] = useState("");
   const poll = useRef<ReturnType<typeof setInterval> | null>(null);
   const alive = useRef(true);
+  // Hash of the invoice on screen; a status reply for any other hash is stale.
+  const curHash = useRef<string | null>(null);
+  const inFlight = useRef(false);
+  const intro = useRef<HTMLParagraphElement | null>(null);
 
   const stopPoll = () => {
     if (poll.current) clearInterval(poll.current);
@@ -72,6 +80,8 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     alive.current = true;
+    // Move keyboard / screen-reader focus into the panel when it opens.
+    intro.current?.focus();
     loadTiers();
     return () => {
       alive.current = false;
@@ -80,28 +90,43 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const current = (cur: Inv) => alive.current && poll.current != null && curHash.current === cur.hash;
+
   const check = async (cur: Inv) => {
+    if (!current(cur)) return;
     if (Date.now() > cur.shownAt + cur.validS * 1000 + 60000) {
       stopPoll();
-      setView("expired");
+      curHash.current = null;
+      setView("lapsed");
       return;
     }
     if (Date.now() - cur.shownAt > HELP_AFTER_MS) setShowHelp(true);
+    if (inFlight.current) return; // a slow reply is still out: don't stack polls
+    inFlight.current = true;
     let r: TipStatus;
     try {
       r = await api<TipStatus>("/api/tip/status", { payment_hash: cur.hash });
     } catch {
       return; // agent briefly unreachable: keep polling
+    } finally {
+      inFlight.current = false;
     }
-    if (!alive.current || !poll.current) return;
+    // Cancelled, closed, or a newer invoice is on screen: this reply is stale.
+    if (!current(cur)) return;
     if (r.ok && r.status === "paid") {
       stopPoll();
+      curHash.current = null;
       setView("paid");
     } else if (r.ok && r.status === "expired") {
       stopPoll();
+      curHash.current = null;
       setView("expired");
+    } else if (r.ok) {
+      setUnconfirmed("");
+    } else if (r.unknown) {
+      setUnconfirmed(r.error || "");
     }
-    // pending, or {ok:false, retry}: nothing changes, keep polling
+    // pending, or {ok:false, retry}: keep polling
   };
 
   const pick = async (t: TipTier) => {
@@ -138,13 +163,17 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
     setInv(cur);
     setCopied("");
     setShowHelp(false);
+    setUnconfirmed("");
     setView("invoice");
     stopPoll();
+    curHash.current = cur.hash;
     poll.current = setInterval(() => check(cur), POLL_MS);
   };
 
   const backToTiers = () => {
     stopPoll();
+    curHash.current = null;
+    setUnconfirmed("");
     setInv(null);
     setView("loading");
     loadTiers();
@@ -161,7 +190,7 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
       }
       bodyClass="p-4 space-y-3"
     >
-      <p className="m-0 text-sm text-muted">
+      <p ref={intro} tabIndex={-1} className="m-0 text-sm text-muted outline-none">
         Like what your agent does? Send a thank-you in sats from your own Lightning wallet. A tip buys nothing — no signals, no
         credit, no refunds. Your agent's wallet never pays it.
       </p>
@@ -181,8 +210,11 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
                   type="button"
                   data-sats={t.amount_sats}
                   onClick={() => pick(t)}
-                  disabled={!t.available || busy != null}
-                  aria-label={t.label}
+                  // An unavailable tier stays focusable (aria-disabled, click is a
+                  // no-op in pick) so keyboard and screen-reader users hear why.
+                  disabled={busy != null}
+                  aria-disabled={!t.available || undefined}
+                  aria-describedby={!t.available && t.reason ? `tip-reason-${t.amount_sats}` : undefined}
                   aria-busy={busy === t.amount_sats}
                   className={cn(
                     "flex min-w-0 flex-col items-start rounded-md border px-3 pb-2.5 pt-3 text-left transition-colors",
@@ -201,7 +233,11 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
                     {busy === t.amount_sats ? "Making invoice…" : t.amount_usd_approx != null ? `≈ $${t.amount_usd_approx.toFixed(2)}` : " "}
                   </span>
                 </button>
-                {!t.available && t.reason && <span className="text-2xs leading-snug text-muted">{t.reason}</span>}
+                {!t.available && t.reason && (
+                  <span id={`tip-reason-${t.amount_sats}`} className="text-2xs leading-snug text-muted">
+                    {t.reason}
+                  </span>
+                )}
               </div>
             ))}
           </div>
@@ -244,7 +280,9 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
           <p className="m-0 text-sm">
             <Msg
               m={info(
-                showHelp
+                unconfirmed
+                  ? unconfirmed
+                  : showHelp
                   ? `Still waiting. Check your wallet sent exactly ${inv.sats.toLocaleString("en-US")} sats and has enough balance plus a small network fee. If it failed, nothing was charged.`
                   : "Waiting for payment…",
               )}
@@ -267,13 +305,20 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
         </div>
       )}
 
+      {view === "lapsed" && (
+        <div className="flex flex-wrap items-center gap-3">
+          <Msg m={info("This invoice is past its 1 hour. If your wallet shows it paid, it reached AgentHC; if not, nothing was charged.")} />
+          <Button onClick={backToTiers}>Get a new invoice</Button>
+        </div>
+      )}
+
       {view === "error" && (
         <div className="flex flex-wrap items-center gap-3">
           <Button onClick={backToTiers}>Try again</Button>
         </div>
       )}
 
-      {msg && view !== "invoice" && view !== "paid" && view !== "expired" && (
+      {msg && view !== "invoice" && view !== "paid" && view !== "expired" && view !== "lapsed" && (
         <p className="m-0 text-sm">
           <Msg m={msg} />
         </p>

@@ -164,6 +164,16 @@ class TipsUnavailable(RuntimeError):
     """The AgentHC server doesn't offer tips (not deployed yet, or off)."""
 
 
+TIP_STATUS_UNKNOWN = ("Can't check this invoice right now. If your wallet "
+                      "shows it paid, it reached AgentHC.")
+
+
+class TipStatusUnknown(RuntimeError):
+    """AgentHC answered a tip status poll with 404 (tips turned off, the tip
+    record gone, or an older server). The invoice itself may still be
+    payable, so this is never read as "expired"."""
+
+
 class TipRefused(RuntimeError):
     """The server (or the local invoice check) refused this tip. `code` is
     the server's error code; `refresh` asks the UI to re-read the tiers."""
@@ -265,12 +275,17 @@ def create_tip(amount_sats):
 
 
 def tip_status(payment_hash):
-    """{'status': pending|paid|expired, …} for a tip invoice."""
+    """{'status': pending|paid|expired, …} for a tip invoice.
+
+    Only the server's own "expired" status means expired. A 404 (tips turned
+    off, the tip record lost, or an older server) raises TipStatusUnknown:
+    turning tips off doesn't cancel the Lightning invoice, so it may still be
+    paid, and the UI must not say nothing was charged."""
     if not isinstance(payment_hash, str) or not _HEX64.fullmatch(payment_hash):
         raise ValueError("That invoice id doesn't look right.")
     resp = _http.get(f"{AGENTHC_API}{TIP_PATH}/{payment_hash}", timeout=10)
     if resp.status_code == 404:
-        return {"status": "expired"}  # gone, or a server without tips
+        raise TipStatusUnknown(_error_code(resp) or "not_found")
     if resp.status_code == 503:
         raise RuntimeError("status_unavailable")
     if resp.status_code != 200:
