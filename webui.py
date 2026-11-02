@@ -2515,6 +2515,130 @@ def _qr_matrix(data):
         return None
 
 
+# ── tips (dashboard "Tip" button) ────────────────────────────────────────────
+# The owner tips AgentHC $100, $500 or $1,000, paid in sats at the live
+# Bitcoin price, by paying an invoice from their own wallet (QR / copy /
+# lightning: link). AgentHC prices the invoice; these routes only ask for it
+# and its status, check it, and never pay, never touch the agent's wallet
+# (a tip is far above max_autopay_sats, and is never paid from it anyway),
+# and write nothing to config, state or the trade log.
+
+# $ tiers AgentHC offered on the last /api/tip/options read, and the BTC
+# price they came with. A create is only sent for one of these tiers that is
+# also on hc.TIP_TIERS_USD.
+_tip_offered = {"usd": (), "btc": None}
+# AgentHC's BTC price may differ by at most this much from the independent
+# price (_btc_usd: Coinbase / blockchain.info, cached 5 min). AgentHC's quote
+# can be up to 15 minutes old; a bigger gap means something is off. Checked
+# before asking for an invoice (against the /options price, so a refusal
+# doesn't leave an unpaid invoice counting against AgentHC's per-IP cap) and
+# again on the invoice's own price. No independent price, no invoice.
+_TIP_XCHECK_BAND = 0.03
+_TIP_PICK = "Pick one of the tip amounts shown."
+_TIP_NOT_OFFERED = ("That tip amount isn't on offer right now. Pick one of "
+                    "the amounts shown.")
+_TIP_PRICE_ODD = ("AgentHC's Bitcoin price for this tip is too far from the "
+                  "market price, so the invoice wasn't shown. Nothing was "
+                  "paid. Try again in a few minutes.")
+_TIP_SATS_ODD = ("The Bitcoin price AgentHC sent looks wrong. Try again in "
+                 "a minute.")
+_TIP_NO_MARKET = "Can't check the Bitcoin price right now. Try again in a minute."
+
+
+def _tip_price_far(btc, market):
+    return abs(btc / market - 1) > _TIP_XCHECK_BAND
+
+
+def _tip_label(usd, sats):
+    """"$500 (~643,500 sats)": the sats rounded to 100 for the tier buttons;
+    the invoice itself shows the exact amount."""
+    label = f"${usd:,}"
+    if type(sats) is int and sats > 0:
+        label += f" (~{round(sats, -2):,} sats)"
+    return label
+
+
+def _tip_options_route(_h):
+    from sources import agenthc_day_trade_ideas as hc
+    try:
+        body = hc.tip_options()
+    except hc.TipsUnavailable:
+        return {"ok": False, "unavailable": True, "error": hc.TIPS_NOT_YET}
+    except Exception as exc:
+        return {"ok": False, "error": _net_error_text(exc)}
+    tiers = []
+    for t in body.get("tiers") or []:
+        sats = t["amount_sats"]  # None unless it matches the quote (hc checked)
+        available = t.get("available") is True and sats is not None
+        reason = str(t["reason"])[:200] if t.get("reason") else None
+        if not available and not reason:
+            reason = _TIP_SATS_ODD
+        tiers.append({"amount_usd": t["amount_usd"], "amount_sats": sats,
+                      "available": available,
+                      "reason": None if available else reason,
+                      "label": _tip_label(t["amount_usd"], sats)})
+    q = body.get("quote")
+    _tip_offered.update(usd=tuple(t["amount_usd"] for t in tiers),
+                        btc=q["btc_usd"] if q else None)
+    return {"ok": True, "tiers": tiers,
+            "quote": {"btc_usd": q["btc_usd"], "age_s": q["age_seconds"],
+                      "source": q["source"]} if q else None,
+            "valid_seconds": body.get("invoice_valid_seconds", 3600)}
+
+
+def _tip_create(_h, data):
+    from sources import agenthc_day_trade_ideas as hc
+    n = (data or {}).get("amount_usd")
+    if type(n) is not int or n not in hc.TIP_TIERS_USD:
+        return {"ok": False, "error": _TIP_PICK}
+    if n not in _tip_offered["usd"]:
+        return {"ok": False, "error": _TIP_NOT_OFFERED, "refresh_tiers": True}
+    # Fail closed: without an independent price nothing bounds AgentHC's.
+    market = _btc_usd()
+    if not market > 0:
+        return {"ok": False, "error": _TIP_NO_MARKET}
+    offered = _tip_offered.get("btc")
+    if offered and _tip_price_far(offered, market):
+        return {"ok": False, "error": _TIP_PRICE_ODD, "refresh_tiers": True}
+    try:
+        body = hc.create_tip(n)
+    except hc.TipRefused as exc:
+        return {"ok": False, "error": str(exc), "refresh_tiers": exc.refresh}
+    except hc.TipsUnavailable:
+        return {"ok": False, "unavailable": True, "error": hc.TIPS_NOT_YET}
+    except Exception as exc:
+        return {"ok": False, "error": _net_error_text(exc)}
+    # create_tip checked the invoice against AgentHC's own price; AgentHC may
+    # have re-priced since /options, so check that price independently too.
+    btc = float(body["btc_usd"])
+    if _tip_price_far(btc, market):
+        return {"ok": False, "error": _TIP_PRICE_ODD, "refresh_tiers": True}
+    bolt11 = body["payment_request"].strip()
+    return {"ok": True, "bolt11": bolt11, "qr": _qr_matrix(bolt11.upper()),
+            "payment_hash": body["payment_hash"], "amount_usd": n,
+            "amount_sats": body["amount_sats"], "btc_usd": btc,
+            "expires_in": body.get("invoice_valid_seconds", 3600)}
+
+
+def _tip_status_route(_h, data):
+    from sources import agenthc_day_trade_ideas as hc
+    h = (data or {}).get("payment_hash")
+    if not isinstance(h, str) or not hc._HEX64.fullmatch(h):
+        return {"ok": False, "error": "That invoice id doesn't look right."}
+    try:
+        st = hc.tip_status(h)
+    except hc.TipStatusUnknown:
+        # Never "expired" here: the invoice may still be payable.
+        return {"ok": False, "retry": True, "unknown": True,
+                "error": hc.TIP_STATUS_UNKNOWN}
+    except Exception as exc:
+        return {"ok": False, "retry": True, "error": _net_error_text(exc, cache_s=60)}
+    status = st.get("status") if isinstance(st, dict) else None
+    if status not in ("pending", "paid", "expired"):
+        status = "pending"
+    return {"ok": True, "status": status}
+
+
 def _restore_notes(cfg, acceptance=None):
     """Per-tab 'already configured' summaries for the wizard restore path.
     Non-secret only — these render as plain text at the top of each completed
@@ -3434,6 +3558,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/llm/providers": llm_providers,
                     "/api/pass/status": pass_status_route,
                     "/api/pass/options": pass_options_route,
+                    "/api/tip/options": _tip_options_route,
                     "/api/status": d_status, "/api/trades": d_trades,
                     "/api/pnl": d_pnl,
                     "/api/proposal": proposal_get,
@@ -3465,6 +3590,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/autostart": autostart_set,
                      "/api/wallet/create": wallet_create,
                      "/api/pass/buy": pass_buy,
+                     "/api/tip/create": _tip_create,
+                     "/api/tip/status": _tip_status_route,
                      "/api/wallet/fund": wallet_fund,
                      "/api/llm": llm, "/api/llm/models": llm_models,
                      "/api/deploy": deploy,

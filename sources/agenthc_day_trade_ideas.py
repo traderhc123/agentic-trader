@@ -14,6 +14,7 @@ GET https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record
 """
 
 import os
+import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -137,6 +138,246 @@ def pass_status(token):
     if resp.status_code == 401:
         return {"status": "invalid"}
     resp.raise_for_status()
+    return resp.json()
+
+
+# ── tips ─────────────────────────────────────────────────────────────────────
+# A tip is a thank-you to AgentHC: $100, $500 or $1,000, paid in sats at the
+# live Bitcoin price. AgentHC prices the invoice from its own current quote
+# (sats = ceil(usd * 1e8 / btc_usd)) and refuses when it has none. The OWNER
+# pays it from their own wallet (QR / copy / lightning: link), exactly like a
+# prepaid pass. It buys nothing. Nothing here pays anything: the agent's
+# wallet never pays a tip (whatever max_autopay_sats says; every tier is far
+# above it anyway), and no pass token, API key or config value is sent with
+# these requests.
+
+TIP_PATH = "/api/v1/payments/tip"
+TIP_TIERS_USD = (100, 500, 1000)     # local hard allowlist, whatever AgentHC offers
+# The /options tier sats (display only) must be within this fraction of
+# amount_usd at the quote returned with them. An invoice's sats are held to
+# the exact contract value instead (tip_sats_exact).
+TIP_PRICE_BAND = 0.02
+# AgentHC prices tips only from a quote at most this old (its pass cache
+# TTL); an older quote on /options is not shown as the current price.
+TIP_QUOTE_MAX_AGE_S = 900
+# A BTC price (USD per BTC) outside this range is treated as broken. These
+# are the bounds AgentHC itself applies before it prices a tip.
+TIP_BTC_USD_RANGE = (1_000.0, 10_000_000.0)
+TIPS_NOT_YET = ("Tips aren't open yet. Thanks for wanting to help — try again "
+                "after the next AgentHC update.")
+TIP_MISMATCH = ("AgentHC sent an invoice that doesn't match the tip you "
+                "picked, so it wasn't shown. Nothing was paid.")
+# Server refusals after which the tier list should be fetched again.
+_TIP_REFRESH_CODES = ("tip_size_temporarily_unavailable", "tips_busy",
+                      "invalid_tip_amount", "price_unavailable",
+                      "node_unavailable")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+class TipsUnavailable(RuntimeError):
+    """The AgentHC server doesn't offer tips (not deployed yet, or off)."""
+
+
+TIP_STATUS_UNKNOWN = ("Can't check this invoice right now. If your wallet "
+                      "shows it paid, it reached AgentHC.")
+
+
+class TipStatusUnknown(RuntimeError):
+    """AgentHC answered a tip status poll with 404 (tips turned off, the tip
+    record gone, or an older server). The invoice itself may still be
+    payable, so this is never read as "expired"."""
+
+
+class TipRefused(RuntimeError):
+    """The server (or the local invoice check) refused this tip. `code` is
+    the server's error code; `refresh` asks the UI to re-read the tiers."""
+
+    def __init__(self, message, code=None, refresh=False):
+        super().__init__(message)
+        self.code = code
+        self.refresh = refresh
+
+
+def _is_tier(n):
+    # bool is an int subclass: True must not pass as 1
+    return type(n) is int and n in TIP_TIERS_USD
+
+
+def _btc_price(v):
+    """v as a float (USD per BTC) when it is a real number inside
+    TIP_BTC_USD_RANGE, else None."""
+    if type(v) not in (int, float) or v != v:  # rejects bool, str, None, NaN
+        return None
+    lo, hi = TIP_BTC_USD_RANGE
+    return float(v) if lo <= v <= hi else None
+
+
+def tip_sats_ok(amount_usd, amount_sats, btc_usd):
+    """True when `amount_sats` is a positive int within TIP_PRICE_BAND of
+    `amount_usd` dollars at `btc_usd` dollars per BTC."""
+    price = _btc_price(btc_usd)
+    if not _is_tier(amount_usd) or type(amount_sats) is not int \
+            or amount_sats <= 0 or price is None:
+        return False
+    fair = amount_usd * 1e8 / price
+    return abs(amount_sats - fair) <= fair * TIP_PRICE_BAND
+
+
+def tip_sats_exact(amount_usd, amount_sats, btc_usd):
+    """True when `amount_sats` is what AgentHC's contract says it charges for
+    `amount_usd` dollars at `btc_usd` (a price in whole cents):
+    ceil(amount_usd * 1e8 / btc_usd), in integer maths, give or take 1 sat."""
+    price = _btc_price(btc_usd)
+    if not _is_tier(amount_usd) or type(amount_sats) is not int \
+            or amount_sats <= 0 or price is None:
+        return False
+    cents = round(price * 100)
+    expected = -(-amount_usd * 10 ** 10 // cents)
+    return abs(amount_sats - expected) <= 1
+
+
+def _detail_message(resp):
+    try:
+        d = resp.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(d, dict):
+        return d.get("message") or None
+    return d if isinstance(d, str) else None
+
+
+_BECH32 = set("qpzry9x8gf2tvdw0s3jn54khce6mua7l")
+_BOLT11_MULT = {"": 10 ** 11, "m": 10 ** 8, "u": 10 ** 5, "n": 100}
+
+
+def bolt11_amount_msat(invoice):
+    """Amount (millisatoshis) a mainnet BOLT11 invoice asks for, read from its
+    human-readable part; None when it isn't a mainnet invoice, names no
+    amount, or doesn't look like an invoice. Only the amount is checked (no
+    checksum or signature): this catches a server sending the wrong amount,
+    and the paying wallet shows the amount again before anything is paid."""
+    if not isinstance(invoice, str):
+        return None
+    s = invoice.strip().lower()
+    if not s.startswith("lnbc") or not 100 <= len(s) <= 2000:
+        return None
+    sep = s.rfind("1")
+    if sep < 4 or not s[sep + 1:] or not set(s[sep + 1:]) <= _BECH32:
+        return None
+    m = re.fullmatch(r"(\d+)([munp]?)", s[4:sep])
+    if not m or m.group(1).startswith("0"):
+        return None
+    digits, mult = int(m.group(1)), m.group(2)
+    if mult == "p":
+        return digits // 10 if digits % 10 == 0 else None
+    return digits * _BOLT11_MULT[mult]
+
+
+def _tip_quote(q):
+    """The server's quote as {btc_usd, age_seconds, source}, or None when it
+    is missing or its price is implausible."""
+    if not isinstance(q, dict):
+        return None
+    price = _btc_price(q.get("btc_usd"))
+    if price is None:
+        return None
+    age, src = q.get("age_seconds"), q.get("source")
+    return {"btc_usd": price,
+            "age_seconds": age if type(age) in (int, float) else None,
+            "source": src if isinstance(src, str) else None}
+
+
+def tip_options():
+    """Tip tiers on offer. Only $ tiers on the local allowlist are kept, once
+    each, in AgentHC's order. Each tier: amount_usd, amount_sats (the price
+    right now, or None), available, reason. amount_sats is set to None
+    unless it matches amount_usd at the quote returned with it."""
+    resp = _http.get(f"{AGENTHC_API}{TIP_PATH}/options", timeout=10)
+    if resp.status_code in (404, 405):
+        raise TipsUnavailable(TIPS_NOT_YET)
+    if resp.status_code != 200:
+        raise RuntimeError(_detail_message(resp)
+                           or f"tip options failed ({resp.status_code})")
+    body = resp.json()
+    if not isinstance(body, dict):
+        raise RuntimeError("tip options: unexpected answer")
+    quote = _tip_quote(body.get("quote"))
+    # A quote too old for AgentHC to price with (it then offers no tier) is
+    # not passed on as the current price. A shorter limit from AgentHC wins.
+    max_age = body.get("quote_max_age_seconds")
+    if type(max_age) not in (int, float) or not 0 < max_age < TIP_QUOTE_MAX_AGE_S:
+        max_age = TIP_QUOTE_MAX_AGE_S
+    if quote and not (quote["age_seconds"] is not None
+                      and 0 <= quote["age_seconds"] <= max_age):
+        quote = None
+    tiers, seen = [], set()
+    for t in body.get("tiers") or []:
+        if not isinstance(t, dict) or not _is_tier(t.get("amount_usd")) \
+                or t["amount_usd"] in seen:
+            continue
+        seen.add(t["amount_usd"])
+        sats = t.get("amount_sats")
+        if not quote or not tip_sats_ok(t["amount_usd"], sats, quote["btc_usd"]):
+            sats = None
+        tiers.append({**t, "amount_sats": sats})
+    return {**body, "tiers": tiers, "quote": quote}
+
+
+def create_tip(amount_usd):
+    """Ask AgentHC for a tip invoice of `amount_usd` dollars (100, 500 or
+    1000), paid in sats. The body sent is {"amount_usd": n} and nothing
+    else. The answer is only returned when it is for that tier, its BOLT11
+    invoice asks for exactly its amount_sats, and amount_sats is exactly
+    what n dollars cost at the btc_usd it came with (tip_sats_exact). The
+    caller still has to check that btc_usd against an independent price."""
+    if not _is_tier(amount_usd):
+        raise ValueError("Pick one of the tip amounts shown.")
+    n = amount_usd
+    resp = _http.post(f"{AGENTHC_API}{TIP_PATH}", json={"amount_usd": n},
+                      timeout=20)
+    if resp.status_code in (404, 405):
+        raise TipsUnavailable(TIPS_NOT_YET)
+    if resp.status_code in (400, 429, 503):
+        code = _error_code(resp)
+        raise TipRefused(_detail_message(resp)
+                         or f"AgentHC couldn't make the tip invoice ({resp.status_code}).",
+                         code=code, refresh=code in _TIP_REFRESH_CODES)
+    if resp.status_code != 200:
+        raise RuntimeError(f"tip invoice failed ({resp.status_code})")
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise TipRefused(TIP_MISMATCH, code="amount_mismatch")
+    sats, quote = body.get("amount_sats"), body.get("quote")
+    if (type(body.get("amount_usd")) is not int or body["amount_usd"] != n
+            or type(sats) is not int or sats <= 0
+            or bolt11_amount_msat(body.get("payment_request")) != sats * 1000
+            or not tip_sats_exact(n, sats, body.get("btc_usd"))
+            or (isinstance(quote, dict) and quote.get("btc_usd") != body["btc_usd"])
+            or not isinstance(body.get("payment_hash"), str)
+            or not _HEX64.fullmatch(body["payment_hash"])):
+        raise TipRefused(TIP_MISMATCH, code="amount_mismatch")
+    return body
+
+
+def tip_status(payment_hash):
+    """{'status': pending|paid|expired, …} for a tip invoice.
+
+    Only the server's own "expired" status means expired. A 404 (tips turned
+    off, the tip record lost, or an older server) raises TipStatusUnknown:
+    turning tips off doesn't cancel the Lightning invoice, so it may still be
+    paid, and the UI must not say nothing was charged."""
+    if not isinstance(payment_hash, str) or not _HEX64.fullmatch(payment_hash):
+        raise ValueError("That invoice id doesn't look right.")
+    resp = _http.get(f"{AGENTHC_API}{TIP_PATH}/{payment_hash}", timeout=10)
+    if resp.status_code == 404:
+        raise TipStatusUnknown(_error_code(resp) or "not_found")
+    if resp.status_code == 503:
+        raise RuntimeError("status_unavailable")
+    if resp.status_code != 200:
+        raise RuntimeError(f"tip status failed ({resp.status_code})")
     return resp.json()
 
 

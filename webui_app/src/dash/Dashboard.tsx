@@ -25,6 +25,7 @@ import { copyToClipboard, useInterval } from "../lib/hooks";
 import { cap1, hhmm, isToday, money, parseContract, parsePositions, shortDate, whenShort, type Contract } from "../lib/format";
 import { MovePanel } from "./MovePanel";
 import { PnlChart, type PnlPoint } from "./PnlChart";
+import { TipPanel } from "./TipPanel";
 
 const SOURCES: Record<string, string> = { agenthc: "AgentHC feed", url: "Your JSON feed", manual: "Manual commands" };
 const SKIPS: Record<string, string> = {
@@ -74,6 +75,7 @@ export function Dashboard() {
   const [updateAvail, setUpdateAvail] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
+  const [tipOpen, setTipOpen] = useState(false);
   const [confirmLive, setConfirmLive] = useState(false);
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
 
@@ -240,6 +242,18 @@ export function Dashboard() {
             <Laptop className="h-4 w-4" />
             <span className="max-lg:hidden">Move computer</span>
           </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setTipOpen((o) => !o)}
+            aria-expanded={tipOpen}
+            aria-controls="tip"
+            aria-label="Tip AgentHC"
+            title="Tip AgentHC"
+          >
+            <Zap className="h-4 w-4" />
+            <span className="max-lg:hidden">Tip</span>
+          </Button>
           <Button variant="ghost" size="sm" onClick={() => setHelpOpen((o) => !o)} aria-expanded={helpOpen} aria-controls="help">
             <CircleHelp className="h-4 w-4" />
             <span className="max-lg:hidden">Help</span>
@@ -307,6 +321,7 @@ export function Dashboard() {
           </div>
           <div className="flex min-w-0 flex-col gap-4 xl:sticky xl:top-[68px]">
             {moveOpen && <MovePanel onClose={() => setMoveOpen(false)} />}
+            {tipOpen && <TipPanel onClose={() => setTipOpen(false)} />}
             {helpOpen && <HelpPanel onClose={() => setHelpOpen(false)} />}
             <ConsolePanel msgs={msgs} send={send} />
           </div>
