@@ -186,8 +186,10 @@ A Premium AgentHC API key also works (*Advanced* in the wizard).
 
 **Tips.** The dashboard's **Tip** button offers $100, $500 or $1,000, paid in
 sats at the live Bitcoin price: AgentHC prices a Lightning invoice and you pay
-it from your own wallet. The agent checks the invoice's amount before showing
-it. A tip is a thank-you and buys nothing; the agent's wallet never pays it,
+it from your own wallet. The agent checks the invoice's exact sats, and AgentHC's
+Bitcoin price against an independent one, before showing it (no independent
+price, no invoice).
+A tip is a thank-you and buys nothing; the agent's wallet never pays it,
 whatever `max_autopay_sats` is set to.
 
 ## How it works

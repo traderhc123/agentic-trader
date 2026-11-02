@@ -2523,13 +2523,17 @@ def _qr_matrix(data):
 # (a tip is far above max_autopay_sats, and is never paid from it anyway),
 # and write nothing to config, state or the trade log.
 
-# $ tiers AgentHC offered on the last /api/tip/options read. A create is only
-# sent for one of these that is also on hc.TIP_TIERS_USD.
-_tip_offered = {"usd": ()}
-# AgentHC's BTC price on an invoice may differ by at most this much from the
-# independent price (_btc_usd: Coinbase / blockchain.info). AgentHC's quote
-# can be up to 15 minutes old; a bigger gap means something is off.
-_TIP_XCHECK_BAND = 0.05
+# $ tiers AgentHC offered on the last /api/tip/options read, and the BTC
+# price they came with. A create is only sent for one of these tiers that is
+# also on hc.TIP_TIERS_USD.
+_tip_offered = {"usd": (), "btc": None}
+# AgentHC's BTC price may differ by at most this much from the independent
+# price (_btc_usd: Coinbase / blockchain.info, cached 5 min). AgentHC's quote
+# can be up to 15 minutes old; a bigger gap means something is off. Checked
+# before asking for an invoice (against the /options price, so a refusal
+# doesn't leave an unpaid invoice counting against AgentHC's per-IP cap) and
+# again on the invoice's own price. No independent price, no invoice.
+_TIP_XCHECK_BAND = 0.03
 _TIP_PICK = "Pick one of the tip amounts shown."
 _TIP_NOT_OFFERED = ("That tip amount isn't on offer right now. Pick one of "
                     "the amounts shown.")
@@ -2538,6 +2542,11 @@ _TIP_PRICE_ODD = ("AgentHC's Bitcoin price for this tip is too far from the "
                   "paid. Try again in a few minutes.")
 _TIP_SATS_ODD = ("The Bitcoin price AgentHC sent looks wrong. Try again in "
                  "a minute.")
+_TIP_NO_MARKET = "Can't check the Bitcoin price right now. Try again in a minute."
+
+
+def _tip_price_far(btc, market):
+    return abs(btc / market - 1) > _TIP_XCHECK_BAND
 
 
 def _tip_label(usd, sats):
@@ -2568,8 +2577,9 @@ def _tip_options_route(_h):
                       "available": available,
                       "reason": None if available else reason,
                       "label": _tip_label(t["amount_usd"], sats)})
-    _tip_offered["usd"] = tuple(t["amount_usd"] for t in tiers)
     q = body.get("quote")
+    _tip_offered.update(usd=tuple(t["amount_usd"] for t in tiers),
+                        btc=q["btc_usd"] if q else None)
     return {"ok": True, "tiers": tiers,
             "quote": {"btc_usd": q["btc_usd"], "age_s": q["age_seconds"],
                       "source": q["source"]} if q else None,
@@ -2583,6 +2593,13 @@ def _tip_create(_h, data):
         return {"ok": False, "error": _TIP_PICK}
     if n not in _tip_offered["usd"]:
         return {"ok": False, "error": _TIP_NOT_OFFERED, "refresh_tiers": True}
+    # Fail closed: without an independent price nothing bounds AgentHC's.
+    market = _btc_usd()
+    if not market > 0:
+        return {"ok": False, "error": _TIP_NO_MARKET}
+    offered = _tip_offered.get("btc")
+    if offered and _tip_price_far(offered, market):
+        return {"ok": False, "error": _TIP_PRICE_ODD, "refresh_tiers": True}
     try:
         body = hc.create_tip(n)
     except hc.TipRefused as exc:
@@ -2591,11 +2608,10 @@ def _tip_create(_h, data):
         return {"ok": False, "unavailable": True, "error": hc.TIPS_NOT_YET}
     except Exception as exc:
         return {"ok": False, "error": _net_error_text(exc)}
-    # create_tip checked the invoice against AgentHC's own price; check that
-    # price against an independent one too (skipped when none can be had).
+    # create_tip checked the invoice against AgentHC's own price; AgentHC may
+    # have re-priced since /options, so check that price independently too.
     btc = float(body["btc_usd"])
-    market = _btc_usd()
-    if market > 0 and abs(btc / market - 1) > _TIP_XCHECK_BAND:
+    if _tip_price_far(btc, market):
         return {"ok": False, "error": _TIP_PRICE_ODD, "refresh_tiers": True}
     bolt11 = body["payment_request"].strip()
     return {"ok": True, "bolt11": bolt11, "qr": _qr_matrix(bolt11.upper()),

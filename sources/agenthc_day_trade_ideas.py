@@ -153,9 +153,13 @@ def pass_status(token):
 
 TIP_PATH = "/api/v1/payments/tip"
 TIP_TIERS_USD = (100, 500, 1000)     # local hard allowlist, whatever AgentHC offers
-# A tip's sats must be within this fraction of amount_usd at the quote that
-# AgentHC returned with it (AgentHC rounds up to the next whole sat).
+# The /options tier sats (display only) must be within this fraction of
+# amount_usd at the quote returned with them. An invoice's sats are held to
+# the exact contract value instead (tip_sats_exact).
 TIP_PRICE_BAND = 0.02
+# AgentHC prices tips only from a quote at most this old (its pass cache
+# TTL); an older quote on /options is not shown as the current price.
+TIP_QUOTE_MAX_AGE_S = 900
 # A BTC price (USD per BTC) outside this range is treated as broken. These
 # are the bounds AgentHC itself applies before it prices a tip.
 TIP_BTC_USD_RANGE = (1_000.0, 10_000_000.0)
@@ -217,6 +221,19 @@ def tip_sats_ok(amount_usd, amount_sats, btc_usd):
         return False
     fair = amount_usd * 1e8 / price
     return abs(amount_sats - fair) <= fair * TIP_PRICE_BAND
+
+
+def tip_sats_exact(amount_usd, amount_sats, btc_usd):
+    """True when `amount_sats` is what AgentHC's contract says it charges for
+    `amount_usd` dollars at `btc_usd` (a price in whole cents):
+    ceil(amount_usd * 1e8 / btc_usd), in integer maths, give or take 1 sat."""
+    price = _btc_price(btc_usd)
+    if not _is_tier(amount_usd) or type(amount_sats) is not int \
+            or amount_sats <= 0 or price is None:
+        return False
+    cents = round(price * 100)
+    expected = -(-amount_usd * 10 ** 10 // cents)
+    return abs(amount_sats - expected) <= 1
 
 
 def _detail_message(resp):
@@ -285,6 +302,14 @@ def tip_options():
     if not isinstance(body, dict):
         raise RuntimeError("tip options: unexpected answer")
     quote = _tip_quote(body.get("quote"))
+    # A quote too old for AgentHC to price with (it then offers no tier) is
+    # not passed on as the current price. A shorter limit from AgentHC wins.
+    max_age = body.get("quote_max_age_seconds")
+    if type(max_age) not in (int, float) or not 0 < max_age < TIP_QUOTE_MAX_AGE_S:
+        max_age = TIP_QUOTE_MAX_AGE_S
+    if quote and not (quote["age_seconds"] is not None
+                      and 0 <= quote["age_seconds"] <= max_age):
+        quote = None
     tiers, seen = [], set()
     for t in body.get("tiers") or []:
         if not isinstance(t, dict) or not _is_tier(t.get("amount_usd")) \
@@ -302,8 +327,9 @@ def create_tip(amount_usd):
     """Ask AgentHC for a tip invoice of `amount_usd` dollars (100, 500 or
     1000), paid in sats. The body sent is {"amount_usd": n} and nothing
     else. The answer is only returned when it is for that tier, its BOLT11
-    invoice asks for exactly its amount_sats, and amount_sats is within
-    TIP_PRICE_BAND of n dollars at the btc_usd it came with."""
+    invoice asks for exactly its amount_sats, and amount_sats is exactly
+    what n dollars cost at the btc_usd it came with (tip_sats_exact). The
+    caller still has to check that btc_usd against an independent price."""
     if not _is_tier(amount_usd):
         raise ValueError("Pick one of the tip amounts shown.")
     n = amount_usd
@@ -328,7 +354,7 @@ def create_tip(amount_usd):
     if (type(body.get("amount_usd")) is not int or body["amount_usd"] != n
             or type(sats) is not int or sats <= 0
             or bolt11_amount_msat(body.get("payment_request")) != sats * 1000
-            or not tip_sats_ok(n, sats, body.get("btc_usd"))
+            or not tip_sats_exact(n, sats, body.get("btc_usd"))
             or (isinstance(quote, dict) and quote.get("btc_usd") != body["btc_usd"])
             or not isinstance(body.get("payment_hash"), str)
             or not _HEX64.fullmatch(body["payment_hash"])):

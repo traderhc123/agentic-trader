@@ -176,6 +176,13 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
     poll.current = setInterval(() => check(cur), POLL_MS);
   };
 
+  // No tier on offer (no current price, node busy…): AgentHC says to try
+  // again shortly, so offer that without closing the panel.
+  const anyAvailable = tiers.some((t) => t.available);
+  // A price is only named when some tier was priced with it (AgentHC still
+  // returns a quote that is too old to use).
+  const priced = tiers.some((t) => t.amount_sats != null);
+
   const backToTiers = () => {
     stopPoll();
     curHash.current = null;
@@ -250,9 +257,16 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
             ))}
           </div>
           <p className="m-0 text-xs text-muted">
-            {quote ? `Sats at AgentHC's Bitcoin price (${btcText(quote.btc_usd)}). ` : ""}
+            {quote && priced ? `Sats at AgentHC's Bitcoin price (${btcText(quote.btc_usd)}). ` : ""}
             The invoice locks the exact sats for 1 hour.
           </p>
+          {!anyAvailable && (
+            <div>
+              <Button variant="ghost" size="sm" onClick={backToTiers}>
+                Check again
+              </Button>
+            </div>
+          )}
         </>
       )}
 

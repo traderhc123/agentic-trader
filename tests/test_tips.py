@@ -80,6 +80,7 @@ def _tip_state(monkeypatch):
     """Every tier offered, and an independent BTC price that agrees with
     AgentHC's (no network)."""
     monkeypatch.setitem(webui._tip_offered, "usd", (100, 500, 1000))
+    monkeypatch.setitem(webui._tip_offered, "btc", BTC)
     monkeypatch.setattr(webui, "_btc_usd", lambda: BTC)
 
 
@@ -169,6 +170,30 @@ def test_sats_check_refuses_odd_values(usd, sats, btc):
     assert not hc.tip_sats_ok(usd, sats, btc)
 
 
+@pytest.mark.parametrize("usd, btc, sats", [
+    (100, BTC, 128701), (500, BTC, 643501), (1000, BTC, 1287002),
+    (1000, 77700.01, 1287002), (1000, 73892.70, 1353314), (100, 100000.0, 100000),
+    (1000, 33333.33, 3000001),
+])
+def test_exact_sats_match_the_contract(usd, btc, sats):
+    # ceil(usd * 1e8 / btc_usd) with btc_usd in whole cents, in integers.
+    assert hc.tip_sats_exact(usd, sats, btc)
+    assert hc.tip_sats_exact(usd, sats + 1, btc) and hc.tip_sats_exact(usd, sats - 1, btc)
+    assert not hc.tip_sats_exact(usd, sats + 2, btc)
+    assert not hc.tip_sats_exact(usd, sats - 2, btc)
+
+
+def test_exact_sats_refuse_what_the_band_allowed():
+    # +1.99% at the true price passes the display band but not the invoice check.
+    over = int(SATS[1000] * 1.0199)
+    assert hc.tip_sats_ok(1000, over, BTC)
+    assert not hc.tip_sats_exact(1000, over, BTC)
+    for bad in (999.0, None, True, "77700", float("nan")):
+        assert not hc.tip_sats_exact(1000, SATS[1000], bad)
+    assert not hc.tip_sats_exact(1000, float(SATS[1000]), BTC)
+    assert not hc.tip_sats_exact(200, 257402, BTC)
+
+
 def test_a_cheap_btc_price_cannot_inflate_a_tip():
     # Even a self-consistent answer is refused below the sane price range:
     # $1,000 at $999/BTC would be ~1 BTC.
@@ -209,6 +234,9 @@ def test_create_tip_accepts_a_price_without_a_quote_block(fake_http):
     {"payment_request": _sinv(SATS[500] + 1)},             # invoice ≠ amount_sats
     {"payment_request": _sinv(SATS[1000])},
     {"amount_sats": SATS[1000], "payment_request": _sinv(SATS[1000])},  # outside the band
+    {"amount_sats": int(SATS[500] * 1.0199),                           # inside the band,
+     "payment_request": _sinv(int(SATS[500] * 1.0199))},               # but not exact
+    {"amount_sats": SATS[500] + 2, "payment_request": _sinv(SATS[500] + 2)},
     {"amount_sats": 643501.0},
     {"amount_sats": 0, "payment_request": _inv("")},
     {"btc_usd": 38850.0},                                  # sats don't match that price
@@ -307,6 +335,34 @@ def test_options_without_a_usable_quote_show_no_sats(fake_http, quote):
     assert all(t["amount_sats"] is None for t in out["tiers"])
 
 
+@pytest.mark.parametrize("age, max_age, kept", [
+    (412, 900, True), (900, 900, True), (901, 900, False), (5000, 900, False),
+    (400, 300, False),          # AgentHC's own shorter limit wins
+    (400, 3600, True), (1000, 3600, False),  # a longer one doesn't
+    (None, 900, False), ("412", 900, False), (-1, 900, False),
+    (float("nan"), 900, False), (412, None, True), (412, "x", True),
+])
+def test_options_drop_a_quote_too_old_to_price_with(fake_http, age, max_age, kept):
+    body = _options()
+    body["quote"]["age_seconds"] = age
+    body["quote_max_age_seconds"] = max_age
+    fake_http(_R(200, body))
+    out = hc.tip_options()
+    assert (out["quote"] is not None) is kept
+    if not kept:
+        assert all(t["amount_sats"] is None for t in out["tiers"])
+
+
+def test_options_route_hides_a_stale_price(fake_http):
+    # AgentHC returns its stale quote with every tier refused for want of a price.
+    tiers = [{"amount_usd": n, "amount_sats": None, "available": False,
+              "reason": REASON_PRICE} for n in (100, 500, 1000)]
+    fake_http(_R(200, _options(tiers=tiers, quote={**QUOTE, "age_seconds": 5000})))
+    r = webui._tip_options_route(None)
+    assert r["quote"] is None and webui._tip_offered["btc"] is None
+    assert [(t["available"], t["reason"]) for t in r["tiers"]] == [(False, REASON_PRICE)] * 3
+
+
 def test_tip_status_checks_the_id_before_asking(fake_http):
     h = fake_http()
     for bad in ("../x", "AB" * 32, "ab" * 31, "", None, HASH + "/../../x"):
@@ -366,6 +422,7 @@ def test_options_route_labels_tiers(fake_http, monkeypatch):
          "reason": REASON_CAPACITY, "label": "$1,000 (~1,287,000 sats)"},
     ]
     assert webui._tip_offered["usd"] == (100, 500, 1000)
+    assert webui._tip_offered["btc"] == BTC
 
 
 def test_options_route_without_a_price(fake_http):
@@ -373,7 +430,7 @@ def test_options_route_without_a_price(fake_http):
               "reason": REASON_PRICE} for n in (100, 500, 1000)]
     fake_http(_R(200, _options(tiers=tiers, quote=None)))
     r = webui._tip_options_route(None)
-    assert r["quote"] is None
+    assert r["quote"] is None and webui._tip_offered["btc"] is None
     assert [(t["label"], t["available"], t["reason"]) for t in r["tiers"]] == [
         ("$100", False, REASON_PRICE), ("$500", False, REASON_PRICE),
         ("$1,000", False, REASON_PRICE)]
@@ -436,18 +493,62 @@ def test_create_route_refuses_a_mismatched_invoice(fake_http):
 
 
 @pytest.mark.parametrize("market, shown", [
-    (BTC, True), (BTC * 1.049, True), (BTC * 0.955, True),
-    (BTC * 1.06, False), (BTC * 0.94, False),
-    (0.0, True),   # no independent price to be had: AgentHC's checked price stands
+    (BTC, True), (BTC * 1.029, True), (BTC * 0.971, True),
+    (BTC * 1.031, False), (BTC * 0.969, False), (BTC * 0.94, False),
 ])
-def test_create_route_cross_checks_the_btc_price(fake_http, monkeypatch, market, shown):
-    fake_http(_R(200, _created(1000)))
+def test_create_route_cross_checks_before_minting(fake_http, monkeypatch, market, shown):
+    """The /options price is checked against the independent one BEFORE any
+    invoice is asked for: a refused click must not leave an unpaid invoice
+    counting against AgentHC's 3-per-IP cap for an hour."""
+    h = fake_http(_R(200, _created(1000)))
     monkeypatch.setattr(webui, "_btc_usd", lambda: market)
     r = webui._tip_create(None, {"amount_usd": 1000})
     if shown:
         assert r["ok"] is True and r["amount_sats"] == SATS[1000]
+        assert len(h.calls) == 1
     else:
         assert r == {"ok": False, "error": webui._TIP_PRICE_ODD, "refresh_tiers": True}
+        assert h.calls == []
+
+
+@pytest.mark.parametrize("market", [0.0, -1.0, float("nan")])
+def test_create_route_fails_closed_without_an_independent_price(fake_http, monkeypatch, market):
+    h = fake_http(_R(200, _created(1000)))
+    monkeypatch.setattr(webui, "_btc_usd", lambda: market)
+    r = webui._tip_create(None, {"amount_usd": 1000})
+    assert r == {"ok": False, "error": webui._TIP_NO_MARKET}
+    assert h.calls == []
+
+
+def _repriced(n, btc):
+    """An answer AgentHC priced (exactly) at another BTC price than /options."""
+    sats = -(-n * 10 ** 10 // round(btc * 100))
+    return {**_created(n, sats=sats), "btc_usd": btc, "quote": {**QUOTE, "btc_usd": btc}}
+
+
+@pytest.mark.parametrize("btc, shown", [
+    (BTC * 1.025, True), (BTC * 0.975, True),
+    (round(BTC * 1.035, 2), False), (73892.70, False),   # ~4.9% under: ~+5.2% sats
+])
+def test_create_route_checks_the_invoice_price_too(fake_http, btc, shown):
+    # /options agreed with the market; AgentHC re-priced when minting.
+    fake_http(_R(200, _repriced(1000, round(btc, 2))))
+    r = webui._tip_create(None, {"amount_usd": 1000})
+    assert r["ok"] is shown
+    if not shown:
+        assert r == {"ok": False, "error": webui._TIP_PRICE_ODD, "refresh_tiers": True}
+
+
+@pytest.mark.parametrize("market", [0.0, BTC])
+def test_a_one_btc_invoice_for_1000_dollars_is_never_shown(fake_http, monkeypatch, market):
+    """AgentHC answering $1,000 at a (self-consistent) $1,000/BTC price is
+    ~1 BTC. It is refused whether or not an independent price can be had."""
+    monkeypatch.setitem(webui._tip_offered, "btc", None)  # nothing to pre-check
+    fake_http(_R(200, {**_created(1000, sats=100_000_000), "btc_usd": 1000.0,
+                       "quote": {**QUOTE, "btc_usd": 1000.0}}))
+    monkeypatch.setattr(webui, "_btc_usd", lambda: market)
+    r = webui._tip_create(None, {"amount_usd": 1000})
+    assert r["ok"] is False and "bolt11" not in r
 
 
 def test_create_route_passes_refusals_on(monkeypatch):
@@ -491,7 +592,8 @@ def test_tip_code_never_pays_or_saves():
     fns = (webui._tip_label, webui._tip_options_route, webui._tip_create,
            webui._tip_status_route, hc.tip_options, hc.create_tip, hc.tip_status,
            hc.bolt11_amount_msat, hc._is_tier, hc._detail_message,
-           hc.tip_sats_ok, hc._btc_price, hc._tip_quote)
+           hc.tip_sats_ok, hc.tip_sats_exact, hc._btc_price, hc._tip_quote,
+           webui._tip_price_far)
     for fn in fns:
         src = inspect.getsource(fn)
         for banned in ("lightning_wallet", "wallet_from_cfg", "pay_invoice", "pay(",
