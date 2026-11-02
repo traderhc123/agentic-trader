@@ -2515,6 +2515,81 @@ def _qr_matrix(data):
         return None
 
 
+# ── tips (dashboard "Tip" button) ────────────────────────────────────────────
+# The owner tips AgentHC 100 / 500 / 1,000 sats by paying an invoice from
+# their own wallet (QR / copy / lightning: link). These routes only ask
+# AgentHC for the invoice and its status: they never pay, never touch the
+# agent's wallet, and write nothing to config, state or the trade log.
+
+def _tip_label(n, usd):
+    label = f"{n:,} sats"
+    if isinstance(usd, (int, float)) and not isinstance(usd, bool):
+        label += f" (~${usd:,.2f})"
+    return label
+
+
+def _tip_options_route(_h):
+    from sources import agenthc_day_trade_ideas as hc
+    try:
+        body = hc.tip_options()
+    except hc.TipsUnavailable:
+        return {"ok": False, "unavailable": True, "error": hc.TIPS_NOT_YET}
+    except Exception as exc:
+        return {"ok": False, "error": _net_error_text(exc)}
+    tiers = []
+    for t in body.get("tiers") or []:
+        usd = t.get("amount_usd_approx")
+        if not isinstance(usd, (int, float)) or isinstance(usd, bool):
+            usd = None
+        tiers.append({"amount_sats": t["amount_sats"],
+                      "available": t.get("available") is not False,
+                      "reason": str(t["reason"])[:200] if t.get("reason") else None,
+                      "amount_usd_approx": usd,
+                      "label": _tip_label(t["amount_sats"], usd)})
+    quote = body.get("quote") if isinstance(body.get("quote"), dict) else None
+    return {"ok": True, "tiers": tiers,
+            "quote_age_s": (quote or {}).get("age_seconds"),
+            "valid_seconds": body.get("invoice_valid_seconds", 3600)}
+
+
+def _tip_create(_h, data):
+    from sources import agenthc_day_trade_ideas as hc
+    n = (data or {}).get("amount_sats")
+    if type(n) is not int or n not in hc.TIP_TIERS_SATS:
+        return {"ok": False, "error": "Pick one of the tip amounts shown."}
+    try:
+        body = hc.create_tip(n)
+    except hc.TipRefused as exc:
+        return {"ok": False, "error": str(exc), "refresh_tiers": exc.refresh}
+    except hc.TipsUnavailable:
+        return {"ok": False, "unavailable": True, "error": hc.TIPS_NOT_YET}
+    except Exception as exc:
+        return {"ok": False, "error": _net_error_text(exc)}
+    bolt11 = body["payment_request"].strip()
+    usd = body.get("amount_usd_approx")
+    if not isinstance(usd, (int, float)) or isinstance(usd, bool):
+        usd = None
+    return {"ok": True, "bolt11": bolt11, "qr": _qr_matrix(bolt11.upper()),
+            "payment_hash": body["payment_hash"], "amount_sats": n,
+            "amount_usd_approx": usd,
+            "expires_in": body.get("invoice_valid_seconds", 3600)}
+
+
+def _tip_status_route(_h, data):
+    from sources import agenthc_day_trade_ideas as hc
+    h = (data or {}).get("payment_hash")
+    if not isinstance(h, str) or not hc._HEX64.fullmatch(h):
+        return {"ok": False, "error": "That invoice id doesn't look right."}
+    try:
+        st = hc.tip_status(h)
+    except Exception as exc:
+        return {"ok": False, "retry": True, "error": _net_error_text(exc, cache_s=60)}
+    status = st.get("status") if isinstance(st, dict) else None
+    if status not in ("pending", "paid", "expired"):
+        status = "pending"
+    return {"ok": True, "status": status}
+
+
 def _restore_notes(cfg, acceptance=None):
     """Per-tab 'already configured' summaries for the wizard restore path.
     Non-secret only — these render as plain text at the top of each completed
@@ -3434,6 +3509,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/llm/providers": llm_providers,
                     "/api/pass/status": pass_status_route,
                     "/api/pass/options": pass_options_route,
+                    "/api/tip/options": _tip_options_route,
                     "/api/status": d_status, "/api/trades": d_trades,
                     "/api/pnl": d_pnl,
                     "/api/proposal": proposal_get,
@@ -3465,6 +3541,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/autostart": autostart_set,
                      "/api/wallet/create": wallet_create,
                      "/api/pass/buy": pass_buy,
+                     "/api/tip/create": _tip_create,
+                     "/api/tip/status": _tip_status_route,
                      "/api/wallet/fund": wallet_fund,
                      "/api/llm": llm, "/api/llm/models": llm_models,
                      "/api/deploy": deploy,

@@ -146,6 +146,39 @@ export interface PnlSummary {
   live: PnlBook | null;
   dry: PnlBook | null;
 }
+export interface TipTier {
+  amount_sats: number;
+  available: boolean;
+  reason: string | null;
+  amount_usd_approx: number | null;
+  label: string;
+}
+export interface TipOptions {
+  ok: boolean;
+  tiers?: TipTier[];
+  quote_age_s?: number | null;
+  valid_seconds?: number;
+  unavailable?: boolean;
+  error?: string;
+}
+export interface TipInvoice {
+  ok: boolean;
+  bolt11?: string;
+  qr?: number[][] | null;
+  payment_hash?: string;
+  amount_sats?: number;
+  amount_usd_approx?: number | null;
+  expires_in?: number;
+  error?: string;
+  refresh_tiers?: boolean;
+  unavailable?: boolean;
+}
+export interface TipStatus {
+  ok: boolean;
+  status?: "pending" | "paid" | "expired";
+  retry?: boolean;
+  error?: string;
+}
 export interface Proposal {
   pending?: boolean;
   explanation?: string;

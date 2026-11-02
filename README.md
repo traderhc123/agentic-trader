@@ -184,6 +184,10 @@ perms.
 
 A Premium AgentHC API key also works (*Advanced* in the wizard).
 
+**Tips.** The dashboard's **Tip** button shows a 100, 500 or 1,000-sat
+Lightning invoice you pay from your own wallet. A tip is a thank-you and buys
+nothing; the agent's wallet never pays it.
+
 ## How it works
 
 - Every `poll_seconds` (default 30) the agent polls the configured source for

@@ -14,6 +14,7 @@ GET https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record
 """
 
 import os
+import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -137,6 +138,143 @@ def pass_status(token):
     if resp.status_code == 401:
         return {"status": "invalid"}
     resp.raise_for_status()
+    return resp.json()
+
+
+# ── tips ─────────────────────────────────────────────────────────────────────
+# A tip is a thank-you to AgentHC: a fixed 100 / 500 / 1,000-sat Lightning
+# invoice the OWNER pays from their own wallet (QR / copy / lightning: link),
+# exactly like a prepaid pass. It buys nothing. Nothing here pays anything:
+# the agent's wallet never pays a tip, and no pass token, API key or config
+# value is sent with these requests.
+
+TIP_PATH = "/api/v1/payments/tip"
+TIP_TIERS_SATS = (100, 500, 1000)
+TIPS_NOT_YET = ("Tips aren't open yet. Thanks for wanting to help — try again "
+                "after the next AgentHC update.")
+TIP_MISMATCH = ("AgentHC sent an invoice for a different amount than you "
+                "picked, so it wasn't shown. Nothing was paid.")
+# Server refusals after which the tier list should be fetched again.
+_TIP_REFRESH_CODES = ("tip_size_temporarily_unavailable", "tips_busy",
+                      "invalid_tip_amount")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+class TipsUnavailable(RuntimeError):
+    """The AgentHC server doesn't offer tips (not deployed yet, or off)."""
+
+
+class TipRefused(RuntimeError):
+    """The server (or the local invoice check) refused this tip. `code` is
+    the server's error code; `refresh` asks the UI to re-read the tiers."""
+
+    def __init__(self, message, code=None, refresh=False):
+        super().__init__(message)
+        self.code = code
+        self.refresh = refresh
+
+
+def _is_tier(n):
+    # bool is an int subclass: True must not pass as 1
+    return type(n) is int and n in TIP_TIERS_SATS
+
+
+def _detail_message(resp):
+    try:
+        d = resp.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(d, dict):
+        return d.get("message") or None
+    return d if isinstance(d, str) else None
+
+
+_BECH32 = set("qpzry9x8gf2tvdw0s3jn54khce6mua7l")
+_BOLT11_MULT = {"": 10 ** 11, "m": 10 ** 8, "u": 10 ** 5, "n": 100}
+
+
+def bolt11_amount_msat(invoice):
+    """Amount (millisatoshis) a mainnet BOLT11 invoice asks for, read from its
+    human-readable part; None when it isn't a mainnet invoice, names no
+    amount, or doesn't look like an invoice. Only the amount is checked (no
+    checksum or signature): this catches a server sending the wrong amount,
+    and the paying wallet shows the amount again before anything is paid."""
+    if not isinstance(invoice, str):
+        return None
+    s = invoice.strip().lower()
+    if not s.startswith("lnbc") or not 100 <= len(s) <= 2000:
+        return None
+    sep = s.rfind("1")
+    if sep < 4 or not s[sep + 1:] or not set(s[sep + 1:]) <= _BECH32:
+        return None
+    m = re.fullmatch(r"(\d+)([munp]?)", s[4:sep])
+    if not m or m.group(1).startswith("0"):
+        return None
+    digits, mult = int(m.group(1)), m.group(2)
+    if mult == "p":
+        return digits // 10 if digits % 10 == 0 else None
+    return digits * _BOLT11_MULT[mult]
+
+
+def tip_options():
+    """Tip tiers on offer: the server body with only the known tiers kept.
+    Each tier: amount_sats, available, reason, amount_usd_approx."""
+    resp = _http.get(f"{AGENTHC_API}{TIP_PATH}/options", timeout=10)
+    if resp.status_code in (404, 405):
+        raise TipsUnavailable(TIPS_NOT_YET)
+    if resp.status_code != 200:
+        raise RuntimeError(_detail_message(resp)
+                           or f"tip options failed ({resp.status_code})")
+    body = resp.json()
+    if not isinstance(body, dict):
+        raise RuntimeError("tip options: unexpected answer")
+    tiers = [t for t in body.get("tiers") or []
+             if isinstance(t, dict) and _is_tier(t.get("amount_sats"))]
+    return {**body, "tiers": tiers}
+
+
+def create_tip(amount_sats):
+    """Ask AgentHC for a tip invoice of exactly `amount_sats` (100, 500 or
+    1000). The body sent is {"amount_sats": n} and nothing else. The answer
+    is only returned when its invoice asks for exactly that amount."""
+    if not _is_tier(amount_sats):
+        raise ValueError("Pick one of the tip amounts shown.")
+    n = amount_sats
+    resp = _http.post(f"{AGENTHC_API}{TIP_PATH}", json={"amount_sats": n},
+                      timeout=20)
+    if resp.status_code in (404, 405):
+        raise TipsUnavailable(TIPS_NOT_YET)
+    if resp.status_code in (400, 429, 503):
+        code = _error_code(resp)
+        raise TipRefused(_detail_message(resp)
+                         or f"AgentHC couldn't make the tip invoice ({resp.status_code}).",
+                         code=code, refresh=code in _TIP_REFRESH_CODES)
+    if resp.status_code != 200:
+        raise RuntimeError(f"tip invoice failed ({resp.status_code})")
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if (not isinstance(body, dict) or body.get("amount_sats") != n
+            or type(body.get("amount_sats")) is not int
+            or bolt11_amount_msat(body.get("payment_request")) != n * 1000
+            or not isinstance(body.get("payment_hash"), str)
+            or not _HEX64.fullmatch(body["payment_hash"])):
+        raise TipRefused(TIP_MISMATCH, code="amount_mismatch")
+    return body
+
+
+def tip_status(payment_hash):
+    """{'status': pending|paid|expired, …} for a tip invoice."""
+    if not isinstance(payment_hash, str) or not _HEX64.fullmatch(payment_hash):
+        raise ValueError("That invoice id doesn't look right.")
+    resp = _http.get(f"{AGENTHC_API}{TIP_PATH}/{payment_hash}", timeout=10)
+    if resp.status_code == 404:
+        return {"status": "expired"}  # gone, or a server without tips
+    if resp.status_code == 503:
+        raise RuntimeError("status_unavailable")
+    if resp.status_code != 200:
+        raise RuntimeError(f"tip status failed ({resp.status_code})")
     return resp.json()
 
 
