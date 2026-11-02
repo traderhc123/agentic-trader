@@ -2516,15 +2516,36 @@ def _qr_matrix(data):
 
 
 # ── tips (dashboard "Tip" button) ────────────────────────────────────────────
-# The owner tips AgentHC 100 / 500 / 1,000 sats by paying an invoice from
-# their own wallet (QR / copy / lightning: link). These routes only ask
-# AgentHC for the invoice and its status: they never pay, never touch the
-# agent's wallet, and write nothing to config, state or the trade log.
+# The owner tips AgentHC $100, $500 or $1,000, paid in sats at the live
+# Bitcoin price, by paying an invoice from their own wallet (QR / copy /
+# lightning: link). AgentHC prices the invoice; these routes only ask for it
+# and its status, check it, and never pay, never touch the agent's wallet
+# (a tip is far above max_autopay_sats, and is never paid from it anyway),
+# and write nothing to config, state or the trade log.
 
-def _tip_label(n, usd):
-    label = f"{n:,} sats"
-    if isinstance(usd, (int, float)) and not isinstance(usd, bool):
-        label += f" (~${usd:,.2f})"
+# $ tiers AgentHC offered on the last /api/tip/options read. A create is only
+# sent for one of these that is also on hc.TIP_TIERS_USD.
+_tip_offered = {"usd": ()}
+# AgentHC's BTC price on an invoice may differ by at most this much from the
+# independent price (_btc_usd: Coinbase / blockchain.info). AgentHC's quote
+# can be up to 15 minutes old; a bigger gap means something is off.
+_TIP_XCHECK_BAND = 0.05
+_TIP_PICK = "Pick one of the tip amounts shown."
+_TIP_NOT_OFFERED = ("That tip amount isn't on offer right now. Pick one of "
+                    "the amounts shown.")
+_TIP_PRICE_ODD = ("AgentHC's Bitcoin price for this tip is too far from the "
+                  "market price, so the invoice wasn't shown. Nothing was "
+                  "paid. Try again in a few minutes.")
+_TIP_SATS_ODD = ("The Bitcoin price AgentHC sent looks wrong. Try again in "
+                 "a minute.")
+
+
+def _tip_label(usd, sats):
+    """"$500 (~643,500 sats)": the sats rounded to 100 for the tier buttons;
+    the invoice itself shows the exact amount."""
+    label = f"${usd:,}"
+    if type(sats) is int and sats > 0:
+        label += f" (~{round(sats, -2):,} sats)"
     return label
 
 
@@ -2538,25 +2559,30 @@ def _tip_options_route(_h):
         return {"ok": False, "error": _net_error_text(exc)}
     tiers = []
     for t in body.get("tiers") or []:
-        usd = t.get("amount_usd_approx")
-        if not isinstance(usd, (int, float)) or isinstance(usd, bool):
-            usd = None
-        tiers.append({"amount_sats": t["amount_sats"],
-                      "available": t.get("available") is not False,
-                      "reason": str(t["reason"])[:200] if t.get("reason") else None,
-                      "amount_usd_approx": usd,
-                      "label": _tip_label(t["amount_sats"], usd)})
-    quote = body.get("quote") if isinstance(body.get("quote"), dict) else None
+        sats = t["amount_sats"]  # None unless it matches the quote (hc checked)
+        available = t.get("available") is True and sats is not None
+        reason = str(t["reason"])[:200] if t.get("reason") else None
+        if not available and not reason:
+            reason = _TIP_SATS_ODD
+        tiers.append({"amount_usd": t["amount_usd"], "amount_sats": sats,
+                      "available": available,
+                      "reason": None if available else reason,
+                      "label": _tip_label(t["amount_usd"], sats)})
+    _tip_offered["usd"] = tuple(t["amount_usd"] for t in tiers)
+    q = body.get("quote")
     return {"ok": True, "tiers": tiers,
-            "quote_age_s": (quote or {}).get("age_seconds"),
+            "quote": {"btc_usd": q["btc_usd"], "age_s": q["age_seconds"],
+                      "source": q["source"]} if q else None,
             "valid_seconds": body.get("invoice_valid_seconds", 3600)}
 
 
 def _tip_create(_h, data):
     from sources import agenthc_day_trade_ideas as hc
-    n = (data or {}).get("amount_sats")
-    if type(n) is not int or n not in hc.TIP_TIERS_SATS:
-        return {"ok": False, "error": "Pick one of the tip amounts shown."}
+    n = (data or {}).get("amount_usd")
+    if type(n) is not int or n not in hc.TIP_TIERS_USD:
+        return {"ok": False, "error": _TIP_PICK}
+    if n not in _tip_offered["usd"]:
+        return {"ok": False, "error": _TIP_NOT_OFFERED, "refresh_tiers": True}
     try:
         body = hc.create_tip(n)
     except hc.TipRefused as exc:
@@ -2565,13 +2591,16 @@ def _tip_create(_h, data):
         return {"ok": False, "unavailable": True, "error": hc.TIPS_NOT_YET}
     except Exception as exc:
         return {"ok": False, "error": _net_error_text(exc)}
+    # create_tip checked the invoice against AgentHC's own price; check that
+    # price against an independent one too (skipped when none can be had).
+    btc = float(body["btc_usd"])
+    market = _btc_usd()
+    if market > 0 and abs(btc / market - 1) > _TIP_XCHECK_BAND:
+        return {"ok": False, "error": _TIP_PRICE_ODD, "refresh_tiers": True}
     bolt11 = body["payment_request"].strip()
-    usd = body.get("amount_usd_approx")
-    if not isinstance(usd, (int, float)) or isinstance(usd, bool):
-        usd = None
     return {"ok": True, "bolt11": bolt11, "qr": _qr_matrix(bolt11.upper()),
-            "payment_hash": body["payment_hash"], "amount_sats": n,
-            "amount_usd_approx": usd,
+            "payment_hash": body["payment_hash"], "amount_usd": n,
+            "amount_sats": body["amount_sats"], "btc_usd": btc,
             "expires_in": body.get("invoice_valid_seconds", 3600)}
 
 

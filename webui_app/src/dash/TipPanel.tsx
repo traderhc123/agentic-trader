@@ -4,13 +4,15 @@ import { Button, LinkButton } from "../components/ui/button";
 import { Panel } from "../components/ui/panel";
 import { QR } from "../components/ui/qr";
 import { Msg, err, info, ok, type MsgT } from "../components/ui/tag";
-import { api, type TipInvoice, type TipOptions, type TipStatus, type TipTier } from "../lib/api";
+import { api, type TipInvoice, type TipOptions, type TipQuote, type TipStatus, type TipTier } from "../lib/api";
 import { cn } from "../lib/cn";
 import { copyToClipboard } from "../lib/hooks";
 
-// "Tip AgentHC": a fixed 100 / 500 / 1,000-sat thank-you, paid by the owner
-// from their own Lightning wallet (QR / copy / lightning: link), like a
-// prepaid pass. The agent's wallet never pays it; nothing is saved.
+// "Tip AgentHC": a $100 / $500 / $1,000 thank-you paid in sats at the live
+// Bitcoin price. AgentHC prices the invoice (the agent checks it before it
+// is shown) and the owner pays it from their own Lightning wallet (QR / copy
+// / lightning: link), like a prepaid pass. The agent's wallet never pays it;
+// nothing is saved.
 
 // "expired" = AgentHC said the invoice expired unpaid. "lapsed" = it is past
 // its validity locally but AgentHC never confirmed either way (e.g. tips were
@@ -22,7 +24,8 @@ interface Inv {
   qr?: number[][] | null;
   hash: string;
   sats: number;
-  usd: number | null;
+  usd: number;
+  btc: number | null;
   validS: number;
   shownAt: number;
 }
@@ -30,14 +33,14 @@ interface Inv {
 const POLL_MS = 3000;
 const HELP_AFTER_MS = 120000;
 
-function amountText(sats: number, usd: number | null) {
-  return `${sats.toLocaleString("en-US")} sats` + (usd != null ? ` (~$${usd.toFixed(2)})` : "");
-}
+const satsText = (n: number) => `${n.toLocaleString("en-US")} sats`;
+const usdText = (n: number) => `$${n.toLocaleString("en-US")}`;
+const btcText = (n: number) => `BTC $${Math.round(n).toLocaleString("en-US")}`;
 
 export function TipPanel({ onClose }: { onClose: () => void }) {
   const [view, setView] = useState<View>("loading");
   const [tiers, setTiers] = useState<TipTier[]>([]);
-  const [noQuote, setNoQuote] = useState(false);
+  const [quote, setQuote] = useState<TipQuote | null>(null);
   const [msg, setMsg] = useState<MsgT>(null);
   const [busy, setBusy] = useState<number | null>(null);
   const [inv, setInv] = useState<Inv | null>(null);
@@ -67,7 +70,7 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
     if (!alive.current) return;
     if (r.ok && Array.isArray(r.tiers)) {
       setTiers(r.tiers);
-      setNoQuote(r.tiers.some((t) => t.amount_usd_approx == null));
+      setQuote(r.quote ?? null);
       setView("tiers");
     } else if (r.unavailable) {
       setMsg(info(r.error || ""));
@@ -131,17 +134,19 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
 
   const pick = async (t: TipTier) => {
     if (busy != null || !t.available) return;
-    setBusy(t.amount_sats);
+    setBusy(t.amount_usd);
     setMsg(null);
     let r: TipInvoice;
     try {
-      r = await api<TipInvoice>("/api/tip/create", { amount_sats: t.amount_sats });
+      r = await api<TipInvoice>("/api/tip/create", { amount_usd: t.amount_usd });
     } catch {
       r = { ok: false, error: "Could not reach the agent on this computer. Is it still running?" };
     }
     if (!alive.current) return;
     setBusy(null);
-    if (!r.ok || !r.bolt11 || !r.payment_hash) {
+    // The agent already checked the invoice; an answer without the exact
+    // sats is never shown.
+    if (!r.ok || !r.bolt11 || !r.payment_hash || !r.amount_sats || r.amount_usd !== t.amount_usd) {
       if (r.unavailable) {
         setMsg(info(r.error || ""));
         setView("unavailable");
@@ -155,8 +160,9 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
       bolt11: r.bolt11,
       qr: r.qr,
       hash: r.payment_hash,
-      sats: r.amount_sats || t.amount_sats,
-      usd: r.amount_usd_approx ?? null,
+      sats: r.amount_sats,
+      usd: t.amount_usd,
+      btc: r.btc_usd ?? null,
       validS: r.expires_in || 3600,
       shownAt: Date.now(),
     };
@@ -191,8 +197,8 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
       bodyClass="p-4 space-y-3"
     >
       <p ref={intro} tabIndex={-1} className="m-0 text-sm text-muted outline-none">
-        Like what your agent does? Send a thank-you in sats from your own Lightning wallet. A tip buys nothing — no signals, no
-        credit, no refunds. Your agent's wallet never pays it.
+        Like what your agent does? Send AgentHC a $100, $500 or $1,000 thank-you, paid in sats at the current Bitcoin price from
+        your own Lightning wallet. A tip buys nothing — no signals, no credit, no refunds. Your agent's wallet never pays it.
       </p>
 
       {view === "loading" && (
@@ -205,43 +211,48 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
         <>
           <div role="group" aria-label="Tip amounts" className="grid grid-cols-[repeat(auto-fit,minmax(110px,1fr))] gap-2">
             {tiers.map((t) => (
-              <div key={t.amount_sats} className="flex min-w-0 flex-col gap-1">
+              <div key={t.amount_usd} className="flex min-w-0 flex-col gap-1">
                 <button
                   type="button"
-                  data-sats={t.amount_sats}
+                  data-usd={t.amount_usd}
                   onClick={() => pick(t)}
                   // An unavailable tier stays focusable (aria-disabled, click is a
                   // no-op in pick) so keyboard and screen-reader users hear why.
                   disabled={busy != null}
                   aria-disabled={!t.available || undefined}
-                  aria-describedby={!t.available && t.reason ? `tip-reason-${t.amount_sats}` : undefined}
-                  aria-busy={busy === t.amount_sats}
+                  aria-describedby={!t.available && t.reason ? `tip-reason-${t.amount_usd}` : undefined}
+                  aria-busy={busy === t.amount_usd}
                   className={cn(
                     "flex min-w-0 flex-col items-start rounded-md border px-3 pb-2.5 pt-3 text-left transition-colors",
                     !t.available
                       ? "cursor-not-allowed border-line bg-panel2 opacity-50"
-                      : busy === t.amount_sats
+                      : busy === t.amount_usd
                         ? "border-accent bg-accent/[0.08] shadow-[inset_0_0_0_1px_rgb(var(--accent))]"
                         : "border-line2 bg-panel2 hover:border-accent/50 hover:bg-raise disabled:opacity-60",
                   )}
                 >
-                  <span className="font-mono text-xl font-medium leading-none tracking-[-0.02em] text-fg">
-                    {t.amount_sats.toLocaleString("en-US")}
-                  </span>
-                  <span className="mt-1 text-xs text-muted">sats</span>
+                  <span className="font-mono text-xl font-medium leading-none tracking-[-0.02em] text-fg">{usdText(t.amount_usd)}</span>
+                  <span className="mt-1 text-xs text-muted">in sats</span>
                   <span className="mt-3 w-full border-t border-line pt-2 font-mono text-xs text-fg2">
-                    {busy === t.amount_sats ? "Making invoice…" : t.amount_usd_approx != null ? `≈ $${t.amount_usd_approx.toFixed(2)}` : " "}
+                    {busy === t.amount_usd
+                      ? "Making invoice…"
+                      : t.amount_sats != null
+                        ? `~${(Math.round(t.amount_sats / 100) * 100).toLocaleString("en-US")} sats`
+                        : " "}
                   </span>
                 </button>
                 {!t.available && t.reason && (
-                  <span id={`tip-reason-${t.amount_sats}`} className="text-2xs leading-snug text-muted">
+                  <span id={`tip-reason-${t.amount_usd}`} className="text-2xs leading-snug text-muted">
                     {t.reason}
                   </span>
                 )}
               </div>
             ))}
           </div>
-          {noQuote && <p className="m-0 text-xs text-muted">Dollar amounts are approximate and appear when AgentHC has a current Bitcoin price.</p>}
+          <p className="m-0 text-xs text-muted">
+            {quote ? `Sats at AgentHC's Bitcoin price (${btcText(quote.btc_usd)}). ` : ""}
+            The invoice locks the exact sats for 1 hour.
+          </p>
         </>
       )}
 
@@ -250,8 +261,14 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
           <div className="flex gap-4 rounded-md border border-line2 bg-sink p-4 max-sm:flex-col max-sm:items-center">
             <QR matrix={inv.qr} />
             <div className="w-full min-w-0 flex-1">
-              <p className="m-0 font-mono text-sm font-medium text-fg">Scan or copy to pay {amountText(inv.sats, inv.usd)}</p>
-              <p className="m-0 mt-1 text-xs text-muted">Pay from any Lightning wallet on your phone or computer. Good for 1 hour.</p>
+              <p className="m-0 font-mono text-sm font-medium text-fg">
+                Scan or copy to pay {satsText(inv.sats)} ({usdText(inv.usd)})
+              </p>
+              <p className="m-0 mt-1 text-xs text-muted">
+                {inv.btc != null ? `Priced at ${btcText(inv.btc)}. ` : ""}This amount stays fixed while the invoice is good (1 hour). Pay from
+                any Lightning wallet on your phone or computer. A payment this big can fail if your wallet can't send that much at once; if
+                it fails, nothing is charged.
+              </p>
               <pre
                 tabIndex={0}
                 aria-label="Lightning invoice"
@@ -283,7 +300,7 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
                 unconfirmed
                   ? unconfirmed
                   : showHelp
-                  ? `Still waiting. Check your wallet sent exactly ${inv.sats.toLocaleString("en-US")} sats and has enough balance plus a small network fee. If it failed, nothing was charged.`
+                  ? `Still waiting. Check your wallet sent exactly ${satsText(inv.sats)} and has enough balance plus a small network fee. If it failed, nothing was charged.`
                   : "Waiting for payment…",
               )}
             />
@@ -293,7 +310,7 @@ export function TipPanel({ onClose }: { onClose: () => void }) {
 
       {view === "paid" && inv && (
         <div className="flex flex-wrap items-center gap-3">
-          <Msg m={ok(`Got it — thank you! Your ${inv.sats.toLocaleString("en-US")}-sat tip reached AgentHC.`)} />
+          <Msg m={ok(`Got it — thank you! Your ${usdText(inv.usd)} tip (${satsText(inv.sats)}) reached AgentHC.`)} />
           <Button onClick={onClose}>Close</Button>
         </div>
       )}

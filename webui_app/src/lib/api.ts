@@ -147,16 +147,21 @@ export interface PnlSummary {
   dry: PnlBook | null;
 }
 export interface TipTier {
-  amount_sats: number;
+  amount_usd: number;
+  amount_sats: number | null;
   available: boolean;
   reason: string | null;
-  amount_usd_approx: number | null;
   label: string;
+}
+export interface TipQuote {
+  btc_usd: number;
+  age_s: number | null;
+  source: string | null;
 }
 export interface TipOptions {
   ok: boolean;
   tiers?: TipTier[];
-  quote_age_s?: number | null;
+  quote?: TipQuote | null;
   valid_seconds?: number;
   unavailable?: boolean;
   error?: string;
@@ -166,8 +171,9 @@ export interface TipInvoice {
   bolt11?: string;
   qr?: number[][] | null;
   payment_hash?: string;
+  amount_usd?: number;
   amount_sats?: number;
-  amount_usd_approx?: number | null;
+  btc_usd?: number;
   expires_in?: number;
   error?: string;
   refresh_tiers?: boolean;
