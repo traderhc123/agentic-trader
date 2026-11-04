@@ -87,10 +87,12 @@ export function PnlChart({ points, height = 220 }: { points: PnlPoint[]; height?
 
   useEffect(() => {
     if (!series.current || !chart.current) return;
-    const off = new Date().getTimezoneOffset() * 60;
     let last = -Infinity;
     const data = points.map((p) => {
-      let t = Math.floor(new Date(p.ts).getTime() / 1000) - off;
+      // lightweight-charts plots times as UTC, so shift each point by ITS OWN
+      // local offset (one fixed offset put pre-DST exits an hour off).
+      const d = new Date(p.ts);
+      let t = Math.floor(d.getTime() / 1000) - d.getTimezoneOffset() * 60;
       if (!isFinite(t)) t = last + 60;
       if (t <= last) t = last + 1; // the library needs strictly increasing times
       last = t;
