@@ -487,18 +487,21 @@ def _prune_expired_positions(cfg, state, save_state):
     an exit usually means the premium was lost, so check the account.
     """
     today = _et_now().date().isoformat()
-    dropped = []
+    dropped, told = [], set()
     for key in list(state.get("positions", {})):
         if _expired(key, today):
-            state["positions"].pop(key)
+            row = state["positions"].pop(key)
             dropped.append(key)
+            if isinstance(row, dict) and row.get("expired_alerted"):
+                told.add(key)  # the expiry check already alerted (once each)
     if _prune_tombstones(state, today) or dropped:
         save_state(state)
         for key in dropped:
             msg = (f"pruned expired position {key} — expired without an exit "
                    f"event; check your broker account")
             print(msg)
-            notify(cfg, f"agentic-trader: {msg}")
+            if key not in told:
+                notify(cfg, f"agentic-trader: {msg}")
     return dropped
 
 
@@ -1789,7 +1792,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             return msg
         policy_reason = verdict["reason"]
     else:
-        policy_reason = "exits always close what was opened"
+        policy_reason = (ev.get("guard_reason")
+                         or "exits always close what was opened")
 
     # Never place a real order against a dry-run position.
     existing = state["positions"].get(pos_key)
@@ -1921,6 +1925,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
     if action:
         record = {"action": action, "event_id": ev["event_id"],
                   "contract": contract, "dry": dry, "reason": policy_reason}
+        if ev.get("exit_cause"):  # e.g. "expiry_guard": not a feed signal
+            record["cause"] = str(ev["exit_cause"])
         if action == "entry" and pos_key in state["positions"]:
             row = state["positions"][pos_key]
             mark = _mark(broker, client, ecfg, ev, "buy")
@@ -1957,6 +1963,417 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         save_state(state)
         return f"{prefix}{action.upper()}: {contract}"
     return None
+
+
+# ── expiry guard ─────────────────────────────────────────────────────────────
+# An option still held at the close on its expiry day can be exercised (or
+# assigned): a follower whose agent missed the last exit signal — offline,
+# asleep, signal published minutes before the close — ends up owning (or
+# short) 100 shares per contract. Backstop, for the agent's OWN ledger rows
+# only (never anything else the account holds):
+#   - from expiry_guard_et (default 15:45 ET) until the close, sell every row
+#     that expires today — a marketable limit (bid -5%), retried every loop,
+#     with the loop at EXPIRY_GUARD_POLL_S while there's work;
+#   - at expiry_alert_et (default 15:50 ET), one urgent notification and a
+#     dashboard banner for every row expiring today that is still open;
+#   - at startup and after a sleep: rows that expire today ("expires today")
+#     and rows that expired while the agent wasn't running ("check for an
+#     exercise/assignment"), once per row.
+# Either time can be "off". On a 1:00 PM early-close day both move three
+# hours earlier (15:45 -> 12:45).
+
+EXPIRY_GUARD_DEFAULT = "15:45"
+EXPIRY_ALERT_DEFAULT = "15:50"
+EXPIRY_GUARD_POLL_S = 10   # loop cadence while the guard or its alert has work
+EXPIRY_WAKE_GAP_S = 180    # a loop that ran this much later than planned = a
+                           # sleep/wake (or a hang): re-run the startup check
+EXPIRY_BEAT_SAVE_S = 120   # how often the last-heartbeat time is persisted
+_REGULAR_CLOSE_MIN = 16 * 60
+_EARLY_CLOSE_MIN = 13 * 60
+# 1:00 PM ET early closes known to the agent; add others with the
+# early_close_days config list. Full holidays need no list: no option
+# expires on a day the market is closed.
+EARLY_CLOSE_DAYS = frozenset({"2026-11-27", "2026-12-24", "2027-11-26"})
+_HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+_EXPIRY_CFG_WARNED = set()
+
+
+def _et_hhmm(cfg, key, default):
+    """An "HH:MM" (24-hour, ET, 09:30-15:59) setting as minutes after
+    midnight, or None when it's "off". Anything else uses the default
+    (and says so once)."""
+    raw = (cfg or {}).get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = default
+    if raw is False or str(raw).strip().lower() in ("off", "false", "no",
+                                                    "none", "disabled"):
+        return None
+    m = _HHMM_RE.match(str(raw).strip())
+    mins = int(m.group(1)) * 60 + int(m.group(2)) if m else -1
+    if not 9 * 60 + 30 <= mins < _REGULAR_CLOSE_MIN:
+        if (key, str(raw)) not in _EXPIRY_CFG_WARNED:
+            _EXPIRY_CFG_WARNED.add((key, str(raw)))
+            print(f"config {key}={raw!r} isn't a time between 09:30 and 15:59 "
+                  f"(HH:MM, ET) or \"off\" — using {default}")
+        m = _HHMM_RE.match(default)
+        mins = int(m.group(1)) * 60 + int(m.group(2))
+    return mins
+
+
+def _close_min(cfg, day):
+    """The market close on `day` (YYYY-MM-DD), minutes after midnight ET."""
+    extra = (cfg or {}).get("early_close_days")
+    extra = {str(d) for d in extra} if isinstance(extra, (list, tuple)) else set()
+    return (_EARLY_CLOSE_MIN if day in EARLY_CLOSE_DAYS or day in extra
+            else _REGULAR_CLOSE_MIN)
+
+
+def _expiry_times(cfg, day):
+    """(guard, alert, close) in minutes after midnight ET on `day`; guard or
+    alert is None when switched off. On an early-close day both move
+    earlier by as much as the close does."""
+    close = _close_min(cfg, day)
+    shift = _REGULAR_CLOSE_MIN - close
+    guard = _et_hhmm(cfg, "expiry_guard_et", EXPIRY_GUARD_DEFAULT)
+    alert = _et_hhmm(cfg, "expiry_alert_et", EXPIRY_ALERT_DEFAULT)
+    return (None if guard is None else guard - shift,
+            None if alert is None else alert - shift, close)
+
+
+def _hm(mins):
+    return f"{mins // 60}:{mins % 60:02d}"
+
+
+def _close_epoch(cfg, day):
+    """Epoch seconds of the market close on `day` (YYYY-MM-DD)."""
+    d = datetime.strptime(day, "%Y-%m-%d")
+    close = _close_min(cfg, day)
+    return datetime(d.year, d.month, d.day, close // 60, close % 60,
+                    tzinfo=MARKET_TZ).timestamp()
+
+
+def _expiring_rows(state, day):
+    """[(key, row)] ledger rows expiring on `day` that hold contracts or
+    have an order working."""
+    out = []
+    for key, row in list((state.get("positions") or {}).items()):
+        parts = key.split("|")
+        if (isinstance(row, dict) and len(parts) == 4 and parts[1] == day
+                and (_int0(row.get("qty")) >= 1 or row.get("pending"))):
+            out.append((key, row))
+    return out
+
+
+def _guard_event(key, day):
+    """The EXITED event the guard sells a ledger row with, or None when the
+    key can't be turned back into exactly that row's contract."""
+    try:
+        t, e, s, ty = key.split("|")
+        strike = float(s)
+    except ValueError:
+        return None
+    ev = {"event": "EXITED", "ticker": t, "expiry": e, "strike": strike,
+          "type": ty, "event_id": f"expiry-guard|{key}|{day}",
+          "exit_cause": "expiry_guard", "exit_limit": "marketable"}
+    if f"{t}|{e}|{strike}|{ty}" != key or not _valid_event(ev):
+        return None
+    return ev
+
+
+def _exit_bid(broker, client, cfg, ev, row):
+    """The adapter's exit_bid hook: best bid (0.0 = none) or None (unknown,
+    no hook, or a bad answer)."""
+    fn = getattr(broker, "exit_bid", None)
+    if fn is None or client is None:
+        return None
+    try:
+        v = fn(client, cfg, ev, row.get("option_id"))
+    except Exception:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v < float("inf"):
+        return None
+    return float(v)
+
+
+def _note_once(state, save_state, row, flag, day):
+    """True the first time `flag` is set to `day` on the row (and saves)."""
+    if row.get(flag) == day:
+        return False
+    row[flag] = day
+    try:
+        save_state(state)
+    except Exception:
+        pass  # the alert matters more; the flag is saved with the next change
+    return True
+
+
+def _expiry_guard_sell(cfg, state, save_state, broker, client, key, day, guard):
+    """Sell one ledger row that expires today. Returns handle_event's line
+    when an exit was placed, else None (retried on the next loop)."""
+    row = state["positions"].get(key)
+    if not isinstance(row, dict):
+        return None
+    contract = _contract_of(key)
+    ev = _guard_event(key, day)
+    if ev is None:
+        if _note_once(state, save_state, row, "expiry_guard_noted", day):
+            print(f"expiry guard: can't read the contract of ledger row {key!r} "
+                  "— not selling it; check it in your broker app")
+        return None
+    ev["guard_reason"] = (f"expiry guard: expires today and was still open at "
+                          f"{_hm(guard)} ET")
+    if not row.get("dry"):
+        if cfg.get("dry_run"):
+            # a real position while the agent is in dry-run: never pop it
+            # unsold (the dry path would) — the alert tells the owner
+            if _note_once(state, save_state, row, "expiry_guard_noted", day):
+                print(f"expiry guard: {contract} expires today, but the agent is "
+                      "in dry-run — it won't sell this real position")
+            return None
+        if (row.get("pending") or {}).get("side") == "sell":
+            print(f"expiry guard: the sell for {contract} is still working — "
+                  "waiting for it")
+            return None
+        bid = _exit_bid(broker, client, cfg, ev, row)
+        if bid is not None and bid <= 0:
+            print(f"expiry guard: {contract} has no bid — not selling (a "
+                  "worthless contract expires on its own); checking again "
+                  "next loop")
+            if _note_once(state, save_state, row, "expiry_no_bid", day):
+                notify(cfg, f"agentic-trader: {contract} expires today and has no "
+                            "bid (likely worthless), so the expiry guard didn't "
+                            "sell it. If it's in the money, sell it in your broker "
+                            "app before the close or it may be exercised.")
+            return None
+    if getattr(client, "last_error", None):
+        print(f"expiry guard: broker connection is down "
+              f"({client.last_error}) — trying the sell anyway")
+    print(f"expiry guard: {contract} expires today and is still open — selling it")
+    try:
+        outcome = handle_event(ev, cfg, state, broker, client, save_state)
+    except ExitNotDone as exc:
+        print(f"expiry guard: {exc} — retrying in ~{EXPIRY_GUARD_POLL_S}s")
+        return None
+    except Exception as exc:
+        print(f"expiry guard: the sell of {contract} failed ({str(exc)[:150]}) "
+              f"— retrying in ~{EXPIRY_GUARD_POLL_S}s")
+        return None
+    if outcome:
+        msg = (f"expiry guard sold {contract} — it expires today and was still "
+               f"open at {_hm(guard)} ET")
+        print(msg)
+        notify(cfg, f"agentic-trader: {'[DRY-RUN] ' if row.get('dry') else ''}{msg}")
+    return outcome
+
+
+def _expiry_alert(cfg, state, save_state, key, row, day, paused):
+    """Once per row and day: the urgent "still open" alert."""
+    if row.get("dry") or not _note_once(state, save_state, row,
+                                        "expiry_alerted", day):
+        return None
+    msg = (f"{_contract_of(key)} expires today and is still open — sell it now "
+           "in your broker app or it may be exercised")
+    if paused:
+        msg += " (the agent is paused, so the expiry guard isn't selling)"
+    elif cfg.get("dry_run"):
+        msg += " (the agent is in dry-run, so it doesn't sell real positions)"
+    elif (row.get("pending") or {}).get("side") == "sell":
+        msg += " (the agent's own sell order hasn't filled yet)"
+    print("EXPIRY ALERT: " + msg)
+    notify(cfg, "⚠️ agentic-trader: " + msg, priority="high")
+    return msg
+
+
+def expiry_guard_tick(cfg, state, save_state, broker, client, paused=False,
+                      now_et=None):
+    """Once per heartbeat: the guard's sells (not while paused) and the
+    still-open alert. Returns the lines of exits it placed. Never raises."""
+    try:
+        return _expiry_guard_tick(cfg, state, save_state, broker, client,
+                                  paused, now_et or _et_now())
+    except Exception as exc:
+        print(f"expiry guard error (non-fatal): {str(exc)[:150]}")
+        return []
+
+
+def _expiry_guard_tick(cfg, state, save_state, broker, client, paused, now_et):
+    if now_et.weekday() >= 5:
+        return []
+    day = now_et.date().isoformat()
+    if not _expiring_rows(state, day):
+        return []
+    guard, alert, close = _expiry_times(cfg, day)
+    now_m = now_et.hour * 60 + now_et.minute
+    if now_m >= close:
+        return []  # nothing trades any more today
+    done = []
+    if guard is not None and now_m >= guard and not paused:
+        for key, _row in _expiring_rows(state, day):
+            out = _expiry_guard_sell(cfg, state, save_state, broker, client,
+                                     key, day, guard)
+            if out:
+                done.append(out)
+    if alert is not None and now_m >= alert:
+        for key, row in _expiring_rows(state, day):
+            _expiry_alert(cfg, state, save_state, key, row, day, paused)
+    return done
+
+
+def expiry_guard_busy(cfg, state, now_et=None):
+    """True while the guard or its alert has work soon (a row expiring
+    today, from a minute before the earlier of the two times to the
+    close): the heartbeat then runs every EXPIRY_GUARD_POLL_S."""
+    now_et = now_et or _et_now()
+    if now_et.weekday() >= 5:
+        return False
+    day = now_et.date().isoformat()
+    if not _expiring_rows(state, day):
+        return False
+    guard, alert, close = _expiry_times(cfg, day)
+    starts = [m for m in (guard, alert) if m is not None]
+    now_m = now_et.hour * 60 + now_et.minute
+    return bool(starts) and min(starts) - 1 <= now_m < close
+
+
+def expiry_wake_check(cfg, state, save_state, prev_beat, now_et=None):
+    """At startup, and when the heartbeat resumes after a gap (sleep): one
+    alert per ledger row that expires today (before the guard time — after
+    it, the guard runs this same loop), and one per row that expired while
+    the agent wasn't running (`prev_beat`: epoch of its last heartbeat
+    before the gap, None = unknown). Returns the alerts sent. Never raises."""
+    try:
+        return _expiry_wake_check(cfg, state, save_state, prev_beat,
+                                  now_et or _et_now())
+    except Exception as exc:
+        print(f"expiry check error (non-fatal): {str(exc)[:150]}")
+        return []
+
+
+def _expiry_wake_check(cfg, state, save_state, prev_beat, now_et):
+    day = now_et.date().isoformat()
+    now_ts = now_et.timestamp()
+    guard, alert, close = _expiry_times(cfg, day)
+    now_m = now_et.hour * 60 + now_et.minute
+    sent, changed = [], False
+    for key, row in list((state.get("positions") or {}).items()):
+        parts = key.split("|")
+        if (not isinstance(row, dict) or row.get("dry") or len(parts) != 4
+                or not _EXPIRY_RE.match(parts[1])):
+            continue
+        try:
+            closes_at = _close_epoch(cfg, parts[1])
+        except ValueError:
+            continue
+        contract = _contract_of(key)
+        if now_ts >= closes_at:
+            if row.get("expired_alerted"):
+                continue
+            if prev_beat is not None and _float0(prev_beat) >= closes_at:
+                continue  # running at that close: not "offline" (prune tells)
+            row["expired_alerted"] = True
+            changed = True
+            msg = (f"{contract} expired while the agent was offline — check your "
+                   "broker account for an exercise/assignment")
+            print("EXPIRY ALERT: " + msg)
+            notify(cfg, "⚠️ agentic-trader: " + msg, priority="high")
+            sent.append(msg)
+        elif parts[1] == day and now_et.weekday() < 5 and alert is not None:
+            if guard is not None and now_m >= guard:
+                print(f"{contract} expires today — the expiry guard runs now")
+                continue
+            if row.get("expiry_today_alerted") == day:
+                continue
+            row["expiry_today_alerted"] = day
+            changed = True
+            if guard is not None:
+                msg = (f"{contract} expires today — the agent sells it at "
+                       f"{_hm(guard)} ET if it's still open then (expiry guard)")
+            else:
+                msg = (f"{contract} expires today and the expiry guard is off — "
+                       f"sell it before the {_hm(close)} ET close or it may be "
+                       "exercised")
+            print(msg)
+            notify(cfg, "agentic-trader: " + msg)
+            sent.append(msg)
+    if changed:
+        try:
+            save_state(state)
+        except Exception:
+            pass
+    return sent
+
+
+def expiry_banner(cfg, state, now_et=None):
+    """Dashboard lines about the agent's own (live) rows at expiry:
+    [{"level": info|warn|urgent, "text": ...}]; [] when none."""
+    try:
+        now_et = now_et or _et_now()
+        day = now_et.date().isoformat()
+        guard, alert, close = _expiry_times(cfg, day)
+        now_m = now_et.hour * 60 + now_et.minute
+        out = []
+        for key, row in sorted((state.get("positions") or {}).items()):
+            parts = key.split("|")
+            if (not isinstance(row, dict) or row.get("dry") or len(parts) != 4
+                    or not _EXPIRY_RE.match(parts[1])):
+                continue
+            contract = _contract_of(key)
+            if parts[1] < day or (parts[1] == day and now_m >= close):
+                out.append({"level": "urgent", "text": (
+                    f"{contract} has expired and the agent still lists it — check "
+                    "your broker account for an exercise/assignment")})
+            elif parts[1] == day and now_et.weekday() < 5:
+                if alert is not None and now_m >= alert:
+                    out.append({"level": "urgent", "text": (
+                        f"{contract} expires today and is still open — sell it now "
+                        "in your broker app or it may be exercised")})
+                elif guard is not None and now_m >= guard:
+                    out.append({"level": "warn", "text": (
+                        f"{contract} expires today — the expiry guard is selling it")})
+                else:
+                    out.append({"level": "info", "text": (
+                        f"{contract} expires today — the agent sells it at "
+                        f"{_hm(guard)} ET if it's still open then"
+                        if guard is not None else
+                        f"{contract} expires today — the expiry guard is off; "
+                        f"sell it before the {_hm(close)} ET close")})
+        return out
+    except Exception:
+        return []
+
+
+def _expiry_guard_desc(cfg):
+    day = _et_now().date().isoformat()
+    guard, alert, close = _expiry_times(cfg, day)
+    g = f"sells at {_hm(guard)} ET" if guard is not None else "off"
+    a = f"alert at {_hm(alert)} ET" if alert is not None else "alert off"
+    return f"{g}, {a}" + (f" (early close {_hm(close)} today)"
+                          if close != _REGULAR_CLOSE_MIN else "")
+
+
+def _expiry_command(t, cfg):
+    """'expiry guard on|off|HH:MM' and 'expiry alert on|off|HH:MM'.
+    Returns (handled, reply)."""
+    for name, key, default in (("expiry guard", "expiry_guard_et", EXPIRY_GUARD_DEFAULT),
+                               ("expiry alert", "expiry_alert_et", EXPIRY_ALERT_DEFAULT)):
+        if t != name and not t.startswith(name + " "):
+            continue
+        arg = t[len(name):].strip()
+        if not arg:
+            return True, f"Expiry guard: {_expiry_guard_desc(cfg)}."
+        if arg == "on":
+            arg = default
+        if arg != "off":
+            m = _HHMM_RE.match(arg)
+            mins = int(m.group(1)) * 60 + int(m.group(2)) if m else -1
+            if not 9 * 60 + 30 <= mins < _REGULAR_CLOSE_MIN:
+                return True, (f"Usage: {name} on | off | HH:MM (ET, 24-hour, "
+                              f"09:30-15:59; default {default})")
+            arg = _hm(mins).zfill(5)
+        cfg[key] = arg
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, f"Expiry guard: {_expiry_guard_desc(cfg)}."
+    return False, ""
 
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -2219,6 +2636,9 @@ def _apply_command(text):
     handled, reply = _rule_command(t, cfg)
     if handled:
         return True, reply
+    handled, reply = _expiry_command(t, cfg)
+    if handled:
+        return True, reply
     if t in ("autostart on", "autostart off", "start at login on",
              "start at login off"):
         import keep_running
@@ -2474,6 +2894,7 @@ def cmd_run(app_window=False):
                                  else "on" if llm_policy.enabled(c) else "off"),
                 "rules": __import__("rules").describe(c) or "none",
                 "market": "open" if _market_open_now() else "closed (slow polling)",
+                "expiry guard": _expiry_guard_desc(c),
                 "open positions": ", ".join(st.get("positions", {})) or "none",
                 "start at login": ("on" if keep_running.autostart_enabled()
                                    else "off"),
@@ -2486,6 +2907,7 @@ def cmd_run(app_window=False):
                    if _broker_conn_desc(client) else {}),
             },
             "cash_warning": cash.get("warning", ""),
+            "expiry_warnings": expiry_banner(c, st),
             "problems": _problems_with_ai_block(c),
             "budget_hints": _budget_hints(c),
             "would_have": dry_run_preview.summary(c),
@@ -2536,8 +2958,24 @@ def cmd_run(app_window=False):
     notify(cfg, f"agentic-trader heartbeat started [{mode}], source={cfg['source']}"
                 # never send the login token to a third-party notifier
                 + (f" — dashboard {dash_url.split('?')[0]}" if dash_url else ""))
+    # positions that expire today, or expired while the agent wasn't running
+    expiry_wake_check(cfg, state, save_state, state.get("heartbeat_at"))
+    beat = {"at": time.time(), "wait": 0.0, "saved": 0.0}
     while True:
         keep_running.touch_alive()
+        now_beat = time.time()
+        if now_beat - beat["at"] - beat["wait"] > EXPIRY_WAKE_GAP_S:
+            # the computer slept (or the loop hung): same check as at startup
+            print(f"heartbeat resumed after {(now_beat - beat['at']) / 60:.0f} "
+                  "min — checking positions that expire")
+            expiry_wake_check(cfg, state, save_state, beat["at"])
+        if now_beat - beat["saved"] >= EXPIRY_BEAT_SAVE_S:
+            beat["saved"] = now_beat
+            state["heartbeat_at"] = now_beat  # read by the next startup check
+            try:
+                save_state(state)
+            except Exception:
+                pass
         cfg = _load(CONFIG_PATH, cfg) or cfg  # dashboard edits apply live
         awake.apply(cfg)  # same thread every time (Windows needs that)
         if time.time() - dash["at"] > DASH_CHECK_EVERY_S:
@@ -2625,6 +3063,10 @@ def cmd_run(app_window=False):
             support.note_error(f"heartbeat error: {exc}")
             if cfg.get("source") == "agenthc":
                 _explain_connection_error(exc, cfg, state, save_state)
+        # after the feed's own exit signals, and even when the feed is
+        # unreachable: sell what expires today, alert on what's still open
+        expiry_guard_tick(cfg, state, save_state, broker, client,
+                          paused=webui.CONTROLS["paused"])
         try:
             _maybe_daily_digest(cfg, state, save_state)
         except Exception:
@@ -2638,6 +3080,9 @@ def cmd_run(app_window=False):
             wait = 2
         else:
             wait = poll if _market_open_now() else max(poll, 300)
+            if expiry_guard_busy(cfg, state):
+                wait = min(wait, EXPIRY_GUARD_POLL_S)
+        beat["at"], beat["wait"] = time.time(), wait
         try:
             _sleep_unless_stopped(wait, webui.CONTROLS)
         except KeyboardInterrupt:

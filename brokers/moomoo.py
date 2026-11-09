@@ -22,6 +22,8 @@ import time
 import broker_events
 import platform_compat
 
+from .pricing import marketable_limit
+
 _TIMEOUT = 15
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 11111
@@ -199,6 +201,43 @@ def mark_price(cl, cfg, event, side="buy"):
     return _ask_price(cfg, _sdk(), _moomoo_code(event))
 
 
+def _bid_price(cfg, sdk, code):
+    """Latest bid via OpenD quotes: 0.0 when there is no bid, None when the
+    quote can't be read (unknown)."""
+    ctx = None
+    try:
+        host, port = _host_port(cfg)
+        ctx = sdk.OpenQuoteContext(host=host, port=port)
+        ret, data = ctx.get_market_snapshot([code])
+        if ret != sdk.RET_OK or data is None or not len(data):
+            return None
+        v = data.iloc[0].get("bid_price")
+        if v is None:
+            return None
+        bid = float(v)
+        return bid if 0 <= bid < float("inf") else None
+    except Exception:
+        return None
+    finally:
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
+def exit_bid(cl, cfg, event, option_id=None):
+    """Best bid per share for the contract the agent is about to sell (the
+    expiry guard skips a sell into no bid): 0.0 = no bid, None = unknown."""
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    try:
+        sdk = _sdk()
+    except RuntimeError:
+        return None
+    code = option_id if str(option_id or "").startswith("US.") else _moomoo_code(event)
+    return _bid_price(cfg, sdk, code)
+
+
 def account_value(cl, cfg):
     """Total assets for %-of-account sizing (0.0 when unavailable)."""
     cfg = cl.cfg if isinstance(cl, _Client) else cfg
@@ -369,7 +408,14 @@ def execute(cl, cfg, event, state):
             return False
         code = pos.get("option_id", code)
         # sell marketable: at the bid if we can get one, else last/ask
-        price = _ask_price(cfg, sdk, code)
+        price = 0.0
+        if event.get("exit_limit") == "marketable":
+            # the expiry guard: bid-5%, rounded down to a $0.05 tick
+            price = marketable_limit(_bid_price(cfg, sdk, code), "sell") or 0.0
+            if price > 0:
+                print(f"  expiry guard — sell placed as marketable limit @ ${price:.2f}")
+        if price <= 0:
+            price = _ask_price(cfg, sdk, code)
         if price <= 0:
             print(f"SKIPPED {contract}: no quote from OpenD for exit — "
                   "will retry on the next poll")

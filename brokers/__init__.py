@@ -39,6 +39,17 @@ reported as "not held":
         that list (last 200), so the agent's sell of an earlier position in
         the same contract never passes for the owner's.
 
+    exit_bid(client, cfg, event, option_id) -> float | None
+        Best bid per share for a contract the agent is about to sell: 0.0
+        when the broker quotes no bid, None when unknown. The expiry guard
+        doesn't sell into no bid (a worthless contract expires harmlessly)
+        and sells as usual when the bid is unknown.
+
+The expiry guard's EXITED events carry event["exit_limit"] == "marketable":
+an adapter that sees it sells with a marketable limit (bid -5%, rounded down
+to a $0.05 tick — pricing.py) instead of a market order. Adapters that
+ignore it sell as usual.
+
     VERIFIES_FILLS = False          module constant for adapters that book an
                                     entry when the order is accepted, without
                                     checking that it filled (default True).

@@ -17,6 +17,8 @@ import requests
 
 import broker_events
 
+from .pricing import marketable_limit
+
 _TIMEOUT = 15
 _OCC_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
 
@@ -123,6 +125,32 @@ def mark_price(cl, cfg, event, side="buy"):
     return _quote_price(cfg, _occ_symbol(event))
 
 
+def _bid(cfg, occ):
+    """Latest bid per share: 0.0 when Alpaca quotes no bid, None when the
+    quote can't be read (unknown)."""
+    try:
+        resp = requests.get(
+            "https://data.alpaca.markets/v1beta1/options/quotes/latest",
+            params={"symbols": occ}, headers=_headers(cfg), timeout=_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        q = (resp.json().get("quotes", {}) or {}).get(occ)
+        if not isinstance(q, dict) or q.get("bp") is None:
+            return None
+        bp = float(q["bp"])
+        return bp if 0 <= bp < float("inf") else None
+    except Exception:
+        return None
+
+
+def exit_bid(cl, cfg, event, option_id=None):
+    """Best bid per share for the contract the agent is about to sell (the
+    expiry guard skips a sell into no bid): 0.0 = no bid, None = unknown."""
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    occ = option_id if option_id and _OCC_RE.match(str(option_id)) else _occ_symbol(event)
+    return _bid(cfg, occ)
+
+
 def account_value(cl, cfg):
     """Account equity for %-of-account sizing (0.0 when unavailable)."""
     cfg = cl.cfg if isinstance(cl, _Client) else cfg
@@ -182,12 +210,13 @@ _CONFIRM_TRIES = 3
 _CONFIRM_WAIT_S = 5.0
 
 
-def _order(cfg, occ, side, qty):
+def _order(cfg, occ, side, qty, limit_price=None):
+    body = {"symbol": occ, "qty": str(int(qty)), "side": side,
+            "type": "market", "time_in_force": "day"}
+    if limit_price is not None:
+        body.update(type="limit", limit_price=f"{limit_price:.2f}")
     resp = requests.post(f"{_base(cfg)}/v2/orders", headers=_headers(cfg),
-                         json={"symbol": occ, "qty": str(int(qty)),
-                               "side": side, "type": "market",
-                               "time_in_force": "day"},
-                         timeout=_TIMEOUT)
+                         json=body, timeout=_TIMEOUT)
     if resp.status_code not in (200, 201):
         print(f"  ORDER FAILED HTTP {resp.status_code}: {resp.text[:200]}")
         broker_events.report("order_failed" if side == "buy" else "exit_failed",
@@ -303,7 +332,15 @@ def execute(cl, cfg, event, state):
         if not pos:
             return False
         print(f"EXITED event -> selling {pos['qty']}x {contract}")
-        oid = _order(cfg, pos.get("option_id", occ), "sell", pos["qty"])
+        limit = None
+        if event.get("exit_limit") == "marketable":
+            # the expiry guard: a marketable limit (bid-5%), not a market order
+            limit = marketable_limit(_bid(cfg, pos.get("option_id", occ)), "sell")
+            print(f"  expiry guard — sell placed as marketable limit @ ${limit:.2f}"
+                  if limit is not None else
+                  "  expiry guard: no usable bid — placing the sell as a market order")
+        oid = _order(cfg, pos.get("option_id", occ), "sell", pos["qty"],
+                     **({"limit_price": limit} if limit is not None else {}))
         if oid:
             _remember_order(state, oid)
             sold = _confirm_fill(cfg, oid, pos["qty"], side="sell")

@@ -210,6 +210,21 @@ whatever `max_autopay_sats` is set to.
   read clearly, nothing changes and exits work as before. Check it any
   time with `python agent.py check-positions` (read-only); turn it off
   with `"position_sync": false` in config.json.
+- **Expiry guard** (on by default): an option the agent opened that it still
+  holds on its expiry day is sold from `expiry_guard_et` (default `"15:45"`
+  ET) until the 4:00 PM close — a marketable limit at the bid −5%, retried
+  every ~10 s — so a missed exit signal (computer asleep, agent offline)
+  doesn't end in exercise or assignment. The feed's own exit signal still
+  comes first. No bid (worthless) = no sell, just a notification. Anything
+  still open at `expiry_alert_et` (default `"15:50"`) gets one urgent
+  notification and a red dashboard banner; at startup the agent also warns
+  about positions that expire today or expired while it was offline. Set
+  either time to `"off"` in config.json, or say `expiry guard off` /
+  `expiry guard 15:40` / `expiry alert off` in the dashboard. Only the
+  agent's own positions are ever sold. Early-close days (1:00 PM) move both
+  times 3 hours earlier; add any the agent doesn't know with
+  `"early_close_days": ["YYYY-MM-DD"]`. Not while paused, and never a real
+  position while in dry-run (the alert still fires).
 - State lives in `~/.agentic-trader/` (consent record, config, broker tokens
   `0600`, seen-events + positions).
 - Deliberately simple by design: no stop-losses, no margin logic, and a
