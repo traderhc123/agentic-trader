@@ -23,6 +23,13 @@ export function isToday(d: Date): boolean {
 export function eventWhen(x: { event_at_et?: unknown }): string {
   return typeof x.event_at_et === "string" && x.event_at_et ? x.event_at_et : "—";
 }
+/** The ET label split into [date, time] for a two-line cell
+ * ("Dec 30, 2025," / "3:55:17 PM ET"); ["—", ""] when unknown. */
+export function eventWhenParts(x: { event_at_et?: unknown }): [string, string] {
+  const s = eventWhen(x);
+  const k = s.lastIndexOf(", ");
+  return k < 0 ? [s, ""] : [s.slice(0, k) + ",", s.slice(k + 2)];
+}
 /** The same instant in the viewer's own time zone, for a tooltip. */
 export function localWhen(iso?: unknown): string {
   const d = new Date(typeof iso === "string" ? iso : "");

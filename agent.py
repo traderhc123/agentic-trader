@@ -285,10 +285,15 @@ def _et_stamp(ts, now=None):
     hour repeated when clocks fall back says EDT / EST instead. No tz on
     the timestamp means UTC (the log writes UTC). '' if missing/unreadable.
     Built by hand, not strftime, so the server's locale can't change it."""
-    iso = _utc_iso(ts) if isinstance(ts, str) else None
-    if not iso:
+    try:
+        # OverflowError: a stamp at the edge of the calendar (year 1 / 9999)
+        # parses but can't be shifted to UTC / ET — blank, not a crash
+        iso = _utc_iso(ts) if isinstance(ts, str) else None
+        if not iso:
+            return ""
+        e = datetime.fromisoformat(iso).astimezone(MARKET_TZ)
+    except (ValueError, OverflowError):
         return ""
-    e = datetime.fromisoformat(iso).astimezone(MARKET_TZ)
     year = (now or datetime.now(timezone.utc)).astimezone(MARKET_TZ).year
     day = f"{_MONTHS[e.month - 1]} {e.day}" + (f", {e.year}" if e.year != year else "")
     # the hour repeated when clocks fall back (1:00–1:59 AM) reads twice as
@@ -305,9 +310,14 @@ def _event_time(t):
     (`closed_at`), else when the agent logged it (`ts`). ('', '') if the row
     has neither."""
     for k in ("closed_at", "ts"):
-        iso = _utc_iso(t.get(k)) if isinstance(t.get(k), str) else None
+        try:
+            iso = _utc_iso(t.get(k)) if isinstance(t.get(k), str) else None
+        except OverflowError:  # year-1 / year-9999 edge: try the next field
+            iso = None
         if iso:
-            return iso, _et_stamp(iso)
+            label = _et_stamp(iso)
+            if label:
+                return iso, label
     return "", ""
 
 

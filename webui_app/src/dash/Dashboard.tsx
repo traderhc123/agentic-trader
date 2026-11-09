@@ -22,7 +22,7 @@ import {
 } from "../lib/api";
 import { cn } from "../lib/cn";
 import { copyToClipboard, useInterval } from "../lib/hooks";
-import { cap1, eventWhen, hhmm, isToday, localWhen, money, parseContract, parsePositions, shortDate, type Contract } from "../lib/format";
+import { cap1, eventWhen, eventWhenParts, hhmm, isToday, localWhen, money, parseContract, parsePositions, shortDate, type Contract } from "../lib/format";
 import { MovePanel } from "./MovePanel";
 import { PnlChart, type PnlPoint } from "./PnlChart";
 import { TipPanel } from "./TipPanel";
@@ -946,7 +946,7 @@ function Blotter({
                   <tr key={i} className="border-t border-line align-top hover:bg-panel2">
                     <Td className="font-mono text-xs leading-5 text-muted">
                       <time dateTime={trades[i].event_at || undefined} title={localWhen(trades[i].event_at)}>
-                        {eventWhen(trades[i])}
+                        {eventWhenParts(trades[i]).map((p, j) => p && <span key={j} className="block">{p}</span>)}
                       </time>
                     </Td>
                     <Td>

@@ -7,6 +7,8 @@ Both are "" for a row with no readable time, which the UI shows as "—".
 
 import json
 import re
+import shutil
+import subprocess
 from datetime import datetime, timezone
 
 import pytest
@@ -75,7 +77,12 @@ def test_et_stamp_adds_the_year_outside_the_current_one():
     assert agent._et_stamp("2026-12-31T20:00:00Z", now=jan1) == "Dec 31, 3:00:00 PM ET"
 
 
-@pytest.mark.parametrize("ts", [None, "", "   ", "not a time", 1730900000, {"x": 1}])
+EDGE_OF_CALENDAR = ["0001-01-01T00:00:00Z", "0001-01-01T00:00:00+01:00",
+                    "9999-12-31T23:59:59-05:00"]
+
+
+@pytest.mark.parametrize("ts", [None, "", "   ", "not a time", 1730900000, {"x": 1},
+                                *EDGE_OF_CALENDAR])
 def test_et_stamp_unreadable_is_blank(ts):
     assert agent._et_stamp(ts, now=NOW_2026) == ""
 
@@ -139,6 +146,21 @@ def test_rows_without_a_time_show_blank(home):
     assert all(r["event_at_et"] == "" for r in rows[1:])
 
 
+def test_one_out_of_range_time_does_not_break_the_list(home):
+    # parses, but can't be shifted to UTC / ET: that row is blank, the rest
+    # of Activity still loads (and a bad fill time still falls back to ts)
+    _write([{"action": "entry", "ts": EDGE_OF_CALENDAR[0]},
+            {"action": "skip_stale", "ts": EDGE_OF_CALENDAR[1]},
+            {"action": "skip_rule", "ts": EDGE_OF_CALENDAR[2]},
+            {"action": "exit", "manual": True, "closed_at": EDGE_OF_CALENDAR[1],
+             "ts": "2026-11-06T20:55:17+00:00"}])
+    rows = agent.trade_page()["trades"]
+    assert [r["action"] for r in rows] == ["exit", "skip_rule", "skip_stale", "entry"]
+    assert rows[0]["event_at"] == "2026-11-06T20:55:17+00:00"
+    assert NOV6_355.fullmatch(rows[0]["event_at_et"])
+    assert all(r["event_at"] == "" and r["event_at_et"] == "" for r in rows[1:])
+
+
 def test_a_close_found_in_the_account_shows_when_the_sale_filled(home):
     # the owner sold in the broker app at 3:55 PM EST; the agent noticed later
     _write([{"action": "exit", "manual": True, "contract": "SPY 2026-11-06 700 CALL",
@@ -177,3 +199,38 @@ def test_classic_dashboard_renders_the_et_time():
     html = webui._DASH_HTML
     assert "when(x)" in html and "x.event_at_et" in html
     assert "when(x.ts)" not in html
+
+
+def _classic_fn(name):
+    """One top-level function from the classic page's script, verbatim."""
+    m = re.search(r"^function " + name + r"\(.*?^}$", webui._DASH_HTML, re.M | re.S)
+    assert m, name
+    return m.group(0)
+
+
+def test_classic_when_renders_rows():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    # esc() uses the DOM; this stand-in escapes the same characters
+    # (what textContent -> innerHTML does)
+    esc = ("function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;')"
+           ".replace(/</g,'&lt;').replace(/>/g,'&gt;');}")
+    js = (esc + "\n" + _classic_fn("when") + "\n" + """
+const rows = [
+  {event_at_et: 'Dec 30, 2025, 3:55:17 PM ET', event_at: '2025-12-30T20:55:17+00:00'},
+  {event_at_et: 'Nov 6, 3:55:17 PM ET', event_at: '2026-11-06T20:55:17+00:00'},
+  {event_at_et: '', event_at: ''},
+  {},
+];
+console.log(JSON.stringify(rows.map(when)));
+""")
+    r = subprocess.run([node, "-e", js], capture_output=True, text=True, timeout=30,
+                       env={"TZ": "America/Chicago", "PATH": ""})
+    assert r.returncode == 0, r.stderr
+    year, nov6, blank, missing = json.loads(r.stdout)
+    # the date / time split is on the LAST ", " so the year stays with the date
+    assert '<span class="wd">Dec 30, 2025,</span> <span class="wt">3:55:17 PM ET</span>' in year
+    assert '<span class="wd">Nov 6,</span> <span class="wt">3:55:17 PM ET</span>' in nov6
+    assert "(your time)" in nov6
+    assert blank == missing == '<span class="when">—</span>'
