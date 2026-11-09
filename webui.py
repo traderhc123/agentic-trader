@@ -1794,13 +1794,14 @@ _DASH_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 
  /* activity feed */
  .feed{list-style:none;margin:0;padding:0}
- .feed li{display:grid;grid-template-columns:62px 22px minmax(0,1fr) auto;gap:var(--s3);align-items:start;
+ .feed li{display:grid;grid-template-columns:112px 22px minmax(0,1fr) auto;gap:var(--s3);align-items:start;
    padding:10px var(--s4);border-bottom:1px solid var(--line)}
  .feed li:last-child{border-bottom:0}
  .feed li:hover{background:var(--surface-2)}
  .feed li.empty{display:block;color:var(--muted);text-align:center;padding:24px var(--s4)}
  .feed li.empty:hover{background:none}
  .feed .when{font:12px/20px var(--mono);color:var(--muted);white-space:nowrap}
+ .feed .when .wd,.feed .when .wt{display:block}
  .ic{width:20px;height:20px;border-radius:4px;display:grid;place-items:center}
  .ic svg.i{width:12px;height:12px;stroke-width:2}
  .ic.in{background:var(--up-soft);color:var(--up)} .ic.out{background:var(--accent-soft);color:var(--accent)}
@@ -1845,6 +1846,7 @@ _DASH_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    .pb,.chart-wrap{padding-left:12px;padding-right:12px}
    .feed li{grid-template-columns:20px minmax(0,1fr) auto;grid-template-rows:auto auto;padding:10px 12px;gap:4px 10px}
    .feed .when{grid-column:2/4;grid-row:2;line-height:1.3;font-size:11px}
+   .feed .when .wd,.feed .when .wt{display:inline}
    .feed .ic{grid-row:1/3}
    .feed .pnl{min-width:0}
    .feed .t .tags{display:block;margin-top:2px;line-height:16px}
@@ -2023,11 +2025,16 @@ const ICON=n=>'<svg class="i"><use href="#i-'+n+'"/></svg>';
 function cap1(s){s=String(s||'');return s.charAt(0).toUpperCase()+s.slice(1);}
 function shortDate(d){return d.toLocaleDateString([], {month:'short',day:'numeric'});}
 function hhmm(d){return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',hour12:false});}
-function when(ts){
-  // 24h HH:MM for today, "Oct 14" for older rows (full time in the title)
-  const d=new Date(ts);if(isNaN(d))return esc(ts||'');
-  const today=new Date().toDateString()===d.toDateString();
-  return '<span class="when" title="'+esc(d.toLocaleString())+'">'+esc(today?hhmm(d):shortDate(d))+'</span>';
+function when(x){
+  // the agent's ET date + time ("Nov 6, 3:55:17 PM ET"; "—" when unknown):
+  // date over time on wide screens, one line on phones; your own time on hover
+  const s=String(x.event_at_et||'');if(!s)return '<span class="when">—</span>';
+  const d=new Date(x.event_at||''),k=s.lastIndexOf(', ');
+  if(k<0)return '<span class="when">'+esc(s)+'</span>';
+  const tip=isNaN(d)?'':d.toLocaleString([], {year:'numeric',month:'short',day:'numeric',hour:'numeric',
+    minute:'2-digit',second:'2-digit',timeZoneName:'short'})+' (your time)';
+  return '<span class="when" title="'+esc(tip)+'"><span class="wd">'+esc(s.slice(0,k))+',</span> '+
+    '<span class="wt">'+esc(s.slice(k+2))+'</span></span>';
 }
 function axisLabel(ts,withTime){
   const d=new Date(ts);if(isNaN(d))return '';
@@ -2193,7 +2200,7 @@ async function refresh(){
           pnl='<span class="pnl '+(v>=0?'up':'down')+'">'+money(v)+'</span>';}}
       else{title='Skipped '+contractHtml(x.contract,x.dry?'<span class="tag dry">DRY-RUN</span>':'');
         n=esc(cap1(SKIPS[a]||a.replace(/_/g,' ')))+(note?' — '+note:'');}
-      return '<li>'+when(x.ts)+'<span class="ic '+ic+'">'+ICON(icon)+'</span><div><div class="t">'+title+'</div>'+
+      return '<li>'+when(x)+'<span class="ic '+ic+'">'+ICON(icon)+'</span><div><div class="t">'+title+'</div>'+
         (n?'<div class="n">'+n+'</div>':'')+'</div>'+pnl+'</li>';
     }).join(''):'<li class="empty">Nothing yet — signals and the agent\\'s decisions show up here</li>';
   }catch(e){badMode('Agent unreachable','unreachable');}

@@ -18,11 +18,26 @@ export function hhmm(d: Date): string {
 export function isToday(d: Date): boolean {
   return new Date().toDateString() === d.toDateString();
 }
-/** 24h HH:MM for today, "Oct 14" for older. */
-export function whenShort(ts?: string): string {
-  const d = new Date(ts || "");
-  if (isNaN(d.getTime())) return ts || "";
-  return isToday(d) ? hhmm(d) : shortDate(d);
+/** An Activity row's date + time as the agent labels it in ET
+ *  ("Nov 6, 3:55:17 PM ET"); "—" for a row with no readable time. */
+export function eventWhen(x: { event_at_et?: unknown }): string {
+  return typeof x.event_at_et === "string" && x.event_at_et ? x.event_at_et : "—";
+}
+/** The same instant in the viewer's own time zone, for a tooltip. */
+export function localWhen(iso?: unknown): string {
+  const d = new Date(typeof iso === "string" ? iso : "");
+  if (isNaN(d.getTime())) return "";
+  return (
+    d.toLocaleString([], {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      timeZoneName: "short",
+    }) + " (your time)"
+  );
 }
 
 export interface Contract {
