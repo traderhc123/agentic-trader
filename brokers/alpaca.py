@@ -17,7 +17,7 @@ import requests
 
 import broker_events
 
-from .pricing import marketable_limit
+from .pricing import exit_qty, marketable_limit
 
 _TIMEOUT = 15
 _OCC_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
@@ -331,28 +331,31 @@ def execute(cl, cfg, event, state):
         pos = state["positions"].get(pos_key)
         if not pos:
             return False
-        print(f"EXITED event -> selling {pos['qty']}x {contract}")
+        qty = exit_qty(pos, event)
+        print(f"EXITED event -> selling {qty}x {contract}")
         limit = None
         if event.get("exit_limit") == "marketable":
-            # the expiry guard: a marketable limit (bid-5%), not a market order
+            # expiry guard / exit remainder: a marketable limit (bid-5%)
             limit = marketable_limit(_bid(cfg, pos.get("option_id", occ)), "sell")
-            print(f"  expiry guard — sell placed as marketable limit @ ${limit:.2f}"
+            print(f"  marketable sell — limit @ ${limit:.2f}"
                   if limit is not None else
-                  "  expiry guard: no usable bid — placing the sell as a market order")
-        oid = _order(cfg, pos.get("option_id", occ), "sell", pos["qty"],
+                  "  marketable sell: no usable bid — placing it as a market order")
+        oid = _order(cfg, pos.get("option_id", occ), "sell", qty,
                      **({"limit_price": limit} if limit is not None else {}))
         if oid:
             _remember_order(state, oid)
-            sold = _confirm_fill(cfg, oid, pos["qty"], side="sell")
+            sold = _confirm_fill(cfg, oid, qty, side="sell")
             remaining = int(pos["qty"]) - sold
             if remaining > 0:
                 pos["qty"] = remaining
                 _stamp_order(pos, oid)
-                print(f"  ⚠️ exit only filled {sold}/{pos['qty'] + sold} — "
-                      f"{remaining}x still held; close manually if needed")
+                # the agent re-sells the remainder (agent.exit_remainder_tick)
+                print(f"  ⚠️ exit only filled {sold}/{qty} — {remaining}x still "
+                      f"held; re-selling the remaining {remaining}x next loop")
                 broker_events.report("exit_partial",
-                                     f"exit filled {sold}/{pos['qty'] + sold} — "
-                                     f"{remaining}x {contract} still held")
+                                     f"exit filled {sold}/{qty} — {remaining}x "
+                                     f"{contract} still held; the agent re-sells "
+                                     f"the remaining {remaining}x next loop")
             else:
                 del state["positions"][pos_key]
             return True
@@ -459,6 +462,40 @@ def closed_fills(cl, cfg, option_id, since_iso=None, own_order_ids=(),
         fill = _owner_fill(o, option_id, own)
         if fill:
             out.append(fill)
+    return out
+
+
+def option_fills(cl, cfg, option_id, since_iso=None):
+    """Every filled (or partly filled) order on option_id — buys and sells,
+    the agent's and the owner's — newest first, or None when orders can't
+    be read (brokers/__init__.py)."""
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    if not _OCC_RE.match(str(option_id or "")):
+        return None
+    params = {"status": "all", "symbols": option_id, "direction": "desc",
+              "limit": 500}
+    if since_iso:
+        params["after"] = since_iso
+    try:
+        resp = requests.get(f"{_base(cfg)}/v2/orders", params=params,
+                            headers=_headers(cfg), timeout=_TIMEOUT)
+        rows = resp.json() if resp.status_code == 200 else None
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    out = []
+    for o in rows:
+        if not isinstance(o, dict) or not o.get("id") or o.get("symbol") != option_id:
+            continue
+        side = str(o.get("side") or "").lower()
+        try:
+            qty = int(round(float(o.get("filled_qty") or 0)))
+        except (TypeError, ValueError, OverflowError):
+            return None  # a fill we can't count: the whole answer is unknown
+        if side in ("buy", "sell") and qty >= 1:
+            out.append({"order_id": str(o["id"]), "side": side, "qty": qty,
+                        "at": o.get("filled_at") or o.get("updated_at")})
     return out
 
 

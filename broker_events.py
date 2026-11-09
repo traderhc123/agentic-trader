@@ -33,9 +33,11 @@ KINDS = {
 }
 
 # Problems worth a notification (once per kind per day). Intentional skips —
-# caps, dry-run — are logged only.
+# caps, dry-run — are logged only. exit_partial is logged only too: the
+# agent re-sells the remainder and notifies once per remainder itself
+# (agent.exit_remainder_tick), saying what it does about it.
 NOTIFY = {"order_failed", "skip_budget", "skip_no_quote", "skip_no_contract",
-          "entry_unfilled", "exit_failed", "exit_partial", "broker_no_order",
+          "entry_unfilled", "exit_failed", "broker_no_order",
           "skip_stale", "skip_sizing", "broker_disconnected",
           "broker_lookup_failed"}
 

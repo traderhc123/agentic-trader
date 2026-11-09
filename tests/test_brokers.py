@@ -525,6 +525,12 @@ class _FakeTradeCtx:
     def get_acc_list(self):
         return self.sdk.RET_OK, _FakeDF([{"acc_id": 1}])
 
+    def order_list_query(self, **kw):  # the exit's fill check: filled
+        qty = self.sdk.orders[-1]["qty"] if self.sdk.orders else 0
+        return self.sdk.RET_OK, _FakeDF([{"order_id": kw.get("order_id"),
+                                          "order_status": "FILLED_ALL",
+                                          "dealt_qty": qty}])
+
     def close(self):
         pass
 

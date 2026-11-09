@@ -227,6 +227,20 @@ whatever `max_autopay_sats` is set to.
   Monday–Thursday) move both times 3 hours earlier, never before 09:30; add
   any other with `"early_close_days": ["YYYY-MM-DD"]`. Not while paused, and
   never a real position while in dry-run (the alert still fires).
+- **Exit remainders** (any day): when an exit sells only part of a position
+  (a partial fill, or an order that died or was cancelled with contracts
+  left), the agent re-sells the rest on the next loop — a marketable limit,
+  sell-to-close, never more than its own ledger remainder and never more
+  than the account holds — until it's gone or the market closes, and again
+  from the next 9:30 ET open. You get one notification when it happens, one
+  when it's cleared, and one if it's still open at 15:50 ET. On an expiry
+  day the expiry guard takes over at its time.
+- **Ledger check**: if the account holds more of a contract the agent bought
+  than its ledger lists (an exit booked as sold that didn't fill), the agent
+  re-adds them — only as many as its own filled orders in your broker's
+  order history account for (bought minus everything sold since). Your own
+  positions are never adopted; a broker whose order history can't be read
+  gets an alert instead.
 - State lives in `~/.agentic-trader/` (consent record, config, broker tokens
   `0600`, seen-events + positions).
 - Deliberately simple by design: no stop-losses, no margin logic, and a

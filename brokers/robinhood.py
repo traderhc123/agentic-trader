@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import broker_events
 
 from .market_hours import close_minute
-from .pricing import marketable_limit, quote_number
+from .pricing import exit_qty, marketable_limit, quote_number
 from .robinhood_mcp import RobinhoodMCP, content_json, tool_ok
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -547,14 +547,15 @@ def _finalize_pending(state, pos_key, filled_total, report_unfilled=True):
         else:
             pos["qty"] = remaining
             _order_settled(pos)
+            # the agent re-sells the remainder (agent.exit_remainder_tick)
             print(f"  ⚠️ exit only filled {filled_total}/{pend['requested']} — "
-                  f"{remaining}x still held ({pos_key}); reconcile keeps working "
-                  "it, or close manually in the app")
+                  f"{remaining}x still held ({pos_key}); re-selling the remaining "
+                  f"{remaining}x next loop")
             broker_events.report(
                 "exit_partial",
                 f"exit filled {filled_total}/{pend['requested']} — {remaining}x "
-                f"{pos_key.replace('|', ' ')} still held; close it in the "
-                "Robinhood app if it doesn't clear")
+                f"{pos_key.replace('|', ' ')} still held; the agent re-sells the "
+                f"remaining {remaining}x next loop")
 
 
 def _record_pending(state, pos_key, placed, side, qty):
@@ -789,13 +790,13 @@ def execute(rh, cfg, event, state):
             if not pos:
                 print(f"  entry never filled — nothing to sell ({contract})")
                 return True
-        print(f"EXITED event -> selling {pos['qty']}x {contract}")
+        qty = exit_qty(pos, event)
+        print(f"EXITED event -> selling {qty}x {contract}")
         guard = ({"marketable": True} if event.get("exit_limit") == "marketable"
-                 else {})  # the expiry guard's sells: marketable limit
-        placed = place(rh, cfg, pos["option_id"], "sell", "close", pos["qty"],
-                       **guard)
+                 else {})  # expiry guard / exit remainder: marketable limit
+        placed = place(rh, cfg, pos["option_id"], "sell", "close", qty, **guard)
         if placed:
-            _record_pending(state, pos_key, placed, "sell", pos["qty"])
+            _record_pending(state, pos_key, placed, "sell", qty)
             _settle_fast(rh, cfg, state, pos_key)
             return True
     return False
@@ -942,10 +943,48 @@ def closed_fills(rh, cfg, option_id, since_iso=None, own_order_ids=(),
         return None
     own = {str(o) for o in own_order_ids or ()}
     try:
-        return _read_fills(rh, str(acct), str(option_id), since_iso, own,
-                           exclude_agentic)
+        return _read_orders(rh, str(acct), since_iso,
+                            lambda o: _owner_fill(o, str(option_id), own,
+                                                  exclude_agentic))
     except Exception:
         return None
+
+
+def option_fills(rh, cfg, option_id, since_iso=None):
+    """Every filled (or partly filled) order on option_id — buys and sells,
+    the agent's and the owner's — newest first, or None when orders can't
+    be read (brokers/__init__.py). The agent's ledger check tells its own
+    buys apart by order id."""
+    acct = (cfg or {}).get("robinhood_account")
+    if not acct or not _is_uuid(option_id) or getattr(rh, "last_error", None):
+        return None
+    try:
+        return _read_orders(rh, str(acct), since_iso,
+                            lambda o: _any_fill(o, str(option_id)))
+    except Exception:
+        return None
+
+
+def _any_fill(o, option_id):
+    """One order -> {order_id, side, qty, at} when it filled contracts of
+    option_id; None otherwise."""
+    if not isinstance(o, dict) or not o.get("id"):
+        return None
+    legs = o.get("legs") if isinstance(o.get("legs"), list) else []
+    leg = next((g for g in legs if isinstance(g, dict) and str(
+        g.get("option_id") or _last_seg(g.get("option"))) == option_id), None)
+    side = str((leg or {}).get("side") or "").lower()
+    if leg is None or side not in ("buy", "sell"):
+        return None
+    try:
+        filled = _leg_fill(o, leg, len(legs))
+        qty = int(round(filled[0])) if filled else 0
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return None
+    if qty < 1:
+        return None
+    return {"order_id": str(o["id"]), "side": side, "qty": qty,
+            "at": filled[2] or o.get("updated_at") or o.get("created_at")}
 
 
 def _day_before(since_iso):
@@ -958,7 +997,10 @@ def _day_before(since_iso):
     return (day - timedelta(days=1)).isoformat()
 
 
-def _read_fills(rh, acct, option_id, since_iso, own, exclude_agentic):
+def _read_orders(rh, acct, since_iso, pick):
+    """pick(order) for every order listed (newest first), keeping the
+    answers that aren't None. A list cut short by paging only misses OLDER
+    orders."""
     args = {"account_number": acct}
     since = _day_before(since_iso)
     if since:
@@ -978,7 +1020,7 @@ def _read_fills(rh, acct, option_id, since_iso, own, exclude_agentic):
         first = False
         pages += 1
         for o in orders:
-            fill = _owner_fill(o, option_id, own, exclude_agentic)
+            fill = pick(o)
             if fill:
                 out.append(fill)
         if not nxt or str(nxt).startswith("http"):

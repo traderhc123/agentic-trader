@@ -45,11 +45,23 @@ reported as "not held":
         doesn't sell into no bid (a worthless contract expires harmlessly)
         and sells as usual when the bid is unknown.
 
-The expiry guard's EXITED events carry event["exit_limit"] == "marketable":
-an adapter that sees it sells with a marketable limit (bid -5%, rounded down
-to a price every option class accepts; at the bid itself under $0.10 —
-pricing.py) instead of a market order. Adapters that ignore it sell as
-usual.
+    option_fills(client, cfg, option_id, since_iso=None) -> [fill] | None
+        Every filled (or partly filled) order on option_id — buys and sells,
+        the agent's and the owner's: {"order_id": str, "side": "buy"|"sell",
+        "qty": int >= 1, "at": str | None}. None means order history can't
+        be read. A list cut short may only leave out OLDER orders. The
+        agent's ledger check uses it to re-add contracts it bought that the
+        account still holds but its ledger lost (its own buy order ids prove
+        they're the agent's); without it, the agent only alerts.
+
+The expiry guard's EXITED events, and the agent's re-sells of an exit
+remainder (an exit that left contracts held), carry event["exit_limit"] ==
+"marketable": an adapter that sees it sells with a marketable limit (bid
+-5%, rounded down to a price every option class accepts; at the bid itself
+under $0.10 — pricing.py) instead of a market order. Adapters that ignore it
+sell as usual. A remainder re-sell can also carry event["max_qty"] (what the
+account holds): sell min(row qty, max_qty) — pricing.exit_qty. An exit that
+sells fewer than asked keeps the rest in row["qty"]; the agent re-sells it.
 
     VERIFIES_FILLS = False          module constant for adapters that book an
                                     entry when the order is accepted, without

@@ -44,6 +44,17 @@ def marketable_limit(price, side):
     return ticked / 100.0
 
 
+def exit_qty(pos, event):
+    """How many contracts an EXITED sells: the ledger row's qty, or fewer
+    when the event carries max_qty (the agent re-selling an exit remainder
+    caps it at what the account holds). Never more than the ledger row."""
+    qty = int(pos.get("qty") or 0)
+    cap = event.get("max_qty")
+    if isinstance(cap, int) and not isinstance(cap, bool) and 1 <= cap < qty:
+        return cap
+    return qty
+
+
 def quote_number(obj, key):
     """The first `key` value found anywhere in a quote payload, as a float:
     0.0 for an explicit zero, None when the key is absent, null or not a

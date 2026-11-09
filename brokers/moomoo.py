@@ -22,7 +22,7 @@ import time
 import broker_events
 import platform_compat
 
-from .pricing import marketable_limit
+from .pricing import exit_qty, marketable_limit
 
 _TIMEOUT = 15
 _DEFAULT_HOST = "127.0.0.1"
@@ -422,13 +422,130 @@ def execute(cl, cfg, event, state):
             broker_events.report("exit_failed",
                                  f"no quote from OpenD to exit {contract}")
             return False
-        print(f"EXITED event -> selling {pos['qty']}x {contract}")
-        oid = _order(cfg, sdk, code, "sell", pos["qty"], price)
+        qty = exit_qty(pos, event)
+        print(f"EXITED event -> selling {qty}x {contract}")
+        oid = _order(cfg, sdk, code, "sell", qty, price)
         if oid:
             _remember_order(state, oid)
-            del state["positions"][pos_key]
+            sold, sure = _confirm_sell(cfg, sdk, oid, qty)
+            if not sure:
+                # booked as sold, like before fills were checked; the agent's
+                # ledger check re-adds contracts it bought that are still held
+                print(f"  couldn't confirm the sell filled — assuming {qty}x "
+                      "(the agent re-checks your holdings)")
+                broker_events.report(
+                    "exit_failed", f"moomoo couldn't confirm whether the sell "
+                    f"order for {qty}x {contract} filled — the agent assumes it "
+                    "did and re-checks your holdings", placed=True)
+            remaining = int(pos["qty"]) - sold
+            if remaining > 0:
+                pos["qty"] = remaining
+                pos["last_order_at"] = time.time()  # holdings lag fresh orders
+                if oid != "submitted":
+                    pos["order_ids"] = ([i for i in pos.get("order_ids") or []
+                                         if i != oid] + [oid])[-20:]
+                # the agent re-sells the remainder (agent.exit_remainder_tick)
+                print(f"  ⚠️ exit only filled {sold}/{qty} — {remaining}x still "
+                      f"held; re-selling the remaining {remaining}x next loop")
+                broker_events.report("exit_partial",
+                                     f"exit filled {sold}/{qty} — {remaining}x "
+                                     f"{contract} still held; the agent re-sells "
+                                     f"the remaining {remaining}x next loop")
+            else:
+                del state["positions"][pos_key]
             return True
     return False
+
+
+# ── exit fill check ─────────────────────────────────────────────────────────
+# An exit used to be booked as sold as soon as OpenD accepted it. It's now
+# polled like Alpaca's: a sell still working after the polls is cancelled
+# and settled with what filled (the agent re-sells the rest). Only when the
+# order's state can't be read at all is it assumed sold (and reported).
+# Column/enum names follow moomoo's API docs; not yet checked on a live OpenD.
+
+_CONFIRM_TRIES = 3
+_CONFIRM_WAIT_S = 5.0
+_CANCEL_SETTLE_S = 2.0
+
+
+def _order_fill(cfg, sdk, oid):
+    """(status, dealt_qty) of one order, or None when it can't be read."""
+    ctx = None
+    try:
+        ctx = _trade_ctx(cfg, sdk)
+        ret, data = ctx.order_list_query(order_id=str(oid),
+                                         trd_env=_trd_env(cfg, sdk),
+                                         refresh_cache=True)
+        if ret != sdk.RET_OK or data is None:
+            return None
+        for i in range(len(data)):
+            row = data.iloc[i]
+            if str(row.get("order_id")) != str(oid):
+                continue
+            status = str(row.get("order_status")).rsplit(".", 1)[-1].upper()
+            return status, int(float(row.get("dealt_qty") or 0))
+        return None
+    except Exception:
+        return None
+    finally:
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
+def _cancel_order(cfg, sdk, oid):
+    ctx = None
+    try:
+        ctx = _trade_ctx(cfg, sdk)
+        if _trd_env(cfg, sdk) == sdk.TrdEnv.REAL and cfg.get("moomoo_trade_pwd"):
+            ctx.unlock_trade(cfg["moomoo_trade_pwd"])
+        ret, _data = ctx.modify_order(sdk.ModifyOrderOp.CANCEL, str(oid), 0, 0,
+                                      trd_env=_trd_env(cfg, sdk))
+        return ret == sdk.RET_OK
+    except Exception:
+        return False
+    finally:
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
+def _confirm_sell(cfg, sdk, oid, qty):
+    """(contracts sold, certain). Polls the order; one still working after
+    the polls is cancelled and settled with what filled. certain=False:
+    the order's state couldn't be read — assumed sold (qty)."""
+    if oid == "submitted":
+        return qty, False
+    seen = False
+    for _ in range(_CONFIRM_TRIES):
+        time.sleep(_CONFIRM_WAIT_S)
+        got = _order_fill(cfg, sdk, oid)
+        if got is None:
+            continue
+        seen = True
+        status, dealt = got
+        if status == "FILLED_ALL":
+            return (dealt or qty), True
+        if status in _MM_DONE:
+            print(f"  sell {status.lower()} — filled {dealt}/{qty}")
+            return min(dealt, qty), True
+    if seen:
+        _cancel_order(cfg, sdk, oid)
+        time.sleep(_CANCEL_SETTLE_S)
+        got = _order_fill(cfg, sdk, oid)
+        if got is not None:
+            status, dealt = got
+            if status == "FILLED_ALL":
+                return (dealt or qty), True
+            if status in _MM_DONE:
+                print(f"  sell didn't fill in time — cancelled; filled {dealt}/{qty}")
+                return min(dealt, qty), True
+    return qty, False
 
 
 _AGENT_ORDERS_KEPT = 200
@@ -499,6 +616,58 @@ def held_option_qty(cl, cfg, option_ids):
                 busy.add(code)
         return {c: held.get(c, 0) for c in ids
                 if c not in busy and held.get(c, 0) >= net.get(c, 0)}
+    except Exception:
+        return None
+    finally:
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
+def option_fills(cl, cfg, option_id, since_iso=None):
+    """Every filled (or partly filled) order on option_id — buys and sells,
+    the agent's and the owner's — or None when orders can't be read
+    (brokers/__init__.py): today's orders plus the order history."""
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    code = str(option_id or "")
+    if not code.startswith("US."):
+        return None
+    ctx = None
+    try:
+        sdk = _sdk()
+        ctx = _trade_ctx(cfg, sdk)
+        env = _trd_env(cfg, sdk)
+        ret, today = ctx.order_list_query(code=code, trd_env=env, refresh_cache=True)
+        if ret != sdk.RET_OK or today is None:
+            return None
+        kw = {"code": code, "trd_env": env}
+        if since_iso:
+            kw["start"] = str(since_iso)[:10] + " 00:00:00"
+        ret, past = ctx.history_order_list_query(**kw)
+        if ret != sdk.RET_OK or past is None:
+            return None
+        out, ids = [], set()
+        for data in (today, past):
+            for i in range(len(data)):
+                row = data.iloc[i]
+                oid = str(row.get("order_id") or "")
+                if not oid or oid in ids or str(row.get("code")) != code:
+                    continue
+                ids.add(oid)
+                side = str(row.get("trd_side") or "").rsplit(".", 1)[-1].lower()
+                # SELL_SHORT is a sale too; BUY_BACK only matters as an own id
+                side = ("sell" if side.startswith("sell") else
+                        "buy" if side.startswith("buy") else side)
+                try:
+                    dealt = int(float(row.get("dealt_qty") or 0))
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if dealt >= 1 and side in ("buy", "sell"):
+                    out.append({"order_id": oid, "side": side, "qty": dealt,
+                                "at": row.get("updated_time") or row.get("create_time")})
+        return out
     except Exception:
         return None
     finally:
