@@ -232,9 +232,14 @@ whatever `max_autopay_sats` is set to.
   left), the agent re-sells the rest on the next loop — a marketable limit,
   sell-to-close, never more than its own ledger remainder and never more
   than the account holds — until it's gone or the market closes, and again
-  from the next 9:30 ET open. You get one notification when it happens, one
-  when it's cleared, and one if it's still open at 15:50 ET. On an expiry
-  day the expiry guard takes over at its time.
+  from the next 9:30 ET open (NYSE holidays skipped; add other closures
+  with `"market_holidays": ["YYYY-MM-DD"]`). If the account holds fewer than
+  the ledger remainder, it sells only what its own filled orders account
+  for. No sell into a zero bid. Without a holdings read it waits; with the
+  holdings check off (`"position_sync": false`) it only alerts. You get one
+  notification when it happens, one when it's cleared, and one if it's
+  still open at 15:50 ET. On an expiry day the expiry guard takes over at
+  its time.
 - **Ledger check**: if the account holds more of a contract the agent bought
   than its ledger lists (an exit booked as sold that didn't fill), the agent
   re-adds them — only as many as its own filled orders in your broker's

@@ -54,7 +54,7 @@ MARKET_TZ = ZoneInfo("America/New_York")
 
 import llm_policy
 from brokers import BROKERS, account_tag
-from brokers.market_hours import REGULAR_CLOSE_MIN, close_minute
+from brokers.market_hours import REGULAR_CLOSE_MIN, close_minute, is_trading_day
 from lightning_wallet import WalletError, print_funding_invoice, wallet_from_cfg
 from notifications import notify
 from notifications import setup as notifications_setup
@@ -1562,10 +1562,12 @@ def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev):
         _keep_exit(tomb, ev["event_id"])
         return "gone"
     res = r.get(pos_key)
-    # a remainder re-sell capped at what the account holds (max_qty) only
-    # needs that many held
+    # the agent's own remainder re-sell, capped at what the account holds
+    # AND what its own filled orders account for (max_qty), only needs that
+    # many held. Feed events never carry max_qty (cmd_run strips it).
     need = _int0(row.get("qty"))
-    if _is_count(ev.get("max_qty")) and 1 <= ev["max_qty"] < need:
+    if (ev.get("exit_cause") == "exit_remainder" and _is_count(ev.get("max_qty"))
+            and 1 <= ev["max_qty"] < need):
         need = ev["max_qty"]
     if unfilled_at:
         if (res is not None and res["status"] in ("ok", "reduced", "miss")
@@ -1913,11 +1915,12 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         action = ("entry" if ev["event"] == "ENTERED" else "exit") if changed else None
         prefix = ""
         try:  # the ledger check's record of contracts the agent bought
+            new_ids = [i for i in _ids(state.get("agent_order_ids"))
+                       if i not in ids_before]
             _remember_agent_row(
                 state, pos_key, state["positions"].get(pos_key) or prior_pos,
-                _account_tag(cfg, broker, client), _now(),
-                new_ids=[i for i in _ids(state.get("agent_order_ids"))
-                         if i not in ids_before],
+                _account_tag(cfg, broker, client), _now(), new_ids=new_ids,
+                buy_ids=new_ids if ev["event"] == "ENTERED" else (),
                 exited=(ev["event"] == "EXITED") if changed else None)
         except Exception as exc:
             print(f"order record error (non-fatal): {str(exc)[:150]}")
@@ -2280,7 +2283,7 @@ def expiry_guard_tick(cfg, state, save_state, broker, client, paused=False,
 
 
 def _expiry_guard_tick(cfg, state, save_state, broker, client, paused, now_et):
-    if now_et.weekday() >= 5:
+    if not is_trading_day(cfg, now_et.date()):
         return []
     day = now_et.date().isoformat()
     if not _expiring_rows(state, day):
@@ -2311,7 +2314,7 @@ def expiry_guard_busy(cfg, state, now_et=None):
     today, from a minute before the earlier of the two times to the
     close): the heartbeat then runs every EXPIRY_GUARD_POLL_S."""
     now_et = now_et or _et_now()
-    if now_et.weekday() >= 5:
+    if not is_trading_day(cfg, now_et.date()):
         return False
     day = now_et.date().isoformat()
     if not _expiring_rows(state, day):
@@ -2472,13 +2475,20 @@ def expiry_banner(cfg, state, now_et=None, paused=False, acct=None):
 # An exit the broker accepted can still leave contracts held: a partial fill
 # (sold 4 of 10), an order that died unfilled, one cancelled with quantity
 # left. The row keeps the remainder plus an "exiting" mark (handle_event).
-# Every loop while the market is open (09:30 to the close, early closes
-# included) the agent re-sells it: a marketable limit, sell-to-close, never
-# more than the ledger remainder and never more than the account holds
-# (held_option_qty), until it's gone or the market closes. Outside market
-# hours it waits for the next open. On its expiry day the expiry guard
-# takes over from the guard time (one seller per row). Notified once when
-# found, once when cleared, once if still open at the alert time (15:50).
+# Every loop while the market is open (09:30 to the close on a trading day,
+# early closes included, NYSE holidays skipped) the agent re-sells it: a
+# marketable limit, sell-to-close, never more than the ledger remainder and
+# never more than the account holds (held_option_qty, one read per loop for
+# all remainders; once a minute 9:28-9:40 when Robinhood throttles). When the
+# account holds fewer than the ledger, only what the agent's own filled
+# orders account for is sold (option_fills: bought minus every sale since).
+# No sell into a zero bid. Without a holdings read it doesn't sell, except a
+# close-only adapter after EXIT_REST_UNKNOWN_S of unreadable reads, at most
+# EXIT_REST_BLIND_TRIES times; with the holdings check off (position_sync:
+# false) it only alerts. Outside market hours it waits for the next open. On
+# its expiry day the expiry guard takes over from the guard time (one
+# seller per row). Notified once when found, once when cleared, once if
+# still open at the alert time (15:50).
 #
 # The ledger check: a contract the AGENT bought (state["agent_bought"],
 # proven by its own filled buy orders in the broker's order history —
@@ -2488,12 +2498,29 @@ def expiry_banner(cfg, state, now_et=None, paused=False, acct=None):
 # are never adopted; a broker without order history gets an alert instead.
 
 EXIT_REST_UNKNOWN_S = 600   # holdings unreadable this long: a close-only
-                            # adapter re-sells the ledger remainder anyway
+                            # adapter re-sells the ledger remainder anyway...
+EXIT_REST_BLIND_TRIES = 3   # ...at most this many times, then alerts
+EXIT_REST_RUSH_READ_S = 60  # 9:28-9:40 ET (Robinhood throttles): remainder
+                            # holdings reads at most this often
+EXIT_REST_PROOF_S = 60      # order-history proof of a shortfall: re-read this often
 LEDGER_CHECK_S = 60         # holdings vs ledger, while the market is open
 LEDGER_CHECK_NEAR_MIN = 5   # ...every loop from this long before the guard
 LEDGER_CONFIRM_S = 20       # two reads at least this far apart before adopting
 _AGENT_BOUGHT_KEPT = 100
+_BUY_IDS_KEPT = 50
 _LEDGER_CHECK = {"next_at": 0.0}
+_REST_READ = {"next_at": 0.0}
+# keys only the agent's own EXITED events may carry (a feed's are dropped)
+_AGENT_EVENT_KEYS = ("max_qty", "exit_limit", "exit_reason", "exit_cause",
+                     "guard_reason")
+
+
+def _from_feed(ev):
+    """A feed event without the keys only the agent's own exits may carry
+    (a remainder's max_qty, the guard's marketable limit...)."""
+    if isinstance(ev, dict) and any(k in ev for k in _AGENT_EVENT_KEYS):
+        return {k: v for k, v in ev.items() if k not in _AGENT_EVENT_KEYS}
+    return ev
 
 
 def _mark_exiting(row, ev):
@@ -2512,10 +2539,13 @@ def _agent_bought(state):
     return reg
 
 
-def _remember_agent_row(state, key, row, tag, now, new_ids=(), exited=None):
+def _remember_agent_row(state, key, row, tag, now, new_ids=(), exited=None,
+                        buy_ids=()):
     """Record a live ledger row's contract (by option id) as one the agent
     bought, with the order ids it placed on it — kept after the row is gone,
-    for the ledger check. True when the record changed."""
+    for the ledger check. Its BUY order ids are kept apart (buy_ids): the
+    re-placed sells of a remainder that won't fill must never push out the
+    proof that the agent bought the contract. True when the record changed."""
     if not isinstance(row, dict) or row.get("dry"):
         return False
     oid = row.get("option_id")
@@ -2535,6 +2565,16 @@ def _remember_agent_row(state, key, row, tag, now, new_ids=(), exited=None):
         if i not in ids:
             ids.append(i)
     rec["order_ids"] = ids[-_FILL_IDS_KEPT:]
+    buys = _ids(rec.get("buy_ids"))
+    pend = row.get("pending")
+    more = [str(i) for i in buy_ids or () if i]
+    if isinstance(pend, dict) and pend.get("side") == "buy" and pend.get("order_id"):
+        more.append(str(pend["order_id"]))  # e.g. a blackout buy converted to market
+    for i in more:
+        if i not in buys:
+            buys.append(i)
+    if buys:
+        rec["buy_ids"] = buys[-_BUY_IDS_KEPT:]
     rec["last_order_at"] = max(_float0(rec.get("last_order_at")), _grace_anchor(row),
                                now if new_ids else 0.0)
     if exited is not None:
@@ -2561,8 +2601,9 @@ def _prune_agent_bought(state, day):
 
 
 def _trading_now(cfg, now_et):
-    """Regular hours on a weekday: 09:30 to today's close."""
-    if now_et.weekday() >= 5:
+    """Regular hours on a trading day (weekday, not an NYSE holiday): 09:30
+    to today's close."""
+    if not is_trading_day(cfg, now_et.date()):
         return False
     m = now_et.hour * 60 + now_et.minute
     return _OPEN_MIN <= m < _close_min(cfg, now_et.date().isoformat())
@@ -2598,24 +2639,35 @@ def _exit_remainder_tick(cfg, state, save_state, broker, client, paused, now_et)
         save_state(state)
     trading = _trading_now(cfg, now_et)
     if trading and not paused and now >= _LEDGER_CHECK["next_at"]:
-        _LEDGER_CHECK["next_at"] = now + _ledger_check_every(cfg, state, now_et)
-        try:
-            _ledger_check(cfg, state, save_state, broker, client, now_et, now, tag)
-        except Exception as exc:
-            print(f"ledger check error (non-fatal): {str(exc)[:150]}")
+        every = _ledger_check_every(cfg, state, now_et)
+        # a backstop: it waits out the open rush (Robinhood throttles then),
+        # unless the expiry guard is minutes away
+        if not (every and _in_open_rush()):
+            _LEDGER_CHECK["next_at"] = now + every
+            try:
+                _ledger_check(cfg, state, save_state, broker, client, now_et, now, tag)
+            except Exception as exc:
+                print(f"ledger check error (non-fatal): {str(exc)[:150]}")
     return _exit_remainders(cfg, state, save_state, broker, client, paused,
                             now_et, now, tag, trading)
+
+
+def _ledger_near_guard(cfg, key, now_et):
+    """True from LEDGER_CHECK_NEAR_MIN before the expiry guard to the close
+    on the expiry day of `key`."""
+    day = now_et.date().isoformat()
+    if str(key or "").split("|")[1:2] != [day]:
+        return False
+    guard, _alert, close = _expiry_times(cfg, day)
+    m = now_et.hour * 60 + now_et.minute
+    return guard is not None and guard - LEDGER_CHECK_NEAR_MIN <= m < close
 
 
 def _ledger_check_every(cfg, state, now_et):
     """Seconds to the next ledger check: every loop in the last minutes
     before the expiry guard on a day an agent-bought contract expires."""
-    day = now_et.date().isoformat()
-    guard, _alert, close = _expiry_times(cfg, day)
-    m = now_et.hour * 60 + now_et.minute
-    if guard is not None and guard - LEDGER_CHECK_NEAR_MIN <= m < close and any(
-            isinstance(r, dict) and str(r.get("key") or "").split("|")[1:2] == [day]
-            for r in _agent_bought(state).values()):
+    if any(isinstance(r, dict) and _ledger_near_guard(cfg, r.get("key"), now_et)
+           for r in _agent_bought(state).values()):
         return 0
     return LEDGER_CHECK_S
 
@@ -2627,9 +2679,12 @@ def _rest_hold_reason(cfg, broker, client, row, tag):
                 "agent uses now, so the agent won't sell it")
     if cfg.get("dry_run"):
         return "the agent is in dry-run, so it doesn't sell real positions"
-    if not (_gate_on(cfg, broker, client) or getattr(broker, "CLOSE_ONLY_EXITS", False)):
+    if not _gate_on(cfg, broker, client):
+        # never more than the account holds: without a holdings read, no re-sell
         name = _BROKER_NAMES.get(_broker_name(cfg, broker), "broker")
-        return (f"the agent can't check your {name} account for them, so it "
+        off = (" (position_sync is off)"
+               if cfg.get("position_sync", True) is False else "")
+        return (f"the agent can't check your {name} account for them{off}, so it "
                 "won't sell again blind")
     return ""
 
@@ -2671,7 +2726,7 @@ def _exit_remainders(cfg, state, save_state, broker, client, paused, now_et,
                    "exit are sold — nothing left to sell")
         print("exit remainder: " + msg)
         notify(cfg, "agentic-trader: " + msg)
-    done = []
+    todo = []
     for key, row in sorted(live.items()):
         expiry = key.split("|")[1]
         if row.get("pending") or expiry < day or (expiry == day and now_m >= close):
@@ -2700,8 +2755,8 @@ def _exit_remainders(cfg, state, save_state, broker, client, paused, now_et,
             print("exit remainder: " + msg)
             notify(cfg, "⚠️ agentic-trader: " + msg)
         t["qty"] = n
-        if (now_et.weekday() < 5 and alert_m <= now_m < close
-                and t.get("alerted") != day
+        if (is_trading_day(cfg, now_et.date()) and alert_m <= now_m < close
+                and t.get("alerted") != day and not t.get("empty_noted")
                 and not (expiry == day and alert is not None)):  # the guard's alert
             t["alerted"] = day
             changed = True
@@ -2721,11 +2776,17 @@ def _exit_remainders(cfg, state, save_state, broker, client, paused, now_et,
             continue
         if _past_expiry_guard(cfg, expiry, now_et) is not None:
             continue  # from the guard time on its expiry day, the guard sells it
-        out = _resell_remainder(cfg, state, save_state, broker, client, key, row,
-                                t, now)
-        changed = True
-        if out:
-            done.append(out)
+        todo.append((key, row, t))
+    done = []
+    if todo:
+        held = _rest_holdings(cfg, broker, client, [r for _k, r, _t in todo], now)
+        if held is not False:  # False: the open rush, read again in a minute
+            for key, row, t in todo:
+                out = _resell_remainder(cfg, state, save_state, broker, client,
+                                        key, row, t, now, held)
+                changed = True
+                if out:
+                    done.append(out)
     if changed:
         try:
             save_state(state)
@@ -2734,10 +2795,36 @@ def _exit_remainders(cfg, state, save_state, broker, client, paused, now_et,
     return done
 
 
-def _resell_remainder(cfg, state, save_state, broker, client, key, row, t, now):
+def _rest_holdings(cfg, broker, client, rows, now):
+    """One holdings read for every remainder this loop re-sells: {option id:
+    count} or None (unreadable — also while the client reports a broken
+    connection), or False while the open-rush throttle holds reads back."""
+    if _in_open_rush():
+        if now < _REST_READ["next_at"]:
+            return False
+        _REST_READ["next_at"] = now + EXIT_REST_RUSH_READ_S
+    if getattr(client, "last_error", None):
+        return None
+    ids = sorted({r.get("option_id") for r in rows
+                  if isinstance(r.get("option_id"), str) and r.get("option_id")})
+    if not ids:
+        return None
+    try:
+        held = broker.held_option_qty(client, cfg, ids)
+    except Exception:
+        return None
+    if not isinstance(held, dict) or getattr(client, "last_error", None):
+        return None
+    return held
+
+
+def _resell_remainder(cfg, state, save_state, broker, client, key, row, t, now,
+                      held):
     """Sell what an exit left of one row: never more than the ledger row,
-    and never more than the account holds. Returns handle_event's line when
-    an exit was placed, else None (tried again next loop)."""
+    never more than the account holds, and — when the account holds fewer
+    than the ledger — never more than the agent's own filled orders account
+    for. Returns handle_event's line when an exit was placed, else None
+    (tried again next loop)."""
     contract = _contract_of(key)
     n = _int0(row.get("qty"))
     ev = _exit_event(key, f"exit-rest|{key}|{int(_float0(row['exiting'].get('at')))}",
@@ -2751,36 +2838,61 @@ def _resell_remainder(cfg, state, save_state, broker, client, key, row, t, now):
             notify(cfg, "⚠️ agentic-trader: " + msg, priority="high")
         return None
     cap = None
-    close_only = bool(getattr(broker, "CLOSE_ONLY_EXITS", False))
-    if _gate_on(cfg, broker, client) and not getattr(client, "last_error", None):
-        oid = row.get("option_id")
-        try:
-            held = broker.held_option_qty(client, cfg, [oid])
-        except Exception:
-            held = None
-        h = held.get(oid) if isinstance(held, dict) else None
-        if _is_count(h):
-            t.pop("unknown_since", None)
-            if h < 1:
-                if not t.get("empty_noted"):
-                    t["empty_noted"] = True
-                    print(f"exit remainder: your account doesn't hold {contract} "
-                          "any more — nothing to sell (the holdings check settles "
-                          "the ledger)")
+    h = held.get(row.get("option_id")) if isinstance(held, dict) else None
+    if _is_count(h):
+        for k in ("unknown_since", "blind", "blind_noted"):
+            t.pop(k, None)
+        if h < 1:
+            if not t.get("empty_noted"):
+                t["empty_noted"] = True
+                print(f"exit remainder: your account doesn't hold {contract} "
+                      "any more — nothing to sell (the holdings check settles "
+                      "the ledger)")
+            return None
+        t.pop("empty_noted", None)
+        if h < n:
+            cap = _rest_proven(cfg, state, broker, client, key, row, t, h, now)
+            if cap is None:
                 return None
-            t.pop("empty_noted", None)
-            if h < n:
-                cap = h
-                print(f"exit remainder: your account holds {h} of the {n} "
-                      f"{contract} left — selling only {h}")
-        else:
-            since = t.setdefault("unknown_since", now)
-            if not (close_only and now - _float0(since) >= EXIT_REST_UNKNOWN_S):
-                print(f"exit remainder: can't read your account for {contract} "
-                      "right now — re-checking next loop")
-                return None
-    elif not close_only:
+            print(f"exit remainder: your account holds {h} of the {n} "
+                  f"{contract} left — selling only {cap}")
+    else:
+        since = t.setdefault("unknown_since", now)
+        if not (getattr(broker, "CLOSE_ONLY_EXITS", False)
+                and now - _float0(since) >= EXIT_REST_UNKNOWN_S):
+            print(f"exit remainder: can't read your account for {contract} "
+                  "right now — re-checking next loop")
+            return None
+        tries = _int0(t.get("blind"))
+        if tries >= EXIT_REST_BLIND_TRIES:
+            if not t.get("blind_noted"):
+                t["blind_noted"] = True
+                name = _BROKER_NAMES.get(_broker_name(cfg, broker), "broker")
+                msg = (f"{n}x {contract} from the agent's exit may still be open: "
+                       f"the agent can't read your {name} account, and "
+                       f"{tries} sells without a holdings check didn't clear "
+                       "them. It stops selling blind and re-sells once it can "
+                       "read your account — sell them in your broker app if "
+                       "they must be gone")
+                print("exit remainder: " + msg)
+                notify(cfg, "⚠️ agentic-trader: " + msg, priority="high")
+            return None
+        t["blind"] = tries + 1
+        print(f"exit remainder: your account has been unreadable for "
+              f"{EXIT_REST_UNKNOWN_S // 60}+ min — selling the {n}x left "
+              f"(sell-to-close only; try {tries + 1} of {EXIT_REST_BLIND_TRIES})")
+    bid = _exit_bid(broker, client, cfg, ev, row)
+    if bid is not None and bid <= 0:
+        if not t.get("no_bid"):
+            t["no_bid"] = True
+            msg = (f"{contract} has no bid right now, so the agent isn't re-selling "
+                   f"the {n}x its exit left — it tries again each loop")
+            print("exit remainder: " + msg)
+            notify(cfg, "agentic-trader: " + msg)
+        if t.get("blind"):
+            t["blind"] -= 1  # nothing was sent
         return None
+    t.pop("no_bid", None)
     ev["exit_reason"] = (f"exit remainder: re-selling the {n}x the agent's exit "
                          "left open")
     if cap:
@@ -2795,6 +2907,51 @@ def _resell_remainder(cfg, state, save_state, broker, client, key, row, t, now):
         print(f"exit remainder: the sell of {contract} failed ({str(exc)[:150]}) "
               "— retrying next loop")
     return None
+
+
+def _rest_proven(cfg, state, broker, client, key, row, t, h, now):
+    """The account holds h (fewer than the ledger's remainder): how many of
+    them the agent's own filled orders account for (bought minus every sale
+    since), or None — order history unreadable (re-read in a minute) or the
+    agent's orders don't account for any (they may be the owner's)."""
+    contract = _contract_of(key)
+    n = _int0(row.get("qty"))
+    p = t.get("proof")
+    if (isinstance(p, dict) and p.get("h") == h and p.get("n") == n
+            and now - _float0(p.get("at")) < EXIT_REST_PROOF_S):
+        return p.get("cap")
+    oid = row.get("option_id")
+    rec = _agent_bought(state).get(oid)
+    rec = rec if isinstance(rec, dict) else {}
+    fn = getattr(broker, "option_fills", None)
+    fills = None
+    if fn is not None:
+        opened = _float0(rec.get("opened_at") or row.get("opened_at"))
+        try:
+            fills = fn(client, cfg, oid,
+                       since_iso=_iso_at(opened - 86400) if opened else None)
+        except Exception:
+            fills = None
+    cap = None
+    if not isinstance(fills, list) or getattr(client, "last_error", None):
+        if not isinstance(p, dict) or p.get("h") != h:
+            print(f"exit remainder: your account holds {h} of the {n} {contract} "
+                  "left, and the agent can't read your order history to confirm "
+                  "they're its own — not selling yet, re-checking in a minute")
+    else:
+        own = (set(_ids(state.get("agent_order_ids"))) | set(_ids(rec.get("order_ids")))
+               | set(_ids(rec.get("buy_ids"))) | set(_ids(row.get("order_ids"))))
+        share = _agent_share(fills, own)
+        bought, sold = (share[0], share[1]) if share else (0, 0)
+        if min(h, n, bought - sold) >= 1:
+            cap = min(h, n, bought - sold)
+        elif not isinstance(p, dict) or p.get("h") != h or p.get("cap") is not None:
+            print(f"exit remainder: your account holds {h} of the {n} {contract} "
+                  f"left, but the agent's own filled orders (bought {bought}, "
+                  f"{sold} sold since) don't account for them — not selling "
+                  "(they may be yours; the holdings check settles the ledger)")
+    t["proof"] = {"h": h, "n": n, "at": now, "cap": cap}
+    return cap
 
 
 def _ledger_check(cfg, state, save_state, broker, client, now_et, now, tag):
@@ -2855,9 +3012,14 @@ def _ledger_check(cfg, state, save_state, broker, client, now_et, now, tag):
             c["held"] = min(_int0(c.get("held")) or h, h)  # never above any read
             if now - _float0(c.get("first_at")) < LEDGER_CONFIRM_S or c["held"] <= have:
                 continue
-            if (c.get("checked_h") == c["held"]
-                    and now - _float0(c.get("checked_at")) < POS_FILLS_RECHECK_S):
-                continue  # same answer as last time: order history every 15 min
+            # the same answer as last time: order history every 15 min — every
+            # minute from just before the guard on its expiry day, and on the
+            # next check after a read that failed
+            recheck = (LEDGER_CHECK_S if _ledger_near_guard(cfg, key, now_et)
+                       else POS_FILLS_RECHECK_S)
+            if (c.get("checked_h") == c["held"] and not c.get("fills_unknown")
+                    and now - _float0(c.get("checked_at")) < recheck):
+                continue
             if _adopt(cfg, state, broker, client, oid, key, c["held"], have, tag, c,
                       now_et, now):
                 changed = True
@@ -2929,20 +3091,34 @@ def _adopt(cfg, state, broker, client, oid, key, h, have, tag, c, now_et, now):
         except Exception:
             fills = None
     if not isinstance(fills, list) or getattr(client, "last_error", None):
-        if c.get("alerted"):
-            return False
-        c["alerted"] = True
+        # an adapter with order history: a failed read is retried on the
+        # next check (not after 15 min) — near the guard that's every loop
+        c["fills_unknown"] = fn is not None
+        seen = f"{day}|{h}|{have}"
+        if rec.get("history_alerted") == seen:
+            return False  # once per day and discrepancy, even if c is recreated
+        rec["history_alerted"] = seen
         msg = (f"your {name} account holds {h}x {contract}, a contract the agent "
-               f"bought earlier, but the agent's ledger lists {have}. The agent "
-               "can't read your order history to confirm they're its own, so it "
-               "won't track or sell them — check your broker app")
-        msg += (f"; it expires today: sell it before the {_hm(close)} ET close or "
-                "it may be exercised." if today else ".")
+               f"bought earlier, but the agent's ledger lists {have}. ")
+        if fn is not None:
+            msg += ("The agent couldn't read your order history just now to "
+                    "confirm they're its own; it keeps trying, and until then it "
+                    "won't track or sell them")
+            msg += (f". It expires today: if this alert isn't followed by a "
+                    f"\"re-added\" one, sell it before the {_hm(close)} ET close "
+                    "or it may be exercised." if today else ".")
+        else:
+            msg += ("The agent can't read your order history to confirm they're "
+                    "its own, so it won't track or sell them — check your broker app")
+            msg += (f"; it expires today: sell it before the {_hm(close)} ET close "
+                    "or it may be exercised." if today else ".")
         print("ledger check: " + msg)
         notify(cfg, "⚠️ agentic-trader: " + msg, priority="high" if today else None)
         return True
+    c.pop("fills_unknown", None)
     row = state["positions"].get(key)
     own = (set(_ids(state.get("agent_order_ids"))) | set(_ids(rec.get("order_ids")))
+           | set(_ids(rec.get("buy_ids")))
            | set(_ids((row or {}).get("order_ids"))))
     share = _agent_share(fills, own)
     bought, sold, last_side, own_ids = share or (0, 0, None, [])
@@ -3705,6 +3881,8 @@ def cmd_run(app_window=False):
                 for ev in events:
                     if ev.get("event_id") in seen:
                         continue
+                    # only the agent's own exits may cap or reprice a sell
+                    ev = _from_feed(ev)
                     try:
                         outcome = handle_event(ev, cfg, state, broker, client,
                                                save_state)

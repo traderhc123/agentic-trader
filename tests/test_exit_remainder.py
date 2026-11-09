@@ -65,6 +65,9 @@ class FakeBroker:
                            "limit": event.get("exit_limit"),
                            "max_qty": event.get("max_qty")})
         oid = f"s{len(self.sells)}"
+        if filled:  # the order history lists the agent's own sale
+            self.fills.insert(0, {"order_id": oid, "side": "sell", "qty": filled,
+                                  "at": agent._iso_at(agent._now())})
         state["agent_order_ids"] = state.get("agent_order_ids", []) + [oid]
         pos["order_ids"] = pos.get("order_ids", []) + [oid]
         pos["last_order_at"] = agent._now()  # holdings lag fresh orders
@@ -96,8 +99,12 @@ class FakeBroker:
 
 
 class NoHistory(FakeBroker):
+    option_fills = None  # an adapter without order history
+
+
+class HistoryDown(FakeBroker):
     def option_fills(self, client, cfg, option_id, since_iso=None):
-        return None  # order history can't be read
+        return None  # order history can't be read right now
 
 
 @pytest.fixture
@@ -110,10 +117,10 @@ def notes(monkeypatch):
 
 
 def _loop(home, monkeypatch, state, broker, times, events=None, cfg=None,
-          upkeep=False, broker_name="fake"):
+          upkeep=False, broker_name="fake", rush=False):
     """`agent.py run` for len(times) loops; loop i runs at ET times[i] (the
-    agent's clock follows). events: {loop index: [feed events]}. Returns the
-    saved state."""
+    agent's clock follows). events: {loop index: [feed events]}. rush=True
+    keeps the real 9:28-9:40 open-rush window. Returns the saved state."""
     import brokers
     import keep_running
     import webui
@@ -142,9 +149,11 @@ def _loop(home, monkeypatch, state, broker, times, events=None, cfg=None,
     monkeypatch.setattr(agent, "_refresh_cash", lambda *a, **k: None)
     monkeypatch.setattr(agent, "_maybe_daily_digest", lambda *a, **k: None)
     monkeypatch.setattr(agent, "_market_open_now", lambda: True)
-    monkeypatch.setattr(agent, "_in_open_rush", lambda: False)
+    if not rush:
+        monkeypatch.setattr(agent, "_in_open_rush", lambda: False)
     monkeypatch.setitem(agent._POS_SYNC, "next_at", 0.0)
     monkeypatch.setitem(agent._LEDGER_CHECK, "next_at", 0.0)
+    monkeypatch.setitem(agent._REST_READ, "next_at", 0.0)
     if not upkeep:
         monkeypatch.setattr(agent, "_position_upkeep", lambda *a, **k: None)
     monkeypatch.setitem(webui.CONTROLS, "paused", False)
@@ -290,13 +299,63 @@ def test_robinhood_remainder_left_working_is_not_sold_twice(home, monkeypatch, n
 
 # ── 2. never more than the account holds ────────────────────────────────────
 
+BOUGHT_10 = {"order_id": "buy-1", "side": "buy", "qty": 10,
+             "at": "2026-11-04T15:00:00+00:00"}
+SOLD_4 = {"order_id": "sell-0", "side": "sell", "qty": 4,
+          "at": "2026-11-05T15:00:00+00:00"}
+
+
 def test_remainder_capped_by_holdings(home, monkeypatch, notes):
-    b = FakeBroker(held={U1: 4})
+    """Holds 4 of the 6 left; the agent's own fills (bought 10, 4 sold)
+    account for 6, so 4 are sold."""
+    b = FakeBroker(held={U1: 4}, fills=[SOLD_4, BOUGHT_10])
     saved = _loop(home, monkeypatch, _rest_state(qty=6), b,
                   [et(14, 0), et(14, 0, s=30), et(14, 1)])
     assert [(s["qty"], s["max_qty"], s["limit"]) for s in b.sells] == [
         (4, 4, "marketable")]
     assert saved["positions"][KEY]["qty"] == 2          # never sold: not held
+
+
+@pytest.mark.parametrize("fills,sold", [
+    ([], []),                                            # no agent buy listed
+    ([{"order_id": "u-1", "side": "buy", "qty": 4,       # only the owner's buy
+       "at": "2026-11-05T15:00:00+00:00"}], []),
+    (None, []),                                          # history unreadable
+    ([BOUGHT_10, {"order_id": "sell-0", "side": "sell", "qty": 8,
+                  "at": "2026-11-05T15:00:00+00:00"}], [(2, 2)]),  # only 2 are its
+], ids=["no-agent-buy", "owner-buy", "unreadable", "partly-its-own"])
+def test_shortfall_sells_only_what_the_agents_fills_account_for(
+        home, monkeypatch, notes, fills, sold):
+    """The account holds fewer than the ledger's remainder: the agent sells
+    only what its own filled orders account for (never the owner's)."""
+    class B(FakeBroker):
+        def option_fills(self, client, cfg, option_id, since_iso=None):
+            return None if fills is None else self.fills + list(fills)
+    b = B(held={U1: 4})
+    saved = _loop(home, monkeypatch, _rest_state(qty=6), b,
+                  [et(14, 0), et(14, 0, s=30), et(14, 1), et(14, 2)])
+    assert [(s["qty"], s["max_qty"]) for s in b.sells] == sold
+    assert saved["positions"][KEY]["qty"] == 6 - sum(q for q, _ in sold)
+
+
+def test_feed_event_cannot_carry_a_cap_or_a_marketable_limit(home, monkeypatch, notes):
+    """max_qty / exit_limit / exit_cause are the agent's own: stripped from
+    feed events, so a feed exit sells the ledger row as before."""
+    t = et(9, 0).timestamp() - 3600
+    st = {"seen": [], "agent_order_ids": ["buy-1"],
+          "position_sync": {"proven": {TAG: "2026-11-01T15:00:00+00:00"}},
+          "positions": {LATER: {"option_id": U1, "qty": 6, "acct": TAG,
+                                "opened_event": "open-1", "opened_at": t,
+                                "last_order_at": t, "order_ids": ["buy-1"]}}}
+    b = FakeBroker(held={U1: 6})
+    feed_exit = {"event": "EXITED", "ticker": "RIVN", "expiry": "2026-11-13",
+                 "strike": 13.5, "type": "C", "event_id": "feed-q", "max_qty": 2,
+                 "exit_limit": "marketable", "exit_cause": "exit_remainder"}
+    saved = _loop(home, monkeypatch, st, b, [et(14, 0)], events={0: [feed_exit]})
+    assert [(s["qty"], s["max_qty"], s["limit"]) for s in b.sells] == [(6, None, None)]
+    assert saved["positions"] == {}
+    (row,) = [r for r in _log() if r.get("action") == "exit"]
+    assert "cause" not in row
 
 
 def test_remainder_never_sells_more_than_the_ledger(home, monkeypatch, notes):
@@ -528,6 +587,80 @@ def test_broker_without_order_history_alerts_only(home, monkeypatch, notes):
     assert "it expires today: sell it before the 16:00 ET close" in alerts[0][0]
 
 
+def test_order_history_down_alerts_once_and_keeps_trying(home, monkeypatch, notes):
+    day = (2026, 11, 6)
+    b = HistoryDown(held={U1: 4})
+    calls = []
+    b.option_fills = lambda *a, **k: calls.append(1)   # always None
+    times = [et(15, 46, day=day), et(15, 46, day=day, s=30), et(15, 47, day=day),
+             et(15, 48, day=day), et(15, 49, day=day)]
+    saved = _loop(home, monkeypatch, _bought_state(), b, times)
+    assert saved["positions"] == {} and b.sells == []
+    assert len(calls) == 4               # every check from the confirming read on
+    alerts = [(m, p) for m, p in notes if "order history" in m]
+    assert len(alerts) == 1 and alerts[0][1] == "high"
+    assert "couldn't read your order history just now" in alerts[0][0]
+    assert "keeps trying" in alerts[0][0]
+
+
+def test_failed_history_read_near_the_guard_is_retried_and_guard_sells(
+        home, monkeypatch, notes):
+    """Review finding: one failed order-history read at 15:43 on expiry day
+    used to block the adoption until after the close (exercise risk)."""
+    day = (2026, 11, 6)
+    b = FakeBroker(held={U1: 10}, fills=[BOUGHT_10])
+    real = b.option_fills
+    n = {"calls": 0}
+
+    def flaky(*a, **k):
+        n["calls"] += 1
+        return None if n["calls"] == 1 else real(*a, **k)
+    b.option_fills = flaky
+    times = [et(15, 43, day=day), et(15, 43, day=day, s=40), et(15, 43, day=day, s=50),
+             et(15, 46, day=day), et(15, 46, day=day, s=10)]
+    saved = _loop(home, monkeypatch, _bought_state(), b, times)
+    assert n["calls"] == 2
+    assert [(s["event_id"], s["qty"]) for s in b.sells] == [
+        (f"expiry-guard|{KEY}|2026-11-06", 10)]
+    assert saved["positions"] == {}
+    assert len(_texts(notes, "couldn't read your order history")) == 1
+    assert len(_texts(notes, "re-added 10x")) == 1
+
+
+def test_failed_history_read_is_retried_on_the_next_check(home, monkeypatch, notes):
+    """Not 15 minutes later: a read that failed is retried on the next check
+    (every minute), and the contracts are re-added once it answers."""
+    b = FakeBroker(held={U1: 3}, fills=[{"order_id": "buy-1", "side": "buy", "qty": 3,
+                                         "at": "2026-11-04T15:00:00+00:00"}])
+    real = b.option_fills
+    n = {"calls": 0}
+
+    def flaky(*a, **k):
+        n["calls"] += 1
+        return None if n["calls"] == 1 else real(*a, **k)
+    b.option_fills = flaky
+    saved = _loop(home, monkeypatch, _bought_state(held_key=LATER), b,
+                  [et(14, 0), et(14, 1), et(14, 2)])
+    assert n["calls"] == 2
+    assert saved["positions"][LATER]["qty"] == 3
+    assert saved["positions"][LATER]["adopted"]["bought"] == 3
+
+
+def test_history_alert_not_repeated_when_the_check_restarts(home, monkeypatch, notes):
+    """The ledger check's entry is dropped (holdings dip) and recreated: the
+    same discrepancy isn't alerted twice the same day."""
+    b = NoHistory(held={U1: 4})
+    times = [et(14, 0), et(14, 1), et(14, 2), et(14, 3), et(14, 4), et(14, 5)]
+    seq = iter([4, 4, 0, 4, 4, 4])
+
+    def held(client, cfg, ids):
+        v = next(seq, 4)
+        return {i: v for i in ids}
+    b.held_option_qty = held
+    _loop(home, monkeypatch, _bought_state(held_key=LATER), b, times)
+    assert len(_texts(notes, "order history")) == 1
+
+
 def test_ledger_check_waits_out_the_agents_own_recent_orders(home, monkeypatch, notes):
     """Holdings and order history lag a fresh sell: not adopted right after."""
     st = _bought_state(held_key=LATER, exited=True, order_ids=("buy-1", "sell-1"))
@@ -556,6 +689,7 @@ def test_entry_records_the_contract_for_the_ledger_check(home, monkeypatch, no_p
     agent.handle_event(ev, {"broker": "fake"}, st, b, Client(), lambda s: None)
     rec = st["agent_bought"][U1]
     assert rec["key"] == LATER and rec["order_ids"] == ["b-1"] and rec["exited"] is False
+    assert rec["buy_ids"] == ["b-1"]
 
 
 # ── adapters ────────────────────────────────────────────────────────────────
@@ -676,3 +810,196 @@ def test_moomoo_option_fills_today_and_history(monkeypatch):
     assert [(f["order_id"], f["side"], f["qty"]) for f in got] == [
         ("m2", "sell", 4), ("m1", "buy", 10)]
     assert moomoo.option_fills(None, {}, "SPY") is None
+
+
+# ── review fixes: the re-sell's own safety rails ────────────────────────────
+
+def test_broken_connection_waits_like_an_unreadable_read(home, monkeypatch, notes):
+    """last_error set: no read, so the EXIT_REST_UNKNOWN_S wait applies (it
+    used to sell 6 on the first loop with nothing held)."""
+    class Down(Client):
+        last_error = "connection lost"
+    b = FakeBroker(held={U1: 0})
+    b.client = lambda cfg: Down()
+    _loop(home, monkeypatch, _rest_state(key=LATER, qty=6), b,
+          [et(14, 0), et(14, 1), et(14, 5)])
+    assert b.sells == [] and b.asked == []
+
+
+def test_blind_resells_are_capped_then_alert(home, monkeypatch, notes):
+    """Holdings unreadable 10+ min: a close-only adapter sells blind at most
+    EXIT_REST_BLIND_TRIES times, then alerts once and stops."""
+    b = FakeBroker(held=None)
+
+    def rejecting(client, cfg, event, state):
+        b.sells.append({"event_id": event["event_id"], "qty": 0})
+        return False                                     # e.g. nothing to close
+    b.execute = rejecting
+    times = [et(14, 0), et(14, 10), et(14, 11), et(14, 12), et(14, 13), et(14, 14)]
+    saved = _loop(home, monkeypatch, _rest_state(key=LATER, qty=6), b, times)
+    assert len(b.sells) == agent.EXIT_REST_BLIND_TRIES == 3
+    alerts = [(m, p) for m, p in notes if "stops selling blind" in m]
+    assert len(alerts) == 1 and alerts[0][1] == "high"
+    assert saved["positions"][LATER]["qty"] == 6
+
+
+def test_holdings_check_off_alerts_and_never_resells(home, monkeypatch, notes):
+    """position_sync: false — the agent can't confirm what's held, so it never
+    re-sells (it used to sell blind on every loop)."""
+    b = FakeBroker(held={U1: 0})
+    _loop(home, monkeypatch, _rest_state(key=LATER, qty=6), b,
+          [et(14, 0), et(14, 1), et(14, 2), et(15, 50)], cfg={"position_sync": False})
+    assert b.sells == [] and b.asked == []
+    (found,) = _texts(notes, "didn't sell everything")
+    assert "position_sync is off" in found and "sell them in your broker app" in found
+    (late,) = _texts(notes, "still open at")
+    assert "sell them in your broker app before the 16:00 ET close" in late
+
+
+def test_no_resell_on_a_market_holiday(home, monkeypatch, notes):
+    """Thanksgiving 2026-11-26: nothing is sent; the next morning (a 1 PM
+    early close) it's sold from 09:30."""
+    key = "RIVN|2026-12-04|13.5|C"
+    b = FakeBroker(held={U1: 6})
+    reads = []
+    real = b.held_option_qty
+    b.held_option_qty = lambda c, cfg, ids: reads.append(agent._now()) or real(c, cfg, ids)
+    saved = _loop(home, monkeypatch, _rest_state(key=key, qty=6), b,
+                  [et(10, 0, day=(2026, 11, 26)), et(12, 0, day=(2026, 11, 26)),
+                   et(9, 30, day=(2026, 11, 27)), et(9, 30, day=(2026, 11, 27), s=30)])
+    assert len(b.sells) == 1 and b.sells[0]["limit"] == "marketable"
+    assert reads and min(reads) >= et(9, 30, day=(2026, 11, 27)).timestamp()
+    assert saved["positions"] == {}
+    (found,) = _texts(notes, "didn't sell everything")
+    assert "The market is closed" in found
+
+
+def test_nyse_holiday_calendar():
+    from brokers import market_hours as mh
+    assert {d.isoformat() for d in mh.nyse_holidays(2026)} == {
+        "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+        "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25"}
+    assert {d.isoformat() for d in mh.nyse_holidays(2027)} == {
+        "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+        "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24"}
+    assert not mh.is_market_holiday({}, "2027-12-31")    # Sat New Year's: not moved
+    assert mh.is_trading_day({}, "2026-11-27")           # early close, still trades
+    assert not mh.is_trading_day({}, "2026-11-28")       # Saturday
+    assert not mh.is_trading_day({"market_holidays": ["2026-11-10"]}, "2026-11-10")
+
+
+def test_open_rush_reads_once_a_minute_and_skips_the_ledger_check(
+        home, monkeypatch, notes):
+    """9:28-9:40 (Robinhood throttles): one holdings read a minute for the
+    remainders, no ledger check."""
+    b = FakeBroker(held={U1: 6}, plan=[1, 1])
+    reads = []
+    real = b.held_option_qty
+    b.held_option_qty = lambda c, cfg, ids: reads.append(agent._now()) or real(c, cfg, ids)
+    times = [et(9, 30), et(9, 30, s=20), et(9, 30, s=40), et(9, 31)]
+    st = _rest_state(key=LATER, qty=6)
+    st["agent_bought"] = {U2: {"key": LATER.replace("13.5", "14.0"), "acct": TAG,
+                               "order_ids": ["buy-2"], "last_order_at": 0}}
+    _loop(home, monkeypatch, st, b, times, rush=True)
+    assert [s["qty"] for s in b.sells] == [6, 5]
+    assert {r for r in reads} <= {et(9, 30).timestamp(), et(9, 31).timestamp()}
+    assert not any(U2 in ids for ids in b.asked)         # ledger check waited
+
+
+def test_no_resell_into_a_zero_bid(home, monkeypatch, notes):
+    bids = iter([0.0, 0.0, 0.40])
+
+    class Bids(FakeBroker):
+        def exit_bid(self, client, cfg, event, option_id=None):
+            return next(bids)
+    b = Bids(held={U1: 6})
+    saved = _loop(home, monkeypatch, _rest_state(key=LATER, qty=6), b,
+                  [et(14, 0), et(14, 1), et(14, 2)])
+    assert [s["qty"] for s in b.sells] == [6]           # only once there's a bid
+    assert len(_texts(notes, "has no bid right now")) == 1
+    assert saved["positions"] == {}
+
+
+def test_still_open_alert_skipped_when_the_account_holds_none(home, monkeypatch, notes):
+    b = FakeBroker(held={U1: 0})
+    _loop(home, monkeypatch, _rest_state(key=LATER, qty=6), b,
+          [et(15, 49), et(15, 50), et(15, 51)])
+    assert b.sells == [] and not _texts(notes, "still open at")
+
+
+def test_buy_ids_survive_many_resold_sells():
+    """Review finding: re-placed sells pushed the buy order id out of the
+    kept lists; the buy ids are kept apart."""
+    st = {"positions": {}, "agent_order_ids": []}
+    row = {"option_id": U1, "qty": 6, "acct": TAG, "order_ids": ["buy-1"]}
+    agent._remember_agent_row(st, KEY, row, TAG, 1.0, new_ids=["buy-1"],
+                              buy_ids=["buy-1"])
+    for i in range(40):
+        robinhood._stamp_order(row, f"sell-{i}")
+        robinhood._remember_order(st, f"sell-{i}")
+        agent._remember_agent_row(st, KEY, row, TAG, 1.0, new_ids=[f"sell-{i}"])
+    rec = st["agent_bought"][U1]
+    assert "buy-1" not in rec["order_ids"] and rec["buy_ids"] == ["buy-1"]
+    # ...and the ledger check still proves the agent's buy with it
+    fills = [BOUGHT_10]
+    share = agent._agent_share(fills, set(agent._ids(rec.get("buy_ids"))))
+    assert share[0] == 10
+
+
+def test_pending_buy_is_recorded_as_a_buy_id():
+    st = {"positions": {}}
+    row = {"option_id": U1, "qty": 0, "order_ids": ["b-2"],
+           "pending": {"order_id": "b-2", "side": "buy", "requested": 2}}
+    agent._remember_agent_row(st, KEY, row, TAG, 1.0)
+    assert st["agent_bought"][U1]["buy_ids"] == ["b-2"]
+
+
+class WorkingRH(ScriptRH):
+    """Orders whose plan entry is None stay working until cancelled."""
+
+    def call_tool(self, name, args):
+        if name == "place_option_order":
+            oid = f"rh-{len(self.placed) + 1}"
+            self.placed.append(dict(args))
+            q = int(args["quantity"])
+            f = self.plan.pop(0) if self.plan else q
+            if f is None:
+                self.orders[oid] = {"id": oid, "state": "confirmed",
+                                    "processed_quantity": "0"}
+            else:
+                self.held -= f
+                self.orders[oid] = {"id": oid, "processed_quantity": str(f),
+                                    "state": "filled" if f >= q else "cancelled"}
+            return _mcp({"data": {"id": oid}})
+        if name == "cancel_option_order":
+            o = self.orders.get(args.get("order_id"))
+            if o and o["state"] == "confirmed":
+                o["state"] = "cancelled"
+            return _mcp({"ok": True})
+        return super().call_tool(name, args)
+
+
+def test_robinhood_remainder_repriced_until_it_fills(home, monkeypatch, notes):
+    """The re-sell keeps not filling: reconcile cancels and re-places it at a
+    fresh marketable price each loop until it fills. Dead unfilled orders
+    are forgotten, so the agent's buy id is never pushed out."""
+    rh = WorkingRH(held=6, plan=[None] * 25 + [6])
+    monkeypatch.setattr(robinhood, "client", lambda cfg: rh)
+    monkeypatch.setattr(robinhood.time, "sleep", lambda s: None)
+    monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: False)
+    monkeypatch.setattr(robinhood, "_before_close", lambda now=None, cfg=None: True)
+    monkeypatch.setattr(robinhood, "_REPRICE_AFTER_S", 0)
+    from brokers import account_tag
+    cfg = {"robinhood_account": "A1"}
+    st = _rest_state(acct=account_tag({"broker": "robinhood", **cfg}))
+    times = [et(14, 0, s=0)] + [datetime.fromtimestamp(et(14, 0).timestamp() + 20 * k, TZ)
+                                for k in range(1, 28)]
+    saved = _loop(home, monkeypatch, st, robinhood, times, cfg=cfg,
+                  broker_name="robinhood")
+    assert len(rh.placed) == 26
+    assert {p["quantity"] for p in rh.placed} == {"6"}
+    assert all(p["type"] == "limit" and p["legs"][0]["position_effect"] == "close"
+               for p in rh.placed)
+    assert saved["positions"] == {} and rh.held == 0
+    assert "buy-1" in saved["agent_order_ids"]
+    assert [i for i in saved["agent_order_ids"] if i.startswith("rh-")] == ["rh-26"]

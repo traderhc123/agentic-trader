@@ -593,6 +593,17 @@ def _stamp_order(pos, order_id):
     pos["last_order_at"] = time.time()
 
 
+def _forget_order(state, pos, order_id):
+    """Drop an order that was cancelled with nothing filled from the kept
+    order-id lists (it can't explain any fill)."""
+    oid = str(order_id or "")
+    if not oid:
+        return
+    pos["order_ids"] = [i for i in pos.get("order_ids") or [] if i != oid]
+    state["agent_order_ids"] = [i for i in state.get("agent_order_ids") or []
+                                if i != oid]
+
+
 def _order_settled(pos):
     """The row survived an order: restart the holdings grace period and
     forget any shortfall seen while the order was working."""
@@ -673,6 +684,12 @@ def reconcile(rh, cfg, state, save_state):
                                                      if st2 in _FILLED else 0))
                 changed = True
                 continue
+            # A cancelled order that filled nothing leaves no fill to tell
+            # apart from the owner's: forget its id once it's replaced, so a
+            # sell re-placed every 30 s never pushes the agent's earlier
+            # (filled) order ids out of the kept lists.
+            dead_unfilled = st2 in _DEAD and not pend["filled"]
+            dead_id = pend["order_id"]
             # Bank what the dying order already filled BEFORE re-pending, so
             # the follow-up order's finalize only accounts for its own fills.
             already = pend["filled"]
@@ -689,6 +706,8 @@ def reconcile(rh, cfg, state, save_state):
                              "open" if pend["side"] == "buy" else "close",
                              remaining, **({"marketable": True} if reprice else {}))
             if replaced:
+                if dead_unfilled:
+                    _forget_order(state, pos, dead_id)
                 _record_pending(state, pos_key, replaced, pend["side"], remaining)
                 print(f"  expiry guard: unfilled sell re-placed x{remaining} at a "
                       f"fresh price ({pos_key})" if reprice else

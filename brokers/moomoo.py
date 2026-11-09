@@ -410,10 +410,10 @@ def execute(cl, cfg, event, state):
         # sell marketable: at the bid if we can get one, else last/ask
         price = 0.0
         if event.get("exit_limit") == "marketable":
-            # the expiry guard: bid-5% on a valid tick (pricing.py)
+            # expiry guard / exit remainder: bid-5% on a valid tick (pricing.py)
             price = marketable_limit(_bid_price(cfg, sdk, code), "sell") or 0.0
             if price > 0:
-                print(f"  expiry guard — sell placed as marketable limit @ ${price:.2f}")
+                print(f"  marketable sell — limit @ ${price:.2f}")
         if price <= 0:
             price = _ask_price(cfg, sdk, code)
         if price <= 0:

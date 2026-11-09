@@ -60,8 +60,10 @@ remainder (an exit that left contracts held), carry event["exit_limit"] ==
 -5%, rounded down to a price every option class accepts; at the bid itself
 under $0.10 — pricing.py) instead of a market order. Adapters that ignore it
 sell as usual. A remainder re-sell can also carry event["max_qty"] (what the
-account holds): sell min(row qty, max_qty) — pricing.exit_qty. An exit that
-sells fewer than asked keeps the rest in row["qty"]; the agent re-sells it.
+account holds that the agent's own fills account for): sell min(row qty,
+max_qty) — pricing.exit_qty. The agent strips these keys from feed
+events. An exit that sells fewer than asked keeps the rest in row["qty"];
+the agent re-sells it.
 
     VERIFIES_FILLS = False          module constant for adapters that book an
                                     entry when the order is accepted, without
