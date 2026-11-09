@@ -221,10 +221,12 @@ whatever `max_autopay_sats` is set to.
   about positions that expire today or expired while it was offline. Set
   either time to `"off"` in config.json, or say `expiry guard off` /
   `expiry guard 15:40` / `expiry alert off` in the dashboard. Only the
-  agent's own positions are ever sold. Early-close days (1:00 PM) move both
-  times 3 hours earlier; add any the agent doesn't know with
-  `"early_close_days": ["YYYY-MM-DD"]`. Not while paused, and never a real
-  position while in dry-run (the alert still fires).
+  agent's own positions are ever sold. Past the guard time it also won't
+  open a new position in a contract that expires that day. Early-close days
+  (1:00 PM: the day after Thanksgiving, and Dec 24 / Jul 3 when they fall
+  Monday–Thursday) move both times 3 hours earlier, never before 09:30; add
+  any other with `"early_close_days": ["YYYY-MM-DD"]`. Not while paused, and
+  never a real position while in dry-run (the alert still fires).
 - State lives in `~/.agentic-trader/` (consent record, config, broker tokens
   `0600`, seen-events + positions).
 - Deliberately simple by design: no stop-losses, no margin logic, and a

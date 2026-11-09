@@ -456,10 +456,40 @@ def test_banner_levels():
 
 # ── pricing + adapters ──────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("bid,limit", [(1.00, 0.95), (2.37, 2.25), (0.10, 0.05),
-                                       (0.03, 0.01), (0.0, None), (None, None)])
+@pytest.mark.parametrize("bid,limit", [
+    (1.00, 0.95), (2.37, 2.25), (0.10, 0.05), (0.11, 0.10), (0.20, 0.15),
+    # under $0.10: at the bid itself (a nickel-tick class rejects $0.01)
+    (0.09, 0.09), (0.06, 0.06), (0.05, 0.05), (0.03, 0.03), (0.01, 0.01),
+    # from $3.00: $0.10 ticks, which every class accepts
+    (3.30, 3.10), (3.25, 3.00), (3.20, 3.00), (3.15, 2.95), (10.00, 9.50),
+    (0.0, None), (None, None), (0.001, None)])
 def test_marketable_sell_limit(bid, limit):
     assert marketable_limit(bid, "sell") == limit
+
+
+@pytest.mark.parametrize("ask,limit", [
+    (1.00, 1.05), (0.01, 0.05), (2.80, 2.95), (2.90, 3.10), (3.00, 3.20),
+    (3.05, 3.30), (10.00, 10.50)])
+def test_marketable_buy_limit(ask, limit):
+    assert marketable_limit(ask, "buy") == limit
+
+
+def test_marketable_limit_is_always_a_valid_tick():
+    """Every price it returns is valid for a nickel/dime-tick class (or is
+    the bid itself, under $0.10), and a sell never goes below $0.05 when
+    the bid is at least that."""
+    for cents in range(1, 2000):
+        p = cents / 100
+        for side in ("buy", "sell"):
+            got = round(marketable_limit(p, side) * 100)
+            if side == "sell" and cents < 10:
+                assert got == cents
+                continue
+            assert got % (10 if got >= 300 else 5) == 0, (p, side, got)
+            if side == "sell":
+                assert 5 <= got <= cents
+            else:
+                assert got >= cents
 
 
 def test_quote_number_tells_zero_from_unknown():
@@ -524,7 +554,7 @@ def test_robinhood_exit_bid_reads_the_bid():
 def test_robinhood_reconcile_reprices_a_stale_guard_sell(monkeypatch):
     monkeypatch.setattr(robinhood.time, "sleep", lambda s: None)
     monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: False)
-    monkeypatch.setattr(robinhood, "_before_close", lambda now=None: True)
+    monkeypatch.setattr(robinhood, "_before_close", lambda now=None, cfg=None: True)
     rh = FakeRH({
         "get_option_orders": _mcp({"data": {"results": [
             {"id": "o-1", "state": "confirmed", "processed_quantity": "0"}]}}),
@@ -602,3 +632,443 @@ def test_high_priority_reaches_ntfy(monkeypatch):
     notifications.notify({"ntfy_topic": "t"}, "hi")
     assert posts[0]["headers"]["Priority"] == "urgent"
     assert "Priority" not in posts[1]["headers"]
+
+
+# ── review fixes ────────────────────────────────────────────────────────────
+
+def _entry(expiry=DAY, **over):
+    ev = {"event": "ENTERED", "ticker": "RIVN", "expiry": expiry, "strike": 13.5,
+          "type": "C", "event_id": "e-1"}
+    ev.update(over)
+    return ev
+
+
+def test_no_new_0dte_entry_past_the_guard_time(monkeypatch, no_policy):
+    monkeypatch.setattr(agent, "_et_now", lambda: et(15, 46))
+    state = {"positions": {}, "seen": []}
+    b = StubBroker()
+    out = agent.handle_event(_entry(), {}, state, b, object(), lambda s: None)
+    assert out.startswith("SKIPPED") and "expiry guard time (15:45 ET)" in out
+    assert b.calls == [] and state["positions"] == {}
+    (row,) = [r for r in _log() if r.get("event_id") == "e-1"]
+    assert row["action"] == "skip_rule" and "expires today" in row["reason"]
+
+
+def test_0dte_entry_before_the_guard_time_and_later_expiries_still_buy(
+        monkeypatch, no_policy):
+    monkeypatch.setattr(agent, "_et_now", lambda: et(15, 44))
+    state = {"positions": {}, "seen": []}
+    b = StubBroker()
+    assert agent.handle_event(_entry(), {}, state, b, object(), lambda s: None)
+    monkeypatch.setattr(agent, "_et_now", lambda: et(15, 50))
+    agent.handle_event(_entry(expiry="2026-11-13", event_id="e-2"), {}, state, b,
+                       object(), lambda s: None)
+    assert [e["event_id"] for e in b.calls] == ["e-1", "e-2"]
+
+
+def test_0dte_entry_late_is_allowed_when_the_guard_is_off(monkeypatch, no_policy):
+    monkeypatch.setattr(agent, "_et_now", lambda: et(15, 50))
+    b = StubBroker()
+    agent.handle_event(_entry(), {"expiry_guard_et": "off"},
+                       {"positions": {}, "seen": []}, b, object(), lambda s: None)
+    assert len(b.calls) == 1
+
+
+def test_0dte_entry_block_follows_an_early_close(monkeypatch, no_policy):
+    monkeypatch.setattr(agent, "_et_now", lambda: et(12, 46, day=(2026, 11, 27)))
+    b = StubBroker()
+    out = agent.handle_event(_entry(expiry="2026-11-27"), {},
+                             {"positions": {}, "seen": []}, b, object(),
+                             lambda s: None)
+    assert out.startswith("SKIPPED") and "12:45" in out and b.calls == []
+
+
+def test_whole_number_strike_key_round_trips_and_sells():
+    key = f"SPY|{DAY}|600|C"               # a custom source's int strike
+    state = _state(key)
+    b = GuardBroker()
+    assert _tick(state, b, et(15, 45)) == [f"EXIT: SPY {DAY} $600 C"]
+    assert b.calls[0]["strike"] == 600 and key not in state["positions"]
+
+
+def test_unreadable_row_notifies_once_with_high_priority(quiet):
+    key = f"SPY|{DAY}|0600|C"              # can't be rebuilt exactly
+    state = _state(key)
+    b = GuardBroker()
+    _tick(state, b, et(15, 45))
+    _tick(state, b, et(15, 46))
+    assert b.calls == []
+    notes = [(m, p) for m, p in quiet if "can't read" in m]
+    assert len(notes) == 1 and notes[0][1] == "high"
+    assert "sell it in your broker app" in notes[0][0]
+
+
+@pytest.mark.parametrize("day,early", [
+    ("2026-11-27", True), ("2027-11-26", True), ("2028-11-24", True),
+    ("2031-11-28", True), ("2026-11-26", False), ("2026-11-20", False),
+    ("2026-12-24", True), ("2030-12-24", True), ("2027-12-24", False),  # Fri: closed
+    ("2025-07-03", True), ("2029-07-03", True), ("2026-07-03", False),  # Fri: closed
+    ("2026-12-23", False), ("2026-07-02", False)])
+def test_early_closes_by_rule(day, early):
+    from brokers import market_hours
+    assert market_hours.is_rule_early_close(day) is early
+    assert market_hours.close_minute({}, day) == (780 if early else 960)
+
+
+def test_early_close_by_rule_after_the_old_list_ends():
+    key = "SPY|2028-11-24|600.0|C"
+    state = _state(key)
+    b = GuardBroker()
+    _tick(state, b, et(12, 44, day=(2028, 11, 24)))
+    assert b.calls == []
+    _tick(state, b, et(12, 45, day=(2028, 11, 24)))
+    assert len(b.calls) == 1
+
+
+def test_early_close_never_moves_the_guard_before_the_open():
+    cfg = {"expiry_guard_et": "10:00", "expiry_alert_et": "10:05"}
+    assert agent._expiry_times(cfg, "2026-11-27") == (570, 570, 780)
+    key = "SPY|2026-11-27|600.0|C"
+    state = _state(key)
+    b = GuardBroker()
+    _tick(state, b, et(9, 0, day=(2026, 11, 27)), cfg=cfg)
+    _tick(state, b, et(9, 29, day=(2026, 11, 27)), cfg=cfg)
+    assert b.calls == []
+    _tick(state, b, et(9, 30, day=(2026, 11, 27)), cfg=cfg)
+    assert len(b.calls) == 1
+
+
+def test_robinhood_before_close_knows_early_closes():
+    assert robinhood._before_close(et(12, 59, day=(2026, 11, 27)))
+    assert not robinhood._before_close(et(13, 0, day=(2026, 11, 27)))
+    assert not robinhood._before_close(et(13, 30, day=(2026, 11, 27)))
+    assert robinhood._before_close(et(15, 59))
+    assert not robinhood._before_close(et(16, 0))
+    extra = {"early_close_days": ["2027-07-02"]}
+    assert robinhood._before_close(et(12, 30, day=(2027, 7, 2)), cfg=extra)
+    assert not robinhood._before_close(et(13, 30, day=(2027, 7, 2)), cfg=extra)
+
+
+def test_robinhood_reconcile_stops_repricing_after_an_early_close(monkeypatch):
+    monkeypatch.setattr(robinhood.time, "sleep", lambda s: None)
+    monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: False)
+    real = robinhood._before_close
+    monkeypatch.setattr(robinhood, "_before_close",
+                        lambda now=None, cfg=None: real(et(13, 5, day=(2026, 11, 27)), cfg))
+    rh = FakeRH({"get_option_orders": _mcp({"data": {"results": [
+        {"id": "o-1", "state": "confirmed", "processed_quantity": "0"}]}})})
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2, "pending": {
+        "order_id": "o-1", "side": "sell", "requested": 2, "filled": 0,
+        "was_limit": True, "reprice": True,
+        "placed_at": robinhood.time.time() - 60}}}}
+    robinhood.reconcile(rh, {"robinhood_account": "1"}, state, lambda s: None)
+    assert not [n for n, _ in rh.calls if n == "cancel_option_order"]
+
+
+def test_startup_notice_runs_with_the_alert_off():
+    state = _state(KEY)
+    sent = _wake(state, None, et(10, 0), cfg={"expiry_alert_et": "off"})
+    assert len(sent) == 1 and "sells it at 15:45" in sent[0]
+
+
+def test_startup_notice_silent_when_both_are_off():
+    state = _state(KEY)
+    cfg = {"expiry_guard_et": "off", "expiry_alert_et": "off"}
+    assert _wake(state, None, et(10, 0), cfg=cfg) == []
+
+
+def test_banner_says_who_is_not_selling():
+    state = _state(KEY)
+    paused = agent.expiry_banner({}, state, et(15, 46), paused=True)[0]
+    assert paused["level"] == "urgent" and "paused" in paused["text"]
+    assert "guard is selling" not in paused["text"]
+    dry = agent.expiry_banner({"dry_run": True}, state, et(15, 46))[0]
+    assert dry["level"] == "urgent" and "dry-run" in dry["text"]
+    other = agent.expiry_banner({}, _state(KEY, acct="alpaca:live"), et(15, 46),
+                                acct="robinhood:abc")[0]
+    assert other["level"] == "urgent" and "different broker account" in other["text"]
+    early = agent.expiry_banner({}, state, et(10, 0), paused=True)[0]
+    assert early["level"] == "warn" and "paused" in early["text"]
+    same = agent.expiry_banner({}, _state(KEY, acct="robinhood:abc"), et(15, 46),
+                               acct="robinhood:abc")[0]
+    assert same["level"] == "warn" and "guard is selling" in same["text"]
+
+
+def test_alert_names_a_different_account(quiet):
+    state = _state(KEY, acct="alpaca:live")
+    _tick(state, GuardBroker(), et(15, 50), cfg={"broker": "robinhood"})
+    (msg,) = [m for m, _ in quiet if "sell it now" in m]
+    assert "different broker account" in msg
+
+
+# heartbeat persistence
+
+def test_beat_save_due_every_loop_while_busy_and_once_after_the_close():
+    state = _state(KEY)
+    t = et(15, 46).timestamp()
+    assert agent._beat_save_due({}, state, t - 10, t, et(15, 46))      # busy
+    assert not agent._beat_save_due({}, {"positions": {}}, t - 10, t, et(15, 46))
+    close = et(16, 0).timestamp()
+    after = et(16, 0, s=20)
+    assert agent._beat_save_due({}, {"positions": {}}, close - 30,
+                                after.timestamp(), after)
+    assert not agent._beat_save_due({}, {"positions": {}}, close + 5,
+                                    after.timestamp(), after)
+    assert agent._beat_save_due({}, {"positions": {}}, t - 130, t, et(15, 46))
+
+
+def test_no_false_offline_alert_after_a_stop_just_past_the_close():
+    """Stopped at 16:01 with the heartbeat saved on the stop: the next start
+    doesn't call the 16:00 expiry 'offline'."""
+    state = _state(KEY)
+    agent._save_heartbeat(state, lambda s: None, et(16, 1).timestamp())
+    assert _wake(state, state["heartbeat_at"], et(16, 30)) == []
+
+
+# ── holdings-reading broker: the guard goes through the exit checks ─────────
+
+U1 = "14a8e49b-0f10-4d64-9cf9-bd1a68e9da44"
+HCFG = {"broker": "robinhood", "robinhood_account": "A1"}
+
+
+class HeldBroker(GuardBroker):
+    """GuardBroker that reads holdings (and the owner's sells)."""
+
+    def __init__(self, held, fills=(), bid=1.0):
+        super().__init__(bid=bid)
+        self.held, self.fills, self.asked = held, list(fills), []
+
+    def held_option_qty(self, client, cfg, option_ids):
+        self.asked.append(list(option_ids))
+        return {i: self.held for i in option_ids}
+
+    def closed_fills(self, client, cfg, option_id, since_iso=None,
+                     own_order_ids=(), exclude_agentic=False):
+        return list(self.fills)
+
+
+class Clock:
+    def __init__(self, t):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+@pytest.fixture
+def held_clock(monkeypatch):
+    c = Clock(et(15, 45).timestamp())
+    monkeypatch.setattr(agent, "_now", c)
+    monkeypatch.setattr(agent, "_market_open_now", lambda: True)
+    monkeypatch.setattr(agent, "_in_open_rush", lambda: False)
+    monkeypatch.setitem(agent._POS_SYNC, "next_at", 0.0)
+    return c
+
+
+def _held_state(c, **over):
+    from brokers import account_tag
+    tag = account_tag(HCFG)
+    row = {"option_id": U1, "qty": 2, "opened_event": "open-1", "entry_mark": 1.0,
+           "acct": tag, "opened_at": c.t - 3600, "last_order_at": c.t - 3600,
+           "order_ids": ["o-agent"]}
+    row.update(over)
+    return {"positions": {KEY: row}, "seen": [],
+            "position_sync": {"proven": {tag: "2026-11-05T15:00:00+00:00"}}}
+
+
+def _htick(state, b, c, now):
+    c.t = now.timestamp()
+    return agent.expiry_guard_tick(HCFG, state, lambda s: None, b, object(),
+                                   now_et=now)
+
+
+def test_guard_sells_when_the_account_holds_it(held_clock):
+    state = _held_state(held_clock)
+    b = HeldBroker(2)
+    assert _htick(state, b, held_clock, et(15, 45)) == [f"EXIT: {CONTRACT}"]
+    assert len(b.calls) == 1 and b.asked
+
+
+def _every_10s():
+    """The guard's 10 s cadence from 15:45:00 to 15:49:50."""
+    return [(m, s) for m in range(45, 50) for s in range(0, 60, 10)]
+
+
+def test_guard_does_not_sell_a_position_the_owner_closed(held_clock):
+    fill = {"order_id": "u1", "qty": 2, "price": 0.2,
+            "at": "2026-11-06T19:00:00Z", "by": "user"}
+    state = _held_state(held_clock)
+    b = HeldBroker(0, fills=[fill])
+    for m, s in _every_10s():
+        _htick(state, b, held_clock, et(15, m, s=s))
+    assert b.calls == []
+    assert KEY not in state["positions"]
+    assert [r for r in _log() if r.get("action") == "exit" and r.get("manual")]
+
+
+def test_guard_waits_on_a_partial_shortfall_then_sells_only_what_is_held(
+        held_clock, quiet):
+    state = _held_state(held_clock)
+    sold = []
+
+    class Recording(HeldBroker):
+        def execute(self, client, cfg, event, st):
+            sold.append(st["positions"][KEY]["qty"])
+            return super().execute(client, cfg, event, st)
+    b = Recording(1)                      # the ledger says 2
+    _htick(state, b, held_clock, et(15, 45))
+    assert sold == [] and state["positions"][KEY]["qty"] == 2   # waits
+    for m, s in _every_10s()[1:]:
+        _htick(state, b, held_clock, et(15, m, s=s))
+    assert sold == [1] and KEY not in state["positions"]
+    assert any("no longer holds 1x" in m for m, _ in quiet)
+
+
+def test_guard_never_sells_another_accounts_row(held_clock, quiet):
+    state = _held_state(held_clock, acct="alpaca:live")
+    b = HeldBroker(2)
+    for m in (45, 46, 47):
+        _htick(state, b, held_clock, et(15, m))
+    assert b.calls == [] and KEY in state["positions"]
+    problems = [r for r in _log() if r.get("action") == "exit_failed"]
+    assert len(problems) == 1 and "different broker" in problems[0]["reason"]
+    assert len([m for m, _ in quiet if "NOT placed" in m]) <= 1
+
+
+# ── the main loop ───────────────────────────────────────────────────────────
+
+def _run(home, monkeypatch, state, events=(), poll_error=None, sleeps=1,
+         execute_ok=True, clock=None, on_sleep=None, on_poll=None):
+    """`agent.py run` with a stub feed and broker. Returns (calls, waits,
+    saved state)."""
+    import brokers
+    import keep_running
+    import webui
+    calls, waits = [], []
+
+    class Broker:
+        @staticmethod
+        def client(cfg):
+            return object()
+
+        @staticmethod
+        def execute(client, cfg, event, st):
+            calls.append(("execute", event["event_id"]))
+            if not execute_ok:
+                return False
+            key = f"{event['ticker']}|{event['expiry']}|{event['strike']}|{event['type']}"
+            return st["positions"].pop(key, None) is not None
+
+    class Source:
+        @staticmethod
+        def poll(cfg, st, save_state):
+            calls.append("poll")
+            if on_poll:
+                on_poll()
+            if poll_error:
+                raise poll_error
+            return list(events)
+
+    def no_dashboard(*a, **k):
+        raise OSError("no dashboard in tests")
+
+    def sleep(wait, controls):
+        waits.append(wait)
+        if len(waits) >= sleeps:
+            raise KeyboardInterrupt
+        if on_sleep:
+            on_sleep()
+    monkeypatch.setattr(agent, "require_consent_or_exit", lambda: None)
+    monkeypatch.setattr(brokers, "broker_ready", lambda c: True)
+    monkeypatch.setitem(agent.BROKERS, "stub", Broker)
+    monkeypatch.setitem(agent.SOURCES, "stub", Source)
+    monkeypatch.setattr(webui, "start_dashboard", no_dashboard)
+    monkeypatch.setattr(keep_running, "refresh_autostart", lambda: False)
+    monkeypatch.setattr(agent, "_refresh_cash", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_position_upkeep", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_market_open_now", lambda: True)
+    monkeypatch.setitem(webui.CONTROLS, "paused", False)
+    monkeypatch.setitem(webui.CONTROLS, "stop", False)
+    monkeypatch.setattr(agent, "_sleep_unless_stopped", sleep)
+    if clock is not None:
+        monkeypatch.setattr(agent, "_now", clock)
+    (home / "config.json").write_text(json.dumps({"source": "stub", "broker": "stub"}))
+    (home / "state.json").write_text(json.dumps(state))
+    agent.cmd_run()
+    return calls, waits, json.loads((home / "state.json").read_text())
+
+
+def test_loop_guard_sells_after_the_feed_even_when_the_feed_is_down(
+        home, monkeypatch):
+    monkeypatch.setattr(agent, "_et_now", lambda: et(15, 46))
+    state = {"seen": [], **_state(KEY, option_id="opt-1", qty=1)}
+    calls, _w, saved = _run(home, monkeypatch, state,
+                            poll_error=ConnectionError("feed unreachable"))
+    assert calls == ["poll", ("execute", f"expiry-guard|{KEY}|{DAY}")]
+    assert KEY not in saved["positions"]
+
+
+def test_loop_feed_exit_and_guard_same_row_sells_once(home, monkeypatch):
+    monkeypatch.setattr(agent, "_et_now", lambda: et(15, 46))
+    state = {"seen": [], **_state(KEY, option_id="opt-1", qty=1)}
+    exit_ev = {"event": "EXITED", "ticker": "RIVN", "expiry": DAY, "strike": 13.5,
+               "type": "C", "event_id": "feed-x"}
+    calls, _w, saved = _run(home, monkeypatch, state, events=[exit_ev])
+    assert [c for c in calls if c != "poll"] == [("execute", "feed-x")]
+    assert saved["positions"] == {}
+
+
+def test_loop_polls_every_10s_while_the_guard_has_work(home, monkeypatch):
+    monkeypatch.setattr(agent, "_et_now", lambda: et(15, 46))
+    state = {"seen": [], **_state(KEY, option_id="opt-1", qty=1)}
+    _c, waits, saved = _run(home, monkeypatch, state, execute_ok=False)
+    assert waits == [agent.EXPIRY_GUARD_POLL_S]
+    assert saved["heartbeat_at"]                 # saved every loop while busy
+    monkeypatch.setattr(agent, "_et_now", lambda: et(14, 0))
+    _c, waits, _s = _run(home, monkeypatch, state, execute_ok=False)
+    assert waits == [30]
+
+
+def test_loop_saves_the_heartbeat_on_a_stop(home, monkeypatch):
+    monkeypatch.setattr(agent, "_et_now", lambda: et(16, 1))
+    c = Clock(et(16, 1).timestamp())
+    _c, _w, saved = _run(home, monkeypatch, {"seen": [], "positions": {}}, clock=c)
+    assert saved["heartbeat_at"] == c.t
+
+
+def _spy_wake(monkeypatch):
+    seen = []
+    real = agent.expiry_wake_check
+    monkeypatch.setattr(agent, "expiry_wake_check",
+                        lambda cfg, st, save, prev, now_et=None:
+                        seen.append(prev) or real(cfg, st, save, prev, now_et))
+    return seen
+
+
+def test_loop_runs_the_wake_check_after_a_sleep(home, monkeypatch):
+    monkeypatch.setattr(agent, "_et_now", lambda: et(10, 0))
+    c = Clock(et(10, 0).timestamp())
+    seen = _spy_wake(monkeypatch)
+
+    def slept():
+        c.t += 3600                       # the computer slept an hour
+    _run(home, monkeypatch, {"seen": [], "positions": {}}, sleeps=2, clock=c,
+         on_sleep=slept)
+    assert seen == [None, et(10, 0).timestamp()]
+
+
+def test_loop_runs_the_wake_check_after_a_hang(home, monkeypatch):
+    """A loop that hangs inside (a stuck call), not in its sleep, is a gap
+    too: measured from the previous loop's start."""
+    monkeypatch.setattr(agent, "_et_now", lambda: et(10, 0))
+    c = Clock(et(10, 0).timestamp())
+    seen = _spy_wake(monkeypatch)
+    hung = []
+
+    def hang():
+        if not hung:
+            hung.append(1)
+            c.t += 900                    # the feed call hung 15 min
+    _run(home, monkeypatch, {"seen": [], "positions": {}}, sleeps=2, clock=c,
+         on_poll=hang)
+    assert seen == [None, et(10, 0).timestamp()]

@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import broker_events
 
+from .market_hours import close_minute
 from .pricing import marketable_limit, quote_number
 from .robinhood_mcp import RobinhoodMCP, content_json, tool_ok
 
@@ -293,8 +294,9 @@ def mark_price(rh, cfg, event, side="buy"):
 
 def _blackout_limit_price(rh, option_id, side):
     """Marketable-limit price (per share) during the opening blackout; None
-    once market orders are allowed. Buys pay up to ask+5% (rounded up to a
-    $0.05 tick); sells accept bid-5% (rounded down, floor $0.01) — aggressive
+    once market orders are allowed. Buys pay up to ask+5% (rounded up),
+    sells accept bid-5% (rounded down; at the bid under $0.10), on ticks
+    every option class accepts (pricing.py) — aggressive
     enough to fill immediately, like the market order it replaces. With no
     usable quote the caller falls through to a market order, whose rejection
     is printed by place()."""
@@ -325,10 +327,12 @@ def exit_bid(rh, cfg, event, option_id=None):
     return _bid(rh, option_id) if option_id else None
 
 
-def _before_close(now=None):
-    """Before 4:00 PM ET on a weekday: orders can still trade today."""
+def _before_close(now=None, cfg=None):
+    """Before today's close (4:00 PM ET, 1:00 PM on an early-close day) on
+    a weekday: orders can still trade today."""
     now = now or datetime.now(MARKET_TZ)
-    return now.weekday() < 5 and (now.hour, now.minute) < (16, 0)
+    return (now.weekday() < 5
+            and now.hour * 60 + now.minute < close_minute(cfg, now.date()))
 
 
 def _skip_kind(note):
@@ -651,7 +655,7 @@ def reconcile(rh, cfg, state, save_state):
                 # an expiry-guard sell the market moved away from: re-place
                 # it at a fresh marketable price, until the close
                 convert = (time.time() - pend.get("placed_at", 0) >= _REPRICE_AFTER_S
-                           and _before_close())
+                           and _before_close(cfg=cfg))
             else:
                 convert = pend.get("was_limit") and not _in_opening_blackout()
             if not (convert or expired):

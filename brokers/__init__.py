@@ -47,8 +47,9 @@ reported as "not held":
 
 The expiry guard's EXITED events carry event["exit_limit"] == "marketable":
 an adapter that sees it sells with a marketable limit (bid -5%, rounded down
-to a $0.05 tick — pricing.py) instead of a market order. Adapters that
-ignore it sell as usual.
+to a price every option class accepts; at the bid itself under $0.10 —
+pricing.py) instead of a market order. Adapters that ignore it sell as
+usual.
 
     VERIFIES_FILLS = False          module constant for adapters that book an
                                     entry when the order is accepted, without

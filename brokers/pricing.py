@@ -1,9 +1,26 @@
 """Marketable-limit pricing shared by the broker adapters.
 
 A marketable limit fills right away like a market order, but with a price
-bound: buys pay up to the ask +5% (rounded UP to a $0.05 tick), sells accept
-down to the bid -5% (rounded DOWN to a $0.05 tick, never below $0.01).
+bound: buys pay up to the ask +5%, sells accept down to the bid -5%.
+
+The price is rounded (UP for buys, DOWN for sells) to a tick every US
+option class accepts: $0.05 under $3.00 and $0.10 from $3.00 (penny-program
+classes also take these; classes outside the program reject in-between
+prices). A sell into a bid under $0.10 goes out AT the bid: the bid is
+already a valid price for that class, while bid -5% would round down to
+$0.05 or $0.01 — a price a nickel-tick class rejects, which would leave an
+expiring position unsold.
 """
+
+
+def _tick_down(cents):
+    step = 10 if cents >= 300 else 5
+    return cents // step * step
+
+
+def _tick_up(cents):
+    up = -(-cents // 5) * 5
+    return -(-up // 10) * 10 if up >= 300 else up
 
 
 def marketable_limit(price, side):
@@ -16,12 +33,14 @@ def marketable_limit(price, side):
     if not 0 < price < float("inf"):
         return None
     cents = int(round(price * 100))
+    if cents < 1:
+        return None
     if side == "buy":
-        buffered = -(-cents * 105 // 100)      # ceil(price * 1.05)
-        ticked = -(-buffered // 5) * 5         # round UP to a $0.05 tick
+        ticked = _tick_up(-(-cents * 105 // 100))      # ceil(price * 1.05)
+    elif cents < 10:
+        ticked = cents                                  # at the bid
     else:
-        buffered = cents * 95 // 100           # floor(price * 0.95)
-        ticked = max(1, buffered // 5 * 5)     # round DOWN, floor $0.01
+        ticked = max(5, _tick_down(cents * 95 // 100))  # floor(price * 0.95)
     return ticked / 100.0
 
 
