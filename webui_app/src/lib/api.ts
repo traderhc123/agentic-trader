@@ -58,9 +58,14 @@ export interface StatusResp {
   paused: boolean;
   fields: Record<string, string>;
   cash_warning?: string;
+  expiry_warnings?: ExpiryWarning[];
   problems?: Problem[];
   budget_hints?: BudgetHint[];
   would_have?: WouldHave | null;
+}
+export interface ExpiryWarning {
+  level: "info" | "warn" | "urgent" | string;
+  text: string;
 }
 export interface WouldHaveRow {
   date: string;

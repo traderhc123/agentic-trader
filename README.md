@@ -210,6 +210,42 @@ whatever `max_autopay_sats` is set to.
   read clearly, nothing changes and exits work as before. Check it any
   time with `python agent.py check-positions` (read-only); turn it off
   with `"position_sync": false` in config.json.
+- **Expiry guard** (on by default): an option the agent opened that it still
+  holds on its expiry day is sold from `expiry_guard_et` (default `"15:45"`
+  ET) until the 4:00 PM close — a marketable limit at the bid −5%, retried
+  every ~10 s — so a missed exit signal (computer asleep, agent offline)
+  doesn't end in exercise or assignment. The feed's own exit signal still
+  comes first. No bid (worthless) = no sell, just a notification. Anything
+  still open at `expiry_alert_et` (default `"15:50"`) gets one urgent
+  notification and a red dashboard banner; at startup the agent also warns
+  about positions that expire today or expired while it was offline. Set
+  either time to `"off"` in config.json, or say `expiry guard off` /
+  `expiry guard 15:40` / `expiry alert off` in the dashboard. Only the
+  agent's own positions are ever sold. Past the guard time it also won't
+  open a new position in a contract that expires that day. Early-close days
+  (1:00 PM: the day after Thanksgiving, and Dec 24 / Jul 3 when they fall
+  Monday–Thursday) move both times 3 hours earlier, never before 09:30; add
+  any other with `"early_close_days": ["YYYY-MM-DD"]`. Not while paused, and
+  never a real position while in dry-run (the alert still fires).
+- **Exit remainders** (any day): when an exit sells only part of a position
+  (a partial fill, or an order that died or was cancelled with contracts
+  left), the agent re-sells the rest on the next loop — a marketable limit,
+  sell-to-close, never more than its own ledger remainder and never more
+  than the account holds — until it's gone or the market closes, and again
+  from the next 9:30 ET open (NYSE holidays skipped; add other closures
+  with `"market_holidays": ["YYYY-MM-DD"]`). If the account holds fewer than
+  the ledger remainder, it sells only what its own filled orders account
+  for. No sell into a zero bid. Without a holdings read it waits; with the
+  holdings check off (`"position_sync": false`) it only alerts. You get one
+  notification when it happens, one when it's cleared, and one if it's
+  still open at 15:50 ET. On an expiry day the expiry guard takes over at
+  its time.
+- **Ledger check**: if the account holds more of a contract the agent bought
+  than its ledger lists (an exit booked as sold that didn't fill), the agent
+  re-adds them — only as many as its own filled orders in your broker's
+  order history account for (bought minus everything sold since). Your own
+  positions are never adopted; a broker whose order history can't be read
+  gets an alert instead.
 - State lives in `~/.agentic-trader/` (consent record, config, broker tokens
   `0600`, seen-events + positions).
 - Deliberately simple by design: no stop-losses, no margin logic, and a

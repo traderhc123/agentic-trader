@@ -11,6 +11,7 @@ import { Disclosure } from "../components/ui/disclosure";
 import {
   api,
   type BudgetHint,
+  type ExpiryWarning,
   type PnlBook,
   type PnlSummary,
   type Problem,
@@ -301,6 +302,7 @@ export function Dashboard() {
 
       <main className="mx-auto max-w-[1440px] px-6 pb-10 pt-5 max-sm:px-4 max-sm:pt-4">
         <ModeBanner conn={conn} live={live} paused={paused} />
+        {conn === "ok" && <ExpiryBanner items={status?.expiry_warnings || []} />}
         <StatusStrip conn={conn} f={f} />
         {conn === "ok" && <WhyNoTrades warning={status?.cash_warning || ""} problems={status?.problems || []} hints={status?.budget_hints || []} live={live} onCommand={send} />}
 
@@ -484,6 +486,25 @@ function WhyNoTrades({
           </>
         )}
       </ConfirmDialog>
+    </div>
+  );
+}
+
+// ── expiry banner: the agent's own positions on their expiry day ────────────
+function ExpiryBanner({ items }: { items: ExpiryWarning[] }) {
+  if (!items.length) return null;
+  const urgent = items.some((i) => i.level === "urgent");
+  const tone = urgent ? "border-down/60 bg-down/[0.10]" : "border-warn/45 bg-warn/[0.07]";
+  return (
+    <div role="alert" className={cn("mb-4 flex items-start gap-3 rounded-md border px-4 py-2.5 text-sm text-fg2", tone)}>
+      <AlertTriangle className={cn("mt-0.5 h-4 w-4 flex-none", urgent ? "text-down" : "text-warn")} />
+      <ul className="m-0 min-w-0 flex-1 list-none space-y-1 p-0">
+        {items.map((i) => (
+          <li key={i.text} className="[overflow-wrap:anywhere]">
+            {i.level === "urgent" ? <b className="text-down">{i.text}</b> : i.text}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
