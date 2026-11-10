@@ -31,6 +31,23 @@ def test_service_may_write_its_install_folder_and_state():
     assert "/home/trader/.agentic-trader" in writable
 
 
+def test_guide_prints_the_fix_for_servers_that_cannot_show_it():
+    """A server made before the fix runs deploy-day code: its Update button
+    shows only git's raw "Read-only file system" error, never the new message.
+    So the guide itself must name that symptom and print the whole command."""
+    with open(os.path.join(REPO, "GETTING_STARTED.md"), encoding="utf-8") as f:
+        guide = f.read()
+    assert "Read-only file system" in guide
+    cmd = next(ln.strip() for ln in guide.splitlines()
+               if ln.strip().startswith("sudo sed "))
+    # sets exactly what the service file shipped today allows
+    assert ("s|^ReadWritePaths=.*|ReadWritePaths="
+            + _unit()["ReadWritePaths"] + "|") in cmd
+    assert "/etc/systemd/system/agentic-trader.service" in cmd
+    assert "sudo systemctl daemon-reload" in cmd
+    assert "sudo systemctl restart agentic-trader" in cmd
+
+
 def _read_only_install(tmp_path, monkeypatch, under_systemd=True):
     install = tmp_path / "install"
     install.mkdir()

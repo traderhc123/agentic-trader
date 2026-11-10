@@ -116,6 +116,61 @@ def test_macos_placeholder_git_falls_back_to_the_snapshot(tmp_path):
     assert "Installed to" in r.stdout
 
 
+# stock macOS: /usr/bin/python3 and /usr/bin/git are the same kind of
+# placeholder — RUNNING either one pops up the developer-tools dialog
+_APPLE_PLACEHOLDER = r'''
+touch "$HOME/developer-tools-dialog-popped-up"
+echo "xcode-select: note: No developer tools were found, requesting install." >&2
+exit 1
+'''
+# astral.sh's installer, faked: puts a `uv` in ~/.local/bin that "installs" Python
+_CURL_WITH_UV = r'''
+case "$*" in
+  *astral.sh*)
+    echo 'mkdir -p "$HOME/.local/bin"'
+    echo 'cp "$FAKE_UV" "$HOME/.local/bin/uv"'
+    echo 'cp "$FAKE_PY" "$HOME/.local/bin/python3.12"' ;;
+  *) cat "$FAKE_TARBALL" ;;
+esac
+'''
+_FAKE_UV = r'''
+if [ "$2" = "find" ]; then echo "$HOME/.local/bin/python3.12"; fi
+exit 0
+'''
+
+
+@needs_bash
+def test_macos_placeholder_python_and_git_are_never_run(tmp_path):
+    """A fresh Mac: the installer must get Python (uv) and the code
+    (snapshot) without ever running Apple's placeholders."""
+    for name, body in (("fake-uv", _FAKE_UV), ("fake-py", _FAKE_PYTHON)):
+        f = tmp_path / name
+        f.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        f.chmod(0o755)
+    r, target = _install(
+        tmp_path, {"python3": _APPLE_PLACEHOLDER, "git": _APPLE_PLACEHOLDER,
+                   "xcode-select": "exit 2\n", "curl": _CURL_WITH_UV},
+        FAKE_UNAME="Darwin", FAKE_UV=str(tmp_path / "fake-uv"),
+        FAKE_PY=str(tmp_path / "fake-py"),
+        # where Apple keeps them; the sandbox's stand-in for /usr/bin
+        AGENTIC_TRADER_APPLE_STUB_DIR=str(tmp_path / "bin"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not (tmp_path / "developer-tools-dialog-popped-up").exists()
+    assert (target / "agent.py").exists() and "Installed to" in r.stdout
+
+
+@needs_bash
+def test_macos_with_developer_tools_uses_its_own_python_and_git(tmp_path):
+    """Developer tools installed: the same paths are the real tools."""
+    r, target = _install(
+        tmp_path, {"git": _GIT_CANNOT_CLONE, "xcode-select": "exit 0\n"},
+        FAKE_UNAME="Darwin",
+        AGENTIC_TRADER_APPLE_STUB_DIR=str(tmp_path / "bin"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "Python 3.10+ not found" not in r.stdout    # python3 was used
+    assert "git could not download the code" in r.stdout   # git was tried
+
+
 @needs_bash
 def test_failed_git_clone_falls_back_to_the_snapshot(tmp_path):
     r, target = _install(tmp_path, {"git": _GIT_CANNOT_CLONE})

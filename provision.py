@@ -30,6 +30,7 @@ rotate the Robinhood session and any API keys it carried.
 """
 
 import base64
+import calendar
 import gzip
 import hashlib
 import json
@@ -61,11 +62,21 @@ _HOME_FILES = ["config.json", "acceptance.json", "robinhood_oauth.json",
 _STATE_FILE = "state.json"
 _LEDGER_FILE = "trades.jsonl"
 USER_DATA_LIMIT = 60 * 1024   # DigitalOcean's cap is 64 KiB; leave headroom
-# After a deploy from a RUNNING agent's dashboard, the agent on this computer
-# is paused at once (no orders) but its process — which also serves the page —
-# lives this much longer, so the page can show the server's address and login
-# command before it goes away.
-LOCAL_STOP_DELAY_S = 120
+# A deploy from a RUNNING agent's dashboard first waits for the heartbeat to
+# finish the cycle it is in (an order being placed, its fill check, the state
+# save), so the copy sent to the server is complete. Longer than this and the
+# deploy is refused — nothing is created, nothing changes here.
+CYCLE_WAIT_S = 90
+# After the server is created, the agent on this computer is on hold at once
+# (no orders) but its process — which also serves the page — keeps running
+# until the page has been given the server's address and login command, plus
+# a moment to load them; or, if DigitalOcean never reports an address, until
+# the cap.
+LOCAL_STOP_AFTER_SHOWN_S = 60
+LOCAL_STOP_CAP_S = 15 * 60
+# Marks "this install's server deploy was already handled or checked", so the
+# one-time warning for deploys made by OLDER versions is not repeated.
+DEPLOY_CHECKED_FILE = "do_deploy_checked"
 _SERVICE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "deploy", "agentic-trader.service")
 
@@ -128,6 +139,44 @@ def _is_todays_row(line, today):
         return False
     return isinstance(t, dict) and (str(t.get("ts", "")).startswith(today)
                                     or str(t.get("closed_at", "")).startswith(today))
+
+
+def deployed_before():
+    """True if this computer ever asked DigitalOcean for a server: the login
+    key is made on the first attempt and never removed."""
+    return os.path.exists(os.path.join(_agent_home(), SSH_KEY_NAME))
+
+
+def mark_deploy_checked():
+    """No warning about an earlier deploy is needed (any more). Never raises."""
+    try:
+        os.makedirs(_agent_home(), exist_ok=True)
+        with open(os.path.join(_agent_home(), DEPLOY_CHECKED_FILE), "w",
+                  encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()) + "\n")
+    except OSError:
+        pass
+
+
+def earlier_deploy_warning():
+    """One-time warning text for an owner who created a server with a version
+    that did NOT retire this computer afterwards (before 2026-11): both
+    copies may be trading the same account. None when there is nothing to
+    say, or it was already said."""
+    if not deployed_before() or os.path.exists(
+            os.path.join(_agent_home(), DEPLOY_CHECKED_FILE)):
+        return None
+    mark_deploy_checked()
+    return (
+        "this computer was once used to create a cloud server for this agent "
+        "(DigitalOcean). Older versions left BOTH copies running, and two "
+        "copies on one broker account place every order twice. Please check "
+        "now: open cloud.digitalocean.com and look under Droplets. If a "
+        "server named agentic-trader is there, keep only one copy — either "
+        "destroy that server, or stop the agent on this computer with: "
+        "python agent.py stop   and then: python agent.py autostart off. "
+        "If there is no such server, nothing is wrong and you can ignore "
+        "this. This message is shown once.")
 
 
 def ensure_ssh_key():
@@ -343,6 +392,39 @@ def _not_available(resp):
     return resp.status_code == 422 and "not available" in resp.text.lower()
 
 
+class OutcomeUnknown(RuntimeError):
+    """DigitalOcean did not answer and the account could not be read either:
+    a server may or may not exist. Nothing was changed on this computer."""
+
+
+def _recent_server(token, name):
+    """(known, droplet): a server by this name that DigitalOcean is creating
+    right now or made in the last few minutes. known=False when the account
+    could not be read (so "none found" would be a guess). Never raises."""
+    try:
+        resp = _do("GET", token, "/droplets?tag_name=agentic-trader&per_page=200")
+        if resp.status_code != 200:
+            return False, None
+        droplets = resp.json().get("droplets") or []
+    except Exception:
+        return False, None
+    now, found = time.time(), None
+    for d in droplets:
+        if not isinstance(d, dict) or d.get("name") != name:
+            continue
+        recent = d.get("status") == "new"
+        try:
+            made = calendar.timegm(time.strptime(
+                str(d.get("created_at", ""))[:19], "%Y-%m-%dT%H:%M:%S"))
+            recent = recent or abs(now - made) < 600
+        except ValueError:
+            pass
+        if recent and (found is None or str(d.get("created_at", ""))
+                       > str(found.get("created_at", ""))):
+            found = d
+    return True, found
+
+
 def create_droplet(token, region="nyc3", name="agentic-trader"):
     """Create the droplet. Returns (droplet_id, message). Raises RuntimeError.
 
@@ -367,8 +449,17 @@ def create_droplet(token, region="nyc3", name="agentic-trader"):
             "ssh_keys": [k for k in key_ids if k], "tags": ["agentic-trader"],
             "monitoring": True}
     tried = [region]
-    resp = _do("POST", token, "/droplets", json=body)
-    while _not_available(resp):  # catalog was stale: walk the nearby regions
+
+    def ask():
+        # No answer (timeout, dropped connection) is NOT "not created": the
+        # request may have arrived. Handled below — never as a plain failure.
+        try:
+            return _do("POST", token, "/droplets", json=body)
+        except requests.RequestException as exc:
+            return exc
+    resp = ask()
+    while not isinstance(resp, Exception) and _not_available(resp):
+        # catalog was stale: walk the nearby regions
         alt = next((r for r in NEARBY.get(tried[0], []) + REGIONS
                     if r not in tried), None)
         if alt is None:
@@ -376,16 +467,47 @@ def create_droplet(token, region="nyc3", name="agentic-trader"):
         tried.append(alt)
         body["region"] = alt
         note = f"{tried[0]} had no room for this server, so it's in {alt} instead"
-        resp = _do("POST", token, "/droplets", json=body)
-    if resp.status_code == 401:
-        raise RuntimeError("DigitalOcean rejected the token (401) — create a "
-                           "personal access token with write scope at "
-                           "cloud.digitalocean.com/account/api/tokens")
-    if resp.status_code not in (201, 202):
-        raise RuntimeError(f"droplet create failed HTTP {resp.status_code}: "
-                           f"{resp.text[:200]}")
-    droplet = resp.json().get("droplet", {})
-    msg = f"droplet {droplet.get('id')} creating in {body['region']}"
+        resp = ask()
+    if isinstance(resp, Exception):
+        known, droplet = _recent_server(token, name)
+        if droplet is None and known:
+            raise RuntimeError(
+                "DigitalOcean did not answer. Your account was checked and "
+                "no new server is there, so none was created. Nothing was "
+                "changed on this computer. Try again in a minute. (If a "
+                "server named agentic-trader shows up under Droplets at "
+                "cloud.digitalocean.com later anyway, destroy it.)")
+        if droplet is None:
+            raise OutcomeUnknown(
+                "DigitalOcean did not answer, so it is not known whether the "
+                "server was created. Nothing was changed on this computer. "
+                "Before you try again, open cloud.digitalocean.com and look "
+                "under Droplets: if a server named agentic-trader is there, "
+                "destroy it. Left running, it would place every order a "
+                "second time.")
+        if (droplet.get("region") or {}).get("slug"):
+            body["region"] = droplet["region"]["slug"]
+    else:
+        if resp.status_code == 401:
+            raise RuntimeError("DigitalOcean rejected the token (401) — create a "
+                               "personal access token with write scope at "
+                               "cloud.digitalocean.com/account/api/tokens")
+        if resp.status_code not in (201, 202):
+            raise RuntimeError(f"droplet create failed HTTP {resp.status_code}: "
+                               f"{resp.text[:200]}")
+        # From here the server EXISTS: nothing below may raise.
+        try:
+            droplet = resp.json().get("droplet") or {}
+        except (ValueError, AttributeError):
+            droplet = {}
+        if not droplet.get("id"):
+            droplet = _recent_server(token, name)[1] or {}
+    if droplet.get("id"):
+        msg = f"droplet {droplet.get('id')} creating in {body['region']}"
+    else:
+        msg = (f"the server was created in {body['region']}, but "
+               "DigitalOcean's reply could not be read — find its address "
+               "under Droplets at cloud.digitalocean.com")
     if note:
         msg += f" ({note})"
     for extra in handoff_notes:

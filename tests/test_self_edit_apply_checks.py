@@ -81,7 +81,8 @@ def test_windows_diff_of_a_file_in_a_folder_is_the_real_diff(sandbox, monkeypatc
 def test_apply_rolls_back_code_that_compiles_but_cannot_import(sandbox):
     repo, home = sandbox
     _stage(home, [
-        {"path": "module.py", "content": "VALUE = 2\n"},
+        # the agent loads module.py, which now loads the new source
+        {"path": "module.py", "content": "from sources import rss\nVALUE = 2\n"},
         {"path": "sources/rss.py",
          "content": "import a_module_nobody_has_installed\nNAME = 'rss'\n"},
     ])
@@ -128,3 +129,36 @@ def test_apply_rolls_back_when_the_start_check_cannot_run(sandbox, monkeypatch):
     ok, msg = self_edit.apply_and_restart(restart=False)
     assert not ok and "rolled back" in msg
     assert (repo / "module.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+# ── review: Apply must not RUN a file that the agent itself never loads ──
+
+def test_apply_does_not_run_a_new_standalone_script(sandbox):
+    """"Write me a script I can run by hand to sell everything": approving it
+    saves the file. It must not be executed by the start check."""
+    repo, home = sandbox
+    ran = home / "script-ran.txt"
+    _stage(home, [{"path": "panic_sell.py", "content": (
+        "import agent\n"
+        f"open({str(ran)!r}, 'w', encoding='utf-8').write('sold everything')\n")}])
+    ok, msg = self_edit.apply_and_restart(restart=False)
+    assert ok, msg
+    assert (repo / "panic_sell.py").exists()
+    assert not ran.exists()
+
+
+def test_apply_still_checks_code_the_agent_loads_later(sandbox):
+    """An import inside a function (the agent has many) is still followed: a
+    new module reached only that way must load, or the change is undone."""
+    repo, home = sandbox
+    _stage(home, [
+        {"path": "module.py", "content": (
+            "VALUE = 2\n\n\ndef later():\n"
+            "    from sources import rss\n    return rss\n")},
+        {"path": "sources/rss.py",
+         "content": "import a_module_nobody_has_installed\nNAME = 'rss'\n"},
+    ])
+    ok, msg = self_edit.apply_and_restart(restart=False)
+    assert not ok and "rolled back" in msg
+    assert "a_module_nobody_has_installed" in msg
+    assert not (repo / "sources" / "rss.py").exists()

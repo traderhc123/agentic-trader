@@ -127,6 +127,39 @@ def test_failed_install_is_undone(install, github, monkeypatch):
     assert not ok and "undone" in note
 
 
+def test_file_that_could_not_be_swapped_needs_no_putting_back(
+        install, github, monkeypatch):
+    """Windows: antivirus holds one file. Its swap fails, so it was never
+    changed — the owner must not be told to copy it back by hand just because
+    the (unneeded) restore of that same locked file fails as well."""
+    su.check(str(install))
+    before = _tree(install)
+    real_replace, real_copy2, calls, locked = os.replace, su.shutil.copy2, [], []
+
+    def replace(src, dst):
+        calls.append(dst)
+        if len(calls) == 2:     # first file is already in place
+            locked.append(os.path.normcase(str(dst)))
+            raise PermissionError(13, "file is in use", str(dst))
+        return real_replace(src, dst)
+
+    def copy2(src, dst, *a, **k):
+        if os.path.normcase(str(dst)) in locked:
+            raise PermissionError(13, "file is in use", str(dst))
+        return real_copy2(src, dst, *a, **k)
+    monkeypatch.setattr(su.os, "replace", replace)
+    monkeypatch.setattr(su.shutil, "copy2", copy2)
+    ok, note = su.pull(str(install), SHA_NEW)
+    monkeypatch.setattr(su.os, "replace", real_replace)
+    monkeypatch.setattr(su.shutil, "copy2", real_copy2)
+    assert locked
+    now = {k: v for k, v in _tree(install).items()
+           if not k.startswith(su.BACKUP_DIR)}
+    assert now == before
+    assert not ok and "undone" in note
+    assert "could not be put back" not in note and "copy them" not in note
+
+
 def test_unreadable_archive_entry_changes_nothing(install, github, monkeypatch):
     su.check(str(install))
     before = _tree(install)

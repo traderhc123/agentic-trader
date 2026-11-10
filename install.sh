@@ -17,9 +17,22 @@ echo "== agentic-trader installer =="
 
 py_ok() { "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; }
 
+# On a Mac without Apple's developer tools, /usr/bin/python3 and /usr/bin/git
+# are placeholders: RUNNING one only pops up the "install developer tools"
+# dialog and fails. Never run those — there is a way without them below.
+# (AGENTIC_TRADER_APPLE_STUB_DIR exists only so the tests can stand in for
+# /usr/bin.)
+APPLE_STUB_DIR="${AGENTIC_TRADER_APPLE_STUB_DIR:-/usr/bin}"
+mac_placeholder() {
+  [ "${1%/*}" = "$APPLE_STUB_DIR" ] && [ "$(uname -s)" = "Darwin" ] \
+    && ! xcode-select -p >/dev/null 2>&1
+}
+
 PYTHON=""
 for c in python3.13 python3.12 python3.11 python3.10 python3; do
-  if command -v "$c" >/dev/null 2>&1 && py_ok "$c"; then PYTHON="$(command -v "$c")"; break; fi
+  p="$(command -v "$c" 2>/dev/null)" || continue
+  if mac_placeholder "$p"; then continue; fi
+  if py_ok "$p"; then PYTHON="$p"; break; fi
 done
 
 if [ -z "$PYTHON" ]; then
@@ -50,8 +63,7 @@ fetch_snapshot() {
 # placeholder that only opens the "install developer tools" dialog and fails.
 git_works() {
   command -v git >/dev/null 2>&1 || return 1
-  if [ "$(uname -s)" = "Darwin" ] && [ "$(command -v git)" = "/usr/bin/git" ] \
-     && ! xcode-select -p >/dev/null 2>&1; then
+  if mac_placeholder "$(command -v git)"; then
     return 1   # the placeholder — don't run it, that pops the dialog
   fi
   git --version >/dev/null 2>&1

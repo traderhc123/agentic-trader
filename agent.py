@@ -3509,6 +3509,16 @@ def _apply_command(text):
         webui.CONTROLS["paused"] = True
         return True, "Paused — no new events processed until you say 'resume'."
     if t == "resume":
+        import transfer
+        if transfer.HANDOFF["hold"] or transfer.moved_away():
+            # handed to a server / another computer: not a pause to undo
+            return True, (
+                "Can't resume here: this setup is being moved, or was moved, "
+                "to a server or another computer, and two copies would place "
+                "every order twice. (If a move fails, the agent carries on "
+                "here by itself.) To run it on this computer again after a "
+                "move: stop or destroy the other copy first, then run: "
+                "python agent.py resume-here")
         webui.CONTROLS["paused"] = False
         return True, "Resumed."
     if t == "stop":
@@ -3751,6 +3761,11 @@ def cmd_run(app_window=False):
         _save(STATE_PATH, st, private=True)  # holds the day-pass L402 token
 
     cash = {"at": 0.0, "bp": None, "warning": ""}
+    # A server deployed by an older version did not retire this computer:
+    # both may be trading the same account. Said once (console, notification,
+    # and on the dashboard for this run).
+    import provision
+    deploy_warn = provision.earlier_deploy_warning()
     import dry_run_preview
     import keep_awake
     awake = keep_awake.KeepAwake()
@@ -3802,9 +3817,18 @@ def cmd_run(app_window=False):
             "would_have": dry_run_preview.summary(c),
         }
 
+    def status_with_deploy_warning():
+        # the dashboard's status, plus (for this run) the one-time warning
+        # about a server made by an older version
+        s = get_status()
+        if deploy_warn:
+            s["expiry_warnings"] = list(s.get("expiry_warnings") or []) + [
+                {"level": "warn", "text": "Check for a second copy: " + deploy_warn}]
+        return s
+
     def start_dash():
         return webui.start_dashboard(
-            get_status, lambda: list(reversed(_recent_trades(25))),
+            status_with_deploy_warning, lambda: list(reversed(_recent_trades(25))),
             _apply_command, lambda: _load(CONFIG_PATH, {}) or {})
 
     dash_url = None
@@ -3844,6 +3868,10 @@ def cmd_run(app_window=False):
         print("\n" + "!" * 72 + "\nWARNING: " + llm_policy.BLOCKED_MSG
               + "\n" + "!" * 72 + "\n")
         notify(cfg, "agentic-trader WARNING: " + llm_policy.BLOCKED_MSG)
+    if deploy_warn:
+        print("\n" + "!" * 72 + "\nWARNING: " + deploy_warn
+              + "\n" + "!" * 72 + "\n")
+        notify(cfg, "agentic-trader WARNING: " + deploy_warn)
     notify(cfg, f"agentic-trader heartbeat started [{mode}], source={cfg['source']}"
                 # never send the login token to a third-party notifier
                 + (f" — dashboard {dash_url.split('?')[0]}" if dash_url else ""))
@@ -3898,8 +3926,12 @@ def cmd_run(app_window=False):
                   list(state["positions"]) or "none")
             notify(cfg, "agentic-trader stopped via dashboard")
             return
+        # A move to a server copies this agent's memory between cycles:
+        # mark "cycle in progress" FIRST, then read the hold (see transfer).
+        transfer.CYCLE_IDLE.clear()
+        paused = webui.CONTROLS["paused"] or transfer.HANDOFF["hold"]
         try:
-            if not webui.CONTROLS["paused"]:
+            if not paused:
                 try:
                     _prune_expired_positions(cfg, state, save_state)
                 except Exception as exc:
@@ -3967,8 +3999,11 @@ def cmd_run(app_window=False):
                 _explain_connection_error(exc, cfg, state, save_state)
         # after the feed's own exit signals, and even when the feed is
         # unreachable: sell what expires today, alert on what's still open
-        expiry_guard_tick(cfg, state, save_state, broker, client,
-                          paused=webui.CONTROLS["paused"])
+        try:
+            expiry_guard_tick(cfg, state, save_state, broker, client,
+                              paused=paused)
+        finally:
+            transfer.CYCLE_IDLE.set()  # cycle over: state is saved
         try:
             _maybe_daily_digest(cfg, state, save_state)
         except Exception:

@@ -333,16 +333,74 @@ def _module_name(rel):
     return ".".join(parts)
 
 
+def _app_modules():
+    """Names of this install's own modules that the running agent can load:
+    whatever agent.py and webui.py import, directly or through each other,
+    including imports written inside functions. Found by READING the source —
+    nothing is run."""
+    import ast
+    repo = _repo()
+
+    def source_of(name):
+        base = os.path.join(repo, *name.split("."))
+        for path in (base + ".py", os.path.join(base, "__init__.py")):
+            if os.path.isfile(path):
+                return path
+        return None
+
+    loaded, todo = set(), ["agent", "webui"]
+    while todo:
+        name = todo.pop()
+        path = None if name in loaded else source_of(name)
+        if path is None:
+            continue  # seen already, or not this install's code
+        loaded.add(name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+        except (OSError, ValueError, SyntaxError):
+            continue
+        package = name.split(".")
+        if os.path.basename(path) != "__init__.py":
+            package = package[:-1]
+        for node in ast.walk(tree):
+            found = []
+            if isinstance(node, ast.Import):
+                found = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                base = package[:len(package) - node.level + 1] if node.level else []
+                base = ".".join(base + (node.module.split(".") if node.module else []))
+                found = [base] + [f"{base}.{a.name}" if base else a.name
+                                  for a in node.names]
+            elif (isinstance(node, ast.Call) and node.args
+                  and isinstance(node.args[0], ast.Constant)
+                  and isinstance(node.args[0].value, str)
+                  and getattr(node.func, "id", getattr(node.func, "attr", ""))
+                  in ("__import__", "import_module")):
+                found = [node.args[0].value]
+            for mod in found:
+                parts = [p for p in mod.split(".") if p]
+                todo.extend(".".join(parts[:i]) for i in range(1, len(parts) + 1))
+    return loaded
+
+
 def _import_problem(paths):
-    """Import the changed modules, then the agent and its dashboard, in a
-    separate Python process. None if all of it loads; otherwise what failed.
+    """Import the changed modules that the agent itself loads, then the agent
+    and its dashboard, in a separate Python process. None if all of it loads;
+    otherwise what failed.
 
     A compile check only proves the syntax: a missing package or a renamed
     function still compiles, and then the restarted agent dies on import —
     over and over, with no dashboard left to undo the change from. If the
     check itself cannot run, that counts as a failure too (the change is
-    rolled back rather than trusted)."""
-    names = [m for m in map(_module_name, paths) if m]
+    rolled back rather than trusted).
+
+    A changed file that nothing in the agent imports (a script the owner
+    asked for, to run by hand) is NOT imported here: importing runs it, with
+    the owner's live broker login. Approving a change saves such a file; it
+    never runs it."""
+    loads = _app_modules()
+    names = [m for m in map(_module_name, paths) if m and m in loads]
     for top in ("agent", "webui"):
         if top not in names and os.path.exists(os.path.join(_repo(), top + ".py")):
             names.append(top)

@@ -178,8 +178,10 @@ def pull(repo_dir, expect):
                 os.makedirs(os.path.dirname(os.path.join(backup, rel)), exist_ok=True)
                 shutil.copy2(dest, os.path.join(backup, rel))
             os.makedirs(os.path.dirname(dest) or repo_dir, exist_ok=True)
-            done.append((rel, dest, had_old))
             os.replace(staged, dest)
+            # only now: a file whose swap failed (e.g. held open by antivirus
+            # on Windows) was never changed and needs no putting back
+            done.append((rel, dest, had_old))
         version_tmp = os.path.join(staging, VERSION_FILE)
         os.makedirs(staging, exist_ok=True)
         with open(version_tmp, "w", encoding="utf-8") as f:
