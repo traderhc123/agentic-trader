@@ -63,34 +63,50 @@ def loss_streak(trades):
 
 def check(cfg, ev, today_trades=(), now=None):
     """(True, "") if the entry passes every rule, else (False, reason)."""
+    return check_detail(cfg, ev, today_trades, now)[:2]
+
+
+def check_detail(cfg, ev, today_trades=(), now=None):
+    """check(), plus which rule said no as data: (ok, reason, code, params).
+    `code` is "" when the entry passes, else one of RULE_CODES; `params`
+    holds that rule's own numbers and names. For the dashboard, which must
+    not parse the sentence."""
     if ev.get("event") != "ENTERED":
-        return True, ""
+        return True, "", "", {}
     ticker = str(ev.get("ticker", "")).upper()
     allow = parse_tickers(cfg.get("rule_tickers"))
     if allow and ticker not in allow:
-        return False, f"{ticker} isn't in your ticker list ({', '.join(allow)})"
+        return (False, f"{ticker} isn't in your ticker list ({', '.join(allow)})",
+                "rule_not_in_list", {"ticker": ticker})
     if ticker in parse_tickers(cfg.get("rule_skip_tickers")):
-        return False, f"{ticker} is on your skip list"
+        return (False, f"{ticker} is on your skip list",
+                "rule_skip_list", {"ticker": ticker})
     sides = str(cfg.get("rule_sides") or "both").lower()
     kind = "calls" if str(ev.get("type", "")).upper().startswith("C") else "puts"
     if sides in ("calls", "puts") and kind != sides:
-        return False, f"you trade {sides} only"
+        return False, f"you trade {sides} only", "rule_side", {"sides": sides}
     floor = _num(cfg.get("rule_min_strike"))
     try:
         strike = float(ev.get("strike") or 0)
     except (TypeError, ValueError):
         strike = 0.0
     if floor and strike < floor:
-        return False, f"strike ${strike:g} is under your ${floor:g} minimum"
+        return (False, f"strike ${strike:g} is under your ${floor:g} minimum",
+                "rule_min_strike", {"strike": strike, "min_strike": floor})
     if cfg.get("rule_skip_0dte"):
         today = (now or datetime.now(MARKET_TZ)).astimezone(MARKET_TZ).date().isoformat()
         if str(ev.get("expiry")) == today:
-            return False, "it expires today and you skip same-day (0DTE) contracts"
+            return (False, "it expires today and you skip same-day (0DTE) contracts",
+                    "rule_0dte", {})
     limit = _num(cfg.get("rule_loss_streak"), int)
     if limit and loss_streak(today_trades) >= limit:
-        return False, (f"{limit} losing exit(s) in a row today — no new entries "
-                       "until tomorrow")
-    return True, ""
+        return (False, (f"{limit} losing exit(s) in a row today — no new entries "
+                        "until tomorrow"), "rule_loss_streak", {"losses": limit})
+    return True, "", "", {}
+
+
+RULE_CODES = ("rule_not_in_list", "rule_skip_list", "rule_side",
+              "rule_min_strike", "rule_0dte", "rule_loss_streak")
 
 
 def active(cfg):

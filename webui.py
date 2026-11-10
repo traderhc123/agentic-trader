@@ -3105,8 +3105,13 @@ def _broker_display(cfg, last4=""):
 
 
 def start_app(get_status=None, get_trades=None, apply_command=None,
-              cfg_getter=None, wait_finish=False):
-    """One server, one port: /setup (wizard) + /dash (dashboard) + all APIs."""
+              cfg_getter=None, wait_finish=False, get_view=None,
+              get_activity=None):
+    """One server, one port: /setup (wizard) + /dash (dashboard) + all APIs.
+    get_view / get_activity: the running agent's view-model and its pages of
+    older activity (agent.cmd_run), served at /api/v2/status and
+    /api/v2/activity; without them those routes answer from the files, as
+    for a stopped agent."""
     import agent as A
     from brokers.robinhood import RobinhoodMCP, _token_path, content_json
     from lightning_wallet import LNbitsWallet, WalletError
@@ -4139,6 +4144,25 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         limit = (qs.get("limit") or [50])[0]
         return A.trade_page(before=before, limit=limit)
 
+    def d_status_v2(_h):
+        """The dashboard's state as typed data (view_model.py, schema 2).
+        /api/status above is unchanged and stays for the current pages."""
+        if get_view is not None:
+            return get_view()
+        # no agent behind this server (setup): "stopped", from the files.
+        # An agent that handed over no view is running but says nothing
+        # about itself, which the view-model reports as "not answering".
+        return A.view_snapshot({"running": True} if get_status else None)
+
+    def d_activity_v2(h):
+        """Older trade-log rows in the same typed shape as the status's
+        `activity`: ?before=<n>&limit=<k>, like /api/trades."""
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(h.path).query)
+        page = get_activity if get_activity is not None else A.view_activity
+        return page(before=(qs.get("before") or [None])[0],
+                    limit=(qs.get("limit") or [None])[0])
+
     def d_pnl(_h):
         """All-time est. P&L from the whole trade log, incl. pass days."""
         if not get_trades:
@@ -4173,6 +4197,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/tip/options": _tip_options_route,
                     "/api/status": d_status, "/api/trades": d_trades,
                     "/api/pnl": d_pnl,
+                    "/api/v2/status": d_status_v2,
+                    "/api/v2/activity": d_activity_v2,
                     "/api/proposal": proposal_get,
                     "/api/autostart": autostart_get,
                     "/api/move/download": move_download}
@@ -4678,6 +4704,8 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
         return f"Q&A failed: {str(exc)[:150]}"
 
 
-def start_dashboard(get_status, get_trades, apply_command, cfg_getter):
+def start_dashboard(get_status, get_trades, apply_command, cfg_getter,
+                    get_view=None, get_activity=None):
     """Serve the combined app (dashboard + settings) from the running agent."""
-    return start_app(get_status, get_trades, apply_command, cfg_getter)
+    return start_app(get_status, get_trades, apply_command, cfg_getter,
+                     get_view=get_view, get_activity=get_activity)

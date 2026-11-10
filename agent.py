@@ -1521,6 +1521,15 @@ def _mode_label(cfg, state):
     return "DRY-RUN (no orders)"
 
 
+def _mode(cfg):
+    """"practice" (dry-run: new trades are only recorded) or "live" (new
+    trades are real orders) — the one place the dashboard's view-model and
+    the trade log's mode stamp read it from. It is what handle_event does
+    with the same settings: only a true `dry_run` is practice, so settings
+    that never said are live."""
+    return "practice" if (cfg or {}).get("dry_run") else "live"
+
+
 def _paused(cfg):
     """The owner pressed Pause (saved in config.json, so it survives a
     restart): no NEW entries. Exits, the expiry guard and the broker checks
@@ -1623,11 +1632,14 @@ _problems_logged = set()  # (event_id, kind) already written this run
 
 
 def _report_problem(cfg, state, save_state, kind, contract, message,
-                    event_id=None, dry=False, book=None, placed=False):
+                    event_id=None, dry=False, book=None, placed=False,
+                    check=None, params=None, code=None):
     """Write a 'why this trade didn't happen' row to the trade log (what the
     dashboard shows) and notify at most once per kind per day. placed=True:
     the order went in and may have filled (broker_events.report), so the
-    alert says "check this trade", not "trade NOT placed"."""
+    alert says "check this trade", not "trade NOT placed". check / params /
+    code: the entry check it stopped at, its numbers and a more exact
+    reason code, for the dashboard only (_row_facts)."""
     import broker_events
     key = (event_id, kind)
     if event_id and key in _problems_logged:
@@ -1644,7 +1656,8 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
         rec["dry"] = True
     if book:
         rec["book"] = book
-    _log_trade(rec)
+    _log_trade(_row_facts(rec, cfg, check, params=params, code=code,
+                          sent=True if placed else None))
     if kind not in broker_events.NOTIFY or dry:
         return
     today = datetime.now(timezone.utc).date().isoformat()
@@ -2690,6 +2703,122 @@ def _order_lock():
     return platform_compat.ORDER_LOCK
 
 
+# The checks a new ENTERED signal has to pass, IN THE ORDER handle_event runs
+# them, each with the trade-log kinds ("action") a signal stopped there is
+# logged as. This is the one list: handle_event writes a check's id on the
+# row it logs ("check"), and the dashboard's "stopped here" drawer shows the
+# list as it is here (its view-model) — tests/test_entry_checks.py fails if
+# the order in handle_event and this list ever differ. The last two run
+# inside the broker adapter (or its dry-run stand-in), where the contract
+# lookup, the quote and the size are worked out together before the order.
+# Steps that log nothing are not listed: a malformed signal, one from before
+# the agent was watching, a replay of a signal whose position the owner
+# closed. Exits are never checked against any of these.
+ENTRY_CHECKS = (
+    ("signal_fresh", ("skip_stale",)),
+    ("not_paused", ("skip_paused",)),
+    ("before_expiry_guard", ("skip_rule",)),
+    ("daily_cap", ("skip_daily_cap",)),
+    ("position_cap", ("skip_position_cap",)),
+    ("daily_loss", ("skip_daily_loss",)),
+    ("your_rules", ("skip_rule",)),
+    ("written_rules", ("skip_ai_needed", "policy_veto")),
+    ("trade_size", ("skip_sizing", "skip_budget", "skip_no_quote")),
+    ("broker_order", ("skip_no_contract", "broker_lookup_failed",
+                      "broker_disconnected", "order_failed",
+                      "entry_unfilled", "broker_no_order")),
+)
+
+
+def _check_of_kind(kind):
+    """The check a row of this kind was stopped at, when only one check
+    logs that kind; else None (skip_rule: two checks log it)."""
+    hits = [c for c, kinds in ENTRY_CHECKS if kind in kinds]
+    return hits[0] if len(hits) == 1 else None
+
+
+# Everything the dashboard's view-model wants to know about a trade-log row
+# that the row did not say before goes under this ONE optional key, so no
+# existing reader of the log meets a new field: the limits, the P&L, the
+# loss-streak rule and the classic Activity list never look at it, and it is
+# taken out of the rows the AI policy check is shown (_rows_without_facts),
+# so that prompt is what it always was. A row without it is an older row:
+# the dashboard then says "unknown", never a guess.
+ROW_FACTS_KEY = "ui"
+
+
+def _row_facts(rec, cfg, check=None, **facts):
+    """Add the dashboard's facts to a row before it is logged, and return
+    the row.
+      mode    "live" | "practice": what NEW trades used when it was written
+      check   the ENTRY_CHECKS id an entry signal stopped at
+      params  the numbers behind the reason (the cap, the loss so far…)
+      book    "main" | "other" (entry and exit rows carry no "book")
+      qty, mark, sent, filled   see _trade_facts
+    Never raises: the row is logged with or without them."""
+    try:
+        ui = {"mode": _mode(cfg)}
+        if check:
+            ui["check"] = str(check)
+        for k, v in facts.items():
+            if k == "params":
+                v = {str(a): b for a, b in (v or {}).items()
+                     if isinstance(b, (int, float, str))
+                     and not isinstance(b, bool)}
+            if v is not None and v != {}:
+                ui[k] = v
+        json.dumps(ui)  # a fact that can't be written must not cost the row
+        rec[ROW_FACTS_KEY] = ui
+    except Exception:
+        pass
+    return rec
+
+
+def _trade_facts(record, cfg, book, dry, row, prior_pos, mark, sold):
+    """_row_facts for an entry or exit row the agent is about to log: which
+    book, how many contracts, the per-share quote the P&L estimate used
+    (brokers don't report fill prices back), whether an order went to the
+    broker and whether it has filled. `row`: the ledger row after the
+    order, `prior_pos`: before it. Never raises."""
+    try:
+        facts = {"book": "main" if book == "main" else "other",
+                 "sent": not dry}
+        if record.get("action") == "entry":
+            qty = _int0((row or {}).get("qty"))
+            # a real buy that is still working at the broker isn't filled yet
+            facts["filled"] = (not dry) and not (row or {}).get("pending")
+        else:
+            qty = (_int0((prior_pos or {}).get("qty")) if dry
+                   else _int0(sold))
+            facts["filled"] = (not dry) and qty >= 1
+        if qty >= 1:
+            facts["qty"] = qty
+        if isinstance(mark, (int, float)) and mark > 0:
+            facts["mark"] = round(float(mark), 4)
+        _row_facts(record, cfg, **facts)
+    except Exception:
+        pass
+    return record
+
+
+def _rule_facts(cfg, ev, today_rows):
+    """Which built-in rule said no, as a code and its numbers (the sentence
+    is already on the row). {} when it can't be told. Never raises."""
+    try:
+        import rules
+        _ok, _why, code, params = rules.check_detail(cfg, ev, today_rows)
+        return {"code": code or None, "params": params}
+    except Exception:
+        return {}
+
+
+def _rows_without_facts(rows):
+    """Trade-log rows as they were before ROW_FACTS_KEY existed — what the
+    AI policy check and the Q&A box are shown."""
+    return [{k: v for k, v in r.items() if k != ROW_FACTS_KEY}
+            if isinstance(r, dict) else r for r in rows]
+
+
 @_order_in_flight
 def handle_event(ev, cfg, state, broker, client, save_state):
     """Run one new event through the safety pipeline. Returns a log line or None."""
@@ -2712,7 +2841,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         _report_problem(cfg, state, save_state, "skip_stale", contract,
                         f"signal was {int(cfg.get('max_event_age_s', 300))}s+ old "
                         "when the agent saw it (computer asleep or offline?)",
-                        event_id=ev["event_id"], book=book)
+                        event_id=ev["event_id"], book=book, check="signal_fresh",
+                        params={"max_age_s": int(cfg.get("max_event_age_s", 300))})
         return msg
 
     pos_key = f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
@@ -2736,8 +2866,9 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         msg = (f"SKIPPED {contract}: the agent is paused — no new entries "
                "until you press Resume")
         print(msg)
-        _log_trade({"action": "skip_paused", "book": book, "event_id": ev["event_id"],
-                    "contract": contract})
+        _log_trade(_row_facts(
+            {"action": "skip_paused", "book": book, "event_id": ev["event_id"],
+             "contract": contract}, cfg, "not_paused"))
         return msg
     if ev["event"] == "ENTERED":
         # A contract that expires today, past the expiry guard time: the
@@ -2749,8 +2880,11 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                    f"({_hm(guard_at)} ET)")
             msg = f"SKIPPED {contract}: {why}"
             print(msg)
-            _log_trade({"action": "skip_rule", "book": book, "event_id": ev["event_id"],
-                        "contract": contract, "reason": why})
+            _log_trade(_row_facts(
+                {"action": "skip_rule", "book": book, "event_id": ev["event_id"],
+                 "contract": contract, "reason": why}, cfg,
+                "before_expiry_guard", code="past_expiry_guard",
+                params={"guard_et": _hm(guard_at)}))
             return msg
         # Hard mechanical caps — independent of (and checked before) the LLM.
         # Counted from the rows of the mode the agent is in: real trades
@@ -2760,8 +2894,10 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         if _entries_today(dry_mode) >= cap:
             msg = f"SKIPPED {contract}: daily entry cap reached ({cap})"
             print(msg)
-            _log_trade({"action": "skip_daily_cap", "book": book, "event_id": ev["event_id"],
-                        "contract": contract})
+            _log_trade(_row_facts(
+                {"action": "skip_daily_cap", "book": book, "event_id": ev["event_id"],
+                 "contract": contract}, cfg, "daily_cap",
+                params={"cap": cap}))
             return msg
         # Concurrent-exposure cap: the daily cap resets every day, so without
         # this a feed could accumulate unbounded open positions across days.
@@ -2770,8 +2906,10 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             msg = (f"SKIPPED {contract}: max open positions reached "
                    f"({pos_cap}) — close positions or raise max_open_positions")
             print(msg)
-            _log_trade({"action": "skip_position_cap", "book": book, "event_id": ev["event_id"],
-                        "contract": contract})
+            _log_trade(_row_facts(
+                {"action": "skip_position_cap", "book": book,
+                 "event_id": ev["event_id"], "contract": contract}, cfg,
+                "position_cap", params={"max_open": pos_cap}))
             return msg
         # Max daily loss (opt-in): once today's estimated realized loss reaches
         # the limit, stop opening positions. Exits are never blocked.
@@ -2783,22 +2921,29 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                        f"(est. ${-pnl:,.0f} of ${loss_cap:,.0f}) — no new "
                        "entries until tomorrow")
                 print(msg)
-                _log_trade({"action": "skip_daily_loss", "book": book, "event_id": ev["event_id"],
-                            "contract": contract})
+                _log_trade(_row_facts(
+                    {"action": "skip_daily_loss", "book": book,
+                     "event_id": ev["event_id"], "contract": contract}, cfg,
+                    "daily_loss", params={"max_loss_usd": loss_cap,
+                                          "loss_usd": round(-pnl, 2)}))
                 return msg
         # Built-in rules (plain settings, no AI): tickers, calls/puts, min
         # strike, no 0DTE, stop after a losing streak.
         import rules
-        ok, why = rules.check(cfg, ev, [t for t in _trades_today()
-                                        if bool(t.get("dry")) == dry_mode])
+        today_rows = [t for t in _trades_today()
+                      if bool(t.get("dry")) == dry_mode]
+        ok, why = rules.check(cfg, ev, today_rows)
         if not ok:
             msg = f"SKIPPED {contract}: {why} (your rules)"
             print(msg)
-            _log_trade({"action": "skip_rule", "book": book, "event_id": ev["event_id"],
-                        "contract": contract, "reason": why})
+            _log_trade(_row_facts(
+                {"action": "skip_rule", "book": book, "event_id": ev["event_id"],
+                 "contract": contract, "reason": why}, cfg, "your_rules",
+                **_rule_facts(cfg, ev, today_rows)))
             return msg
         # The user's own policy, applied by the LLM policy brain (veto-only).
-        verdict = llm_policy.evaluate(cfg, ev, _recent_trades(20))
+        verdict = llm_policy.evaluate(
+            cfg, ev, _rows_without_facts(_recent_trades(20)))
         if not verdict["act"] and verdict.get("ai_problem"):
             # NOT the owner's rules saying no: the AI that checks them is
             # missing or failing, so every entry is being skipped. Log it as
@@ -2816,14 +2961,16 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 rec["hint"] = hint
             if cfg.get("dry_run"):
                 rec["dry"] = True
-            _log_trade(rec)
+            _log_trade(_row_facts(rec, cfg, "written_rules"))
             _notify_ai_problem_once(cfg, state, save_state, contract, reason)
             return msg
         if not verdict["act"]:
             msg = f"POLICY VETO {contract}: {verdict['reason']}"
             print(msg)
-            _log_trade({"action": "policy_veto", "book": book, "event_id": ev["event_id"],
-                        "contract": contract, "reason": verdict["reason"]})
+            _log_trade(_row_facts(
+                {"action": "policy_veto", "book": book, "event_id": ev["event_id"],
+                 "contract": contract, "reason": verdict["reason"]}, cfg,
+                "written_rules"))
             return msg
         policy_reason = verdict["reason"]
     else:
@@ -2859,7 +3006,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             msg = f"{'[DRY-RUN] ' if dry else ''}SKIPPED {contract}: {skip}"
             print(msg)
             _report_problem(cfg, state, save_state, "skip_sizing", contract, skip,
-                            event_id=ev["event_id"], dry=dry, book=book)
+                            event_id=ev["event_id"], dry=dry, book=book,
+                            check="trade_size")
             return msg
     if ev["event"] == "EXITED" and existing and not dry:
         if (existing.get("pending") or {}).get("side") == "sell":
@@ -2917,7 +3065,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             ecfg, ev, state, broker, client,
             on_skip=lambda kind, note: _report_problem(
                 cfg, state, save_state, kind, contract, note,
-                event_id=ev["event_id"], dry=True, book=book))
+                event_id=ev["event_id"], dry=True, book=book,
+                check="trade_size"))
         prefix = "[DRY-RUN] "
     else:
         import broker_events
@@ -2964,13 +3113,16 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                     msg += f" (buying power now ${bp:,.2f})"
             _report_problem(cfg, state, save_state, r["kind"], contract, msg,
                             event_id=ev["event_id"], book=book,
-                            placed=r.get("placed", False))
+                            placed=r.get("placed", False),
+                            check=(_check_of_kind(r["kind"])
+                                   if ev["event"] == "ENTERED" else None))
         if (not action and ev["event"] == "ENTERED" and not existing
                 and not reported and not adopted):
             _report_problem(cfg, state, save_state, "broker_no_order", contract,
                             "the broker adapter didn't place the order and gave "
                             "no reason — see agent-run.log",
-                            event_id=ev["event_id"], book=book)
+                            event_id=ev["event_id"], book=book,
+                            check="broker_order")
         if not action and ev["event"] == "EXITED":
             held = state["positions"].get(pos_key)
             if held and not held.get("pending"):
@@ -2991,6 +3143,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                   "contract": contract, "dry": dry, "reason": policy_reason}
         if ev.get("exit_cause"):  # e.g. "expiry_guard": not a feed signal
             record["cause"] = str(ev["exit_cause"])
+        mark = None  # the quote the estimate used (_trade_facts)
         if action == "entry" and pos_key in state["positions"]:
             row = state["positions"][pos_key]
             mark = _mark(broker, client, ecfg, ev, "buy")
@@ -3002,7 +3155,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 row["last_order_at"] = max(_float0(row.get("last_order_at")), _now())
                 row.setdefault("acct", _account_tag(cfg, broker, client))
         elif action == "exit" and sold is None:  # dry run
-            est = _est_exit_pnl(prior_pos, _mark(broker, client, ecfg, ev, "sell"), ev)
+            mark = _mark(broker, client, ecfg, ev, "sell")
+            est = _est_exit_pnl(prior_pos, mark, ev)
             if est is not None:
                 record["est_pnl_usd"] = est
         elif action == "exit":
@@ -3014,8 +3168,9 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                     record.update(partial=True, remaining=_int0(left.get("qty")))
             # contracts an earlier exit row already counted get no estimate
             counted = sold - min(sold, _int0((prior_pos or {}).get("exit_logged")))
-            est = (_est_exit_pnl({**(prior_pos or {}), "qty": counted},
-                                 _mark(broker, client, ecfg, ev, "sell"), ev)
+            if counted >= 1:
+                mark = _mark(broker, client, ecfg, ev, "sell")
+            est = (_est_exit_pnl({**(prior_pos or {}), "qty": counted}, mark, ev)
                    if counted >= 1 else None)
             if est is not None:
                 record["est_pnl_usd"] = est
@@ -3028,7 +3183,9 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             for old in _ids((buried if isinstance(buried, dict) else {})
                             .get("held_exits")):
                 _note_stale_exit(state, old)
-        _log_trade(record)
+        _log_trade(_trade_facts(record, cfg, book, dry,
+                                state["positions"].get(pos_key), prior_pos,
+                                mark, sold))
         save_state(state)
         return f"{prefix}{action.upper()}: {contract}"
     return None
@@ -3184,7 +3341,8 @@ def _skip_exited_entry(ev, cfg, state, save_state):
                     "the exit for this trade had already arrived when the "
                     "agent first saw the entry, so it was not bought",
                     event_id=ev["event_id"],
-                    book="main" if str(ev.get("track", "main")) == "main" else "shadow")
+                    book="main" if str(ev.get("track", "main")) == "main" else "shadow",
+                    check="signal_fresh", code="exit_already_arrived")
     return msg
 
 
@@ -5090,6 +5248,126 @@ def _command(t, cfg, text):
     return False, ""
 
 
+# ── the dashboard's view-model (GET /api/v2/status) ─────────────────────────
+# What only the running loop knows, for the dashboard: when it last started
+# a cycle, how long it then sleeps, when it last read the signal feed and
+# whether that worked. Written by cmd_run (_loop_note), read by its status
+# closure; nothing in the agent decides anything from it.
+LOOP = {}
+
+
+def _loop_note(**facts):
+    """Remember facts about the running loop for the dashboard. Never raises."""
+    try:
+        LOOP.update(facts)
+    except Exception:
+        pass
+
+
+def _loop_note_poll(source, events, poll_error):
+    """The loop just read the signal feed (or failed to): note when, whether
+    it worked, whether it could see entry signals, and when the newest
+    signal it listed happened. Never raises."""
+    try:
+        ok = poll_error is None
+        newest = _newest_signal_time(events) if ok else None
+        before = LOOP.get("signal_at")
+        _loop_note(poll_at=time.time(), poll_ok=ok,
+                   feed_access=_poll_had_access(source) if ok else None,
+                   signal_at=(max(before or 0.0, newest or 0.0) or None))
+    except Exception:
+        pass
+
+
+def _newest_signal_time(events):
+    """Epoch seconds of the newest signal in a poll's events that says when
+    it happened, or None."""
+    newest = None
+    try:
+        for ev in events or ():
+            ts = ev.get("occurred_at") if isinstance(ev, dict) else None
+            if not ts:
+                continue
+            try:
+                at = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            newest = at.timestamp() if newest is None else max(newest, at.timestamp())
+    except Exception:
+        return newest
+    return newest
+
+
+_VIEW_LOG = {"snap": (None, [])}  # (the file's size and time, its rows)
+
+
+def _view_rows():
+    """Every trade-log row for the view-model, oldest first, each with its
+    line number; rows this run could not write yet come last, numbered on.
+    The dashboard asks every few seconds and the log only grows by appends,
+    so the parsed rows are kept until the file's size or time changes."""
+    try:
+        st = os.stat(TRADES_PATH)
+        key = (TRADES_PATH, st.st_size, st.st_mtime_ns)
+    except OSError:
+        key = None
+    kept_key, kept = _VIEW_LOG["snap"]
+    if key is None or kept_key != key:
+        kept = _read_trade_log()
+        _VIEW_LOG["snap"] = (key, kept)  # one assignment: other threads read it
+    rows = list(kept)
+    n = rows[-1]["n"] + 1 if rows else 0
+    for i, r in enumerate(_unwritten_rows()):
+        rows.append({**r, "n": n + i})
+    return rows
+
+
+def _view_hold():
+    """(kind, since, recorded) of the full hold the loop is on — the same
+    three cases cmd_run's `held` is made of — or (None, None, None)."""
+    import webui
+    if _handed_off():
+        return "handoff_hold", None, None
+    if _state_held():
+        rec = _state_hold()
+        return "state_hold", (rec or {}).get("at"), rec is not None
+    if webui.orders_held():
+        return "restarting", None, None
+    return None, None, None
+
+
+def view_snapshot(runtime=None, cfg=None):
+    """The dashboard's whole state as data (view_model.build_status). Reads
+    the settings, the agent's memory and the trade log; `runtime` is what
+    only a running loop knows (None: no agent behind this server). `cfg`:
+    the settings the agent runs on, shown when config.json can't be read."""
+    import view_model
+    c = _load(CONFIG_PATH, None)
+    readable = isinstance(c, dict) and bool(c)
+    if not readable:
+        c = cfg if isinstance(cfg, dict) else {}
+    st = _load(STATE_PATH, {}) or {}
+    rt = dict(runtime) if isinstance(runtime, dict) else {"running": False}
+    rt.setdefault("settings_readable",
+                  readable or not os.path.exists(CONFIG_PATH))
+    if callable(rt.get("notices")):  # the banners, from the same c and st
+        try:
+            rt["notices"] = rt["notices"](c, st)
+        except Exception:
+            rt["notices"] = []
+    return view_model.build_status(c, st, _view_rows(), rt)
+
+
+def view_activity(before=None, limit=None):
+    """One page of the trade log as view-model Activity rows."""
+    import view_model
+    return view_model.activity_page(
+        _view_rows(), before=before,
+        limit=view_model.ACTIVITY_LIMIT if limit is None else limit)
+
+
 def cmd_run(app_window=False):
     import keep_running
     # One copy only: two heartbeats on the same config would place every
@@ -5247,10 +5525,61 @@ def cmd_run(app_window=False):
                 {"level": "warn", "text": "Check for a second copy: " + deploy_warn}]
         return s
 
+    def get_view():
+        # the same facts as get_status, as data (view_model.py)
+        hold, hold_since, hold_recorded = _view_hold()
+        err = getattr(client, "last_error", None)
+        tracked = client is not None and hasattr(client, "last_error")
+
+        try:
+            ai_blocked = llm_policy.entries_blocked(cfg)
+        except Exception:
+            ai_blocked = False
+
+        def notices(c, st):
+            # the banners get_status shows, each with a code
+            out = [{**w, "code": "records"} for w in _durability_banner()]
+            out += [{**w, "code": "expiry"} for w in expiry_banner(
+                c, st, paused=bool(_full_hold_note()), acct=_status_acct(c))]
+            if cash.get("warning"):
+                out.append({"level": "warn", "code": "low_cash",
+                            "text": cash["warning"]})
+            if deploy_warn:
+                out.append({"level": "warn", "code": "second_copy",
+                            "text": "Check for a second copy: " + deploy_warn})
+            return out
+
+        return view_snapshot({
+            "running": True,
+            "stopping": bool(webui.CONTROLS["stop"]),
+            "started_at": LOOP.get("started_at"),
+            "heartbeat_at": LOOP.get("beat_at"),
+            "wait_s": LOOP.get("wait_s"),
+            "hold": hold, "hold_since": hold_since,
+            "hold_recorded": hold_recorded,
+            "poll_at": LOOP.get("poll_at"), "poll_ok": LOOP.get("poll_ok"),
+            "signal_at": LOOP.get("signal_at"),
+            "feed_access": LOOP.get("feed_access"),
+            "ai_blocked": ai_blocked,
+            "broker": {
+                "id": _broker_name(cfg, broker),
+                "account_tag": _status_acct(cfg),
+                "connected": (not err) if tracked else None,
+                "down_since": getattr(client, "down_since", None),
+                "last_ok_at": getattr(client, "last_ok_at", None),
+                "last_error": err,
+                "buying_power": cash.get("bp"),
+                "buying_power_at": cash.get("at"),
+            },
+            "notices": notices,
+        }, cfg)
+
     def start_dash():
         return webui.start_dashboard(
-            status_with_deploy_warning, lambda: list(reversed(_recent_trades(25))),
-            _apply_command, lambda: _load(CONFIG_PATH, {}) or {})
+            status_with_deploy_warning,
+            lambda: _rows_without_facts(list(reversed(_recent_trades(25)))),
+            _apply_command, lambda: _load(CONFIG_PATH, {}) or {},
+            get_view=get_view, get_activity=view_activity)
 
     dash_url = None
     try:
@@ -5307,9 +5636,12 @@ def cmd_run(app_window=False):
     # "at" = when the previous loop STARTED, so a loop that hangs (not only
     # a sleep) shows up as a gap at the next start
     beat = {"at": _now(), "wait": 0.0, "saved": 0.0}
+    _loop_note(started_at=beat["at"], beat_at=None, wait_s=None, poll_at=None,
+               poll_ok=None, feed_access=None, signal_at=None)
     while True:
         keep_running.touch_alive()
         now_beat = _now()
+        _loop_note(beat_at=now_beat)
         if now_beat - beat["at"] - beat["wait"] > EXPIRY_WAKE_GAP_S:
             # the computer slept (or the loop hung): same check as at startup
             print(f"heartbeat resumed after {(now_beat - beat['at']) / 60:.0f} "
@@ -5419,6 +5751,7 @@ def cmd_run(app_window=False):
                     try:
                         events = source.poll(cfg, state, save_state)
                     except Exception as exc:
+                        _loop_note_poll(source, None, exc)  # (dashboard)
                         if not _exits_to_retry(state):
                             raise
                         # the feed can't be read, but the exits the agent
@@ -5426,6 +5759,7 @@ def cmd_run(app_window=False):
                         poll_error, events = exc, []
                     if poll_error is None:
                         note_watching(cfg, access=_poll_had_access(source))
+                        _loop_note_poll(source, events, None)  # (dashboard)
                     else:
                         feed_read = False
                 # Also while paused and when the feed wasn't read: the exits
@@ -5478,6 +5812,7 @@ def cmd_run(app_window=False):
             if expiry_guard_busy(cfg, state):
                 wait = min(wait, EXPIRY_GUARD_POLL_S)
         beat["wait"] = wait
+        _loop_note(wait_s=wait)
         try:
             _sleep_unless_stopped(wait, webui.CONTROLS)
         except KeyboardInterrupt:

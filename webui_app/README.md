@@ -24,6 +24,18 @@ login link once so the browser has the session cookie, then `npm run dev`
 and open `http://127.0.0.1:5173/dash` (or `/setup`). Use 127.0.0.1, not
 localhost, so the cookie applies. API calls proxy to 8721.
 
+## The typed status (`/api/v2/status`)
+
+`src/lib/viewModel.ts` is the type of what `GET /api/v2/status` and
+`GET /api/v2/activity` return. It is **generated** from the schema in
+`../view_model.py` — never edit it by hand:
+
+```bash
+python view_model.py --ts     # from the repo folder; no Node needed
+```
+
+A test fails when the file and the Python schema differ.
+
 ## Rules this app follows
 
 - No network loads at runtime: fonts (IBM Plex, via @fontsource) and all
