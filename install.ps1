@@ -47,8 +47,8 @@ if (-not $Python) {
 
 # git is preferred but NOT required - without it we download a snapshot zip
 # (Expand-Archive ships with Windows). `.venv` and local edits are left in place.
-function Get-Snapshot {
-    Write-Host "git not found - downloading a snapshot of the code instead..."
+function Get-Snapshot($Why = "git not found") {
+    Write-Host "$Why - downloading a snapshot of the code instead..."
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ("agentic-trader-" + [Guid]::NewGuid())
     New-Item -ItemType Directory -Path $tmp | Out-Null
     $zip = Join-Path $tmp "src.zip"
@@ -65,9 +65,17 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
         Write-Host "Existing install found at $Dir - updating..."
         git -C $Dir pull --ff-only
     } elseif (Test-Path (Join-Path $Dir "agent.py")) {
-        Get-Snapshot   # zip install being re-run on a box that now has git
+        # zip install being re-run on a box that now has git
+        Get-Snapshot "Updating the copy already here"
     } else {
         git clone --depth 1 $Repo $Dir
+        if ($LASTEXITCODE -ne 0) {
+            # a clone can fail (proxy, antivirus, git blocked) - the snapshot
+            # download uses plain HTTPS like a browser, so try that first
+            $half = Join-Path $Dir ".git"
+            if (Test-Path $half) { Remove-Item $half -Recurse -Force }
+            Get-Snapshot "git could not download the code"
+        }
     }
 } else {
     Get-Snapshot
@@ -75,12 +83,27 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
 
 Set-Location $Dir
 $VenvPy = Join-Path $Dir ".venv\Scripts\python.exe"
-if (-not ((Test-Path $VenvPy) -and (Test-Py $VenvPy @()))) {
+# A usable .venv has a new-enough Python AND pip. A half-made one (an
+# interrupted or blocked first run) is rebuilt, not reused.
+function Test-Venv {
+    if (-not ((Test-Path $VenvPy) -and (Test-Py $VenvPy @()))) { return $false }
+    try {
+        & $VenvPy -m pip --version 2>$null | Out-Null
+        return $LASTEXITCODE -eq 0
+    } catch { return $false }
+}
+if (-not (Test-Venv)) {
     if (Test-Path ".venv") { Remove-Item ".venv" -Recurse -Force }
     & $Python @PyArgs -m venv .venv
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $VenvPy)) {
+        throw "could not create the Python environment (.venv) - see the message above, then run this installer again"
+    }
 }
 & $VenvPy -m pip install --quiet --upgrade pip
 & $VenvPy -m pip install --quiet -r requirements.txt
+if ($LASTEXITCODE -ne 0) {
+    throw "installing the Python packages failed - see the message above. Check your internet connection, then run this installer again"
+}
 
 Write-Host ""
 Write-Host "Installed to $Dir"

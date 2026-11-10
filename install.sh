@@ -17,9 +17,22 @@ echo "== agentic-trader installer =="
 
 py_ok() { "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; }
 
+# On a Mac without Apple's developer tools, /usr/bin/python3 and /usr/bin/git
+# are placeholders: RUNNING one only pops up the "install developer tools"
+# dialog and fails. Never run those — there is a way without them below.
+# (AGENTIC_TRADER_APPLE_STUB_DIR exists only so the tests can stand in for
+# /usr/bin.)
+APPLE_STUB_DIR="${AGENTIC_TRADER_APPLE_STUB_DIR:-/usr/bin}"
+mac_placeholder() {
+  [ "${1%/*}" = "$APPLE_STUB_DIR" ] && [ "$(uname -s)" = "Darwin" ] \
+    && ! xcode-select -p >/dev/null 2>&1
+}
+
 PYTHON=""
 for c in python3.13 python3.12 python3.11 python3.10 python3; do
-  if command -v "$c" >/dev/null 2>&1 && py_ok "$c"; then PYTHON="$(command -v "$c")"; break; fi
+  p="$(command -v "$c" 2>/dev/null)" || continue
+  if mac_placeholder "$p"; then continue; fi
+  if py_ok "$p"; then PYTHON="$p"; break; fi
 done
 
 if [ -z "$PYTHON" ]; then
@@ -37,7 +50,7 @@ fi
 # Without git we download a snapshot tarball instead (curl+tar are always
 # present on macOS/Linux). `.venv` and any local edits are left in place.
 fetch_snapshot() {
-  echo "git not found — downloading a snapshot of the code instead…"
+  echo "${1:-git not found} — downloading a snapshot of the code instead…"
   TMP="$(mktemp -d)"
   curl -fsSL "https://codeload.github.com/traderhc123/agentic-trader/tar.gz/refs/heads/main" \
     | tar -xz -C "$TMP"
@@ -46,23 +59,57 @@ fetch_snapshot() {
   rm -rf "$TMP"
 }
 
-if command -v git >/dev/null 2>&1; then
+# "git is on the PATH" is not "git works": on a stock Mac /usr/bin/git is a
+# placeholder that only opens the "install developer tools" dialog and fails.
+git_works() {
+  command -v git >/dev/null 2>&1 || return 1
+  if mac_placeholder "$(command -v git)"; then
+    return 1   # the placeholder — don't run it, that pops the dialog
+  fi
+  git --version >/dev/null 2>&1
+}
+
+if git_works; then
   if [ -d "$DIR/.git" ]; then
     echo "Existing install found at $DIR — updating…"
     git -C "$DIR" pull --ff-only
   elif [ -f "$DIR/agent.py" ]; then
-    fetch_snapshot   # tarball install being re-run on a box that now has git
+    # tarball install being re-run on a box that now has git
+    fetch_snapshot "Updating the copy already here"
   else
-    git clone --depth 1 "$REPO" "$DIR"
+    # a clone can still fail (proxy, antivirus, git blocked) — the snapshot
+    # download uses plain HTTPS like a browser, so try that before giving up
+    git clone --depth 1 "$REPO" "$DIR" || {
+      rm -rf "$DIR/.git"
+      fetch_snapshot "git could not download the code"
+    }
   fi
 else
   fetch_snapshot
 fi
 
 cd "$DIR"
-if [ ! -x .venv/bin/python ] || ! py_ok .venv/bin/python; then
+# A usable .venv has a new-enough Python AND pip. A half-made one (python but
+# no pip — what a failed `python -m venv` leaves behind on Ubuntu/Debian
+# without the python3-venv package) is rebuilt, not reused.
+venv_ok() {
+  [ -x .venv/bin/python ] && py_ok .venv/bin/python \
+    && ./.venv/bin/python -m pip --version >/dev/null 2>&1
+}
+if ! venv_ok; then
   rm -rf .venv
-  "$PYTHON" -m venv .venv
+  if ! "$PYTHON" -m venv .venv; then
+    rm -rf .venv
+    echo
+    echo "ERROR: could not create the Python environment (.venv) — see the message above."
+    if command -v apt-get >/dev/null 2>&1; then
+      PYVER="$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 3)"
+      echo "On Ubuntu/Debian that part of Python is a separate package. Install it with:"
+      echo "  sudo apt install -y python${PYVER}-venv"
+      echo "then run this installer again."
+    fi
+    exit 1
+  fi
 fi
 ./.venv/bin/python -m pip install --quiet --upgrade pip
 ./.venv/bin/pip install --quiet -r requirements.txt

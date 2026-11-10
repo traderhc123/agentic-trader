@@ -364,6 +364,8 @@ function AgentWallet() {
   );
   const [mwMsg, setMwMsg] = useState<MsgT>(null);
   const [warn, setWarn] = useState("");
+  // after a replace: where the old wallet's details were saved, and that its sats were not moved
+  const [madeNote, setMadeNote] = useState("");
   const [sats, setSats] = useState("16000");
   const satsEdited = useRef(false);
   const [quote, setQuote] = useState("");
@@ -449,6 +451,7 @@ function AgentWallet() {
         setMwMsg(null);
         setMade({ label: replace ? "New wallet created" : "Created", page: r.page });
         setWarn(r.warning || "");
+        setMadeNote(r.note || "");
         if (replace) {
           // the invoice and balance on screen belonged to the old wallet
           setInv(null);
@@ -507,6 +510,7 @@ function AgentWallet() {
         )}
         <Msg m={mwMsg} />
       </div>
+      {madeNote && <p className="m-0 text-sm text-fg2">{madeNote}</p>}
       {warn && <p className="m-0 text-sm text-down">⚠ {warn}</p>}
       <ConfirmDialog
         open={confirmReplace}

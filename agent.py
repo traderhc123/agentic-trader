@@ -378,8 +378,33 @@ _STATE_HELD_NOTE = (
     "yourself if needed.")
 
 
+# The same for a hand-off to a server (transfer.HANDOFF): Resume is refused.
+_HANDOFF_NOTE = (
+    "This setup is being moved, or was moved, to a server. The agent on this "
+    "computer places NO orders at all, exits and the expiry guard included, "
+    "and reads no signals, so the two can never both trade. Resume is "
+    "switched off; if the move fails, the agent carries on here by itself.")
+
+
 def _state_held():
     return bool(_STATE_HELD["on"])
+
+
+def _handed_off():
+    """A move to a server is in progress or done (transfer.HANDOFF): the
+    heartbeat places no orders at all, and `resume` can't lift it."""
+    import transfer
+    return bool(transfer.HANDOFF["hold"])
+
+
+def _full_hold_note():
+    """Why the agent places no orders at all right now — no entries and no
+    exits, unlike the owner's Pause — in the owner's words; "" when it is
+    not on such a hold. (The few seconds before a restart are reported
+    separately: status "restarting".)"""
+    if _handed_off():
+        return _HANDOFF_NOTE
+    return _STATE_HELD_NOTE if _state_held() else ""
 
 
 def _end_state_hold():
@@ -2644,6 +2669,28 @@ def _note_stale_exit(state, event_id):
     state["stale_exits"] = (ids + [str(event_id)])[-_STALE_EXITS_KEPT:]
 
 
+def _order_in_flight(fn):
+    """Hold platform_compat.ORDER_LOCK while `fn` runs, so a restart (update,
+    self-edit, import) waits until an order that was sent to the broker is
+    also saved in the ledger."""
+    import functools
+
+    @functools.wraps(fn)
+    def held(*args, **kwargs):
+        import platform_compat
+        with platform_compat.ORDER_LOCK:
+            return fn(*args, **kwargs)
+    return held
+
+
+def _order_lock():
+    """The same lock for a `with` block: the main loop's order reconcile
+    (cancel, re-place, save) is an order in flight too."""
+    import platform_compat
+    return platform_compat.ORDER_LOCK
+
+
+@_order_in_flight
 def handle_event(ev, cfg, state, broker, client, save_state):
     """Run one new event through the safety pipeline. Returns a log line or None."""
     contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
@@ -4827,6 +4874,17 @@ def _command(t, cfg, text):
                          "resume."
                          if _feed_paid_per_day(cfg) else ""))
     if t == "resume":
+        import transfer
+        if transfer.HANDOFF["hold"] or transfer.moved_away():
+            # handed to a server / another computer: not a pause to undo
+            # (nothing is changed: not the saved pause, not a memory hold)
+            return True, (
+                "Can't resume here: this setup is being moved, or was moved, "
+                "to a server or another computer, and two copies would place "
+                "every order twice. (If a move fails, the agent carries on "
+                "here by itself.) To run it on this computer again after a "
+                "move: stop or destroy the other copy first, then run: "
+                "python agent.py resume-here")
         cfg.pop("paused", None)
         _save(CONFIG_PATH, cfg, private=True)
         was_held = _state_held()
@@ -5015,7 +5073,9 @@ def _command(t, cfg, text):
         note = _dry_run_note(cfg, st) if cfg.get("dry_run") else ""
         dry = bool(cfg.get("dry_run"))  # each mode counts its own trades
         return True, (f"{'DRY-RUN' if cfg.get('dry_run') else 'LIVE'} · "
-                      + ("ON HOLD (memory file was damaged: no orders at "
+                      + ("ON HOLD (being moved to a server: no orders at "
+                         "all) · " if _handed_off() else
+                         "ON HOLD (memory file was damaged: no orders at "
                          "all until you say 'resume') · " if _state_held() else
                          "PAUSED (no new entries; exits still run) · "
                          if _paused(cfg) else "") +
@@ -5043,6 +5103,12 @@ def cmd_run(app_window=False):
         print("Stop it with: python agent.py stop")
         sys.exit(0)
     keep_running.clear_stop()
+    # Not "running" yet: the checks below can still fail. The first loop's
+    # touch_alive() is what tells `start`/`status` that it really started.
+    keep_running.clear_alive()
+    # `docker stop`, `systemctl stop` and a shutdown end it like `agent.py
+    # stop`: the loop finishes what it is doing and exits with code 0
+    keep_running.stop_on_sigterm()
     import transfer
     moved = transfer.moved_away()
     if moved:
@@ -5089,10 +5155,21 @@ def cmd_run(app_window=False):
             sys.exit(1)
 
     def save_state(st):
+        import webui
+        if webui.setup_replaced():
+            # A move file was just imported: state.json on disk is the
+            # imported setup now, and `st` is the one from before. Never
+            # written over it — the agent is on hold until it restarts.
+            return
         # holds the day-pass L402 token; backup: see _load_state
         _save(STATE_PATH, st, private=True, backup=True)
 
     cash = {"at": 0.0, "bp": None, "warning": ""}
+    # A server deployed by an older version did not retire this computer:
+    # both may be trading the same account. Said once (console, notification,
+    # and on the dashboard for this run).
+    import provision
+    deploy_warn = provision.earlier_deploy_warning()
     import dry_run_preview
     import keep_awake
     awake = keep_awake.KeepAwake()
@@ -5116,10 +5193,13 @@ def cmd_run(app_window=False):
         st = _load(STATE_PATH, {"positions": {}})
         return {
             "mode": "DRY-RUN" if c.get("dry_run") else "LIVE",
-            # also on a memory hold (damaged state.json): the dashboard
-            # then offers Resume, which is what ends it
-            "paused": _paused(c) or _state_held(),
-            "pause_note": _STATE_HELD_NOTE if _state_held() else _pause_note(c, st),
+            # also on a full hold: a damaged state.json (the dashboard then
+            # offers Resume, which is what ends it) or a hand-off to a
+            # server (Resume answers why not). "hold": the dashboard then
+            # shows pause_note instead of what the owner's Pause means.
+            "paused": _paused(c) or bool(_full_hold_note()),
+            "hold": bool(_full_hold_note()),
+            "pause_note": _full_hold_note() or _pause_note(c, st),
             # an update or a move is about to restart the agent: until then
             # it reads no signals and places no orders
             "restarting": webui.orders_held(),
@@ -5150,17 +5230,26 @@ def cmd_run(app_window=False):
                    if _broker_conn_desc(client) else {}),
             },
             "cash_warning": cash.get("warning", ""),
-            # the owner's Pause doesn't stop the expiry guard; a memory hold does
+            # the owner's Pause doesn't stop the expiry guard; a full hold does
             "expiry_warnings": _durability_banner() + expiry_banner(
-                c, st, paused=_state_held(), acct=_status_acct(c)),
+                c, st, paused=bool(_full_hold_note()), acct=_status_acct(c)),
             "problems": _problems_with_ai_block(c),
             "budget_hints": _budget_hints(c),
             "would_have": dry_run_preview.summary(c),
         }
 
+    def status_with_deploy_warning():
+        # the dashboard's status, plus (for this run) the one-time warning
+        # about a server made by an older version
+        s = get_status()
+        if deploy_warn:
+            s["expiry_warnings"] = list(s.get("expiry_warnings") or []) + [
+                {"level": "warn", "text": "Check for a second copy: " + deploy_warn}]
+        return s
+
     def start_dash():
         return webui.start_dashboard(
-            get_status, lambda: list(reversed(_recent_trades(25))),
+            status_with_deploy_warning, lambda: list(reversed(_recent_trades(25))),
             _apply_command, lambda: _load(CONFIG_PATH, {}) or {})
 
     dash_url = None
@@ -5206,6 +5295,10 @@ def cmd_run(app_window=False):
         print("\n" + "!" * 72 + "\nWARNING: " + llm_policy.BLOCKED_MSG
               + "\n" + "!" * 72 + "\n")
         notify(cfg, "agentic-trader WARNING: " + llm_policy.BLOCKED_MSG)
+    if deploy_warn:
+        print("\n" + "!" * 72 + "\nWARNING: " + deploy_warn
+              + "\n" + "!" * 72 + "\n")
+        notify(cfg, "agentic-trader WARNING: " + deploy_warn)
     notify(cfg, f"agentic-trader heartbeat started [{mode}], source={cfg['source']}"
                 # never send the login token to a third-party notifier
                 + (f" — dashboard {dash_url.split('?')[0]}" if dash_url else ""))
@@ -5260,14 +5353,24 @@ def cmd_run(app_window=False):
                   list(state["positions"]) or "none")
             notify(cfg, "agentic-trader stopped via dashboard")
             return
+        # A move to a server copies this agent's memory between cycles:
+        # mark "cycle in progress" FIRST, then read the hold (see transfer).
+        transfer.CYCLE_IDLE.clear()
         # Pause (the owner's, in config.json) only stops NEW entries — see
-        # handle_event. `held` is something else: nothing is polled (so
-        # nothing is paid for) and nothing is ordered — no entries, no
-        # exits, no expiry-guard sells. Either an update or a move is about
-        # to restart the agent (a few seconds), or this run started from a
-        # damaged state.json (_state_held) and waits for the owner's Resume:
-        # its memory is in doubt, so it must not sell from it either.
-        held = webui.orders_held() or _state_held()
+        # handle_event. `held` is something else, a FULL stop: nothing is
+        # polled (so nothing is paid for) and nothing is ordered — no
+        # entries, no exits, no owed exits, no expiry-guard sells. Either
+        #  - an update or a move file is about to restart the agent (a few
+        #    seconds; webui.orders_held), or
+        #  - this run started from a damaged state.json (_state_held) and
+        #    waits for the owner's Resume: its memory is in doubt, so it
+        #    must not sell from it either, or
+        #  - this setup is being handed to a server (transfer.HANDOFF): the
+        #    server has, or is getting, a copy of this memory, and an order
+        #    placed here now — an exit included — would be one the server
+        #    doesn't know about, or one it places too.
+        held = (webui.orders_held() or _state_held()
+                or bool(transfer.HANDOFF["hold"]))
         try:
             if not held:
                 try:
@@ -5280,7 +5383,10 @@ def cmd_run(app_window=False):
                     try:
                         # progress any unverified orders (fill verification,
                         # blackout-limit conversion) before new events
-                        broker.reconcile(client, cfg, state, save_state)
+                        # (it cancels and re-places orders and saves at
+                        # the end: no restart may cut in between)
+                        with _order_lock():
+                            broker.reconcile(client, cfg, state, save_state)
                     except Exception as exc:
                         print(f"order reconcile error (non-fatal): {str(exc)[:150]}")
                     for r in broker_events.drain():
@@ -5332,8 +5438,8 @@ def cmd_run(app_window=False):
                 if poll_error is not None:
                     raise poll_error
             else:
-                # restarting, or on hold over a damaged state.json: no
-                # orders, but the remainder alerts still go out
+                # restarting, on hold over a damaged state.json, or handed
+                # to a server: no orders, but the remainder alerts still go out
                 exit_remainder_tick(cfg, state, save_state, broker, client,
                                     paused=True)
         except KeyboardInterrupt:
@@ -5349,8 +5455,11 @@ def cmd_run(app_window=False):
                 _explain_connection_error(exc, cfg, state, save_state)
         # after the feed's own exit signals, and even when the feed is
         # unreachable: sell what expires today, alert on what's still open
-        expiry_guard_tick(cfg, state, save_state, broker, client,
-                          paused=held)
+        try:
+            expiry_guard_tick(cfg, state, save_state, broker, client,
+                              paused=held)
+        finally:
+            transfer.CYCLE_IDLE.set()  # cycle over: state is saved
         try:
             _maybe_daily_digest(cfg, state, save_state)
         except Exception:
@@ -5360,7 +5469,8 @@ def cmd_run(app_window=False):
             dry_run_preview.refresh(cfg, _market_open_now())
         # Market-hours-aware cadence: fast while the market can move, slow
         # overnight/weekends; short while a restart is pending, and while
-        # on hold over a damaged state.json so Resume takes effect at once.
+        # on hold (damaged state.json: Resume takes effect at once; a
+        # hand-off: a move that fails is picked up again at once).
         if held:
             wait = 2
         else:
@@ -5440,8 +5550,24 @@ def cmd_netcheck():
 def cmd_status():
     import keep_running
     pid = keep_running.running_pid()
-    print(f"agent running    : " + (f"yes (pid {pid})" if pid else
-          "yes" if keep_running.is_running() else "no"))
+    if keep_running.is_ready():
+        running = f"yes (pid {pid})" if pid else "yes"
+    elif keep_running.is_running():
+        running = "starting — not trading yet (still in its startup checks)"
+    elif keep_running.supervisor_running():
+        why = keep_running.start_failure()
+        if keep_running.supervisor_status().get("state") != "waiting":
+            # the background process is launching it at this moment (login,
+            # a `start` a second ago, a restart): nothing has failed
+            running = "starting — not trading yet"
+        else:
+            running = ("NO — it stopped with an error and will be started "
+                       "again automatically (cancel: python agent.py stop)"
+                       + (f"\n                   what it said: "
+                          + why.replace("\n", " / ") if why else ""))
+    else:
+        running = "no"
+    print(f"agent running    : {running}")
     auto = keep_running.autostart_status()
     print(f"start at login   : {'on' if auto['enabled'] else 'off'}"
           + (f" ({auto['path']})" if auto["enabled"] else ""))
@@ -5782,6 +5908,7 @@ def cmd_setup_from(path, as_json=False):
         new, report = setup_plan.apply(plan, cfg, consent_ok(), HOME)
     if new is not None:
         _save(CONFIG_PATH, new, private=True)
+        report["sizing"] = _sizing_desc(new)  # incl. the other-trades book
         checks, _ = doctor_checks()
         report["owner_steps"] = [c["fix"] for c in checks
                                  if not c["ok"] and c["who"] == "owner"]
@@ -5791,9 +5918,17 @@ def cmd_setup_from(path, as_json=False):
         print(json.dumps(report, indent=2))
     else:
         if report["ok"]:
-            print("Plan applied (dry-run stays ON):")
+            print("Plan applied:")
             for a in report["applied"]:
                 print(f"  ✓ {a}")
+            if report.get("mode") == "LIVE":
+                print("\nMode: LIVE — this agent places REAL orders. It was "
+                      "already live before the plan; the plan did not change "
+                      "that.")
+            else:
+                print("\nMode: DRY-RUN — no real orders. Only the owner can "
+                      "go live (`dry off` in the dashboard).")
+            print(f"Trade size now: {report.get('sizing', '?')}")
             if report["owner_steps"]:
                 print("\nStill needs the OWNER:")
                 for s_ in report["owner_steps"]:
@@ -5820,12 +5955,19 @@ def _dashboard_link():
     return f"http://127.0.0.1:{webui.APP_PORT}/dash?k={webui.ui_token()}"
 
 
-def _open_running_dashboard():
+def _open_running_dashboard(wait=0.0):
     """If the agent is already running, open its dashboard instead of
     starting anything (the wizard and a second agent can't share its port).
-    Returns True if it was running."""
+    Returns True if it was running. "Running" = past its startup checks
+    (keep_running.is_ready): a copy that is still in them may be about to
+    stop with an error (broker login expired), and its dashboard isn't up.
+    `wait`: seconds to give such a copy to either come up or give up."""
     import keep_running
-    if not keep_running.is_running():
+    end = time.time() + wait
+    while (keep_running.is_running() and not keep_running.is_ready()
+           and time.time() < end):
+        time.sleep(0.5)
+    if not keep_running.is_ready():
         return False
     link = _dashboard_link()
     print("Your agent is already running. Its dashboard (settings live there "
@@ -5855,7 +5997,7 @@ def cmd_start(open_dashboard=False, app_window=False):
     it, and it restarts itself after a crash."""
     import keep_running
     import webui
-    if keep_running.is_running():
+    if keep_running.is_ready():
         print("The agent is already running.")
         print(f"Dashboard: {_dashboard_link()}")
         if open_dashboard:
@@ -5870,9 +6012,23 @@ def cmd_start(open_dashboard=False, app_window=False):
               "To run it here again (stop the other one first): "
               "python agent.py resume-here")
         sys.exit(1)
-    proc = keep_running.start_background(port=webui.APP_PORT)
-    print("Starting the agent in the background…")
-    if keep_running.wait_until_running(timeout=40, proc=proc):
+    before = keep_running.supervisor_status()
+    proc = None
+    keeper_up = keep_running.supervisor_running()
+    waiting = keeper_up and before.get("state") == "waiting"
+    if keep_running.is_running() or (keeper_up and not waiting):
+        # A copy holds the one-copy lock but isn't up yet, or the background
+        # process is launching one at this moment (login, a `start` a second
+        # ago): it is starting now.
+        print("The agent is already starting — waiting for it…")
+    else:
+        if waiting:
+            print("An earlier start failed and the agent was waiting to try "
+                  "again — trying again now…")
+        # a waiting supervisor is asked to retry now (never a second one)
+        proc = keep_running.start_background(port=webui.APP_PORT)
+        print("Starting the agent in the background…")
+    if keep_running.wait_until_running(timeout=40, proc=proc, before=before):
         print("Running. You can close this window — the agent keeps going.")
         print(f"Dashboard: {_dashboard_link()}")
         if open_dashboard:
@@ -5882,10 +6038,33 @@ def cmd_start(open_dashboard=False, app_window=False):
         if not keep_running.autostart_enabled():
             print("Start it automatically at login: python agent.py autostart on")
         return
-    print("It didn't start. Last lines of the log "
-          f"({keep_running.log_path()}):")
-    for line in keep_running.last_log_lines():
-        print("  " + line)
+    why = keep_running.start_failure(before)
+    if why is None and (keep_running.is_running()
+                        or keep_running.supervisor_running()):
+        # no failure, just slow (e.g. the broker is slow to answer)
+        print("It is still starting — it is NOT trading yet. Check in a "
+              "minute:  python agent.py status")
+        print(f"Log:       {keep_running.log_path()}")
+        print("Stop:      python agent.py stop")
+        return
+    print("It did NOT start — the agent is not running.")
+    if why:
+        print("What it said:")
+        for line in why.splitlines():
+            print("  " + line)
+    else:
+        print(f"Last lines of the log ({keep_running.log_path()}):")
+        for line in keep_running.last_log_lines():
+            print("  " + line)
+    if keep_running.is_running() or keep_running.supervisor_running():
+        # don't leave it retrying behind the owner's back with a problem
+        # they have just been told to fix
+        if not keep_running.stop(out=lambda *_: None):
+            print("It is still retrying in the background and could not be "
+                  "stopped — run: python agent.py stop")
+            sys.exit(1)
+    print("Nothing is left running in the background. Fix the problem above, "
+          "then run: python agent.py start")
     sys.exit(1)
 
 
@@ -5968,7 +6147,11 @@ def cmd_supervise():
     on_first = None
     if keep_running.AT_LOGIN_FLAG in sys.argv and _open_at_login_wanted():
         on_first = _open_dashboard_when_ready
-    sys.exit(keep_running.supervise(port=port, on_first_start=on_first))
+
+    def tell_owner(text):  # the agent keeps failing to start / keeps crashing
+        notify(_load(CONFIG_PATH, {}) or {}, text, priority="high")
+    sys.exit(keep_running.supervise(port=port, on_first_start=on_first,
+                                    notify=tell_owner))
 
 
 def _open_at_login_wanted(cfg=None):
@@ -6072,7 +6255,14 @@ def main():
     cmd = sys.argv[1]
     if cmd == "setup":
         if "--web" in sys.argv:
-            if _open_running_dashboard():
+            if _open_running_dashboard(wait=20):
+                return
+            import keep_running
+            if keep_running.is_running():
+                # the setup page and the agent's dashboard use the same port
+                print("Your agent is still starting (it is not trading yet), "
+                      "so the setup page can't be opened right now. Check on "
+                      "it in a minute: python agent.py status")
                 return
             import webui
             webui.run_wizard()

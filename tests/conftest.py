@@ -27,8 +27,12 @@ def _no_order_waits(monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_state_hold_left_over(monkeypatch):
     """The damaged-state hold is kept in memory for the run (agent._STATE_HELD):
-    one test's hold must not stop the next test's loop."""
+    one test's hold must not stop the next test's loop. The same for "a
+    move file was imported" (webui.CONTROLS["replaced"]), after which the
+    loop saves nothing."""
+    import webui
     monkeypatch.setitem(agent._STATE_HELD, "on", False)
+    monkeypatch.setitem(webui.CONTROLS, "replaced", False)
 
 
 @pytest.fixture
@@ -52,6 +56,26 @@ def no_policy(monkeypatch):
     monkeypatch.setattr(
         llm_policy, "evaluate",
         lambda cfg, ev, log: {"act": True, "reason": "test: mechanical"})
+
+
+@pytest.fixture(autouse=True)
+def _no_leftover_sigterm_handler():
+    """`agent.cmd_run()` makes SIGTERM a stop request for its process — here
+    that is the test runner. Put back whatever was there after every test."""
+    import signal
+
+    import keep_running
+    try:
+        before = signal.getsignal(signal.SIGTERM)
+    except (ValueError, AttributeError):
+        before = None
+    yield
+    getattr(keep_running, "_sigterm", [False])[0] = False
+    if before is not None:
+        try:
+            signal.signal(signal.SIGTERM, before)
+        except (ValueError, OSError):
+            pass
 
 
 @pytest.fixture

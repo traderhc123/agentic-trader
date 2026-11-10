@@ -862,15 +862,38 @@ export function LaunchStep() {
     setDeployMsg(<span className="text-muted">Creating server… (takes 1–3 minutes)</span>);
     const r = await api("/api/deploy", { token: doToken, region });
     if (!r.ok) return setDeployMsg(<span className="text-down">{r.error}</span>);
+    // The server has the setup now, so the agent retired THIS computer (two
+    // copies on one broker account would place every order twice). Say so
+    // from the first moment, in the agent's own words.
+    const here = r.here ? (
+      <Notice tone="live" role="alert">
+        <p className="m-0">{r.here}</p>
+      </Notice>
+    ) : null;
     const poll = async () => {
-      const s = await api("/api/deploy/status");
+      let s;
+      try {
+        s = await api("/api/deploy/status");
+      } catch {
+        // The agent on this computer stopped before the address arrived.
+        return setDeployMsg(
+          <div className="space-y-1.5">
+            <p className="m-0 text-up">Server created.</p>
+            <p className="m-0 text-muted">
+              This page can't show its address because the agent on this computer has stopped. Find the address under
+              Droplets at cloud.digitalocean.com. You'll get the "heartbeat started" notification when the server is running.
+            </p>
+            {here}
+          </div>,
+        );
+      }
       if (s.ip) {
         setDeployMsg(
           <div className="space-y-1.5">
             <p className="m-0 text-up">Server created at {s.ip}</p>
             <p className="m-0 text-muted">
               It's installing the agent now (about 5 minutes). You'll get the "heartbeat started" notification when it's
-              running; after that this computer doesn't need to run anything. Dashboard from here:
+              running. Copy this command now. It opens the server's dashboard from this computer:
             </p>
             <pre className="m-0 overflow-auto rounded border border-line bg-sink p-2 font-mono text-xs text-fg2">
               {`${s.ssh || `ssh -L 8721:127.0.0.1:8721 trader@${s.ip}`}\nthen open http://127.0.0.1:8721/dash`}
@@ -879,11 +902,17 @@ export function LaunchStep() {
               No notification after 15 minutes? Log in with the command above and run{" "}
               <code className="font-mono text-xs">sudo tail -50 /var/log/cloud-init-output.log</code>
             </p>
+            {here}
           </div>,
         );
-        api("/api/finish", {});
+        api("/api/finish", {}).catch(() => {});
       } else {
-        setDeployMsg(<span className="text-muted">Server status: {s.status}. Waiting…</span>);
+        setDeployMsg(
+          <div className="space-y-1.5">
+            <p className="m-0 text-muted">Server status: {s.status}. Waiting for its address…</p>
+            {here}
+          </div>,
+        );
         timers.current.push(setTimeout(poll, 5000));
       }
     };

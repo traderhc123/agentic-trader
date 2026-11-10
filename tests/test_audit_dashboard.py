@@ -989,7 +989,7 @@ def test_damaged_state_hold_places_no_orders_at_all_until_resume(
     # the dashboard shows it as paused (so it offers Resume) and says that
     # this is not the ordinary pause
     status = _one_loop.status[0]()
-    assert status["paused"] is True
+    assert status["paused"] is True and status["hold"] is True
     assert "NO orders at all" in status["pause_note"]
     banner = [b["text"] for b in status["expiry_warnings"]]
     assert any("older backup" in t for t in banner)
@@ -1006,7 +1006,8 @@ def test_damaged_state_hold_places_no_orders_at_all_until_resume(
     assert "paused" not in _cfg(home)
     assert agent._durability_banner() == []
     status = _one_loop.status[0]()
-    assert status["paused"] is False and status["pause_note"] == ""
+    assert status["paused"] is False and status["hold"] is False
+    assert status["pause_note"] == ""
     assert agent._apply_command("resume")[1].startswith("Resumed — the agent takes")
 
     # the next start reads the feed and trades again
@@ -1024,6 +1025,98 @@ def test_resume_ends_a_hold_whose_record_could_not_be_written(home, monkeypatch)
     handled, reply = agent._apply_command("resume")
     assert handled and reply.startswith("Resumed.") and "close those" in reply
     assert not agent._state_held() and "paused" not in _cfg(home)
+
+
+def test_handoff_hold_places_no_orders_at_all_not_even_exits(
+        home, monkeypatch, no_policy):
+    """A move to a server holds the heartbeat while this agent's memory is
+    copied, and for good once the server has it. That is a FULL stop — not
+    the owner's Pause, which keeps selling on exit signals: an exit sold
+    here after the copy was taken is one the server would sell again."""
+    import transfer
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    monkeypatch.setitem(transfer.HANDOFF, "hold", True)
+    key = "RIVN|2026-10-30|13.5|C"                         # expires "today"
+    now = datetime(2026, 10, 30, 15, 46, tzinfo=agent.MARKET_TZ)   # guard time
+    owed = make_event(event="EXITED", ticker="RIVN", expiry="2026-10-30",
+                      strike=13.5, event_id="x-owed")
+    state = {"seen": [], "seen_order": "oldest_first",
+             "positions": {key: dict(REAL_ROW), FAR_KEY: dict(REAL_ROW)},
+             "exits_to_retry": [owed]}
+    events = [make_event(event="EXITED", expiry=FAR, event_id="x-1"),
+              make_event(ticker="QQQ", expiry=FAR, event_id="e-1")]
+    # the owner's Pause on or off makes no difference to it
+    for cfg in ({}, {"paused": True}):
+        calls, _b, saved = _one_loop(home, monkeypatch, cfg, state, events, now=now)
+        # no feed read, no reconcile, no exit signal, no owed exit, no
+        # expiry-guard sell, no entry
+        assert calls == [], cfg
+        assert set(saved["positions"]) == {key, FAR_KEY} and saved["seen"] == []
+        assert [e["event_id"] for e in saved["exits_to_retry"]] == ["x-owed"]
+        assert transfer.CYCLE_IDLE.is_set()                # the cycle was closed
+    status = _one_loop.status[0]()
+    assert status["paused"] is True and status["hold"] is True
+    assert "moved" in status["pause_note"] and "NO orders at all" in status["pause_note"]
+    assert any("RIVN" in b["text"] and "the agent is paused" in b["text"]
+               for b in status["expiry_warnings"])
+    assert "ON HOLD (being moved to a server" in agent._apply_command("status")[1]
+
+    # the move failed and the hold was lifted: the same loop sells again
+    monkeypatch.setitem(transfer.HANDOFF, "hold", False)
+    calls, _b, saved = _one_loop(home, monkeypatch, {"paused": True}, state,
+                                 events, now=now)
+    assert ("order", "EXITED", "RIVN") in calls and ("order", "EXITED", "SPY") in calls
+    assert not [c for c in calls if c[:2] == ("order", "ENTERED")]   # still paused
+    assert saved["positions"] == {} and saved["exits_to_retry"] == []
+
+
+def test_resume_is_refused_during_a_handoff_and_changes_nothing(home, monkeypatch):
+    """Resume can't lift a hand-off — and must not half-work either: the
+    saved pause and a damaged-memory hold stay exactly as they were."""
+    import transfer
+    _write_cfg(home, {"source": "stub", "broker": "stub", "paused": True})
+    hold_file = home / "state-hold.json"
+    hold_file.write_text(json.dumps({"why": "old_backup"}), encoding="utf-8")
+    monkeypatch.setitem(agent._STATE_HELD, "on", True)
+    monkeypatch.setitem(transfer.HANDOFF, "hold", True)
+    handled, reply = agent._apply_command("resume")
+    assert handled and reply.startswith("Can't resume here")
+    assert "resume-here" in reply and "twice" in reply
+    assert transfer.HANDOFF["hold"] is True
+    assert _cfg(home)["paused"] is True
+    assert agent._state_held() and hold_file.exists()
+    # nothing was moved after all: Resume works again, and ends both
+    monkeypatch.setitem(transfer.HANDOFF, "hold", False)
+    handled, reply = agent._apply_command("resume")
+    assert handled and "older backup" in reply
+    assert "paused" not in _cfg(home)
+    assert not agent._state_held() and not hold_file.exists()
+
+
+def test_after_an_import_the_old_memory_is_never_saved_over_the_new_files(
+        home, monkeypatch, no_policy):
+    """A move file was imported while the agent runs and the restart is
+    slow (or gave up on a stuck order): the loop is on hold with no time
+    limit, and whatever it still saves — the heartbeat time, an alert flag,
+    the state at shutdown — must not replace the imported state.json."""
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    imported = {"seen": ["from-the-other-computer"], "seen_order": "oldest_first",
+                "positions": {"QQQ|2099-12-18|500.0|P": {"option_id": "o9", "qty": 3}}}
+    old = {"seen": [], "seen_order": "oldest_first",
+           "positions": {FAR_KEY: dict(REAL_ROW)}}
+
+    def the_import_lands(*a, **k):        # as /api/move/import does, mid-run
+        webui.hold_orders(float("inf"))
+        (home / "state.json").write_text(json.dumps(imported), encoding="utf-8")
+        webui.CONTROLS["replaced"] = True
+    # runs once the old state.json is loaded, before the first loop
+    monkeypatch.setattr(agent, "expiry_wake_check", the_import_lands)
+    calls, _b, saved = _one_loop(
+        home, monkeypatch, {}, old,
+        [make_event(event="EXITED", expiry=FAR, event_id="x-1")])
+    assert calls == [] and webui.setup_replaced()          # on hold: nothing done
+    assert saved == imported                               # and nothing written
+    assert webui.orders_held(now=4e9)                      # it never resumes
 
 
 def _import_route(home, app, monkeypatch, restart):

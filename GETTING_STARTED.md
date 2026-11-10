@@ -148,13 +148,79 @@ the dashboard. No "heartbeat started" notification after 15 minutes? Log in
 with that command and run `sudo tail -50 /var/log/cloud-init-output.log`.
 DigitalOcean's browser **Web Console** also works.
 
+The server takes over the whole setup: your settings, broker login, open
+positions, the signals already handled, today's entry and loss counters and
+any paid day-pass go with it (a very long trade history is shortened to the
+most recent entries; the full file stays on this computer). **This computer
+is retired at the same moment** — start-at-login is turned off, the agent
+here places no more orders ("resume" is switched off) and it will not start
+again — because two copies on one broker account would place every order
+twice. If you deploy from the running agent's dashboard, that dashboard keeps
+answering until about a minute after it has shown you the server's address
+(15 minutes at the latest), then stops. If the agent is running in the
+background while you use the setup page, the page asks you to stop it first
+(`python agent.py stop`). If the agent is in the middle of a trade when you
+press the button, the page waits for it to finish, so the server knows about
+that trade; if it has not finished after a minute and a half, no server is
+created and you are asked to try again. For the few minutes until the
+server's "heartbeat started" notification, nothing is watching your open
+positions. To run it on this computer again instead: destroy the server in
+DigitalOcean first, then run `python agent.py resume-here`.
+
+**Update button on a server made before November 2026:** on these servers
+the button fails with an error that mentions `Read-only file system`, because
+the background service was not allowed to change the agent's own files. Fix
+it once: log in to the server (the `ssh` command above, or DigitalOcean's
+Web Console) and paste this one line:
+
+```bash
+sudo sed -i 's|^ReadWritePaths=.*|ReadWritePaths=/home/trader/.agentic-trader /home/trader/agentic-trader|' /etc/systemd/system/agentic-trader.service && sudo systemctl daemon-reload && sudo systemctl restart agentic-trader
+```
+
+It restarts the agent; your settings, positions and trade history are kept.
+Then press Update again. (This line is for a server the wizard created. If
+you set up the service by hand with other folders, put your state folder and
+your install folder after `ReadWritePaths=` instead.) Once a server has
+updated, the button itself shows this line if it is ever needed again.
+
 ### Option C — Docker (if you already use Docker)
 
 ```bash
 docker build -t agentic-trader .
 docker run -it -v agentic-trader-data:/data agentic-trader python agent.py setup
-docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trader
+docker run -d --name agentic-trader --restart on-failure -v agentic-trader-data:/data agentic-trader
 ```
+
+- **Stopping:** press Stop in the dashboard, or run
+  `docker exec agentic-trader python agent.py stop`. Both let the agent
+  finish what it is doing (an order it is placing is saved first). It stays
+  stopped until you run `docker start agentic-trader`.
+- **`docker stop agentic-trader` also stops it** the same way, but Docker
+  waits only 10 seconds and then ends the agent by force. If that happens
+  while an order is being placed, the agent may not have recorded the
+  order, and Docker counts a forced end as a crash: it **may start the
+  agent again, trading, the next time the server or Docker restarts**. So
+  after `docker stop`, check how it ended:
+  `docker inspect -f '{{.State.ExitCode}}' agentic-trader` must print `0`.
+  If it prints anything else (usually `137`), run
+  `docker start agentic-trader` and stop it again with one of the two ways
+  above. `docker stop -t 150 agentic-trader` gives it enough time.
+- **Crashes:** `--restart on-failure` makes Docker start the agent again if
+  it crashes. Do **not** use `--restart unless-stopped` or `always` here:
+  with those, Docker starts the agent again a few seconds after you press
+  Stop, and it goes back to trading.
+- **After the server or Docker itself restarts, the agent is normally OFF.**
+  Shutting down stops the agent cleanly, like `docker stop`, and Docker
+  only restarts containers that crashed. After every restart run
+  `docker ps`: if `agentic-trader` is not listed, it is not running, places
+  no orders and does not act on exit signals for your open positions —
+  start it with `docker start agentic-trader`. (After a power cut or a hard
+  reset it may be listed and running again; that is the crash restart.) If
+  you need the agent to come back by itself after every reboot, run it with
+  the systemd service in `deploy/` instead of Docker.
+- **Already running a container started with `--restart unless-stopped`?**
+  Switch it without recreating it:
+  `docker update --restart on-failure <container name or id>`.
 
 ## The safety rails are on by default
 
@@ -276,8 +342,11 @@ and your AI policy, daily caps and budget aren't applied. Turn it off with
 - [ ] You watched at least a few days of dry-run activity and it did what
       you expected
 - [ ] You know how to stop it: `stop` in the dashboard or `python agent.py
-      stop` (Ctrl-C if you ran it in the foreground; `docker stop` /
-      `systemctl stop agentic-trader` on a server) — open positions stay in
-      your account; close them in the Robinhood app if needed
+      stop` (Ctrl-C if you ran it in the foreground). On a server:
+      `sudo systemctl disable --now agentic-trader` (plain `systemctl stop`
+      stops it only until the next reboot), or in Docker `docker exec
+      agentic-trader python agent.py stop` (read the Docker notes above
+      before you rely on plain `docker stop`). Open positions stay in your
+      account; close them in the Robinhood app if needed
 - [ ] You decided whether it should start at login (`python agent.py
       autostart on|off`)

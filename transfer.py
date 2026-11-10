@@ -27,6 +27,7 @@ import json
 import os
 import secrets
 import struct
+import threading
 import time
 import zipfile
 
@@ -39,6 +40,10 @@ _SCRYPT = {"n": 2 ** 15, "r": 8, "p": 1, "maxmem": 64 * 1024 * 1024, "dklen": 64
 _SKIP_NAMES = {
     "agent.lock", "agent.pid", "stop.request", "ui_token", ".acl-locked",
     "launchd.log", "MOVED_AWAY",
+    # what the background process on THIS computer is doing right now: its
+    # pid (never another computer's — `stop` may end that process), its note
+    # on the last failed start, a pending "try again", the agent's alive mark
+    "supervisor.pid", "supervisor.status", "retry.request", "agent.alive",
 }
 _SKIP_PREFIXES = ("agent-run.log",)
 _SKIP_SUFFIXES = (".tmp", ".lock")
@@ -47,6 +52,24 @@ MAX_BUNDLE_BYTES = 200 * 1024 * 1024
 
 class TransferError(Exception):
     pass
+
+
+# ── handing the setup over while the agent is running here ──────────────────
+# The copy that goes to the other machine must hold everything this one has
+# done, so it is taken only when the heartbeat is between cycles:
+#   HANDOFF["hold"]  the heartbeat stops completely: no feed read and no
+#                    orders at all — no entries, no exits, no expiry-guard
+#                    sells. Unlike the dashboard's Pause (which only stops
+#                    new entries) typing "resume" cannot undo it. Set
+#                    before the copy is taken; left on once the setup has
+#                    moved (this computer is retired).
+#   CYCLE_IDLE       set while the heartbeat is NOT in the middle of a cycle
+#                    (reconcile, feed poll, orders, state save). The heartbeat
+#                    clears it, THEN reads the hold; the mover sets the hold,
+#                    THEN waits for idle — so one always sees the other.
+HANDOFF = {"hold": False}
+CYCLE_IDLE = threading.Event()
+CYCLE_IDLE.set()
 
 
 def home():
@@ -148,10 +171,17 @@ def mark_moved_away():
     """Turn off start-at-login and leave a marker so this computer won't run
     the setup again by accident. Returns a short note."""
     import keep_running
-    keep_running.disable_autostart()
+    # The marker first: it alone keeps `agent.py run` (and so start-at-login)
+    # from trading here, even if the login entry below can't be removed.
     os.makedirs(home(), exist_ok=True)
     with open(_moved_path(), "w", encoding="utf-8") as f:
         json.dump({"moved_at": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())}, f)
+    try:
+        keep_running.disable_autostart()
+    except OSError as exc:
+        return ("this computer won't run the agent again (its start-at-login "
+                f"entry could not be removed: {str(exc)[:120]} — it is "
+                "harmless now, the agent refuses to start here)")
     return "start-at-login turned off; this computer won't run the agent again"
 
 
