@@ -89,7 +89,94 @@ def _load(path, default=None):
         return default
 
 
-def _save(path, payload, private=False):
+_REPLACE_TRIES = 8      # ~1.4 s in all: long enough for a reader to let go
+_REPLACE_WAIT_S = 0.05
+
+
+def _replace(tmp, path):
+    """os.replace, retried briefly on PermissionError. On Windows the swap
+    fails while anything else has the file open — the dashboard thread
+    reading it, antivirus, a backup tool — and works a moment later."""
+    for i in range(_REPLACE_TRIES):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == _REPLACE_TRIES - 1:
+                raise
+            time.sleep(_REPLACE_WAIT_S * (i + 1))
+
+
+_IS_MAC = sys.platform == "darwin"
+
+
+def _fsync(fd):
+    """Have the system put this file's bytes on the disk. Returns quietly
+    when it did, or when this filesystem has no such call at all (some
+    network shares). Raises OSError when the system says it could NOT
+    write them (failing disk or card, full disk, quota): the caller must
+    then keep the old file. (Windows reports most such failures as "invalid
+    argument", which can't be told from "no such call" and is let through.)"""
+    import errno
+    unsupported = {getattr(errno, n) for n in (
+        "EINVAL", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "ENOTTY")
+        if hasattr(errno, n)}
+    if _IS_MAC:
+        # macOS: fsync alone leaves the bytes in the drive's own cache,
+        # where a power cut still loses them. F_FULLFSYNC empties it.
+        try:
+            import fcntl
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except (ImportError, AttributeError):
+            pass
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        if exc.errno not in unsupported:
+            raise
+
+
+def _write_json(path, payload, private):
+    """Write `payload` to `path` so a power cut leaves the old file or the
+    new one, never a half-written one: temp file, flush + fsync (the bytes
+    are on the disk), then swap it in. If the bytes can't be written, or
+    the system reports it could not put them on the disk, the temp file is
+    removed and `path` is left as it was (OSError)."""
+    import platform_compat
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            _fsync(f.fileno())
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    if private and not platform_compat.IS_WINDOWS:
+        os.chmod(tmp, 0o600)  # Windows: inherits the locked directory's ACL
+    _replace(tmp, path)
+    if not platform_compat.IS_WINDOWS:
+        try:  # make the swap itself durable (POSIX: fsync the folder)
+            fd = os.open(os.path.dirname(path), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
+
+def _save(path, payload, private=False, backup=False):
+    """backup=True (state.json) also keeps a second copy, `path`.bak,
+    written right after the file itself: whatever damages one of the two
+    leaves the other (see _load_state)."""
     import platform_compat
     d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
@@ -105,12 +192,372 @@ def _save(path, payload, private=False):
                 open(marker, "w", encoding="utf-8").close()
             except OSError:
                 pass
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-    if private and not platform_compat.IS_WINDOWS:
-        os.chmod(tmp, 0o600)  # Windows: inherits the locked directory's ACL
-    os.replace(tmp, path)
+    _write_json(path, payload, private)
+    if backup:
+        try:
+            _write_json(path + ".bak", payload, private)
+            _BAK_FAIL.pop("stale", None)
+        except OSError as exc:
+            _backup_write_failed(path, exc)
+
+
+_BAK_FAIL = {}  # "stale": the backup is behind; "day": UTC day the owner was told
+_BAK_FAIL_TEXT = (
+    "The agent saved its memory file (state.json) but could not update the "
+    "backup copy beside it (state.json.bak): the disk may be full, or "
+    "another program may be using the file. The agent keeps running and "
+    "trading as before. If the memory file is damaged while this lasts, the "
+    "agent will load the older backup and pause until you press Resume. "
+    "Free some disk space or check the agent's folder.")
+
+
+def _backup_write_failed(path, exc):
+    """The save itself worked, but the backup beside it is now a save or
+    more behind. Never raises. _load_state tells a backup from the same
+    save by its date (written after the file): make sure this one can't
+    pass for that where file dates are coarse, and tell the owner (once a
+    day)."""
+    try:
+        print(f"could not refresh the backup of {os.path.basename(path)}: "
+              f"{str(exc)[:120]}")
+        _BAK_FAIL["stale"] = True
+        try:
+            at, bak_at = os.stat(path).st_mtime_ns, os.stat(path + ".bak").st_mtime_ns
+            if bak_at >= at:
+                old = at - 10 * 10 ** 9
+                os.utime(path + ".bak", ns=(old, old))
+        except OSError:
+            pass
+        today = datetime.now(timezone.utc).date().isoformat()
+        if _BAK_FAIL.get("day") == today:
+            return
+        _BAK_FAIL["day"] = today
+        notify(_load(CONFIG_PATH, {}) or {},
+               "⚠️ agentic-trader: " + _BAK_FAIL_TEXT, priority="high")
+    except Exception:
+        pass
+
+
+# ── state.json: the file the agent must never silently lose ──────────────────
+# Open positions, what the agent bought, the signals it already handled and
+# the paid day pass all live in it. "Missing" is a fresh install; "there but
+# unreadable" (a power cut under an older version, a failing disk) is damage,
+# and must never be treated as an empty start.
+
+def _state_hold_path():
+    return os.path.join(os.path.dirname(STATE_PATH), "state-hold.json")
+
+
+def _state_stuck_path():
+    return os.path.join(os.path.dirname(STATE_PATH), "state-stuck.json")
+
+
+def _read_state_file(path):
+    """(state dict or None, what). what:
+
+      ok        read normally
+      missing   there is no such file
+      damaged   it was read and is not a state (bad JSON, bad bytes, not a
+                JSON object), or the disk itself reported a read error
+      unopened  it is there but could not be opened (in use by another
+                program, another user's file, anything else). What it holds
+                is unknown: it must not be treated as damaged."""
+    import errno
+    err = None
+    for i in range(_REPLACE_TRIES):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            return (data, "ok") if isinstance(data, dict) else (None, "damaged")
+        except FileNotFoundError:
+            return None, "missing"
+        except ValueError:
+            return None, "damaged"
+        except OSError as exc:
+            # Windows: briefly locked by another program — look again, for
+            # as long as a save waits for the same thing (_replace)
+            err = exc.errno
+            if i < _REPLACE_TRIES - 1:
+                time.sleep(_REPLACE_WAIT_S * (i + 1))
+    return None, ("damaged" if err == errno.EIO else "unopened")
+
+
+def _set_aside(path):
+    """Keep a damaged file under a new name next to it (never deleted, never
+    overwritten). Returns the new file name, or None if it couldn't be kept."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    for n in range(100):
+        kept = f"{path}.damaged-{stamp}" + (f"-{n}" if n else "")
+        if not os.path.exists(kept):
+            break
+    try:
+        _replace(path, kept)
+        return os.path.basename(kept)
+    except OSError:
+        pass
+    try:
+        import shutil
+        shutil.copyfile(path, kept)
+        return os.path.basename(kept)
+    except OSError:
+        return None
+
+
+def _load_state():
+    """state.json for the trading loop → (state, info). info["how"]:
+
+      ok            read normally
+      fresh         no state.json and no backup: a new install
+      restored      state.json was damaged; the backup written right after
+                    it (same save) was loaded instead
+      restored_old  loaded from a backup written BEFORE the file it
+                    replaces, or state.json is gone: it may miss trades
+      lost          damaged and no usable backup: an EMPTY state
+      unopened      state.json (or, when it is needed, the backup) is there
+                    but could not be opened: info["file"]. The state returned
+                    is EMPTY and must not be used or saved — the caller must
+                    not start
+
+    Nothing is written here. The caller (cmd_run) sets the damaged file
+    aside, alerts the owner and, for restored_old / lost, starts paused.
+
+    Each save writes state.json first and the backup right after it, so a
+    backup of the same save is never dated before the file. A backup dated
+    even slightly before it is from an earlier save (saves come in bursts,
+    milliseconds apart) and may miss the agent's last action."""
+    fresh = {"seen": [], "positions": {}}
+    bak = STATE_PATH + ".bak"
+    state, what = _read_state_file(STATE_PATH)
+    if state is not None:
+        return state, {"how": "ok"}
+    if what == "unopened":
+        return fresh, {"how": "unopened", "file": os.path.basename(STATE_PATH)}
+    old, bak_what = _read_state_file(bak)
+    if what == "missing" and bak_what == "missing":
+        return fresh, {"how": "fresh"}
+    if bak_what == "unopened":
+        return fresh, {"how": "unopened", "file": os.path.basename(bak)}
+    if old is None:
+        return fresh, {"how": "lost"}
+    try:
+        st = os.stat(bak)
+        saved_at = st.st_mtime
+        same_save = (what != "missing"
+                     and st.st_mtime_ns >= os.stat(STATE_PATH).st_mtime_ns)
+    except OSError:
+        saved_at, same_save = None, False
+    return old, {"how": "restored" if same_save else "restored_old",
+                 "backup_at": saved_at}
+
+
+def _state_hold():
+    """The standing "state was lost / restored from an old backup" record,
+    or None. While it exists every start is paused; the owner's `resume`
+    ends it (_end_state_hold)."""
+    hold = _load(_state_hold_path())
+    return hold if isinstance(hold, dict) and hold.get("why") else None
+
+
+def _end_state_hold():
+    """The owner said resume: forget the hold. Returns the record it ended
+    (None if there was none)."""
+    hold = _state_hold()
+    if hold is None:
+        return None
+    for i in range(_REPLACE_TRIES):
+        try:
+            os.remove(_state_hold_path())
+            break
+        except FileNotFoundError:
+            break
+        except OSError:
+            # Windows: the dashboard is reading it this instant — try again.
+            # Left behind, it would pause the next start once more.
+            time.sleep(_REPLACE_WAIT_S * (i + 1))
+    return hold
+
+
+def _age_words(cfg):
+    """max_event_age_s in words: '5 minutes', '90 seconds'."""
+    try:
+        age = int(float((cfg or {}).get("max_event_age_s", 300)))
+    except (TypeError, ValueError):
+        age = 300
+    return f"{age // 60} minutes" if age >= 120 and age % 60 == 0 else f"{age} seconds"
+
+
+def _state_hold_text(hold, cfg=None):
+    """What happened and what the agent will and won't do, in plain words:
+    the alert, the console line and the dashboard banner all use it."""
+    kept = (f" The damaged file was kept as {hold['kept']}."
+            if hold.get("kept") else "")
+    undated = cfg is not None and cfg.get("source", "agenthc") != "agenthc"
+    paused = ("While paused the agent places no orders and pays for no "
+              "signals. When you have checked, press Resume on the dashboard")
+    if hold.get("why") == "old_backup":
+        when = _et_stamp(hold.get("backup_at")) or "an earlier time"
+        return ("PAUSED: the agent's memory file (state.json) was damaged or "
+                f"missing, and was restored from an older backup saved {when}. "
+                "Anything the agent bought or sold after that is not in its "
+                "memory, so it will NOT sell those positions for you: compare "
+                "the dashboard's open positions with your broker account and "
+                f"close what is missing yourself. {paused}."
+                + (" Your signal source does not date its signals, so after "
+                   "Resume the agent will act again on any signal it handled "
+                   "after that backup: remove those first." if undated else
+                   " After Resume the agent may pay for today's signals "
+                   "again, if it paid for them after that backup.")
+                + kept)
+    return ("PAUSED: the agent's memory file (state.json) was damaged (for "
+            "example by a power cut) and there was no backup to restore. The "
+            "agent no longer knows which positions it opened, so it will NOT "
+            "sell them for you: check your broker account and close them "
+            f"yourself. {paused}: the agent then starts with an empty memory"
+            + (". Your signal source does not date its signals, so the agent "
+               "cannot tell old signals from new ones and will act on every "
+               "signal still in it: remove the old ones first." if undated else
+               f", skips signals more than {_age_words(cfg)} old, and may "
+               "pay for today's signals again.")
+            + kept)
+
+
+def _state_startup(cfg, state, info):
+    """Act on what _load_state found, before anything can trade: keep the
+    damaged file, write the restored (or empty) state back, tell the owner,
+    and pause when the agent can't be sure its memory is complete. Returns
+    True when this run starts paused."""
+    import webui
+    how = info.get("how")
+    if how == "unopened":
+        # Its contents are unknown (it may be perfectly good): never set it
+        # aside as damaged, never write a backup or an empty state over it.
+        _state_stuck_exit(cfg, info.get("file"))
+    if how in ("restored", "restored_old", "lost"):
+        kept = _set_aside(STATE_PATH) if os.path.exists(STATE_PATH) else None
+        if how == "lost" and kept is None and os.path.exists(STATE_PATH):
+            # It could be neither moved nor copied, and an empty state must
+            # never be written over the only copy: don't run at all.
+            _state_stuck_exit(cfg, None)
+        if how == "lost" and os.path.exists(STATE_PATH + ".bak"):
+            also = _set_aside(STATE_PATH + ".bak")
+            kept = (f"{kept} (and its damaged backup as {also})"
+                    if kept and also else kept or also)
+        hold = None
+        if how != "restored":
+            prev = _state_hold() or {}  # a restart loop: one alert a day
+            hold = {"why": "old_backup" if how == "restored_old" else "lost",
+                    "at": _iso_at(_now()), "kept": kept or prev.get("kept"),
+                    "notified": prev.get("notified")}
+            if info.get("backup_at"):
+                hold["backup_at"] = _iso_at(info["backup_at"])
+            try:
+                _save(_state_hold_path(), hold, private=True)
+            except OSError as exc:
+                print(f"could not write {_state_hold_path()}: {str(exc)[:150]}")
+        try:
+            _save(STATE_PATH, state, private=True, backup=True)
+        except OSError as exc:
+            print(f"could not write state.json: {str(exc)[:150]}")
+        if how == "restored":
+            when = _et_stamp(_iso_at(info["backup_at"])) or "the same moment"
+            msg = ("the agent's memory file (state.json) was damaged (for "
+                   "example by a power cut) and was restored from the backup "
+                   f"copy the agent wrote right after it ({when}). The agent "
+                   "keeps running as before. The backup should hold the same "
+                   "information, but the agent cannot check it against the "
+                   "damaged file: compare the dashboard's open positions with "
+                   "your broker account and close anything missing from the "
+                   "list yourself, because the agent will not sell a position "
+                   "that is not in its list."
+                   + (f" The damaged file was kept as {kept}." if kept else ""))
+            print(msg)
+            notify(cfg, "⚠️ agentic-trader: " + msg)
+        elif _state_hold() is None:
+            # no record on disk: this run still starts paused
+            return _announce_state_hold(cfg, hold, webui)
+    try:  # this start got past the file: forget an earlier "did not start"
+        os.remove(_state_stuck_path())
+    except OSError:
+        pass
+    hold = _state_hold()
+    if hold is None:
+        return False
+    return _announce_state_hold(cfg, hold, webui)
+
+
+def _state_stuck_text(unopened=None):
+    """Why the agent did not start, in plain words. `unopened`: the file
+    that could not be opened; None: state.json is damaged, has no backup
+    and could not be moved aside."""
+    bak = os.path.basename(STATE_PATH) + ".bak"
+    busy = ("another program may be using it, the file may belong to a "
+            "different user account, or the disk may be failing")
+    if unopened == bak:
+        why = ("its memory file (state.json) is damaged or missing, and it "
+               f"could not open the backup copy ({bak}): {busy}")
+    elif unopened:
+        why = f"it could not open its memory file ({unopened}): {busy}"
+    else:
+        why = ("its memory file (state.json) is damaged, there is no usable "
+               "backup to restore, and the damaged file could not be moved aside "
+               "(another program may be using it, or the disk may be full)")
+    return (f"agentic-trader did NOT start: {why}. Nothing was changed, and "
+            "the agent tries again every time it is started. While it is not "
+            "running it places no orders and does NOT sell your open "
+            "positions for you: check your broker account.")
+
+
+def _state_stuck_exit(cfg, unopened=None):
+    """The agent can't start without putting the owner's only copy of its
+    memory at risk: say so and stop (exit code 1). One alert a day — a
+    supervisor may start it again in a loop. No hold is written: nothing is
+    known to be lost, and the next start may read the file normally."""
+    text = _state_stuck_text(unopened)
+    print("\n" + "!" * 72 + "\n" + text + "\n" + "!" * 72 + "\n")
+    today = datetime.now(timezone.utc).date().isoformat()
+    last = _load(_state_stuck_path())
+    if not isinstance(last, dict) or last.get("notified") != today:
+        try:
+            _save(_state_stuck_path(), {"notified": today}, private=True)
+        except OSError:
+            pass
+        notify(cfg, "⚠️ " + text, priority="high")
+    sys.exit(1)
+
+
+def _announce_state_hold(cfg, hold, webui):
+    webui.CONTROLS["paused"] = True
+    text = _state_hold_text(hold, cfg)
+    print("\n" + "!" * 72 + "\n" + text + "\n(No dashboard? Check your broker "
+          f"account, then delete {_state_hold_path()} and start the agent "
+          "again.)\n" + "!" * 72 + "\n")
+    today = datetime.now(timezone.utc).date().isoformat()
+    if hold.get("notified") != today:  # a restart loop must not repeat it
+        hold["notified"] = today
+        try:
+            _save(_state_hold_path(), hold, private=True)
+        except OSError:
+            pass
+        notify(cfg, "⚠️ agentic-trader " + text, priority="high")
+    return True
+
+
+def _durability_banner():
+    """Urgent dashboard lines while the agent's own records are in doubt:
+    a state hold (above), or a trade log that can't be written."""
+    out = []
+    try:
+        hold = _state_hold()
+        if hold is not None:
+            out.append({"level": "urgent", "text": _state_hold_text(
+                hold, _load(CONFIG_PATH, {}) or {})})
+        if _unwritten_rows():
+            out.append({"level": "urgent", "text": _LOG_FAIL_TEXT})
+        if _BAK_FAIL.get("stale"):
+            out.append({"level": "warn", "text": _BAK_FAIL_TEXT})
+    except Exception:
+        pass
+    return out
 
 
 # ── event safety rails (see SECURITY.md) ─────────────────────────────────────
@@ -179,23 +626,125 @@ def _backlog(ev):
     return since is not None and occurred < since
 
 
+# Trade-log rows that could not be written (full disk, locked or read-only
+# file): (log path, row). They stay in memory, still count toward today's
+# entry cap, loss limit and loss streak, and are written — first, in order —
+# by the next row that does get through. Lost only if the agent stops first.
+_UNWRITTEN = []
+_UNWRITTEN_KEPT = 2000
+_LOG_FAIL = {}  # "day": the UTC day the owner was last told
+_LOG_FAIL_TEXT = (
+    "The agent can't write its trade log (trades.jsonl): the disk may be "
+    "full, or the file locked or read-only. It keeps trading and keeps "
+    "today's trades in memory, so your daily limits still apply while it "
+    "runs. If the agent stops or restarts before this is fixed, those trades "
+    "will be missing from the Activity list, the P&L and today's limits. "
+    "Free some disk space or check the agent's folder.")
+
+
+def _unwritten_rows():
+    """Rows this run could not write to the current trade log yet."""
+    return [r for p, r in _UNWRITTEN if p == TRADES_PATH]
+
+
+def _append_trade_rows(path, rows):
+    os.makedirs(HOME, exist_ok=True)
+    lead = ""
+    try:
+        # a last line torn by a crash or a full disk has no newline: start
+        # on a fresh line, or this row would be glued to it and unreadable
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell() > 0:
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    lead = "\n"
+    except OSError:
+        pass
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = None if os.path.exists(path) else 0
+    text = lead + "".join(json.dumps(r) + "\n" for r in rows)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())  # an entry must survive a power cut:
+            except OSError:           # the daily cap counts from this file
+                pass
+    except OSError:
+        if size is not None:
+            try:
+                # drop a half-written tail: these rows are written again
+                # later, and must not be counted twice
+                os.truncate(path, size)
+            except OSError:
+                pass
+        raise
+
+
 def _log_trade(record):
     record["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    path = TRADES_PATH
+    waiting = [x for x in _UNWRITTEN if x[0] == path]
     try:
-        os.makedirs(HOME, exist_ok=True)
-        with open(TRADES_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-    except OSError:
+        _append_trade_rows(path, [r for _p, r in waiting] + [record])
+    except OSError as exc:
+        _UNWRITTEN.append((path, record))
+        if len(_UNWRITTEN) > _UNWRITTEN_KEPT:
+            # keep what the limits count (entries, exits) the longest
+            for i, (_p, r) in enumerate(_UNWRITTEN):
+                if r.get("action") not in ("entry", "exit"):
+                    del _UNWRITTEN[i]
+                    break
+            else:
+                del _UNWRITTEN[0]
+        _log_write_failed(exc)
+        return
+    if waiting:
+        _UNWRITTEN[:] = [x for x in _UNWRITTEN if not any(x is w for w in waiting)]
+        print(f"trade log is writable again — wrote the {len(waiting)} row(s) "
+              "kept in memory")
+
+
+def _log_write_failed(exc):
+    """Tell the owner (once a day) that trades aren't being recorded. Never
+    raises: the order this row describes has already happened."""
+    try:
+        print(f"TRADE LOG NOT WRITTEN ({str(exc)[:150]}) — row kept in memory")
+        today = datetime.now(timezone.utc).date().isoformat()
+        if _LOG_FAIL.get("day") == today:
+            return
+        _LOG_FAIL["day"] = today
+        import support
+        support.note_error(f"trade log write failed: {exc}")
+        notify(_load(CONFIG_PATH, {}) or {},
+               "⚠️ agentic-trader: " + _LOG_FAIL_TEXT, priority="high")
+    except Exception:
         pass
 
 
 def _recent_trades(limit=50):
+    """The last `limit` trade-log rows, oldest first. A line that can't be
+    read (torn by a crash, a bad byte, not a row) is skipped — it must not
+    hide the rows around it: the loss-streak rule and the dashboard's "why
+    no trade" list are built from these."""
     try:
-        with open(TRADES_PATH, encoding="utf-8") as f:
+        with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
             lines = f.readlines()[-limit:]
-        return [json.loads(x) for x in lines if x.strip()]
-    except (OSError, ValueError):
-        return []
+    except OSError:
+        lines = []
+    rows = []
+    for x in lines:
+        try:
+            t = json.loads(x)
+        except ValueError:
+            continue
+        if isinstance(t, dict):
+            rows.append(t)
+    return (rows + _unwritten_rows())[-limit:]
 
 
 def _trades_today():
@@ -206,17 +755,12 @@ def _trades_today():
             if str(t.get("closed_at") or t.get("ts", "")).startswith(today)]
 
 
-def _entries_today():
-    """Count today's entries by scanning the FULL trade log.
-
-    Deliberately not a tail read: every skip/veto also appends a log line, so
-    a hostile or misbehaving feed could emit enough skippable events to push
-    today's real entries out of a fixed-size tail and slip past the daily cap.
-    """
-    today = datetime.now(timezone.utc).date().isoformat()
-    count = 0
+def _todays_log_rows(today):
+    """Every trade-log row that mentions `today` (full-file scan), then the
+    rows this run could not write yet — so an unwritable log can't make
+    today's entries or losses disappear from the limits."""
     try:
-        with open(TRADES_PATH, encoding="utf-8") as f:
+        with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
             for line in f:
                 if today not in line:
                     continue
@@ -224,10 +768,30 @@ def _entries_today():
                     t = json.loads(line)
                 except ValueError:
                     continue
-                if t.get("action") == "entry" and str(t.get("ts", "")).startswith(today):
-                    count += 1
+                if isinstance(t, dict):
+                    yield t
     except OSError:
         pass
+    yield from _unwritten_rows()
+
+
+def _entries_today(dry=False):
+    """Count today's entries by scanning the FULL trade log.
+
+    Deliberately not a tail read: every skip/veto also appends a log line, so
+    a hostile or misbehaving feed could emit enough skippable events to push
+    today's real entries out of a fixed-size tail and slip past the daily cap.
+
+    Real-money rows only by default. dry=True counts the dry-run (practice)
+    rows instead: the two books never mix, so practice entries can't use up
+    the real cap (handle_event passes the mode the agent is in).
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    count = 0
+    for t in _todays_log_rows(today):
+        if (t.get("action") == "entry" and bool(t.get("dry")) == bool(dry)
+                and str(t.get("ts", "")).startswith(today)):
+            count += 1
     return count
 
 
@@ -241,35 +805,28 @@ def _counted_before(t):
         return False
 
 
-def _est_pnl_today():
+def _est_pnl_today(dry=False):
     """Today's estimated realized P&L (USD) from the trade log's exit records.
 
     An ESTIMATE: brokers don't report fill prices back to the agent, so each
     exit's P&L is (exit quote - entry quote) x qty x 100, or the feed's own
     paper P&L %% applied to the entry estimate when an exit quote is missing.
     Exits with no estimate at all count as 0 (see `unmeasured`). Full-log
-    scan for the same reason as _entries_today."""
+    scan for the same reason as _entries_today, and like it real-money rows
+    only (dry=True: the dry-run rows instead) — a practice gain must never
+    offset a real loss against max_daily_loss_usd."""
     today = datetime.now(timezone.utc).date().isoformat()
     total, unmeasured = 0.0, 0
-    try:
-        with open(TRADES_PATH, encoding="utf-8") as f:
-            for line in f:
-                if today not in line:
-                    continue
-                try:
-                    t = json.loads(line)
-                except ValueError:
-                    continue
-                # a close found in the account counts on the day it filled
-                day = str(t.get("closed_at") or t.get("ts", ""))
-                if t.get("action") != "exit" or not day.startswith(today):
-                    continue
-                if isinstance(t.get("est_pnl_usd"), (int, float)):
-                    total += float(t["est_pnl_usd"])
-                elif not _counted_before(t):
-                    unmeasured += 1
-    except OSError:
-        pass
+    for t in _todays_log_rows(today):
+        # a close found in the account counts on the day it filled
+        day = str(t.get("closed_at") or t.get("ts", ""))
+        if (t.get("action") != "exit" or bool(t.get("dry")) != bool(dry)
+                or not day.startswith(today)):
+            continue
+        if isinstance(t.get("est_pnl_usd"), (int, float)):
+            total += float(t["est_pnl_usd"])
+        elif not _counted_before(t):
+            unmeasured += 1
     return total, unmeasured
 
 
@@ -1461,6 +2018,16 @@ def _pick_fills(fills, k, used, opened_at=None):
     return got, px, (max(times) if times else None), ids
 
 
+def _save_error(save_state, state):
+    """save_state(state); the error it raised, or None. For the callers
+    that must still write their log row / alert before passing it on."""
+    try:
+        save_state(state)
+    except Exception as exc:
+        return exc
+    return None
+
+
 def _close_outside(cfg, state, save_state, broker, key, target, px, closed_at,
                    ids, cause, detected_by, event_id=None):
     """Stop tracking contracts the account no longer holds: drop the row
@@ -1493,11 +2060,13 @@ def _close_outside(cfg, state, save_state, broker, key, target, px, closed_at,
             msg = (f"only {target} of {q} {contract} showed up in your {name} "
                    "account — the buy probably only partly filled; the agent "
                    f"now tracks {target}")
-        save_state(state)
+        save_failed = _save_error(save_state, state)
         print(msg)
         # a partly filled buy is a real position: "check this trade"
         _report_problem(cfg, state, save_state, "entry_unfilled", contract, msg,
                         placed=target > 0)
+        if save_failed is not None:
+            raise save_failed
         return
     if ids:  # the owner's sales this close used: never proof for another
         sync = state.setdefault("position_sync", {})
@@ -1516,7 +2085,11 @@ def _close_outside(cfg, state, save_state, broker, key, target, px, closed_at,
         if ids:
             pos["fill_ids_used"] = (list(snap.get("fill_ids_used") or [])
                                     + list(ids))[-_FILL_IDS_KEPT:]
-    save_state(state)  # before the log row: a crash can't log it twice
+    # Before the log row: a crash can't log it twice. A save that FAILS is
+    # different: the close is already applied in memory and goes to disk
+    # with the next save, so skipping the row here would lose the exit (and
+    # its P&L, which the daily loss limit counts) for good. Raised below.
+    save_failed = _save_error(save_state, state)
     est = None
     if unlogged >= 1:
         rec = {"action": "exit", "manual": True, "cause": cause,
@@ -1540,6 +2113,8 @@ def _close_outside(cfg, state, save_state, broker, key, target, px, closed_at,
     msg = _outside_message(cause, name, contract, k, target, unlogged, px, est)
     print(msg)
     notify(cfg, "agentic-trader: " + msg)
+    if save_failed is not None:
+        raise save_failed
 
 
 def _bury(state, key, snap, q, cause):
@@ -1863,8 +2438,11 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                         "contract": contract, "reason": why})
             return msg
         # Hard mechanical caps — independent of (and checked before) the LLM.
+        # Counted from the rows of the mode the agent is in: real trades
+        # when live, practice trades in dry-run — never one against the other.
+        dry_mode = bool(cfg.get("dry_run"))
         cap = int(cfg.get("max_entries_per_day", 5))
-        if _entries_today() >= cap:
+        if _entries_today(dry_mode) >= cap:
             msg = f"SKIPPED {contract}: daily entry cap reached ({cap})"
             print(msg)
             _log_trade({"action": "skip_daily_cap", "book": book, "event_id": ev["event_id"],
@@ -1884,7 +2462,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # the limit, stop opening positions. Exits are never blocked.
         loss_cap = float(cfg.get("max_daily_loss_usd") or 0)
         if loss_cap > 0:
-            pnl, _unmeasured = _est_pnl_today()
+            pnl, _unmeasured = _est_pnl_today(dry_mode)
             if -pnl >= loss_cap:
                 msg = (f"SKIPPED {contract}: max daily loss reached "
                        f"(est. ${-pnl:,.0f} of ${loss_cap:,.0f}) — no new "
@@ -1896,7 +2474,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # Built-in rules (plain settings, no AI): tickers, calls/puts, min
         # strike, no 0DTE, stop after a losing streak.
         import rules
-        ok, why = rules.check(cfg, ev, _trades_today())
+        ok, why = rules.check(cfg, ev, [t for t in _trades_today()
+                                        if bool(t.get("dry")) == dry_mode])
         if not ok:
             msg = f"SKIPPED {contract}: {why} (your rules)"
             print(msg)
@@ -3569,6 +4148,15 @@ def _apply_command(text):
         return True, "Paused — no new events processed until you say 'resume'."
     if t == "resume":
         webui.CONTROLS["paused"] = False
+        hold = _end_state_hold()  # paused at startup over a damaged state.json
+        if hold is not None:
+            return True, ("Resumed. The agent is trading again from "
+                          + ("the older backup of its memory"
+                             if hold.get("why") == "old_backup" else
+                             "an empty memory")
+                          + ": it will not sell positions that are missing "
+                          "from the open positions list, so close those in "
+                          "your broker account yourself.")
         return True, "Resumed."
     if t == "stop":
         webui.CONTROLS["stop"] = True
@@ -3742,10 +4330,11 @@ def _apply_command(text):
         return True, msg
     if t == "status":
         st = _load(STATE_PATH, {"positions": {}})
+        dry = bool(cfg.get("dry_run"))  # each mode counts its own trades
         return True, (f"{'DRY-RUN' if cfg.get('dry_run') else 'LIVE'} · "
-                      f"{_sizing_desc(cfg)} · entries today {_entries_today()}/"
+                      f"{_sizing_desc(cfg)} · entries today {_entries_today(dry)}/"
                       f"{cfg.get('max_entries_per_day', 5)} · "
-                      f"est. P&L today ${_est_pnl_today()[0]:,.0f}"
+                      f"est. P&L today ${_est_pnl_today(dry)[0]:,.0f}"
                       + (f" (max loss ${float(cfg['max_daily_loss_usd']):,.0f})"
                          if float(cfg.get('max_daily_loss_usd') or 0) > 0 else "")
                       + " · open: "
@@ -3789,7 +4378,12 @@ def cmd_run(app_window=False):
     if client is None:
         print("Broker auth missing/expired — run: python agent.py setup")
         sys.exit(1)
-    state = _load(STATE_PATH, {"seen": [], "positions": {}})
+    # Never _load here: an unreadable state.json is damage, not "no state"
+    state, state_info = _load_state()
+    state.setdefault("seen", [])
+    state.setdefault("positions", {})
+    # sets the damaged file aside, alerts, and pauses if memory may be missing
+    _state_startup(cfg, state, state_info)
     seen = set(state["seen"])
     if llm_policy.entries_blocked(cfg):
         if state.get("positions"):
@@ -3802,12 +4396,13 @@ def cmd_run(app_window=False):
             today = datetime.now(timezone.utc).date().isoformat()
             if state.get("policy_block_notified") != today:
                 state["policy_block_notified"] = today
-                _save(STATE_PATH, state, private=True)
+                _save(STATE_PATH, state, private=True, backup=True)
                 notify(cfg, "agentic-trader did NOT start: " + llm_policy.BLOCKED_MSG)
             sys.exit(1)
 
     def save_state(st):
-        _save(STATE_PATH, st, private=True)  # holds the day-pass L402 token
+        # holds the day-pass L402 token; backup: see _load_state
+        _save(STATE_PATH, st, private=True, backup=True)
 
     cash = {"at": 0.0, "bp": None, "warning": ""}
     import dry_run_preview
@@ -3836,7 +4431,8 @@ def cmd_run(app_window=False):
                 **({"feed access": _feed_access(c, st)}
                    if c.get("source") == "agenthc" else {}),
                 "sizing": _sizing_desc(c),
-                "entries today": f"{_entries_today()} / cap {c.get('max_entries_per_day', 5)}",
+                "entries today": (f"{_entries_today(bool(c.get('dry_run')))} / cap "
+                                  f"{c.get('max_entries_per_day', 5)}"),
                 "policy brain": ("blocked" if llm_policy.entries_blocked(c)
                                  else "on" if llm_policy.enabled(c) else "off"),
                 "rules": __import__("rules").describe(c) or "none",
@@ -3854,8 +4450,8 @@ def cmd_run(app_window=False):
                    if _broker_conn_desc(client) else {}),
             },
             "cash_warning": cash.get("warning", ""),
-            "expiry_warnings": expiry_banner(c, st, paused=webui.CONTROLS["paused"],
-                                             acct=_status_acct(c)),
+            "expiry_warnings": _durability_banner() + expiry_banner(
+                c, st, paused=webui.CONTROLS["paused"], acct=_status_acct(c)),
             "problems": _problems_with_ai_block(c),
             "budget_hints": _budget_hints(c),
             "would_have": dry_run_preview.summary(c),
@@ -4152,7 +4748,7 @@ def cmd_status():
     print(f"mode             : {'DRY-RUN' if cfg.get('dry_run') else 'LIVE'}")
     print(f"policy brain     : {'ON (' + llm_policy.policy_path() + ')' if llm_policy.enabled(cfg) else 'off'}")
     print(f"daily entry cap  : {cfg.get('max_entries_per_day', 5)}")
-    print(f"entries today    : {_entries_today()}")
+    print(f"entries today    : {_entries_today(bool(cfg.get('dry_run')))}")
     print(f"open positions   : {list(state.get('positions', {})) or 'none'}")
 
 
