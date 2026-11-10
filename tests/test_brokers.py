@@ -101,7 +101,7 @@ def instant_fills(monkeypatch):
 def test_alpaca_execute_entry_places_buy(monkeypatch):
     orders = []
     monkeypatch.setattr(alpaca, "_order",
-                        lambda cfg, occ, side, qty:
+                        lambda cfg, occ, side, qty, **kw:
                         orders.append((occ, side, qty)) or "oid-1")
     monkeypatch.setattr(alpaca, "_quote_price", lambda cfg, occ: 2.50)
     state = {"positions": {}}
@@ -122,7 +122,7 @@ def test_alpaca_execute_never_double_enters(monkeypatch):
 def test_alpaca_execute_exit_sells_stored_position(monkeypatch):
     orders = []
     monkeypatch.setattr(alpaca, "_order",
-                        lambda cfg, occ, side, qty:
+                        lambda cfg, occ, side, qty, **kw:
                         orders.append((occ, side, qty)) or "oid-2")
     state = {"positions": {"SPY|2026-07-10|752.0|C":
                            {"option_id": "STORED_OCC", "qty": 3}}}
@@ -141,7 +141,7 @@ def test_alpaca_execute_exit_without_position_is_noop(monkeypatch):
 
 
 def test_alpaca_failed_order_leaves_state_clean(monkeypatch):
-    monkeypatch.setattr(alpaca, "_order", lambda *a: None)  # HTTP failure
+    monkeypatch.setattr(alpaca, "_order", lambda *a, **kw: None)  # HTTP failure
     monkeypatch.setattr(alpaca, "_quote_price", lambda cfg, occ: 2.50)
     state = {"positions": {}}
     assert not alpaca.execute(alpaca._Client(_budget_cfg()), {},
@@ -223,7 +223,7 @@ def test_robinhood_resolve_instrument_empty_payload():
 
 
 def _fake_place(placed, oid="order-1", was_limit=False):
-    def _p(rh, cfg, opt, side, effect, qty):
+    def _p(rh, cfg, opt, side, effect, qty, **kw):
         placed.append((opt, side, effect, qty))
         return {"order_id": oid, "was_limit": was_limit}
     return _p
@@ -273,7 +273,7 @@ def test_robinhood_execute_exit_closes_what_it_opened(monkeypatch):
 
 
 def test_robinhood_failed_place_keeps_position(monkeypatch):
-    monkeypatch.setattr(robinhood, "place", lambda *a: None)
+    monkeypatch.setattr(robinhood, "place", lambda *a, **kw: None)
     state = {"positions": {"SPY|2026-07-10|752.0|C":
                            {"option_id": "opt-123", "qty": 2}}}
     assert not robinhood.execute(None, {}, make_event(event="EXITED"), state)

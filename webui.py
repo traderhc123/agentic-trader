@@ -3620,6 +3620,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 # in-flight event finish its state save, so nothing in memory
                 # overwrites the imported files. A restart then loads them.
                 import time as _t
+                was_paused = CONTROLS["paused"]
                 CONTROLS["paused"] = True
                 _t.sleep(2.0)
             try:
@@ -3627,7 +3628,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                               replace=bool(data.get("replace")))
             except Exception:
                 if running_here:
-                    CONTROLS["paused"] = False  # nothing changed: carry on
+                    # nothing changed: carry on as before — still paused if
+                    # the owner (or a damaged-memory start) had paused it
+                    CONTROLS["paused"] = was_paused
                 raise
         except transfer.TransferError as exc:
             if str(exc) == "NEEDS_REPLACE":

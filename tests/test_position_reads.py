@@ -508,7 +508,7 @@ def test_alpaca_closed_fills(monkeypatch):
 
 def test_alpaca_execute_stamps_order_ids(monkeypatch):
     monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": qty)
-    monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty: "oid-1")
+    monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty, **kw: "oid-1")
     st = {"positions": {}}
     cl = alpaca._Client(ALPACA)
     assert alpaca.execute(cl, {"contracts_per_trade": 3},
@@ -519,7 +519,7 @@ def test_alpaca_execute_stamps_order_ids(monkeypatch):
     # a partial exit keeps the rest of the row: its order is stamped too
     pos["last_order_at"] = 1.0
     monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": 1)
-    monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty: "oid-2")
+    monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty, **kw: "oid-2")
     broker_events.begin()
     assert alpaca.execute(cl, {}, make_event(event="EXITED", expiry="2099-12-18"), st)
     broker_events.drain()
@@ -527,13 +527,13 @@ def test_alpaca_execute_stamps_order_ids(monkeypatch):
     assert pos["last_order_at"] > 1.0
     # the full exit deletes the row; the account keeps every id
     monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": qty)
-    monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty: "oid-3")
+    monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty, **kw: "oid-3")
     assert alpaca.execute(cl, {}, make_event(event="EXITED", expiry="2099-12-18"), st)
     assert st["positions"] == {}
     assert st["agent_order_ids"] == ["oid-1", "oid-2", "oid-3"]
     # no order id from Alpaca: nothing to remember, but the time still counts
     st = {"positions": {}}
-    monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty: "submitted")
+    monkeypatch.setattr(alpaca, "_order", lambda cfg, occ, side, qty, **kw: "submitted")
     alpaca.execute(cl, {}, make_event(expiry="2099-12-18"), st)
     pos = st["positions"]["SPY|2099-12-18|752.0|C"]
     assert "order_ids" not in pos and pos["last_order_at"] > 1.0
