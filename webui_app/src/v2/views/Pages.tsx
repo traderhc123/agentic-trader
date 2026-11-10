@@ -11,6 +11,8 @@ import type { Page, View } from "../App";
 import { HoldGroups, LimitsPanel, Notes } from "./Today";
 
 const SETUP = "/setup";
+const SOURCE_NAMES: Record<string, string> = { agenthc: "AgentHC Day Trade Ideas" };
+const sourceName = (id: string) => (Object.prototype.hasOwnProperty.call(SOURCE_NAMES, id) ? SOURCE_NAMES[id] : id);
 
 function Row({ label, exp, val, act, valClass = "sm" }: { label: ReactNode; exp: ReactNode; val?: ReactNode; act?: ReactNode; valClass?: string }) {
   return (
@@ -101,7 +103,8 @@ export function RulesView({ page }: { page: Page }) {
   const mu = L.trade_size.main.usd;
   const ou = L.trade_size.other.usd;
   const perTrade = mu != null && ou != null ? Math.max(mu, ou) : null;
-  const guard = s.positions.find((p) => p.next.expiry_guard_at)?.next.expiry_guard_at ?? null;
+  // the soonest expiry sell among what is held (ISO times sort as text)
+  const guard = s.positions.map((p) => p.next.expiry_guard_at).filter((x): x is string => !!x).sort()[0] ?? null;
   return (
     <div className="view">
       <div className="view-h">
@@ -303,7 +306,7 @@ export function SignalsView({ page }: { page: Page }) {
         <div>
           <h1>Signals & pass</h1>
           <p>
-            Your agent acts on trade signals from its signal source{sig.source ? ` (${sig.source})` : ""}. This page shows what access it has
+            Your agent acts on trade signals from its signal source{sig.source ? ` (${sourceName(sig.source)})` : ""}. This page shows what access it has
             and when it last heard from the source.
           </p>
         </div>
@@ -448,7 +451,7 @@ export function SettingsView({ page }: { page: Page }) {
           }
         />
         <Row
-          label={`Signals${s.signals.source ? `: ${s.signals.source}` : ""}`}
+          label={`Signals${s.signals.source ? `: ${sourceName(s.signals.source)}` : ""}`}
           exp={s.signals.last_signal ? `Newest signal seen ${etWhen(s.signals.last_signal, today)}.` : "No signal seen yet."}
           val={plain(s.signals.reading ? "Reading" : "Not reading", s.signals.reading)}
           act={

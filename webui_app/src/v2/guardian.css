@@ -742,3 +742,9 @@ a.btn{text-decoration:none}
 .h-paid{white-space:normal;overflow-wrap:anywhere;min-width:0}
 .h-paid small{white-space:nowrap}
 .limit-top b,.money li b,.periods dd,.setrow .val{overflow-wrap:anywhere}
+.tally li b{white-space:normal;text-align:right;overflow-wrap:anywhere;min-width:0}
+.tally li > span{min-width:0}
+.toast{width:max-content}
+@media (max-width:760px){
+  .toast{left:12px;right:12px;transform:none;width:auto;max-width:none}
+}

@@ -375,6 +375,8 @@ function Shell({ feed, status }: { feed: StatusFeed; status: Status }) {
 function Waiting({ feed }: { feed: StatusFeed }) {
   const locked = feed.fetching.kind === "locked";
   const failed = feed.failing || locked;
+  // the agent answered, but not with a status this page can read
+  const mismatch = feed.fetching.kind === "failing" && feed.fetching.why === "schema";
   useEffect(() => {
     document.documentElement.dataset.mode = failed ? "unknown" : "setup";
     document.title = failed ? "No connection · Agentic Trader" : "Agentic Trader";
@@ -391,8 +393,10 @@ function Waiting({ feed }: { feed: StatusFeed }) {
           <p className="mode-say" role="status">
             {locked
               ? "Your dashboard login expired."
-              : failed
-                ? "This window can't reach your agent, and it has no earlier report to show."
+              : failed && mismatch
+                ? "Your agent answered in a form this page can't read."
+                : failed
+                  ? "This window can't reach your agent, and it has no earlier report to show."
                 : "Asking your agent how things stand…"}
           </p>
         </div>
@@ -402,11 +406,13 @@ function Waiting({ feed }: { feed: StatusFeed }) {
           <div className="view">
             <div className="note note-crit" role="alert">
               <Icon name="alert" />
-              <h3>{locked ? "Open your login link again" : "Nothing here is known yet"}</h3>
+              <h3>{locked ? "Open your login link again" : mismatch ? "The agent and this page are different versions" : "Nothing here is known yet"}</h3>
               <p>
                 {locked
                   ? "Run `python agent.py link` in the agent folder (or restart the agent) and open the link it prints. Nothing was changed."
-                  : "The agent may be stopped, or this computer may have just woken up. This page keeps trying every few seconds. If the agent is stopped, it is not buying or selling anything: check your positions at your broker."}
+                  : mismatch
+                    ? "Nothing is shown rather than something misread. The classic dashboard still works; updating the agent brings this page back."
+                    : "The agent may be stopped, or this computer may have just woken up. This page keeps trying every few seconds. If the agent is stopped, it is not buying or selling anything: check your positions at your broker."}
               </p>
               {!locked && (
                 <div className="note-act">
