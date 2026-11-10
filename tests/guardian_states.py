@@ -1,0 +1,369 @@
+"""Named dashboard states for the /v2 ("Guardian") dashboard, as view-models.
+
+Every state here is built by the real builder (view_model.build_status) from
+made-up settings, memory and trade-log rows at one fixed moment, so the
+screens can be opened, screenshotted and tested with no broker, wallet or
+network. Nothing in the product imports this file.
+
+  STATES                  {name: (cfg, state, rows, runtime)}
+  status(name)            the Status the agent would serve for that state
+  activity(name, ...)     an ActivityPage of the same rows
+  python tests/guardian_states.py --out DIR    write one JSON file per state
+  python tests/guardian_dev_server.py          serve them to the built UI
+"""
+
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import view_model as vm  # noqa: E402
+
+# Monday 2026-11-09, 2:41:07 PM ET: a trading day, market open
+NOW = datetime(2026, 11, 9, 19, 41, 7, tzinfo=timezone.utc)
+TODAY = "2026-11-09"
+ACCT = "robinhood:0123456789"
+
+CFG = {"source": "agenthc", "broker": "robinhood", "dry_run": True,
+       "robinhood_account": "5QR74821", "max_entries_per_day": 4,
+       "max_daily_loss_usd": 300, "max_open_positions": 8,
+       "sizing_mode": "budget", "budget_per_trade_usd": 500,
+       "other_sizing_mode": "budget", "other_budget_per_trade_usd": 150,
+       "agenthc_api_key": "", "feed_pass": {"token": "fixture-pass"}}
+
+
+def at(hh, mm=0, day=TODAY):
+    """An ISO UTC stamp for hh:mm ET on `day` (EST, UTC-5)."""
+    d = datetime.strptime(day, "%Y-%m-%d").replace(
+        hour=hh, minute=mm, tzinfo=timezone.utc) + timedelta(hours=5)
+    return d.isoformat(timespec="seconds")
+
+
+def runtime(**over):
+    t = NOW.timestamp()
+    rt = {"running": True, "started_at": t - 7200, "heartbeat_at": t - 4,
+          "wait_s": 30.0, "poll_at": t - 4, "poll_ok": True,
+          "feed_access": True, "signal_at": t - 4987,  # 1:18 PM ET
+          "broker": {"id": "robinhood", "account_tag": ACCT, "connected": True,
+                     "down_since": None, "last_ok_at": t - 7,
+                     "last_error": None, "buying_power": 2431.18,
+                     "buying_power_at": t - 7}}
+    rt.update(over)
+    return rt
+
+
+def _pass_state(days_left=13, status="active"):
+    from sources import agenthc_day_trade_ideas as hc
+    return {"pass_status": {hc._token_id("fixture-pass"): {
+        "status": status, "days_left": days_left}},
+        "paid_days": ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05",
+                      "2026-11-06", TODAY]}
+
+
+def _text(c):
+    sym, expiry, strike, side = c
+    return f"{sym} {expiry} ${float(strike)} {side}"
+
+
+def _key(c):
+    sym, expiry, strike, side = c
+    return f"{sym}|{expiry}|{float(strike)}|{side}"
+
+
+def _row(action, c, ts, mode, book="main", **over):
+    r = {"action": action, "event_id": f"{action}|{_key(c)}|{ts}",
+         "contract": _text(c), "ts": ts, "book": book}
+    ui = {"mode": mode}
+    for k in ("check", "code", "params", "qty", "mark", "sent", "filled"):
+        if k in over:
+            ui[k] = over.pop(k)
+    if action in ("entry", "exit"):
+        ui["book"] = "main" if book == "main" else "other"
+        r.pop("book")
+    r.update(over)
+    r["ui"] = ui
+    return r
+
+
+def entry(c, ts, qty, mark, real, mode=None, book="main"):
+    return _row("entry", c, ts, mode or ("live" if real else "practice"), book,
+                dry=not real, reason="passed your rules", qty=qty, mark=mark,
+                sent=real, filled=real)
+
+
+def exit_(c, ts, qty, pnl, real, mode=None, book="main", **over):
+    r = _row("exit", c, ts, mode or ("live" if real else "practice"), book,
+             dry=not real, reason="exit signal", est_pnl_usd=pnl, qty=qty,
+             sent=real, filled=real)
+    r["qty"] = qty
+    r.update(over)
+    return r
+
+
+SPY = ("SPY", "2026-11-13", 700, "C")
+AAPL = ("AAPL", "2026-11-20", 285, "C")
+IWM_TODAY = ("IWM", TODAY, 245, "C")
+QQQ = ("QQQ", "2026-11-13", 640, "C")
+NVDA = ("NVDA", "2026-11-13", 232.5, "P")
+AMD = ("AMD", "2026-11-13", 262.5, "C")
+
+
+def _history(real_today):
+    """The trade log, oldest first: a real-money week, then today traded in
+    `real_today`'s book."""
+    m = "live"
+    d2, d3, d4, d5, d6 = ("2026-11-02", "2026-11-03", "2026-11-04",
+                          "2026-11-05", "2026-11-06")
+    p28, p29, p30 = "2026-10-28", "2026-10-29", "2026-10-30"
+    rows = [
+        # an older practice week
+        entry(("SPY", "2026-10-30", 688, "C"), at(10, 2, p28), 1, 2.10, False),
+        exit_(("SPY", "2026-10-30", 688, "C"), at(11, 40, p28), 1, 41.0, False),
+        entry(("QQQ", "2026-10-30", 630, "P"), at(12, 5, p28), 1, 1.75, False),
+        exit_(("QQQ", "2026-10-30", 630, "P"), at(14, 30, p28), 1, 15.0, False),
+        entry(("NVDA", "2026-10-30", 225, "C"), at(10, 15, p29), 2, 1.90, False),
+        exit_(("NVDA", "2026-10-30", 225, "C"), at(13, 2, p29), 2, 210.0, False),
+        entry(("IWM", "2026-10-30", 243, "C"), at(10, 30, p30), 1, 1.31, False),
+        exit_(("IWM", "2026-10-30", 243, "C"), at(15, 45, p30), 1, -54.0, False,
+              cause="expiry_guard"),
+        # the real-money week
+        _row("policy_veto", ("AMD", d6, 255, "C"), at(9, 38, d2), m,
+             check="written_rules",
+             reason="The signal arrived at 9:38 AM ET, and your written rules "
+                    "allow no new trades before 9:45 AM ET."),
+        entry(("SPY", d4, 694, "C"), at(10, 12, d2), 2, 2.35, True),
+        exit_(("SPY", d4, 694, "C"), at(13, 26, d2), 2, 188.0, True),
+        _row("skip_no_quote", ("PLTR", d6, 187.5, "C"), at(14, 2, d2), m,
+             check="trade_size", reason="no price quote for the contract"),
+        entry(("QQQ", d6, 628, "C"), at(10, 3, d3), 4, 1.21, True),
+        _row("entry_unfilled", ("META", d6, 742.5, "C"), at(10, 44, d3), m,
+             check="broker_order", sent=True, filled=False,
+             reason="the order was placed but never filled; the broker "
+                    "cancelled it"),
+        _row("order_failed", ("AAPL", d6, 282.5, "P"), at(11, 30, d3), m,
+             check="broker_order", sent=True, filled=False,
+             reason="the broker rejected the order: not enough buying power",
+             hint="Add cash to your broker account, or lower your trade size."),
+        exit_(("QQQ", d6, 628, "C"), at(12, 58, d3), 4, -316.0, True),
+        _row("skip_daily_loss", ("AMD", d6, 257.5, "C"), at(14, 21, d3), m,
+             check="daily_loss",
+             params={"max_loss_usd": 300.0, "loss_usd": 316.0}),
+        entry(("NVDA", d6, 228, "C"), at(9, 58, d4), 4, 1.18, True),
+        entry(("SPY", d6, 697, "P"), at(10, 20, d4), 2, 1.92, True),
+        entry(("IWM", d6, 244, "C"), at(10, 52, d4), 1, 1.44, True),
+        _row("exit_partial", ("NVDA", d6, 228, "C"), at(11, 36, d4), m,
+             sent=True, reason="the exit only partly filled: 2 of 4 contracts"),
+        exit_(("NVDA", d6, 228, "C"), at(11, 36, d4), 2, 106.0, True),
+        exit_(("NVDA", d6, 228, "C"), at(11, 37, d4), 2, 96.0, True,
+              cause="exit_remainder"),
+        exit_(("IWM", d6, 244, "C"), at(12, 5, d4), 1, 26.0, True),
+        entry(("AMZN", d6, 262.5, "C"), at(13, 11, d4), 2, 2.02, True),
+        _row("skip_daily_cap", ("GOOGL", d6, 301, "C"), at(13, 40, d4), m,
+             check="daily_cap", params={"cap": 4}),
+        exit_(("SPY", d6, 697, "P"), at(14, 48, d4), 2, -96.0, True),
+        exit_(("AMZN", d6, 262.5, "C"), at(15, 31, d4), 2, 74.0, True),
+        _row("broker_disconnected", ("QQQ", d6, 633, "P"), at(9, 51, d5), m,
+             check="broker_order", sent=False,
+             reason="the broker connection is down (login expired)",
+             hint="Sign in to your broker again in Settings."),
+        _row("skip_ai_needed", ("AMZN", d6, 264, "C"), at(10, 5, d5), m,
+             check="written_rules",
+             reason="your written rules need the AI helper, and it is not "
+                    "connected",
+             hint="Reconnect the AI helper in Settings, or turn off written "
+                  "rules."),
+        entry(("SPY", d6, 699, "C"), at(10, 47, d5), 2, 2.26, True),
+        _row("skip_stale", ("NVDA", d6, 231, "P"), at(11, 20, d5), m,
+             check="signal_fresh", params={"max_age_s": 300},
+             reason="signal was 300s+ old when the agent saw it (computer "
+                    "asleep or offline?)"),
+        _row("exit_failed", ("SPY", d6, 699, "C"), at(13, 2, d5), m,
+             sent=True, reason="the exit order didn't go through; retrying"),
+        exit_(("SPY", d6, 699, "C"), at(13, 3, d5), 2, 102.0, True),
+        entry(("META", "2026-11-13", 745, "C"), at(13, 35, d5), 1, 4.60, True),
+        entry(("IWM", d6, 246, "P"), at(14, 5, d5), 1, 1.52, True),
+        {**exit_(("META", "2026-11-13", 745, "C"), at(15, 6, d5), 1, 55.0, True),
+         "manual": True, "exit_price": 5.15,
+         "closed_at": at(15, 6, d5)},
+        entry(SPY, at(9, 49, d6), 1, 4.12, True),
+        entry(AAPL, at(10, 33, d6), 2, 2.31, True),
+        entry(IWM_TODAY, at(11, 5, d6), 1, 1.86, True),
+        _row("ledger_adopt", AAPL, at(11, 42, d6), m, dry=False, qty=1,
+             reason="the broker shows 2 contracts, the records showed 1"),
+        _row("skip_position_cap", ("NFLX", "2026-11-13", 1180, "C"),
+             at(11, 50, d6), m, check="position_cap", params={"max_open": 8}),
+        entry(("QQQ", "2026-11-13", 636, "P"), at(12, 18, d6), 1, 3.05, True),
+        exit_(("QQQ", "2026-11-13", 636, "P"), at(14, 10, d6), 1, -74.0, True),
+        exit_(("IWM", d6, 246, "P"), at(15, 45, d6), 1, -57.0, True,
+              cause="expiry_guard"),
+    ]
+    tm = "live" if real_today else "practice"
+    rows += [
+        entry(QQQ, at(9, 41), 1, 4.35, real_today),
+        _row("skip_budget", ("MSFT", "2026-11-13", 525, "C"), at(10, 5), tm,
+             check="trade_size", params={"cost_usd": 1120.0},
+             reason="1 contract ≈ $1,120 exceeds per-trade budget $500"),
+        entry(NVDA, at(10, 22), 2, 2.44, real_today),
+        entry(("IWM", "2026-11-13", 246, "C"), at(10, 40), 1, 1.12, real_today),
+        exit_(("IWM", "2026-11-13", 246, "C"), at(11, 31), 1, 64.0, real_today),
+        _row("policy_veto", ("META", "2026-11-13", 748, "C"), at(11, 48), tm,
+             check="written_rules",
+             reason="META reports earnings this week, and your written rules "
+                    "skip single stocks in their earnings week."),
+        _row("skip_rule", ("TSLA", "2026-11-13", 452.5, "C"), at(12, 15), tm,
+             check="your_rules", code="rule_skip_list",
+             params={"ticker": "TSLA"}, reason="TSLA is on your skip list"),
+        _row("skip_budget", ("COST", "2026-11-13", 1010, "C"), at(12, 42), tm,
+             check="trade_size", params={"cost_usd": 1240.0},
+             reason="1 contract ≈ $1,240 exceeds per-trade budget $500"),
+        _row("skip_budget", ("AVGO", "2026-11-13", 395, "C"), at(13, 5), tm,
+             "shadow", check="trade_size",
+             params={"cost_usd": 480.0},
+             reason="1 contract ≈ $480 exceeds per-trade budget $150"),
+        _row("skip_budget", ("AMZN", "2026-11-13", 265, "P"), at(13, 18), tm,
+             "shadow", check="trade_size",
+             params={"cost_usd": 295.0},
+             reason="1 contract ≈ $295 exceeds per-trade budget $150"),
+    ]
+    return rows
+
+
+def _cap_rows(real_today):
+    tm = "live" if real_today else "practice"
+    return [entry(AMD, at(13, 30), 1, 1.38, real_today, book="other"),
+            _row("skip_daily_cap", ("GOOGL", "2026-11-13", 305, "C"),
+                 at(14, 10), tm, check="daily_cap", params={"cap": 4})]
+
+
+def _pos(c, qty, mark, real, opened):
+    if real:
+        return {"option_id": "x-" + c[0], "qty": qty, "live": True,
+                "entry_mark": mark, "acct": ACCT,
+                "opened_at": datetime.fromisoformat(opened).timestamp()}
+    return {"option_id": "dry", "qty": qty, "dry": True, "entry_mark": mark}
+
+
+def _state(real_today, extra=()):
+    d6 = "2026-11-06"
+    pos = {_key(SPY): _pos(SPY, 1, 4.12, True, at(9, 49, d6)),
+           _key(AAPL): _pos(AAPL, 2, 2.31, True, at(10, 33, d6)),
+           _key(IWM_TODAY): _pos(IWM_TODAY, 1, 1.86, True, at(11, 5, d6)),
+           _key(QQQ): _pos(QQQ, 1, 4.35, real_today, at(9, 41)),
+           _key(NVDA): _pos(NVDA, 2, 2.44, real_today, at(10, 22))}
+    for c, qty, mark, opened in extra:
+        pos[_key(c)] = _pos(c, qty, mark, real_today, opened)
+    return {"positions": pos, "seen": [], **_pass_state()}
+
+
+def _numbered(rows):
+    return [{**r, "n": i} for i, r in enumerate(rows)]
+
+
+LIVE = {**CFG, "dry_run": False}
+_BROKER = runtime()["broker"]
+_AMD_POS = [(AMD, 1, 1.38, at(13, 30))]
+
+# name -> (cfg, state, rows, runtime)
+STATES = {
+    "practice": (CFG, _state(False), _history(False), runtime()),
+    "live": (LIVE, _state(True), _history(True), runtime()),
+    "paused-new-trades": ({**LIVE, "paused": True}, _state(True),
+                          _history(True), runtime()),
+    "practice-paused-new-trades": ({**CFG, "paused": True}, _state(False),
+                                   _history(False), runtime()),
+    # a full hold: the agent places no orders at all until the owner resumes
+    "state-hold": (LIVE, _state(True), _history(True),
+                   runtime(hold="state_hold",
+                           hold_since="2026-11-09T18:02:00+00:00")),
+    "handoff-hold": (LIVE, _state(True), _history(True),
+                     runtime(hold="handoff_hold")),
+    "restarting": (LIVE, _state(True), _history(True),
+                   runtime(hold="restarting")),
+    "limit-hit": (LIVE, _state(True, _AMD_POS),
+                  _history(True) + _cap_rows(True), runtime()),
+    "broker-disconnected": (
+        LIVE, _state(True), _history(True),
+        runtime(broker={**_BROKER, "connected": False,
+                        "down_since": NOW.timestamp() - 2587,  # 1:58 PM ET
+                        "last_ok_at": NOW.timestamp() - 2590,
+                        "last_error": "login expired",
+                        "buying_power_at": NOW.timestamp() - 2590})),
+    "low-cash": (LIVE, _state(True), _history(True),
+                 runtime(broker={**_BROKER, "buying_power": 38.5})),
+    "not-answering": (LIVE, _state(True), _history(True),
+                      runtime(heartbeat_at=NOW.timestamp() - 1500,
+                              poll_at=NOW.timestamp() - 1500)),
+    "stopped": (LIVE, _state(True), _history(True), None),
+    "empty-first-run": (CFG, {"positions": {}, "seen": [],
+                              **_pass_state(13)}, [],
+                        runtime(signal_at=None)),
+    "empty-live": (LIVE, {"positions": {}, "seen": [], **_pass_state(13)}, [],
+                   runtime(signal_at=None)),
+    # the prepaid signal days ran out: exit signals still arrive, entries don't
+    "pass-exits-only": (CFG, {**_state(False), **_pass_state(0, "exits_only")},
+                        _history(False), runtime(feed_access=False)),
+}
+
+
+def _stress():
+    """Hostile and oversized data: long names, huge numbers, unknown kinds,
+    rows from before the facts were recorded."""
+    long = "W" * 400
+    rows = _history(False) + [
+        {"action": "something_new", "contract": long, "ts": at(13, 40),
+         "reason": "<script>alert(1)</script> " + long},
+        {"action": "entry", "event_id": "old", "ts": at(13, 41),
+         "contract": "BRK.B 2027-01-15 $99999.5 C", "dry": False,
+         "reason": "old row"},
+        {"action": "exit", "event_id": "old-x", "ts": at(13, 42),
+         "contract": "BRK.B 2027-01-15 $99999.5 C", "dry": False,
+         "est_pnl_usd": -1234567.89},
+        {"action": "skip_rule", "ts": "not a time", "contract": None},
+        {"action": "exit", "ts": at(13, 43), "contract": "SPY", "dry": True,
+         "est_pnl_usd": 98765432.1},
+    ]
+    st = _state(False)
+    st["positions"]["not|a|key"] = {"qty": "many", "live": True}
+    st["positions"]["BRK.B|2027-01-15|99999.5|C"] = {
+        "option_id": "big", "qty": 250, "live": True, "entry_mark": 812.345,
+        "acct": ACCT, "opened_at": NOW.timestamp() - 90000}
+    st["positions"][_key(("GOOGL", "2026-12-18", 305, "P"))] = {
+        "option_id": "dry", "qty": 3, "dry": True}
+    cfg = {**CFG, "max_entries_per_day": 40, "max_open_positions": 60,
+           "sizing_mode": "percent", "percent_per_trade": 2.5,
+           "other_sizing_mode": "", "max_daily_loss_usd": 0}
+    rt = runtime(notices=[
+        {"level": "urgent", "code": "expiry", "text": "IWM $245 call expires "
+         "today and was not sold by 3:50 PM ET. " + long},
+        {"level": "warn", "code": "update", "text": "An update is ready."},
+        {"level": "info", "code": "note", "text": "Signals resumed."}])
+    return cfg, st, rows, rt
+
+
+STATES["stress"] = _stress()
+
+
+def status(name, now=NOW):
+    cfg, state, rows, rt = STATES[name]
+    return vm.build_status(cfg, state, _numbered(rows), rt, now=now)
+
+
+def activity(name, before=None, limit=None):
+    _cfg, _state_, rows, _rt = STATES[name]
+    return vm.activity_page(_numbered(rows), before=before,
+                            limit=limit or vm.ACTIVITY_LIMIT)
+
+
+if __name__ == "__main__":
+    if "--out" in sys.argv:
+        out = sys.argv[sys.argv.index("--out") + 1]
+        os.makedirs(out, exist_ok=True)
+        for name in STATES:
+            with open(os.path.join(out, name + ".json"), "w",
+                      encoding="utf-8", newline="\n") as f:
+                json.dump(status(name), f, indent=1)
+        print(f"wrote {len(STATES)} states to {out}")
+    else:
+        print(__doc__)
