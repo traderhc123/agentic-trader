@@ -7,6 +7,7 @@
 // band changes only when the next status says so.
 import { useState } from "react";
 import type { Position, Status } from "../lib/viewModel";
+import { sellsHow } from "./lib/copy";
 import { brokerLabel, paidFor, practicePositions, realPositions } from "./lib/derive";
 import { UNKNOWN, contractName, count, etTime, plural, usd } from "./lib/format";
 import { Dialog, ExpiresFlag, Icon, WillWont } from "./ui";
@@ -138,7 +139,9 @@ export function ActionDialog({
         <WillWont
           will={[
             "Buy real option contracts when a signal passes your rules and limits.",
-            "Sell them when the exit signal arrives, or at its expiry sell time on the day they expire.",
+            s.expiry_guard_on
+              ? "Sell them when the exit signal arrives, or at its expiry sell time on the day they expire."
+              : "Sell them when the exit signal arrives. The expiry sell is off: sell expiring positions yourself before the close.",
             pp.length
               ? `Leave your ${plural(pp.length, "practice position")} as practice. ${their(pp.length, "It closes", "They close")} as pretend ${their(pp.length, "trade", "trades")}.`
               : "Keep every rule and limit exactly as saved.",
@@ -216,7 +219,7 @@ export function ActionDialog({
           <strong>Stop new trades only</strong>
           <span>
             {managed || !n
-              ? "The agent keeps selling what you hold: on exit signals, and at its expiry sell time on expiry day. Choose this to take a break without leaving positions unwatched."
+              ? `The agent keeps selling what you hold: ${sellsHow(s)}. Choose this to take a break without leaving positions unwatched.`
               : "No new trades. Whether the agent sells what you hold does not change with a pause: see What the agent will do for each position."}
           </span>
         </label>

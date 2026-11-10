@@ -19,6 +19,7 @@ import {
   ANSWER_LOOK,
   CHECK_FALLBACK,
   CHECK_LABELS,
+  EXPIRY_OFF,
   FALLBACK_TITLE,
   REASONS,
   UNMANAGED_SHORT,
@@ -27,10 +28,27 @@ import {
   answerWhy,
   checkLabel,
   describe,
+  expiryWill,
   nextSay,
+  sellsHow,
   tagOf,
 } from "../src/v2/lib/copy.ts";
-import { asOf, bandModel, dayTally, isStale, linkOf, nextFor, notes, paidFor, statement, unwatched, vitals } from "../src/v2/lib/derive.ts";
+import {
+  asOf,
+  bandModel,
+  bookToday,
+  bookTodayNote,
+  dayTally,
+  isStale,
+  linkOf,
+  nextFor,
+  notes,
+  paidFor,
+  realBookCaption,
+  statement,
+  unwatched,
+  vitals,
+} from "../src/v2/lib/derive.ts";
 import { UNKNOWN, ago, contractName, dayLong, etDayKey, etTime, etWhen, plural, signed, span, tone, usd } from "../src/v2/lib/format.ts";
 
 const BAD = /undefined|NaN|\[object|\bnull\b|Infinity/;
@@ -102,6 +120,104 @@ test("the money tag follows what the row recorded, never a guess", () => {
   assert.equal(tagOf(row({ action: "skip_x", order_sent: null })), "unk");
   // a failed sale written in practice mode is not a practice event
   assert.equal(tagOf(row({ action: "exit_failed", reason_code: "exit_failed", real: false, order_sent: null })), "unk");
+});
+
+test("an order with no clear answer is never 'rejected', and 'filled' only when recorded", () => {
+  for (const [code, action] of [["buy_unconfirmed", "order_failed"], ["sell_unconfirmed", "exit_failed"]]) {
+    const d = describe(row({ action, reason_code: code, real: true, mode_at_time: "live", order_sent: true, filled: null, stopped_at_check: null }), "Robinhood");
+    const said = [d.title, d.sub, d.what].join(" ");
+    assert.ok(!/rejected|did not go through|Nothing was bought|failed/i.test(said), `${code}: ${said}`);
+    assert.match(d.sub, /may have gone through/, code);
+    assert.equal(d.tag, "real", code);
+    assert.match(d.money, /not known/, code);
+    assert.ok(!/was filled/.test(d.money), `${code}: ${d.money}`);
+  }
+  const partly = describe(row({ action: "entry_unfilled", reason_code: "buy_partly_filled", real: true, order_sent: true, filled: null }), "Robinhood");
+  assert.ok(!/Nothing was bought/.test(partly.what + partly.sub), partly.what);
+  // `filled` null: never "filled"; true: filled
+  const unk = describe(row({ action: "entry", reason_code: "entered", real: true, order_sent: true, filled: null }), "Robinhood");
+  assert.equal(unk.money, "Real money. An order was sent to Robinhood; whether it filled is not known.");
+  const yes = describe(row({ action: "entry", reason_code: "entered", real: true, order_sent: true, filled: true }), "Robinhood");
+  assert.equal(yes.money, "Real money. An order was filled at Robinhood.");
+});
+
+test("a sell still working is 'sent', never 'Sold'", () => {
+  for (const code of ["exit_signal", "expiry_guard", "exit_remainder"]) {
+    const d = describe(row({ action: "exit", reason_code: code, real: true, order_sent: true, filled: false, qty: 3 }), "Robinhood");
+    assert.ok(d.title.startsWith("Sell order sent"), d.title);
+    assert.ok(!/\bsold\b/i.test(d.title) && !/The agent sold/.test(d.what), `${code}: ${d.title} / ${d.what}`);
+    assert.match(d.money, /had not filled/);
+    const done = describe(row({ action: "exit", reason_code: code, real: true, order_sent: true, filled: true, qty: 3 }), "Robinhood");
+    assert.ok(/^Sold/.test(done.title), done.title);
+  }
+});
+
+// a minimal Status / Position for the sentence functions
+const S = (over = {}) => ({
+  broker: { name: "Robinhood", paper_account: false, account_mask: null },
+  market: { open: true, closes_at: "2026-11-09T21:00:00Z" },
+  limits: { open_positions: { real: 1, practice: 0 } },
+  signals: { pass: { days_left: null }, last_signal: null },
+  expiry_guard_on: true,
+  ...over,
+});
+const P = (next, over = {}) => ({
+  real: true, expires_today: false, qty: 1, contract: null, label: "SPY",
+  next: { action: "unmanaged", at: null, reason_code: "no_exit_signals", expiry_guard_at: null, ...next }, ...over,
+});
+
+test("with no exit signals a real position is never presented as looked after", () => {
+  const s = S();
+  for (const [action, reason] of [["unmanaged", "no_exit_signals"], ["unknown", "feed_unreachable"], ["unmanaged", "no_bid"]]) {
+    const say = nextSay(P({ action, reason_code: reason }), s);
+    assert.equal(say.look, "bad", reason);
+    assert.match(say.text, /yourself|watch it/, reason);
+  }
+  // expiring today, expiry sell on: it still runs, and only that is promised
+  const guarded = nextSay(P({ expiry_guard_at: "2026-11-09T20:45:00Z" }, { expires_today: true }), s).text;
+  assert.match(guarded, /expiry sell still sells it/);
+  assert.ok(!/before the close/.test(guarded), guarded);
+  // ...with no expiry sell, the owner is told to sell it before the close
+  assert.match(nextSay(P({}, { expires_today: true }), s).text, /before the close/);
+  // the no-bid sentence says it once
+  const nb = nextSay(P({ action: "unmanaged", reason_code: "no_bid" }, { expires_today: true }), s).text;
+  assert.equal(nb.match(/before the close/g).length, 1, nb);
+  const closing = answerWhy("closing", { state: "cant", reason_code: "no_signal_access" }, s);
+  assert.match(closing, /No exit signals reach the agent/);
+  assert.match(answerWhy("closing", { state: "cant", reason_code: "feed_unreachable" }, s), /exit signal can't reach/);
+});
+
+test("the expiry sell is promised only when it is on", () => {
+  const p = P({ action: "sell_on_exit", reason_code: "exit_signal" });
+  assert.equal(expiryWill(p, S({ expiry_guard_on: false })).will, null);
+  assert.equal(expiryWill(p, S({ expiry_guard_on: false })).wont, EXPIRY_OFF);
+  assert.ok(!/expiry sell time/.test(sellsHow(S({ expiry_guard_on: false }))));
+  assert.match(expiryWill(p, S()).will, /expiry sell time/);
+  assert.match(expiryWill(P({ expiry_guard_at: "2026-11-13T20:45:00Z" }), S()).will, /3:45 PM ET/);
+  assert.match(sellsHow(S()), /expiry sell time/);
+});
+
+test("a sale today with no estimate is never 'nothing closed'", () => {
+  const B = (days, unmeasured_today) => ({ days, unmeasured_today });
+  assert.equal(bookTodayNote(bookToday(B([], 0), "2026-11-09")), "nothing closed today");
+  const only = bookToday(B([], 2), "2026-11-09");
+  assert.deepEqual(only, { closed: 0, pnl: null, unmeasured: 2 });
+  assert.ok(!/nothing closed/.test(bookTodayNote(only)), bookTodayNote(only));
+  assert.match(bookTodayNote(only), /2 sales not measured/);
+  const both = bookToday(B([{ day: "2026-11-09", pnl: 12, closed: 1 }], 1), "2026-11-09");
+  assert.equal(bookTodayNote(both), "1 trade closed, plus 1 sale not measured");
+});
+
+test("a broker paper account is never real money", () => {
+  const e = row({ action: "exit", reason_code: "exit_signal", real: true, paper_account: true, order_sent: true, filled: true, qty: 1 });
+  assert.equal(tagOf(e), "paper");
+  const d = describe(e, "Alpaca");
+  assert.ok(!/Real money/.test(d.money), d.money);
+  assert.match(d.money, /Not real money/);
+  assert.equal(tagOf({ ...e, paper_account: false }), "real");
+  assert.equal(tagOf({ ...e, paper_account: null }), "real");
+  assert.match(realBookCaption(S({ broker: { name: "Alpaca", paper_account: true, account_mask: null } })), /paper-trading/);
+  assert.equal(realBookCaption(S()), "Orders filled at Robinhood");
 });
 
 test("money and times", () => {
@@ -225,6 +341,49 @@ test("every state: nothing undefined, and the band keeps to its rules", { skip }
         assert.ok(notes(s, l).some((n) => n.level === "crit"), where);
       }
     }
+});
+
+test("the review states say what the agent can and can't do", { skip }, () => {
+  const get = (n) => {
+    const hit = states.find(([x]) => x === n);
+    assert.ok(hit, `state ${n}`);
+    return hit[1];
+  };
+  // no exit signal can arrive: nothing is "sold on its exit signal"
+  for (const name of ["pass-lapsed", "day-pass-refused", "feed-down"]) {
+    const s = get(name);
+    assert.equal(s.real_positions_managed, false, name);
+    assert.notEqual(s.capabilities.closing.state, "yes", name);
+    for (const p of s.positions.filter((x) => x.real)) assert.equal(nextSay(p, s).look, "bad", `${name} ${p.id}`);
+    assert.ok(notes(s, "ok").some((n) => n.level === "crit"), name);
+    const said = [statement(s, "ok").lead, answerWhy("closing", s.capabilities.closing, s)].join(" ");
+    assert.ok(!/It sells what it holds|On each exit signal/.test(said), `${name}: ${said}`);
+  }
+  const lapsed = notes(get("pass-lapsed"), "ok");
+  assert.ok(lapsed.some((n) => n.key === "pass"), "pass note on a waiting pass");
+  assert.ok(lapsed.some((n) => n.text.includes("has run out")), "the agent's own pass notice");
+  assert.ok(notes(get("day-pass-refused"), "ok").some((n) => n.text.includes("refused")));
+  // the expiry sell is off: never promised
+  const off = get("expiry-guard-off");
+  assert.equal(off.expiry_guard_on, false);
+  for (const p of off.positions.filter((x) => x.real)) assert.equal(expiryWill(p, off).will, null, p.id);
+  // no bid: not "being sold"
+  const nb = get("expiry-no-bid");
+  const iwm = nb.positions.find((p) => p.id.startsWith("IWM|2026-11-09"));
+  assert.equal(iwm.next.reason_code, "no_bid");
+  assert.match(nextSay(iwm, nb).text, /in the money/);
+  // unclear orders, a working sell, a sale with no estimate
+  const c = get("check-these-orders");
+  const said = c.activity.rows.map((e) => describe(e, c.broker.name));
+  assert.ok(said.some((d) => d.title.startsWith("No clear answer on a buy")));
+  assert.ok(said.some((d) => d.title.startsWith("No clear answer on a sell")));
+  assert.ok(said.some((d) => d.title.startsWith("Sell order sent")));
+  assert.ok(bookToday(c.results.real, etDayKey(c.as_of)).unmeasured >= 1);
+  // a paper account
+  const pa = get("paper-account");
+  assert.equal(pa.results.paper_account.total, 64);
+  assert.ok(pa.activity.rows.filter((e) => e.action === "exit" && etDayKey(e.at) === etDayKey(pa.as_of)).every((e) => tagOf(e) === "paper"));
+  assert.match(realBookCaption(pa), /paper-trading/);
 });
 
 test("amounts paid are never a partial sum", { skip }, () => {

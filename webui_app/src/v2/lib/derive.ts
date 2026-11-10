@@ -10,7 +10,7 @@
 //   - when the agent is not answering, or this page can't fetch, nothing is
 //     presented as current: the mode is "unknown" and every panel is stamped
 //     "as of" the last report.
-import type { Activity, Iso, Position, Status } from "../../lib/viewModel";
+import type { Activity, Book, Iso, Position, Status } from "../../lib/viewModel";
 import { UNMANAGED_FALLBACK, UNMANAGED_SHORT, UNMANAGED_WHY, answerWhy, describe, leftToday, nextSay, own, sizeEach, type IconName, type NextSay } from "./copy.ts";
 import { contractName, etDayKey, etTime, etWhen, dayLong, plural, span, secondsBetween, usd } from "./format.ts";
 
@@ -328,7 +328,10 @@ export function notes(s: Status, l: Link): Note[] {
     });
   else if (l === "ok" && n && !s.real_positions_managed) {
     const lost = unwatched(s);
-    const exp = lost.find((p) => p.expires_today);
+    // with no exit signals the expiry sell still acts: not "nobody is selling it"
+    const exp = lost.find(
+      (p) => p.expires_today && !(p.next.expiry_guard_at && (p.next.reason_code === "no_exit_signals" || p.next.reason_code === "feed_unreachable")),
+    );
     const k = lost.length;
     out.push({
       key: "unmanaged",
@@ -382,18 +385,31 @@ export function notes(s: Status, l: Link): Note[] {
       });
     }
     const p = s.signals.pass;
-    if (l === "ok" && (p.status === "exits_only" || p.status === "none") && p.kind !== "not_needed")
+    if (l === "ok" && (p.status === "exits_only" || p.status === "none" || p.status === "waiting") && p.kind !== "not_needed") {
+      const held = n ? ` Until then, watch your ${plural(n, "real position")} and sell ${their(n, "it", "them")} yourself at ${b}.` : "";
       out.push({
         key: "pass",
         level: "warn",
         icon: "info",
-        title: p.status === "exits_only" ? "No signal days left for new trades" : "No signal pass",
+        title:
+          p.status === "exits_only"
+            ? "No signal days left for new trades"
+            : p.status === "waiting"
+              ? p.auto_pay
+                ? "No signal pass for today yet"
+                : "No usable signal pass"
+              : "No signal pass",
         text:
           p.status === "exits_only"
             ? "The agent still receives exit signals for what it holds, so open positions are still sold. It takes no new trades until you add signal days."
-            : "Without a pass the agent receives no signals, so it takes no new trades.",
+            : p.status === "waiting" && p.auto_pay
+              ? "Your wallet's auto-pay buys a day-pass on the agent's next read of the feed on a market day. Until it has one, the agent receives no signals: no new trades, and no exit signals for what it holds."
+              : p.status === "waiting"
+                ? `Your signal pass is used up, expired or waiting for payment, so the agent receives no signals: no new trades, and no exit signals for what it holds.${held}`
+                : `Without a pass the agent receives no signals: no new trades, and no exit signals for what it holds.${held}`,
         actions: ["signals"],
       });
+    }
   }
   return out;
 }
@@ -502,6 +518,40 @@ export function statement(s: Status, l: Link): Statement {
             : answerWhy("opening", o, s),
     empty: false,
   };
+}
+
+// ── a book's day ────────────────────────────────────────────────────────────
+
+export interface BookToday {
+  /** trades closed today with an estimate */
+  closed: number;
+  /** their estimated result; null when none was measured */
+  pnl: number | null;
+  /** sales today with no estimate: a sale, never "nothing closed" */
+  unmeasured: number;
+}
+
+export function bookToday(B: Book, today: string): BookToday {
+  const t = B.days.find((d) => d.day === today);
+  const unmeasured = B.unmeasured_today ?? 0;
+  return { closed: t ? t.closed : 0, pnl: t ? t.pnl : null, unmeasured };
+}
+
+/** What the "Real money" book holds. Sales in a broker's paper-trading
+ *  account are booked apart (results.paper_account) once each line records
+ *  its account; older lines can't be told apart, and the caption says so
+ *  whenever the agent trades a paper account. */
+export function realBookCaption(s: Status): string {
+  if (!s.broker.paper_account) return `Orders filled at ${brokerLabel(s)}`;
+  return `Orders filled at ${brokerName(s)}. Sales in its paper-trading account, the one the agent trades now, are counted apart; older lines that did not record the account are counted here and may include paper ones.`;
+}
+export const PAPER_BOOK_CAPTION = "Orders filled in a broker's paper-trading account. Not real money.";
+
+/** The line under a book's "Today" figure. */
+export function bookTodayNote(x: BookToday): string {
+  const um = x.unmeasured ? `${plural(x.unmeasured, "sale")} not measured` : "";
+  if (!x.closed) return um ? `${um} (no estimate)` : "nothing closed today";
+  return `${plural(x.closed, "trade")} closed${um ? `, plus ${um}` : ""}`;
 }
 
 // ── today, from the rows the page has ───────────────────────────────────────

@@ -195,8 +195,9 @@ def test_broker_problems_on_an_entry_stop_at_the_broker_check(home, no_policy):
     run(make_event(), {"dry_run": False}, broker=Rejects(), client=None)
     failed, unfilled = rows(home)[-2:]
     assert failed["ui"] == {"mode": "live", "check": "broker_order"}
+    # placed=True: it may have (partly) filled — never "nothing was bought"
     assert unfilled["ui"] == {"mode": "live", "check": "broker_order",
-                              "sent": True}
+                              "sent": True, "code": "buy_partly_filled"}
 
 
 def test_broker_that_gives_no_reason(home, no_policy):
@@ -255,7 +256,8 @@ def test_live_entry_row_with_its_quote(home, no_policy):
         "contract": "SPY 2026-07-10 $752.0 C", "dry": False,
         "reason": "test: mechanical"}
     assert e["ui"] == {"mode": "live", "book": "main", "sent": True,
-                       "filled": True, "qty": 1, "mark": 4.1235}
+                       "filled": True, "qty": 1, "mark": 4.1235,
+                       "paper": False}
     run(make_event(event="EXITED", event_id="x1"),
         {"dry_run": True, "position_sync": False}, state, broker=b,
         client=object())
@@ -263,7 +265,7 @@ def test_live_entry_row_with_its_quote(home, no_policy):
     # a real position sold while the agent is in practice mode
     assert x["dry"] is False and x["qty"] == 1 and x["est_pnl_usd"] == 37.65
     assert x["ui"] == {"mode": "practice", "book": "main", "sent": True,
-                       "filled": True, "qty": 1, "mark": 4.5}
+                       "filled": True, "qty": 1, "mark": 4.5, "paper": False}
 
 
 def test_a_buy_still_working_at_the_broker_is_not_filled(home, no_policy):

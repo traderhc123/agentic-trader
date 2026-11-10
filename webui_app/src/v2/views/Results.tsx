@@ -1,7 +1,7 @@
 // Results: real money and practice are two books that never share a number.
 import { Suspense, lazy, useMemo, useState } from "react";
 import type { Book, Status } from "../../lib/viewModel";
-import { brokerLabel } from "../lib/derive";
+import { PAPER_BOOK_CAPTION, bookToday, bookTodayNote, realBookCaption } from "../lib/derive";
 import { dayLong, etDayKey, plural, signed, tone } from "../lib/format";
 import { Stamp, Tag } from "../ui";
 import type { Page } from "../App";
@@ -26,14 +26,15 @@ export function chartModel(s: Status): ChartModel {
   return { days, real: run("real"), practice: run("practice") };
 }
 
-function BookPanel({ k, B, cap, page }: { k: "real" | "practice"; B: Book; cap: string; page: Page }) {
-  const today = etDayKey(page.s.as_of);
-  const t = B.days.find((d) => d.day === today);
+function BookPanel({ k, B, cap, page }: { k: "real" | "practice" | "paper"; B: Book; cap: string; page: Page }) {
+  const t = bookToday(B, etDayKey(page.s.as_of));
+  // sales today, none of them measured: not a $0.00 day
+  const unmeasuredOnly = !t.closed && t.unmeasured > 0;
   return (
-    <section className={`panel book book-${k} ${page.stale ? "stale" : ""}`}>
+    <section className={`panel book book-${k === "paper" ? "practice" : k} ${page.stale ? "stale" : ""}`}>
       <div className="ph">
         <h2>
-          <Tag kind={k === "real" ? "real" : "prac"} />
+          <Tag kind={k === "real" ? "real" : k === "paper" ? "paper" : "prac"} />
         </h2>
         <span className="meta">{cap}</span>
       </div>
@@ -41,9 +42,9 @@ function BookPanel({ k, B, cap, page }: { k: "real" | "practice"; B: Book; cap: 
         <dl className="periods">
           <div>
             <dt>Today</dt>
-            <dd className={tone(B.today)}>
-              {signed(B.today)}
-              <small>{t ? `${plural(t.closed, "trade")} closed` : "nothing closed today"}</small>
+            <dd className={unmeasuredOnly ? "" : tone(B.today)}>
+              {unmeasuredOnly ? "not measured" : signed(B.today)}
+              <small>{bookTodayNote(t)}</small>
             </dd>
           </div>
           <div>
@@ -70,6 +71,8 @@ export function ResultsView({ page }: { page: Page }) {
   const s = page.s;
   const R = s.results.real;
   const P = s.results.practice;
+  const A = s.results.paper_account;
+  const hasPaper = A.closed > 0 || A.unmeasured > 0;
   const [allDays, setAllDays] = useState(false);
   // rebuild only when the numbers change, not on every poll
   const key = JSON.stringify([R.days, P.days]);
@@ -87,7 +90,7 @@ export function ResultsView({ page }: { page: Page }) {
       {page.stale && <Stamp at={page.asOf} />}
     </div>
   );
-  if (!C.days.length && !R.unmeasured && !P.unmeasured)
+  if (!C.days.length && !R.unmeasured && !P.unmeasured && !hasPaper)
     return (
       <div className="view">
         {head}
@@ -118,8 +121,9 @@ export function ResultsView({ page }: { page: Page }) {
     <div className="view">
       {head}
       <div className="books">
-        <BookPanel k="real" B={R} cap={`Orders filled at ${brokerLabel(s)}`} page={page} />
+        <BookPanel k="real" B={R} cap={realBookCaption(s)} page={page} />
         <BookPanel k="practice" B={P} cap="Pretend trades. Never counted as money." page={page} />
+        {hasPaper && <BookPanel k="paper" B={A} cap={PAPER_BOOK_CAPTION} page={page} />}
       </div>
       <section className={`panel ${page.stale ? "stale" : ""}`}>
         <div className="ph">

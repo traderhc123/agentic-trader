@@ -63,6 +63,8 @@ export function Icon({ name, small, className = "" }: { name: IconId; small?: bo
 const TAG_CLASS: Record<TagKind, string> = {
   real: "tag-real",
   prac: "tag-prac",
+  // a broker's paper-trading account: not real money, so drawn as practice
+  paper: "tag-prac",
   none: "tag-none",
   nobuy: "tag-none",
   unk: "tag-unk",

@@ -2,8 +2,9 @@
 // is held and what the agent will do with it, what the agent is doing right
 // now, today's limits, today so far, money so far.
 import type { Activity, Position, Status } from "../../lib/viewModel";
-import { answerLook, answerWhy, describe } from "../lib/copy";
+import { answerLook, answerWhy, describe, sellsHow } from "../lib/copy";
 import {
+  bookToday,
   brokerLabel,
   dayTally,
   nextFor,
@@ -272,9 +273,8 @@ function HoldingsPanel({ page }: { page: Page }) {
         <HoldGroups page={page} wide={false} />
       </div>
       <p className="pfoot">
-        An exit signal is the signal provider saying a trade is over. The agent has no stop-loss and no profit target: it sells on the exit
-        signal, or at its expiry sell time on the day a contract expires. Today's value is not tracked yet; {s.broker.name || "your broker"}{" "}
-        shows live prices.
+        An exit signal is the signal provider saying a trade is over. The agent has no stop-loss and no profit target: it sells {sellsHow(s)}.
+        Today's value is not tracked yet; {s.broker.name || "your broker"} shows live prices.
       </p>
     </section>
   );
@@ -479,7 +479,7 @@ function DayPanel({ page }: { page: Page }) {
   const anyToday = page.rows.some((e) => etDayKey(e.at) === today);
   if (!anyToday) return null;
   const book = live ? s.results.real : s.results.practice;
-  const day = book.days.find((d) => d.day === today);
+  const day = bookToday(book, today);
   const opened = live ? s.limits.used_today.real : s.limits.used_today.practice;
   const word = live ? "real-money trade" : "practice trade";
   const least = t.complete ? "" : "at least ";
@@ -503,10 +503,13 @@ function DayPanel({ page }: { page: Page }) {
           <li>
             <span>Closed</span>
             <b>
-              {day ? (
+              {day.closed ? (
                 <>
                   {plural(day.closed, word)}, <span className={tone(day.pnl)}>{signed(day.pnl)}</span>
+                  {day.unmeasured ? `, plus ${plural(day.unmeasured, "sale")} not measured` : ""}
                 </>
+              ) : day.unmeasured ? (
+                `${plural(day.unmeasured, "sale")}, not measured`
               ) : (
                 "none"
               )}

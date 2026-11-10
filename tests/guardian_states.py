@@ -307,6 +307,73 @@ STATES = {
 }
 
 
+def _with(rows, **ui):
+    """A copy of a row with more facts recorded on it."""
+    return {**rows, "ui": {**rows["ui"], **ui}}
+
+
+_LAPSED = ("Your AgentHC feed pass has run out — the agent gets no signals "
+           "until you buy more signal days (dashboard → Settings → Signal "
+           "source).")
+_REFUSED = ("AgentHC refused the day-pass your agent's wallet paid for today. "
+            "The agent will NOT buy another one today. Until AgentHC accepts "
+            "it the agent gets no signals — no new entries, and no exit "
+            "signals for positions it holds, so watch those yourself.")
+_T = NOW.timestamp()
+STATES.update({
+    # the prepaid pass is used up past its exits-only days, no wallet
+    # auto-pay: no exit signal can arrive, so nothing sells on one
+    "pass-lapsed": (LIVE, {**_state(True), **_pass_state(0, "used_up"),
+                           "pass_notice": _LAPSED},
+                    _history(True), runtime(feed_access=False)),
+    # AgentHC refused the day-pass the wallet paid for today
+    "day-pass-refused": (
+        {**LIVE, "feed_pass": None, "lnbits_url": "https://wallet.example",
+         "day_pass_recurring": True},
+        {**_state(True), "l402": {"token": "t", "expires_at": _T + 3600,
+                                  "refused_at": _T - 600},
+         "daypass_alert": "daypass_refused_notified", "pass_notice": _REFUSED},
+        _history(True), runtime(feed_access=False)),
+    # the last read of the feed failed
+    "feed-down": (LIVE, _state(True), _history(True),
+                  runtime(poll_ok=False, feed_access=None)),
+    # the owner switched the expiry sell off
+    "expiry-guard-off": ({**LIVE, "expiry_guard_et": "off"}, _state(True),
+                         _history(True), runtime()),
+    # past the (earlier) expiry sell time, IWM has no bid: the guard leaves it
+    "expiry-no-bid": (
+        {**LIVE, "expiry_guard_et": "14:30"},
+        {**_state(True), "positions": {
+            **_state(True)["positions"],
+            _key(IWM_TODAY): {**_pos(IWM_TODAY, 1, 1.86, True, at(11, 5, "2026-11-06")),
+                              "expiry_no_bid": TODAY}}},
+        _history(True), runtime()),
+    # orders the broker gave no clear answer on, a sell still working, a sale
+    # with no estimate
+    "check-these-orders": (LIVE, _state(True), _history(True) + [
+        _row("order_failed", ("TSLA", "2026-11-13", 460, "C"), at(14, 20),
+             "live", check="broker_order", code="buy_unconfirmed", sent=True,
+             reason="Robinhood didn't answer the buy order for 1x TSLA, and "
+                    "it isn't listed yet — the agent won't buy again"),
+        _row("exit_failed", ("AMD", "2026-11-13", 262.5, "C"), at(14, 25),
+             "live", code="sell_unconfirmed", sent=True,
+             reason="Robinhood didn't answer the sell order for 1x AMD"),
+        _with(exit_(("MSFT", "2026-11-13", 530, "C"), at(14, 30), 2, 12.0,
+                    True), filled=False),
+        exit_(("META", "2026-11-13", 750, "C"), at(14, 35), 1, None, True),
+    ], runtime()),
+    # LIVE on a broker's paper-trading account
+    "paper-account": (
+        {**LIVE, "broker": "alpaca", "alpaca_paper": True},
+        {"positions": {}, "seen": [], **_pass_state()},
+        _history(True)[:-10] + [
+            _with(entry(QQQ, at(9, 41), 1, 4.35, True), paper=True),
+            _with(exit_(QQQ, at(11, 31), 1, 64.0, True), paper=True)],
+        runtime(broker={**_BROKER, "id": "alpaca",
+                        "account_tag": "alpaca:paper"})),
+})
+
+
 def _stress():
     """Hostile and oversized data: long names, huge numbers, unknown kinds,
     rows from before the facts were recorded."""

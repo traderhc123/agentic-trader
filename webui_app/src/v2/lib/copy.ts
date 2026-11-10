@@ -11,10 +11,10 @@
 //   - no imports that exist at run time except ./format (the Node tests load
 //     these two files as they are).
 import type { Activity, Answer, CheckId, NextAction, Position, ReasonCode, Status } from "../../lib/viewModel";
-import { clip, contractName, etTime, plural, usd } from "./format.ts";
+import { clip, contractName, etTime, etWhen, plural, usd } from "./format.ts";
 
 export type Cat = "trade" | "limit" | "problem" | "other";
-export type TagKind = "real" | "prac" | "none" | "nobuy" | "unk";
+export type TagKind = "real" | "prac" | "paper" | "none" | "nobuy" | "unk";
 export type Go = "rules" | "settings" | "signals";
 export type IconName =
   | "in" | "out" | "skip" | "clock" | "alert" | "plug" | "note" | "q" | "check" | "dash" | "pause" | "info";
@@ -24,6 +24,7 @@ export const FALLBACK_TITLE = "Recorded, but not described yet";
 export const TAG_WORDS: Record<TagKind, string> = {
   real: "Real money",
   prac: "Practice",
+  paper: "Paper account",
   none: "No order",
   nobuy: "Nothing bought",
   unk: "Unknown",
@@ -94,6 +95,11 @@ const result = (c: Ctx) =>
 const cost = (c: Ctx) =>
   c.e.qty != null && c.e.quote_price != null ? `, about ${usd(c.e.qty * c.e.quote_price * 100)} at the quoted price` : "";
 const sold = (c: Ctx, lead: string) => `${lead} ${qtyOf(c)}.${result(c)}`;
+/** a real sell the row does not record as filled (still working, or nothing
+ *  sold yet): never "Sold" */
+const sellSent = (c: Ctx) => c.real !== false && c.e.filled === false;
+const sentSale = (c: Ctx, of: string) =>
+  `The agent sent a real sell order for ${qtyOf(c)} of ${of}. It had not filled when this line was written.${result(c)}`;
 
 function rule(sub: (c: Ctx) => string, can: string): Entry {
   return {
@@ -134,9 +140,10 @@ export const REASONS: Record<ReasonCode, Entry> = {
   exit_signal: {
     cat: "trade",
     icon: "out",
-    title: (c) => (c.real === false ? `Practice sale: ${c.name}` : `Sold ${c.name}`),
+    title: (c) => (c.real === false ? `Practice sale: ${c.name}` : sellSent(c) ? `Sell order sent: ${c.name}` : `Sold ${c.name}`),
     sub: () => "Exit signal arrived",
-    what: (c) => sold(c, c.real === false ? "The agent recorded a pretend sale of" : "The agent sold"),
+    what: (c) =>
+      sellSent(c) ? sentSale(c, c.name) : sold(c, c.real === false ? "The agent recorded a pretend sale of" : "The agent sold"),
     why: () =>
       "The signal source reported this trade closed. The agent always sells what it bought when the exit signal arrives, whatever your entry rules say.",
     can: nothing,
@@ -144,9 +151,15 @@ export const REASONS: Record<ReasonCode, Entry> = {
   expiry_guard: {
     cat: "trade",
     icon: "out",
-    title: (c) => (c.real === false ? `Practice sale before expiry: ${c.name}` : `Sold ${c.name} before it expired`),
+    title: (c) =>
+      c.real === false
+        ? `Practice sale before expiry: ${c.name}`
+        : sellSent(c)
+          ? `Sell order sent before expiry: ${c.name}`
+          : `Sold ${c.name} before it expired`,
     sub: () => "Expiry protection",
-    what: (c) => sold(c, c.real === false ? "The agent recorded a pretend sale of" : "The agent sold"),
+    what: (c) =>
+      sellSent(c) ? sentSale(c, c.name) : sold(c, c.real === false ? "The agent recorded a pretend sale of" : "The agent sold"),
     why: () =>
       "It expired that day and was still open at the expiry sell time. The agent sells expiring positions then, so they cannot be exercised or expire worthless after the close.",
     can: nothing,
@@ -154,9 +167,9 @@ export const REASONS: Record<ReasonCode, Entry> = {
   exit_remainder: {
     cat: "trade",
     icon: "out",
-    title: (c) => `Sold the rest of ${c.name}`,
+    title: (c) => (sellSent(c) ? `Sell order sent for the rest of ${c.name}` : `Sold the rest of ${c.name}`),
     sub: () => "The first sell order only sold part",
-    what: (c) => sold(c, "The agent sold the remaining"),
+    what: (c) => (sellSent(c) ? sentSale(c, `the rest of ${c.name}`) : sold(c, "The agent sold the remaining")),
     why: () => "An earlier sell order for this position only partly filled. This is the agent selling what was left.",
     can: nothing,
   },
@@ -431,6 +444,37 @@ export const REASONS: Record<ReasonCode, Entry> = {
       c.e.hint ??
       `The agent sells the rest by itself. Look for a later "Sold the rest" line; if there is none, check the position at ${c.broker}.`,
   },
+  buy_unconfirmed: {
+    cat: "problem",
+    icon: "alert",
+    title: (c) => `No clear answer on a buy: ${c.name}`,
+    sub: (c) => `${c.broker} gave no clear answer. The order may have gone through`,
+    what: (c) =>
+      `The agent sent a real buy order for ${c.name} and got no clear answer from ${c.broker}. It may have gone through: whether anything was bought is not known.`,
+    why: (c) => c.note || "The broker neither confirmed nor rejected the order.",
+    can: (c) => c.e.hint ?? `Check your ${c.broker} account for ${c.name}. The order may have filled even though the agent could not confirm it.`,
+  },
+  sell_unconfirmed: {
+    cat: "problem",
+    icon: "alert",
+    title: (c) => `No clear answer on a sell: ${c.name}`,
+    sub: (c) => `${c.broker} gave no clear answer. The sell may have gone through`,
+    what: (c) =>
+      `The agent sent a real sell order for ${c.name} and got no clear answer from ${c.broker}. It may have gone through: whether anything was sold is not known.`,
+    why: (c) => c.note || "The broker neither confirmed nor rejected the order.",
+    can: (c) =>
+      c.e.hint ?? `Check ${c.name} in your ${c.broker} account before you sell anything yourself: it may already be sold.`,
+  },
+  buy_partly_filled: {
+    cat: "problem",
+    icon: "alert",
+    title: (c) => `Buy order partly filled: ${c.name}`,
+    sub: () => "The order did not fill in full. Part of it may be a real position",
+    what: (c) =>
+      `The agent's real buy order for ${c.name} did not fill in full. The part that filled is a real position in your account.`,
+    why: (c) => withNote(c, "There were not enough sellers at the order's price for all of it."),
+    can: (c) => c.e.hint ?? `Check what your ${c.broker} account holds of ${c.name}. The agent looks after the part it finds there.`,
+  },
   unknown: {
     cat: "other",
     icon: "q",
@@ -479,17 +523,33 @@ export interface Described {
 }
 
 const TRADE_CODES = ["entered", "exit_signal", "expiry_guard", "exit_remainder", "closed_outside"];
-const EXIT_CODES = ["exit_signal", "expiry_guard", "exit_remainder", "closed_outside", "exit_failed", "exit_partial"];
+const EXIT_CODES = [
+  "exit_signal", "expiry_guard", "exit_remainder", "closed_outside", "exit_failed", "exit_partial", "sell_unconfirmed",
+];
+/** an order that went in and may have filled: "filled" is not known */
+const UNCONFIRMED = ["buy_unconfirmed", "sell_unconfirmed"];
 
 /** Which money tag a row gets, from what the row recorded and nothing else. */
 export function tagOf(e: Activity): TagKind {
+  // a broker's paper-trading account is never real money
+  if (e.paper_account === true && e.real !== false && e.order_sent !== false) return "paper";
   if (e.action === "entry" || e.action === "exit")
     return e.real === true ? "real" : e.real === false ? "prac" : "unk";
-  if (e.reason_code === "exit_failed" || e.reason_code === "exit_partial")
+  if (e.reason_code === "exit_failed" || e.reason_code === "exit_partial" || e.reason_code === "sell_unconfirmed")
     return e.order_sent === true ? "real" : "unk";
   if (e.order_sent === true) return e.filled === false ? "nobuy" : e.real === true ? "real" : "unk";
   if (e.order_sent === false) return "none";
   return "unk";
+}
+
+/** What became of the order, from `filled` alone: "filled" only when the
+ *  row says so, "not known" when it does not. */
+function orderFate(e: Activity, at: string, to: string): string {
+  if (e.reason_code === "buy_partly_filled") return `A buy order ${at} only partly filled.`;
+  if (UNCONFIRMED.includes(e.reason_code)) return `An order was sent ${to}; whether it went through is not known.`;
+  if (e.filled === true) return `An order was filled ${at}.`;
+  if (e.filled === false) return `An order was sent ${to}; it had not filled when this was recorded.`;
+  return `An order was sent ${to}; whether it filled is not known.`;
 }
 
 function moneyLine(e: Activity, tag: TagKind, broker: string): string {
@@ -497,8 +557,10 @@ function moneyLine(e: Activity, tag: TagKind, broker: string): string {
     case "real":
       if (e.reason_code === "closed_outside") return `Real money. Sold at ${broker} by an order the agent did not send.`;
       if (e.reason_code === "exit_failed") return "Real money. A sell order was sent and did not go through.";
-      if (e.filled === false) return `Real money. An order was sent to ${broker}; it had not filled when this was recorded.`;
-      return `Real money. An order was filled at ${broker}.`;
+      return `Real money. ${orderFate(e, `at ${broker}`, `to ${broker}`)}`;
+    case "paper":
+      if (e.reason_code === "closed_outside") return `Not real money: sold in ${broker}'s paper-trading account by an order the agent did not send.`;
+      return `Not real money: ${broker}'s paper-trading account. ${orderFate(e, "in that account", "to that account")}`;
     case "prac":
       return `Practice. Recorded only; nothing was sent to ${broker}.`;
     case "nobuy":
@@ -634,11 +696,15 @@ export function answerWhy(which: Which, a: Answer, s: Status): string {
     case "market_closed":
       return "The market is closed for today.";
     case "no_signal_access":
-      return which === "opening"
-        ? "Your signal pass does not cover new trades right now. Exit signals for what you hold still arrive if the pass allows it."
-        : "The agent has no access to the signal feed: there is no usable pass.";
+      if (which === "opening")
+        return "Your signal pass does not cover new trades right now. Exit signals for what you hold still arrive if the pass allows it.";
+      if (which === "closing")
+        return `No exit signals reach the agent: there is no usable signal pass. It will not sell your real positions on an exit signal, so watch them and sell them yourself at ${b}.${s.expiry_guard_on ? " The expiry sell on expiry day still runs." : ""}`;
+      return "The agent has no access to the signal feed: there is no usable pass.";
     case "feed_unreachable":
-      return "The last check of the signal feed failed. The agent keeps trying.";
+      return which === "closing"
+        ? `The last check of the signal feed failed, so an exit signal can't reach the agent right now. It keeps trying; if this lasts, watch your real positions at ${b}.`
+        : "The last check of the signal feed failed. The agent keeps trying.";
     case "ai_needed":
       return "Your written rules need the AI helper, and it is not connected, so every new trade is skipped.";
     case "practice_holds_real_sells":
@@ -677,7 +743,28 @@ const NEXT_UNMANAGED: Record<string, (p: Position, b: string) => string> = {
   pause_feed_not_read: () => "Not updated while paused. Pretend, so nothing is at risk.",
   exit_signal: (_p, b) =>
     `Unknown. The agent can't read this entry as a contract, so it will not sell it at expiry. Check it at ${b}.`,
+  no_exit_signals: (p, b) =>
+    p.real
+      ? `Not sold on an exit signal: no exit signals reach the agent right now (there is no usable signal pass). Watch it and sell it yourself at ${b}.${guardStill(p)}`
+      : "Not updated: no signals reach the agent right now. Pretend, so nothing is at risk.",
+  feed_unreachable: (p, b) =>
+    p.real
+      ? `Unknown for now: the last check of the signal feed failed, so an exit signal can't reach the agent. It keeps trying; if this lasts, watch it at ${b}.${guardStill(p)}`
+      : "Not updated while the signal feed can't be reached. Pretend, so nothing is at risk.",
+  no_bid: (p, b) =>
+    p.real
+      ? `Not being sold: nobody is bidding for it, so the expiry sell left it (a contract with no bid is usually worthless). The agent checks again each loop. If it is in the money, sell it yourself at ${b} before the close, or it may be exercised.`
+      : "No bid on its expiry day. Pretend, so nothing is at risk.",
 };
+
+/** " The expiry sell at …" when the expiry sell still acts on it without
+ *  any signal. */
+function guardStill(p: Position): string {
+  return p.next.expiry_guard_at ? ` The expiry sell still sells it on ${etWhen(p.next.expiry_guard_at)} if it is open then.` : "";
+}
+/** Reasons whose own sentence already says what happens on expiry day. */
+const SAYS_EXPIRY = ["expired", "no_bid"];
+const GUARD_STILL = ["no_exit_signals", "feed_unreachable"];
 
 /** What the agent will do with a position, from its `next` alone. */
 export function nextSay(p: Position, s: Status): NextSay {
@@ -713,7 +800,8 @@ export function nextSay(p: Position, s: Status): NextSay {
     case "unknown": {
       const say = own(NEXT_UNMANAGED, n.reason_code);
       let text = say ? say(p, b) : real ? "Not being looked after. The reason is not described in this version." : "Not updated right now.";
-      if (real && p.expires_today && n.reason_code !== "expired")
+      const guarded = GUARD_STILL.includes(n.reason_code) && n.expiry_guard_at != null;
+      if (real && p.expires_today && !SAYS_EXPIRY.includes(n.reason_code) && !guarded)
         text += ` It expires today: sell it yourself at ${b} before the close${s.market.open ? ` (${etTime(s.market.closes_at)})` : ""} if you want it closed.`;
       return real
         ? { text, look: "bad", icon: "alert" }
@@ -735,6 +823,9 @@ export const UNMANAGED_SHORT: Record<NonNullable<Status["unmanaged_reason"]>, st
   practice_holds_real_sells: "Not sold in practice mode.",
   other_account: "One is in another broker account.",
   expired: "One is past its expiry.",
+  no_exit_signals: "No exit signals reach the agent.",
+  feed_unreachable: "The signal feed can't be reached right now.",
+  no_bid: "One has no bid on its expiry day.",
 };
 /** The same reasons as a full sentence, for the needs-you note. */
 export const UNMANAGED_WHY: Record<NonNullable<Status["unmanaged_reason"]>, string> = {
@@ -747,5 +838,31 @@ export const UNMANAGED_WHY: Record<NonNullable<Status["unmanaged_reason"]>, stri
   practice_holds_real_sells: "In practice mode your agent is set not to sell real positions.",
   other_account: "A position was opened in a different broker account than the agent uses now, and the agent will not sell it.",
   expired: "A position is past its expiry and the agent no longer acts on it.",
+  no_exit_signals:
+    "No exit signals reach the agent right now: the signal pass is used up, expired or waiting for payment, or AgentHC refused the day-pass. The agent will not sell on an exit signal.",
+  feed_unreachable:
+    "The last check of the signal feed failed, so an exit signal can't reach the agent right now. It keeps trying.",
+  no_bid:
+    "A position that expires today has no bid, so the expiry sell is not selling it. If it is in the money it can be exercised.",
 };
 export const UNMANAGED_FALLBACK = "Not being watched.";
+
+// ── the expiry sell, said only when it is switched on ───────────────────────
+
+/** What the agent does with a real position on its expiry day, for the
+ *  position drawer: `will` when the expiry sell is on, `wont` when it is off. */
+export function expiryWill(p: Position, s: Status): { will: string | null; wont: string | null } {
+  const at = p.next.expiry_guard_at;
+  if (at) return { will: `Sell it at ${etWhen(at)} if it is still open then, so it can't be exercised.`, wont: null };
+  if (s.expiry_guard_on) return { will: "Sell it at its expiry sell time if it is still open then.", wont: null };
+  return { will: null, wont: EXPIRY_OFF };
+}
+export const EXPIRY_OFF =
+  "Sell it on its expiry day: the expiry sell is off in your settings, so sell it yourself before the close that day.";
+
+/** How the agent sells what you hold, for the dialogs. */
+export function sellsHow(s: Status): string {
+  return s.expiry_guard_on
+    ? "on exit signals, and at its expiry sell time on expiry day"
+    : "on exit signals only (the expiry sell is off: sell expiring positions yourself before the close)";
+}

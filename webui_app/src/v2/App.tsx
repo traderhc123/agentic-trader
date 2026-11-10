@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Activity, Iso, Position, Status } from "../lib/viewModel";
 import { Band, type BandAction } from "./Band";
 import { ActionDialog, type DialogKind } from "./Dialogs";
-import { describe } from "./lib/copy";
+import { describe, expiryWill } from "./lib/copy";
 import { asOf, brokerLabel, isStale, linkOf, nextFor, type Link } from "./lib/derive";
 import { UNKNOWN, contractName, count, dayLong, etDayKey, etTime, etWhen, usd } from "./lib/format";
 import { Drawer, ExpiresFlag, Icon, Tag, WillWont, type IconId } from "./ui";
@@ -94,20 +94,18 @@ function PositionDrawer({ p, page, onClose }: { p: Position; page: Page; onClose
         .slice()
         .reverse()
     : [];
-  const guard = p.next.expiry_guard_at;
+  const exp = expiryWill(p, s);
   const will = p.real
     ? looked
-      ? [
-          `Sell ${p.qty === 1 ? "the contract" : `all ${count(p.qty)} contracts`} when the exit signal arrives.`,
-          guard ? `Sell it at ${etWhen(guard)} if it is still open then, so it can't be exercised.` : "Sell it at its expiry sell time if it is still open then.",
-        ]
+      ? [`Sell ${p.qty === 1 ? "the contract" : `all ${count(p.qty)} contracts`} when the exit signal arrives.`, ...(exp.will ? [exp.will] : [])]
       : ["Nothing with this position right now. See above for why."]
     : ["Record a pretend sale when the exit signal arrives.", "Show the pretend result under Results, in the practice column."];
   const wont = p.real
     ? [
         "Buy more of it.",
-        "Sell it early on its own judgement. It has no stop-loss and no profit target; it follows the exit signal and the expiry rule.",
+        `Sell it early on its own judgement. It has no stop-loss and no profit target; it follows the exit signal${s.expiry_guard_on ? " and the expiry rule" : ""}.`,
         `Sell it while the agent is stopped or on hold, or while ${b} is not connected.`,
+        ...(exp.wont ? [exp.wont] : []),
       ]
     : [`Send anything to ${b}.`, "Turn into a real position if you switch to LIVE."];
   return (

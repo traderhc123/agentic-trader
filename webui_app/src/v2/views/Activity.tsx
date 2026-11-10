@@ -131,7 +131,7 @@ export function ActivityView({ page }: { page: Page }) {
           const so = c((e) => e.action === "exit");
           const st = c((e) => mm(e).cat === "limit");
           const pr = c((e) => mm(e).cat === "problem");
-          const tot = (k: "real" | "prac") => {
+          const tot = (k: "real" | "prac" | "paper") => {
             const x = rows.filter((e) => e.action === "exit" && mm(e).tag === k && e.est_pnl_usd != null);
             if (!x.length) return null;
             const sum = x.reduce((a, e) => a + (e.est_pnl_usd as number), 0);
@@ -153,6 +153,7 @@ export function ActivityView({ page }: { page: Page }) {
                 <span className="day-t">{bits}</span>
                 <span className="day-r">
                   {tot("real")}
+                  {tot("paper")}
                   {tot("prac")}
                 </span>
               </div>
@@ -270,7 +271,7 @@ export function EventDrawer({ e, page, onClose }: { e: Row; page: Page; onClose:
       "Estimated result",
       <>
         <span className={tone(e.est_pnl_usd)}>{signed(e.est_pnl_usd)}</span>
-        {d.tag === "prac" ? " (pretend)" : ""}
+        {d.tag === "prac" ? " (pretend)" : d.tag === "paper" ? " (paper account, not real money)" : ""}
       </>,
     ]);
   const goLabel = d.go === "rules" ? "Rules & limits" : d.go === "signals" ? "Signals & pass" : "Settings";
