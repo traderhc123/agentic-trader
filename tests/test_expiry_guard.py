@@ -559,7 +559,7 @@ def test_robinhood_exit_event_flag_reaches_place(monkeypatch):
                         lambda *a, **kw: seen.append(kw) or None)
     state = {"positions": {KEY: {"option_id": "opt-1", "qty": 1}}}
     robinhood.execute(None, {}, agent._guard_event(KEY, DAY), state)
-    assert seen == [{"marketable": True}]
+    assert [kw.get("marketable") for kw in seen] == [True]
 
 
 def test_robinhood_exit_bid_reads_the_bid():

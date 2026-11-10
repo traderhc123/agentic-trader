@@ -24,6 +24,13 @@ def _no_order_waits(monkeypatch):
     monkeypatch.setattr(moomoo, "_CANCEL_SETTLE_S", 0)
 
 
+@pytest.fixture(autouse=True)
+def _no_state_hold_left_over(monkeypatch):
+    """The damaged-state hold is kept in memory for the run (agent._STATE_HELD):
+    one test's hold must not stop the next test's loop."""
+    monkeypatch.setitem(agent._STATE_HELD, "on", False)
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """Isolated AGENT_HOME; yields its path."""

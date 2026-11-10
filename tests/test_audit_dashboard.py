@@ -25,6 +25,14 @@ def _cfg(home):
     return json.loads((home / "config.json").read_text(encoding="utf-8"))
 
 
+def _cfg_recurring_on(home):
+    """config.json after "Recurring day-pass" was switched on: the switch
+    also notes when (day_pass_recurring_on_at), taken out here."""
+    cfg = _cfg(home)
+    assert cfg.pop("day_pass_recurring_on_at") > 0
+    return cfg
+
+
 @pytest.fixture
 def app(home, monkeypatch):
     """start(**cfg) -> the settings/dashboard server's routes, with the
@@ -220,7 +228,8 @@ def test_w1_a_typo_in_config_json_is_never_saved_over(home, app, monkeypatch):
     _write_cfg(home, WITH_KEYS)
     assert h.routes_post["/api/wallet/recurring"](None, {"on": True})["ok"]
     assert agent._apply_command("pause")[0]
-    assert _cfg(home) == {**WITH_KEYS, "day_pass_recurring": True, "paused": True}
+    assert _cfg_recurring_on(home) == {**WITH_KEYS, "day_pass_recurring": True,
+                                       "paused": True}
 
 
 def test_w1_a_refused_save_leaves_nothing_behind_in_the_settings_pages(
@@ -247,7 +256,7 @@ def test_w1_setup_wizard_may_start_over_a_damaged_config_and_keeps_a_copy(
 
     assert h.routes_post["/api/wallet/recurring"](None, {"on": True})["ok"]
 
-    assert _cfg(home) == {**WITH_KEYS, "day_pass_recurring": True}
+    assert _cfg_recurring_on(home) == {**WITH_KEYS, "day_pass_recurring": True}
     kept = [p for p in home.iterdir() if p.name.startswith("config.json.damaged-")]
     assert len(kept) == 1 and kept[0].read_text(encoding="utf-8") == broken
     assert kept[0].name in capsys.readouterr().out       # the owner is told where
@@ -690,7 +699,7 @@ def test_w4_pause_says_when_a_paused_agent_still_uses_a_signal_day(home):
 def _one_loop(home, monkeypatch, cfg, state, events=(), now=None, feed="stub"):
     """One pass of `agent.py run` with a stub broker and feed (registered
     under the source name `feed`). Returns (calls in order, broker, saved
-    state)."""
+    state). state=None: start from the state files already in `home`."""
     import brokers
     import keep_running
     calls = []
@@ -738,7 +747,8 @@ def _one_loop(home, monkeypatch, cfg, state, events=(), now=None, feed="stub"):
     if now is not None:
         monkeypatch.setattr(agent, "_et_now", lambda: now)
     _write_cfg(home, {"source": "stub", "broker": "stub", **cfg})
-    (home / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    if state is not None:
+        (home / "state.json").write_text(json.dumps(state), encoding="utf-8")
     agent.cmd_run()
     saved = json.loads((home / "state.json").read_text(encoding="utf-8"))
     return calls, b, saved
@@ -759,7 +769,8 @@ def test_w4_paused_loop_still_reconciles_checks_and_exits(
     assert saved["positions"] == {}
     assert set(saved["seen"]) == {"e-1", "x-1"}           # the entry isn't retried
     actions = [r["action"] for r in _log()]
-    assert actions == ["skip_paused", "exit"]
+    # one poll's exits run before its entries (_handle_feed_events)
+    assert actions == ["exit", "skip_paused"]
 
 
 def test_w4_not_paused_the_same_loop_takes_the_entry(home, monkeypatch, no_policy):
@@ -863,6 +874,156 @@ def test_w4_status_shows_the_settings_the_agent_runs_on_when_config_has_a_typo(
     status = get_status()
     assert status["mode"] == "DRY-RUN"                     # not "LIVE" from {}
     assert status["fields"]["entries today"].endswith("cap 2")
+
+
+# ── Pause, the exits the agent still owes, and the damaged-memory hold ──────
+# Pause stops new entries only. An exit that could not be completed is kept
+# in state["exits_to_retry"] and retried on every loop — also while paused,
+# and also when the paused agent is not reading the pay-per-day feed. A start
+# from a damaged state.json is a different, full hold: no orders at all.
+
+FAR = "2099-12-18"                                        # never pruned as expired
+FAR_KEY = f"SPY|{FAR}|752.0|C"
+
+
+def test_paused_loop_sells_an_owed_exit_and_buys_nothing(home, monkeypatch, no_policy):
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    owed = make_event(event="EXITED", expiry=FAR, event_id="x-owed")
+    state = {"seen": ["old-1"], "seen_order": "oldest_first",
+             "positions": {FAR_KEY: dict(REAL_ROW)}, "exits_to_retry": [owed]}
+    # the feed no longer lists the exit; it does list a new entry
+    events = [make_event(ticker="QQQ", expiry=FAR, event_id="e-1")]
+    calls, _b, saved = _one_loop(home, monkeypatch, {"paused": True}, state, events)
+    assert ("order", "EXITED", "SPY") in calls            # the owed exit was sold
+    assert not [c for c in calls if c[:2] == ("order", "ENTERED")]   # nothing bought
+    assert saved["positions"] == {} and saved["exits_to_retry"] == []
+    # each id is remembered because it was handled: the exit sold, the entry
+    # logged as skipped (it is not bought after Resume either)
+    assert saved["seen"] == ["old-1", "x-owed", "e-1"]
+    assert [r["action"] for r in _log()] == ["exit", "skip_paused"]
+
+
+def test_paused_loop_keeps_an_exit_that_failed_and_sells_it_on_the_next_loop(
+        home, monkeypatch, no_policy):
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    broker_down = [True]
+    real_execute = StubBroker.execute
+
+    def execute(self, client, cfg, event, state):
+        if broker_down[0] and event["event"] == "EXITED":
+            raise RuntimeError("broker unreachable")
+        return real_execute(self, client, cfg, event, state)
+    monkeypatch.setattr(StubBroker, "execute", execute)
+    state = {"seen": [], "seen_order": "oldest_first",
+             "positions": {FAR_KEY: dict(REAL_ROW)}}
+    events = [make_event(ticker="QQQ", expiry=FAR, event_id="e-1"),
+              make_event(event="EXITED", expiry=FAR, event_id="x-1")]
+    calls, _b, saved = _one_loop(home, monkeypatch, {"paused": True}, state, events)
+    assert ("order", "EXITED", "SPY") in calls            # tried, and it failed
+    assert FAR_KEY in saved["positions"]
+    # not handled, so not remembered as handled — and kept to be tried again
+    assert saved["seen"] == ["e-1"]
+    assert [e["event_id"] for e in saved["exits_to_retry"]] == ["x-1"]
+    assert not [c for c in calls if c[:2] == ("order", "ENTERED")]
+
+    # still paused, and the feed has stopped listing the exit
+    broker_down[0] = False
+    calls, _b, saved = _one_loop(home, monkeypatch, {"paused": True}, saved)
+    assert ("order", "EXITED", "SPY") in calls
+    assert saved["positions"] == {} and saved["exits_to_retry"] == []
+    assert saved["seen"] == ["e-1", "x-1"]
+    assert not [c for c in calls if c[:2] == ("order", "ENTERED")]
+
+
+def test_paused_agent_not_reading_the_paid_feed_still_settles_owed_exits(
+        home, monkeypatch, no_policy):
+    """Paused with no real position on the pay-per-day feed: the feed is not
+    read. The exits the agent owes don't need it — and since nobody knows
+    what the feed lists now, nothing is dropped from the handled list."""
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    handled = [f"old-{i:03d}" for i in range(agent._SEEN_KEPT)]   # the list is full
+    owed = make_event(event="EXITED", expiry=FAR, event_id="x-owed")
+    state = {"seen": list(handled), "seen_order": "oldest_first",
+             "positions": {FAR_KEY: dict(PAPER_ROW)}, "exits_to_retry": [owed]}
+    calls, _b, saved = _one_loop(
+        home, monkeypatch, {"paused": True, "dry_run": True, "source": "agenthc"},
+        state, [make_event(ticker="QQQ", expiry=FAR, event_id="e-1")], feed="agenthc")
+    assert "poll" not in calls                             # no signal day used
+    assert not [c for c in calls if c[0] == "order"]       # paper: no real order
+    assert saved["positions"] == {} and saved["exits_to_retry"] == []
+    assert saved["seen"] == handled + ["x-owed"]           # nothing forgotten
+    assert "e-1" not in saved["seen"]                      # never read, never handled
+
+
+def _damaged_state_with_an_old_backup(home, positions):
+    """state.json unreadable, and a backup from three hours earlier."""
+    import os
+    agent._save(agent.STATE_PATH, {"seen": [], "seen_order": "oldest_first",
+                                   "positions": positions},
+                private=True, backup=True)
+    bak = agent.STATE_PATH + ".bak"
+    old = os.path.getmtime(bak) - 3 * 3600
+    os.utime(bak, (old, old))
+    (home / "state.json").write_bytes(b"\x00" * 64)
+
+
+def test_damaged_state_hold_places_no_orders_at_all_until_resume(
+        home, monkeypatch, no_policy):
+    """Pause no longer stops exits — but the hold after a damaged state.json
+    promises "no orders": a memory restored from an old backup may list
+    positions that are long gone, and must not be sold from on its own."""
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    key = "RIVN|2026-10-30|13.5|C"                         # expires "today"
+    now = datetime(2026, 10, 30, 15, 46, tzinfo=agent.MARKET_TZ)   # guard time
+    events = [make_event(event="EXITED", ticker="RIVN", expiry="2026-10-30",
+                         strike=13.5, event_id="x-1"),
+              make_event(ticker="QQQ", expiry=FAR, event_id="e-1")]
+    _damaged_state_with_an_old_backup(home, {key: dict(REAL_ROW)})
+    calls, _b, saved = _one_loop(home, monkeypatch, {}, None, events, now=now)
+    # not the feed (nothing is paid for), not the exit signal, not the expiry
+    # guard, not an entry: nothing at all
+    assert calls == []
+    assert agent._state_held() and agent._state_hold()["why"] == "old_backup"
+    assert key in saved["positions"] and saved["seen"] == []
+    assert not saved.get("exits_to_retry")
+    # the dashboard shows it as paused (so it offers Resume) and says that
+    # this is not the ordinary pause
+    status = _one_loop.status[0]()
+    assert status["paused"] is True
+    assert "NO orders at all" in status["pause_note"]
+    banner = [b["text"] for b in status["expiry_warnings"]]
+    assert any("older backup" in t for t in banner)
+    assert any("RIVN" in t and "the agent is paused" in t for t in banner)
+    assert "ON HOLD" in agent._apply_command("status")[1]
+
+    # the owner's own Pause is something else: it does not end the hold
+    assert agent._apply_command("pause")[0] and agent._state_held()
+    # Resume — the chat command, which is also what the dashboard button
+    # sends — ends the hold (and the pause) and says what to check
+    handled, reply = agent._apply_command("resume")
+    assert handled and "older backup" in reply and "close those" in reply
+    assert not agent._state_held() and agent._state_hold() is None
+    assert "paused" not in _cfg(home)
+    assert agent._durability_banner() == []
+    status = _one_loop.status[0]()
+    assert status["paused"] is False and status["pause_note"] == ""
+    assert agent._apply_command("resume")[1].startswith("Resumed — the agent takes")
+
+    # the next start reads the feed and trades again
+    calls, _b, saved = _one_loop(home, monkeypatch, {}, saved, events, now=now)
+    assert "poll" in calls and ("order", "EXITED", "RIVN") in calls
+    assert key not in saved["positions"]
+
+
+def test_resume_ends_a_hold_whose_record_could_not_be_written(home, monkeypatch):
+    """The hold is for the run, in memory: it holds (and Resume ends it)
+    even when state-hold.json could not be written."""
+    _write_cfg(home, {"source": "stub", "broker": "stub", "paused": True})
+    monkeypatch.setitem(agent._STATE_HELD, "on", True)
+    assert agent._state_hold() is None
+    handled, reply = agent._apply_command("resume")
+    assert handled and reply.startswith("Resumed.") and "close those" in reply
+    assert not agent._state_held() and "paused" not in _cfg(home)
 
 
 def _import_route(home, app, monkeypatch, restart):
