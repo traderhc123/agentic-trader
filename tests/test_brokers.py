@@ -438,11 +438,16 @@ def test_robinhood_place_blackout_no_quote_stays_market(monkeypatch):
     assert args["type"] == "market"   # observable rejection beats a bad limit
 
 
-def test_robinhood_blackout_sell_floor_is_one_cent(monkeypatch):
+def test_robinhood_blackout_sell_under_ten_cents_is_at_the_bid(monkeypatch):
+    """Under $0.10 the sell goes out at the bid itself: bid -5% would round
+    to $0.01, a price nickel-tick option classes reject."""
     monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: True)
     monkeypatch.setattr(robinhood, "quote_price",
                         lambda rh, oid, side="buy": 0.03)
-    assert robinhood._blackout_limit_price(None, "opt-1", "sell") == 0.01
+    assert robinhood._blackout_limit_price(None, "opt-1", "sell") == 0.03
+    monkeypatch.setattr(robinhood, "quote_price",
+                        lambda rh, oid, side="buy": 0.05)
+    assert robinhood._blackout_limit_price(None, "opt-1", "sell") == 0.05
 
 
 def test_robinhood_blackout_window_boundaries():
@@ -519,6 +524,12 @@ class _FakeTradeCtx:
 
     def get_acc_list(self):
         return self.sdk.RET_OK, _FakeDF([{"acc_id": 1}])
+
+    def order_list_query(self, **kw):  # the exit's fill check: filled
+        qty = self.sdk.orders[-1]["qty"] if self.sdk.orders else 0
+        return self.sdk.RET_OK, _FakeDF([{"order_id": kw.get("order_id"),
+                                          "order_status": "FILLED_ALL",
+                                          "dealt_qty": qty}])
 
     def close(self):
         pass

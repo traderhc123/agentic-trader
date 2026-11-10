@@ -163,6 +163,11 @@ docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trad
   `"dry_run": false` in `~/.agentic-trader/config.json` to go live.
 - **Daily entry cap** (default 5) and **1-contract default sizing** bound the
   worst day; no trade is ever larger than `max_contracts_per_trade` (100).
+- **Expiry guard** (on): a position the agent opened that it still holds on
+  its expiry day is sold at 3:45 PM ET, and anything still open at 3:50 PM
+  gets an urgent notification — so a missed exit doesn't end in exercise.
+  Change or turn off with `expiry guard 15:40` / `expiry guard off` in the
+  dashboard (README → How it works).
 - **Max daily loss** (optional): set it in the wizard's Safety step or say
   `set max loss 300` in the dashboard — after an estimated $300 realized loss
   in a day, no new entries until tomorrow (exits still run).

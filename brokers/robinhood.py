@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 
 import broker_events
 
+from .market_hours import close_minute
+from .pricing import exit_qty, marketable_limit, quote_number
 from .robinhood_mcp import RobinhoodMCP, content_json, tool_ok
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -27,6 +29,8 @@ _DEAD = ("cancelled", "canceled", "rejected", "failed", "expired", "voided")
 _SETTLE_TRIES = 3           # quick inline polls right after placing
 _SETTLE_WAIT_S = 5.0
 _PENDING_GIVEUP_S = 30 * 60  # cancel + settle any order still working after this
+_REPRICE_AFTER_S = 30        # expiry-guard sell still working: re-place it at
+                             # a fresh marketable price after this long
 
 # Every exit sells with position_effect "close" (execute, and the orders
 # reconcile re-places), so a repeat sell can never open a position
@@ -290,8 +294,9 @@ def mark_price(rh, cfg, event, side="buy"):
 
 def _blackout_limit_price(rh, option_id, side):
     """Marketable-limit price (per share) during the opening blackout; None
-    once market orders are allowed. Buys pay up to ask+5% (rounded up to a
-    $0.05 tick); sells accept bid-5% (rounded down, floor $0.01) — aggressive
+    once market orders are allowed. Buys pay up to ask+5% (rounded up),
+    sells accept bid-5% (rounded down; at the bid under $0.10), on ticks
+    every option class accepts (pricing.py) — aggressive
     enough to fill immediately, like the market order it replaces. With no
     usable quote the caller falls through to a market order, whose rejection
     is printed by place()."""
@@ -300,14 +305,34 @@ def _blackout_limit_price(rh, option_id, side):
     price = quote_price(rh, option_id, side=side)
     if price <= 0:
         return None
-    cents = int(round(price * 100))
-    if side == "buy":
-        buffered = -(-cents * 105 // 100)      # ceil(price * 1.05)
-        ticked = -(-buffered // 5) * 5         # round UP to a $0.05 tick
-    else:
-        buffered = cents * 95 // 100           # floor(price * 0.95)
-        ticked = max(1, buffered // 5 * 5)     # round DOWN, floor $0.01
-    return ticked / 100.0
+    return marketable_limit(price, side)
+
+
+def _bid(rh, option_id):
+    """Best bid per share: 0.0 when Robinhood quotes no bid, None when the
+    quote can't be read (unknown)."""
+    try:
+        payload = content_json(rh.call_tool("get_option_quotes",
+                                            {"instrument_ids": [option_id]}))
+    except Exception:
+        return None
+    return quote_number(payload, "bid_price") if payload is not None else None
+
+
+def exit_bid(rh, cfg, event, option_id=None):
+    """Best bid per share for the contract the agent is about to sell (the
+    expiry guard skips a sell into no bid): 0.0 = no bid, None = unknown."""
+    if not option_id or not _is_uuid(option_id):
+        option_id = resolve_instrument(rh, event)
+    return _bid(rh, option_id) if option_id else None
+
+
+def _before_close(now=None, cfg=None):
+    """Before today's close (4:00 PM ET, 1:00 PM on an early-close day) on
+    a weekday: orders can still trade today."""
+    now = now or datetime.now(MARKET_TZ)
+    return (now.weekday() < 5
+            and now.hour * 60 + now.minute < close_minute(cfg, now.date()))
 
 
 def _skip_kind(note):
@@ -432,9 +457,23 @@ def _cancel_order(rh, account, order_id):
         return False
 
 
-def place(rh, cfg, option_id, side, effect, qty):
-    """Submit the order. Returns {"order_id": ..., "was_limit": bool} or None."""
+def place(rh, cfg, option_id, side, effect, qty, marketable=False):
+    """Submit the order. Returns {"order_id": ..., "was_limit": bool} or None.
+
+    marketable=True (the expiry guard's sells): a marketable limit at any
+    time of day — bid-5% for a sell, ask+5% for a buy — re-placed at a fresh
+    price by reconcile() while it doesn't fill (the result then also has
+    "reprice": True). With no usable quote it goes out as a market order."""
     limit_price = _blackout_limit_price(rh, option_id, side)
+    why = "opening blackout (pre-9:35 ET)"
+    if limit_price is None and marketable:
+        why = "expiry guard"
+        quote = (_bid(rh, option_id) if side == "sell"
+                 else quote_price(rh, option_id, side="buy"))
+        limit_price = marketable_limit(quote, side)
+        if limit_price is None:
+            print(f"  expiry guard: no usable {'bid' if side == 'sell' else 'ask'}"
+                  f" for the {side} — placing it as a market order")
     args = {
         "account_number": cfg["robinhood_account"],
         "legs": [{"option_id": option_id, "side": side, "position_effect": effect}],
@@ -446,7 +485,7 @@ def place(rh, cfg, option_id, side, effect, qty):
     if limit_price is not None:
         # Schema: price (per-share premium) required for limit, omitted for market.
         args["price"] = f"{limit_price:.2f}"
-        print(f"  opening blackout (pre-9:35 ET) — {side} placed as "
+        print(f"  {why} — {side} placed as "
               f"marketable limit @ ${limit_price:.2f}")
     result = rh.call_tool("place_option_order", args)
     if not tool_ok(result):
@@ -457,7 +496,10 @@ def place(rh, cfg, option_id, side, effect, qty):
         return None
     oid = _extract_order_id(result)
     print(f"  order {side}/{effect} x{qty} -> {oid or 'submitted (no id)'}")
-    return {"order_id": oid, "was_limit": limit_price is not None}
+    out = {"order_id": oid, "was_limit": limit_price is not None}
+    if marketable:
+        out["reprice"] = True
+    return out
 
 
 def _error_text(result):
@@ -505,14 +547,15 @@ def _finalize_pending(state, pos_key, filled_total, report_unfilled=True):
         else:
             pos["qty"] = remaining
             _order_settled(pos)
+            # the agent re-sells the remainder (agent.exit_remainder_tick)
             print(f"  ⚠️ exit only filled {filled_total}/{pend['requested']} — "
-                  f"{remaining}x still held ({pos_key}); reconcile keeps working "
-                  "it, or close manually in the app")
+                  f"{remaining}x still held ({pos_key}); re-selling the remaining "
+                  f"{remaining}x next loop")
             broker_events.report(
                 "exit_partial",
                 f"exit filled {filled_total}/{pend['requested']} — {remaining}x "
-                f"{pos_key.replace('|', ' ')} still held; close it in the "
-                "Robinhood app if it doesn't clear")
+                f"{pos_key.replace('|', ' ')} still held; the agent re-sells the "
+                f"remaining {remaining}x next loop")
 
 
 def _record_pending(state, pos_key, placed, side, qty):
@@ -522,6 +565,8 @@ def _record_pending(state, pos_key, placed, side, qty):
         "filled": 0, "was_limit": bool(placed["was_limit"]),
         "placed_at": time.time(),
     }
+    if placed.get("reprice"):
+        pos["pending"]["reprice"] = True
     _stamp_order(pos, placed["order_id"])
     _remember_order(state, placed["order_id"])
 
@@ -546,6 +591,17 @@ def _stamp_order(pos, order_id):
         ids = [i for i in pos.get("order_ids") or [] if i != str(order_id)]
         pos["order_ids"] = (ids + [str(order_id)])[-_ORDER_IDS_KEPT:]
     pos["last_order_at"] = time.time()
+
+
+def _forget_order(state, pos, order_id):
+    """Drop an order that was cancelled with nothing filled from the kept
+    order-id lists (it can't explain any fill)."""
+    oid = str(order_id or "")
+    if not oid:
+        return
+    pos["order_ids"] = [i for i in pos.get("order_ids") or [] if i != oid]
+    state["agent_order_ids"] = [i for i in state.get("agent_order_ids") or []
+                                if i != oid]
 
 
 def _order_settled(pos):
@@ -607,7 +663,13 @@ def reconcile(rh, cfg, state, save_state):
                 _finalize_pending(state, pos_key, pend["filled"])
                 changed = True
         else:  # order is working
-            convert = pend.get("was_limit") and not _in_opening_blackout()
+            if pend.get("reprice"):
+                # an expiry-guard sell the market moved away from: re-place
+                # it at a fresh marketable price, until the close
+                convert = (time.time() - pend.get("placed_at", 0) >= _REPRICE_AFTER_S
+                           and _before_close(cfg=cfg))
+            else:
+                convert = pend.get("was_limit") and not _in_opening_blackout()
             if not (convert or expired):
                 continue
             if not _cancel_order(rh, account, pend["order_id"]):
@@ -622,6 +684,12 @@ def reconcile(rh, cfg, state, save_state):
                                                      if st2 in _FILLED else 0))
                 changed = True
                 continue
+            # A cancelled order that filled nothing leaves no fill to tell
+            # apart from the owner's: forget its id once it's replaced, so a
+            # sell re-placed every 30 s never pushes the agent's earlier
+            # (filled) order ids out of the kept lists.
+            dead_unfilled = st2 in _DEAD and not pend["filled"]
+            dead_id = pend["order_id"]
             # Bank what the dying order already filled BEFORE re-pending, so
             # the follow-up order's finalize only accounts for its own fills.
             already = pend["filled"]
@@ -631,13 +699,19 @@ def reconcile(rh, cfg, state, save_state):
                 else:
                     pos["qty"] = max(0, int(pos.get("qty", 0)) - already)
                 pend["filled"] = 0
-            # blackout over: re-place the remainder as MARKET (guaranteed fill)
+            # blackout over: re-place the remainder as MARKET (guaranteed
+            # fill); an expiry-guard sell goes out again as a marketable limit
+            reprice = bool(pend.get("reprice"))
             replaced = place(rh, cfg, pos["option_id"], pend["side"],
                              "open" if pend["side"] == "buy" else "close",
-                             remaining)
+                             remaining, **({"marketable": True} if reprice else {}))
             if replaced:
+                if dead_unfilled:
+                    _forget_order(state, pos, dead_id)
                 _record_pending(state, pos_key, replaced, pend["side"], remaining)
-                print(f"  blackout limit converted to market x{remaining} "
+                print(f"  expiry guard: unfilled sell re-placed x{remaining} at a "
+                      f"fresh price ({pos_key})" if reprice else
+                      f"  blackout limit converted to market x{remaining} "
                       f"({pos_key})")
             else:
                 _finalize_pending(state, pos_key, 0)
@@ -735,10 +809,13 @@ def execute(rh, cfg, event, state):
             if not pos:
                 print(f"  entry never filled — nothing to sell ({contract})")
                 return True
-        print(f"EXITED event -> selling {pos['qty']}x {contract}")
-        placed = place(rh, cfg, pos["option_id"], "sell", "close", pos["qty"])
+        qty = exit_qty(pos, event)
+        print(f"EXITED event -> selling {qty}x {contract}")
+        guard = ({"marketable": True} if event.get("exit_limit") == "marketable"
+                 else {})  # expiry guard / exit remainder: marketable limit
+        placed = place(rh, cfg, pos["option_id"], "sell", "close", qty, **guard)
         if placed:
-            _record_pending(state, pos_key, placed, "sell", pos["qty"])
+            _record_pending(state, pos_key, placed, "sell", qty)
             _settle_fast(rh, cfg, state, pos_key)
             return True
     return False
@@ -885,10 +962,48 @@ def closed_fills(rh, cfg, option_id, since_iso=None, own_order_ids=(),
         return None
     own = {str(o) for o in own_order_ids or ()}
     try:
-        return _read_fills(rh, str(acct), str(option_id), since_iso, own,
-                           exclude_agentic)
+        return _read_orders(rh, str(acct), since_iso,
+                            lambda o: _owner_fill(o, str(option_id), own,
+                                                  exclude_agentic))
     except Exception:
         return None
+
+
+def option_fills(rh, cfg, option_id, since_iso=None):
+    """Every filled (or partly filled) order on option_id — buys and sells,
+    the agent's and the owner's — newest first, or None when orders can't
+    be read (brokers/__init__.py). The agent's ledger check tells its own
+    buys apart by order id."""
+    acct = (cfg or {}).get("robinhood_account")
+    if not acct or not _is_uuid(option_id) or getattr(rh, "last_error", None):
+        return None
+    try:
+        return _read_orders(rh, str(acct), since_iso,
+                            lambda o: _any_fill(o, str(option_id)))
+    except Exception:
+        return None
+
+
+def _any_fill(o, option_id):
+    """One order -> {order_id, side, qty, at} when it filled contracts of
+    option_id; None otherwise."""
+    if not isinstance(o, dict) or not o.get("id"):
+        return None
+    legs = o.get("legs") if isinstance(o.get("legs"), list) else []
+    leg = next((g for g in legs if isinstance(g, dict) and str(
+        g.get("option_id") or _last_seg(g.get("option"))) == option_id), None)
+    side = str((leg or {}).get("side") or "").lower()
+    if leg is None or side not in ("buy", "sell"):
+        return None
+    try:
+        filled = _leg_fill(o, leg, len(legs))
+        qty = int(round(filled[0])) if filled else 0
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return None
+    if qty < 1:
+        return None
+    return {"order_id": str(o["id"]), "side": side, "qty": qty,
+            "at": filled[2] or o.get("updated_at") or o.get("created_at")}
 
 
 def _day_before(since_iso):
@@ -901,7 +1016,10 @@ def _day_before(since_iso):
     return (day - timedelta(days=1)).isoformat()
 
 
-def _read_fills(rh, acct, option_id, since_iso, own, exclude_agentic):
+def _read_orders(rh, acct, since_iso, pick):
+    """pick(order) for every order listed (newest first), keeping the
+    answers that aren't None. A list cut short by paging only misses OLDER
+    orders."""
     args = {"account_number": acct}
     since = _day_before(since_iso)
     if since:
@@ -921,7 +1039,7 @@ def _read_fills(rh, acct, option_id, since_iso, own, exclude_agentic):
         first = False
         pages += 1
         for o in orders:
-            fill = _owner_fill(o, option_id, own, exclude_agentic)
+            fill = pick(o)
             if fill:
                 out.append(fill)
         if not nxt or str(nxt).startswith("http"):

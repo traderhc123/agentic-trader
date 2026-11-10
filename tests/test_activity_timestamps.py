@@ -6,6 +6,7 @@ Both are "" for a row with no readable time, which the UI shows as "—".
 """
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -225,9 +226,13 @@ const rows = [
 ];
 console.log(JSON.stringify(rows.map(when)));
 """)
-    r = subprocess.run([node, "-e", js], capture_output=True, text=True, timeout=30,
-                       env={"TZ": "America/Chicago", "PATH": ""})
-    assert r.returncode == 0, r.stderr
+    # Keep the parent environment: node.exe cannot start on Windows without
+    # SystemRoot (exit 134, empty stderr). Decode as UTF-8 on every platform
+    # (the default there is cp1252, which garbles the em dash below).
+    r = subprocess.run([node, "-e", js], capture_output=True, text=True,
+                       encoding="utf-8", timeout=30,
+                       env={**os.environ, "TZ": "America/Chicago"})
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     year, nov6, blank, missing = json.loads(r.stdout)
     # the date / time split is on the LAST ", " so the year stays with the date
     assert '<span class="wd">Dec 30, 2025,</span> <span class="wt">3:55:17 PM ET</span>' in year

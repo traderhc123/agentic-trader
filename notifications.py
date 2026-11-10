@@ -18,8 +18,11 @@ import requests
 _TIMEOUT = 10
 
 
-def notify(cfg, text):
-    """Send `text` to every configured channel. Never raises."""
+def notify(cfg, text, priority=None):
+    """Send `text` to every configured channel. Never raises.
+
+    priority="high": urgent — ntfy delivers it at its top priority; the
+    other channels have no priority setting and get the same text."""
     sent = False
     url = cfg.get("discord_webhook_url")
     if url:
@@ -30,10 +33,13 @@ def notify(cfg, text):
             pass
     topic = cfg.get("ntfy_topic")
     if topic:
+        headers = {"Title": "agentic-trader"}
+        if priority == "high":
+            headers.update({"Priority": "urgent", "Tags": "warning"})
         try:
             requests.post(f"https://ntfy.sh/{topic}",
                           data=text[:4000].encode(),
-                          headers={"Title": "agentic-trader"}, timeout=_TIMEOUT)
+                          headers=headers, timeout=_TIMEOUT)
             sent = True
         except Exception:
             pass

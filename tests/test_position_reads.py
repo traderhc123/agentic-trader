@@ -570,7 +570,26 @@ class _MMCtx:
 
     def order_list_query(self, **kw):
         self.queries.append(("orders", kw))
+        if kw.get("order_id"):  # the exit's fill check: the agent's own order
+            if self.sdk.ord_ret != self.sdk.RET_OK:
+                return self.sdk.ord_ret, None
+            n = int(str(kw["order_id"]).rsplit("-", 1)[-1])
+            placed = self.sdk.placed[n - 1]
+            return self.sdk.RET_OK, _FakeDF([{
+                "order_id": kw["order_id"], "order_status": self.sdk.sell_status,
+                "dealt_qty": placed["qty"] if self.sdk.sell_status == "FILLED_ALL"
+                else self.sdk.sell_dealt}])
         return self._answer(self.sdk.ord_ret, self.sdk.orders)
+
+    def history_order_list_query(self, **kw):
+        self.queries.append(("history", kw))
+        return self._answer(self.sdk.ord_ret, self.sdk.history)
+
+    def modify_order(self, op, order_id, qty, price, **kw):
+        self.sdk.cancelled.append(order_id)
+        self.sdk.sell_status = ("CANCELLED_PART" if self.sdk.sell_dealt
+                                else "CANCELLED_ALL")
+        return self.sdk.RET_OK, None
 
     def accinfo_query(self, **kw):
         self.queries.append(("accinfo", kw))
@@ -606,11 +625,17 @@ class _MMSDK:
     class SecurityFirm:
         FUTUINC = "FUTUINC"
 
-    def __init__(self, positions=(), orders=(), pos_ret=0, ord_ret=0):
+    class ModifyOrderOp:
+        CANCEL = "CANCEL"
+
+    def __init__(self, positions=(), orders=(), pos_ret=0, ord_ret=0, history=(),
+                 sell_status="FILLED_ALL", sell_dealt=0):
         self.positions = None if positions is None else list(positions)
         self.orders = None if orders is None else list(orders)
+        self.history = None if history is None else list(history)
         self.pos_ret, self.ord_ret = pos_ret, ord_ret
-        self.ctxs, self.placed = [], []
+        self.sell_status, self.sell_dealt = sell_status, sell_dealt
+        self.ctxs, self.placed, self.cancelled = [], [], []
 
     def OpenSecTradeContext(self, **kw):
         self.ctxs.append(_MMCtx(self))

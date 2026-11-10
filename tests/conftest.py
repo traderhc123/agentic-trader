@@ -16,6 +16,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import agent  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_order_waits(monkeypatch):
+    """moomoo's exit fill check polls with sleeps: none in tests."""
+    from brokers import moomoo
+    monkeypatch.setattr(moomoo, "_CONFIRM_WAIT_S", 0)
+    monkeypatch.setattr(moomoo, "_CANCEL_SETTLE_S", 0)
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """Isolated AGENT_HOME; yields its path."""
