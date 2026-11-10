@@ -52,6 +52,21 @@ import {
   vitals,
 } from "../src/v2/lib/derive.ts";
 import { UNKNOWN, ago, contractName, dayLong, etDayKey, etTime, etWhen, plural, signed, span, tone, usd } from "../src/v2/lib/format.ts";
+import { UPDATE } from "../src/v2/lib/copy.ts";
+import { postJson } from "../src/v2/lib/http.ts";
+import {
+  CHECK_PATH,
+  PULL_PATH,
+  backOnNewVersion,
+  badgeFor,
+  checkForUpdate,
+  failureText,
+  installUpdate,
+  pullBody,
+  readCheck,
+  readPull,
+  updateLine,
+} from "../src/v2/lib/update.ts";
 
 const BAD = /undefined|NaN|\[object|\bnull\b|Infinity/;
 const clean = (s, where) => {
@@ -469,4 +484,232 @@ test("amounts paid are never a partial sum", { skip }, () => {
   const live = states.find(([n]) => n === "live")[1];
   assert.equal(paidFor(live.positions.filter((p) => p.real)), 1983);
   assert.ok(vitals(s, "ok")[0].text.includes("not known"));
+});
+
+// ── the update badge and its dialog (lib/update.ts) ─────────────────────────
+// Every answer GET /api/update/check and POST /api/update/pull can give
+// (webui.check_code_updates / pull_code_updates, snapshot_update.check),
+// driven through a fake fetch that records what the page sends.
+
+const SHA = "0123456789abcdef0123456789abcdef01234567";
+const fakeFetch = (answers) => {
+  const calls = [];
+  const f = async (url, init = {}) => {
+    calls.push({ url, init });
+    const a = answers.length > 1 ? answers.shift() : answers[0];
+    if (a instanceof Error) throw a;
+    return {
+      status: a.status ?? 200,
+      json: async () => {
+        if (a.body === undefined) throw new SyntaxError("not JSON");
+        return a.body;
+      },
+    };
+  };
+  return { f, calls };
+};
+const AVAILABLE = { ok: true, behind: 3, upstream: "origin/main", summary: "abc1234 fix one\nbcd2345 fix two\ncde3456 fix three", target: SHA };
+
+test("update: copy has words for every case", () => {
+  for (const [k, v] of Object.entries(UPDATE)) {
+    if (typeof v === "string") clean(v, `UPDATE.${k}`);
+    else if (Array.isArray(v)) v.forEach((x, i) => clean(x, `UPDATE.${k}[${i}]`));
+    else for (const arg of [0, 1, 3, "a note", 25]) clean(String(v(arg)), `UPDATE.${k}(${arg})`);
+  }
+  assert.equal(UPDATE.badgeShort + UPDATE.badgeRest, UPDATE.badge);
+  // the dialog says what happens in plain words
+  assert.match(UPDATE.lead("0123456789ab"), /exactly version 0123456789ab/);
+  assert.ok(UPDATE.will.some((w) => /no orders/.test(w)));
+  assert.ok(UPDATE.wont.some((w) => /Pause setting/.test(w)));
+  assert.match(UPDATE.live(2), /LIVE.*2 real positions/);
+  assert.ok(!/position/.test(UPDATE.live(0)));
+});
+
+test("update: up to date or a failed check shows no badge, and the failure quietly", () => {
+  const quiet = [
+    [200, { ok: true, behind: 0, upstream: "origin/main", summary: "", target: SHA }, "current"],
+    [200, { ok: true, behind: 0, upstream: "github/main", summary: "", target: SHA, mode: "snapshot" }, "current"],
+    // install folder not writable (old systemd unit), with its fix on a second line
+    [200, { ok: false, error: "Can't update: the background service on this server is not allowed to change the agent's own files.\n  sudo systemctl edit agentic-trader" }, "unavailable"],
+    [200, { ok: false, error: "refusing to update from an unrecognised remote (https://evil.example/x) — updates only come from github.com/traderhc123/agentic-trader" }, "unavailable"],
+    [200, { ok: false, error: "fetch failed: GitHub is not reachable from this computer" }, "unavailable"],
+    [200, { ok: false, error: "GitHub's hourly limit for update checks was reached from this network — try again in an hour" }, "unavailable"],
+    [200, { ok: false }, "unavailable"],
+    [500, { ok: false, error: "boom" }, "unavailable"],
+    [404, { error: "not found" }, "unavailable"],
+    [401, { error: "locked — open the dashboard login link (python agent.py link)" }, "unavailable"],
+    [403, null, "unavailable"],
+    [200, undefined, "unavailable"], // not JSON
+    [200, [], "unavailable"],
+    [200, { ok: true, behind: "3", target: SHA }, "unavailable"],
+    [200, { ok: true, behind: -1, target: SHA }, "unavailable"],
+    [200, { ok: true, behind: 1.5, target: SHA }, "unavailable"],
+    [200, { ok: true }, "unavailable"],
+  ];
+  for (const [http, body, kind] of quiet) {
+    const where = `${http} ${JSON.stringify(body)}`;
+    const c = readCheck(http, body);
+    assert.equal(c.kind, kind, where);
+    assert.equal(badgeFor(c, "idle", true), null, where);
+    const line = updateLine(c, "idle");
+    assert.equal(line.review, false, where);
+    clean(line.text, where);
+    if (kind === "unavailable") {
+      assert.match(line.text, /^Couldn't check for updates/, where);
+      if (typeof body?.error === "string" && http !== 401) assert.ok(line.text.includes(body.error), `${where}: the agent's words`);
+    } else assert.equal(line.text, UPDATE.current);
+  }
+  assert.match(readCheck(401, {}).text, /login expired/);
+});
+
+test("update: behind with an exact version shows the badge with the count", () => {
+  const c = readCheck(200, AVAILABLE);
+  assert.equal(c.kind, "available");
+  assert.equal(c.offer.target, SHA);
+  assert.equal(c.offer.short, SHA.slice(0, 12));
+  assert.equal(c.offer.count, 3);
+  assert.deepEqual(c.offer.changes, ["abc1234 fix one", "bcd2345 fix two", "cde3456 fix three"]);
+  assert.deepEqual(badgeFor(c, "idle", true), { count: 3 });
+  assert.match(UPDATE.badgeLabel(3), /^Update available: 3 changes/);
+  assert.equal(UPDATE.badgeCount(1), "1 change");
+  assert.deepEqual(updateLine(c, "idle"), { text: UPDATE.available(3), review: true });
+  // a zip install: same badge
+  const snap = readCheck(200, { ...AVAILABLE, upstream: "github/main", mode: "snapshot" });
+  assert.equal(snap.offer.snapshot, true);
+  assert.deepEqual(badgeFor(snap, "idle", true), { count: 3 });
+  // a zip install whose version isn't recorded: the number is not a count
+  const unk = readCheck(200, {
+    ...AVAILABLE,
+    mode: "snapshot",
+    behind: 20,
+    version_unknown: true,
+    summary: "(this install's version isn't recorded — showing the latest changes; updating installs the newest code)\nx",
+  });
+  assert.deepEqual(badgeFor(unk, "idle", true), { count: null });
+  assert.equal(UPDATE.badgeCount(null), "");
+  assert.ok(!/\d/.test(UPDATE.badgeLabel(null)));
+  // no exact version to install: nothing is offered
+  for (const target of [undefined, "", "main", SHA.slice(0, 12), SHA + "x", "origin/main"]) {
+    const c2 = readCheck(200, { ...AVAILABLE, target });
+    assert.equal(c2.kind, "unavailable", String(target));
+    assert.equal(badgeFor(c2, "idle", true), null, String(target));
+  }
+});
+
+test("update: never offered while the check is in flight, an install is under way, or the agent can't be reached", () => {
+  const c = readCheck(200, AVAILABLE);
+  assert.equal(badgeFor({ kind: "checking" }, "idle", true), null);
+  assert.equal(updateLine({ kind: "checking" }, "idle").review, false);
+  for (const phase of ["installing", "failed", "restarting", "installed", "slow"]) {
+    assert.equal(badgeFor(c, phase, true), null, phase);
+    assert.equal(updateLine(c, phase, "x").review, false, phase);
+  }
+  assert.equal(badgeFor(c, "idle", false), null);
+});
+
+test("update: the check is one GET that never installs", async () => {
+  const { f, calls } = fakeFetch([{ body: AVAILABLE }]);
+  const c = await checkForUpdate(f, 1000);
+  assert.equal(c.kind, "available");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, CHECK_PATH);
+  assert.equal(calls[0].init.method, undefined);
+  assert.equal(calls[0].init.body, undefined);
+  // no answer: quiet, no badge
+  const down = await checkForUpdate(fakeFetch([new TypeError("Failed to fetch")]).f, 1000);
+  assert.equal(down.kind, "unavailable");
+  assert.match(down.text, /could not reach the agent/);
+  const hang = (_url, init) =>
+    new Promise((_, no) => init.signal.addEventListener("abort", () => no(Object.assign(new Error("aborted"), { name: "AbortError" }))));
+  const slow = await checkForUpdate(hang, 20);
+  assert.equal(slow.kind, "unavailable");
+  assert.match(slow.text, /no answer after/);
+});
+
+test("update: the pull sends exactly the checked version, the way /v2 sends commands", async () => {
+  const c = readCheck(200, AVAILABLE);
+  const { f, calls } = fakeFetch([{ body: { ok: true, restarting: true, note: "updated to origin/main — restarting with the new code" } }]);
+  const r = await installUpdate(c.offer, f, 1000);
+  assert.deepEqual(r, { ok: true, restarting: true, note: "updated to origin/main — restarting with the new code" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, PULL_PATH);
+  assert.deepEqual(JSON.parse(calls[0].init.body), { expect: SHA });
+  assert.deepEqual(pullBody(c.offer), { expect: SHA });
+  // the same request shape as POST /api/command: same method, same headers,
+  // the login cookie only (no credentials override, no token of its own)
+  const cmd = fakeFetch([{ body: { reply: "ok" } }]);
+  await postJson("/api/command", { text: "pause" }, undefined, cmd.f);
+  const a = calls[0].init;
+  const b = cmd.calls[0].init;
+  assert.equal(a.method, "POST");
+  assert.equal(a.method, b.method);
+  assert.deepEqual(a.headers, b.headers);
+  assert.deepEqual(a.headers, { "Content-Type": "application/json" });
+  assert.equal(a.credentials, undefined);
+  assert.deepEqual(Object.keys(a).sort(), ["body", "headers", "method", "signal"]);
+  // a pull that does not restart (AGENT_UPDATE_NO_RESTART)
+  const plain = readPull(200, { ok: true, note: "updated to origin/main — restart skipped (AGENT_UPDATE_NO_RESTART)" });
+  assert.equal(plain.restarting, false);
+  assert.match(updateLine(c, "installed", plain.note).text, /restart skipped/);
+});
+
+test("update: a failed pull shows the agent's words, once, and offers nothing more", async () => {
+  const c = readCheck(200, AVAILABLE);
+  const cases = [
+    // diverged checkout / local changes: the check said behind, the pull refuses
+    [200, { ok: false, error: "cannot fast-forward (local changes or diverged history): fatal: Not possible to fast-forward, aborting." }, /cannot fast-forward/],
+    [200, { ok: false, error: "the remote changed since you checked — press 'Check for code updates' again and review the new commit list" }, /remote changed/],
+    [200, { ok: false, error: "Can't update: the background service on this server is not allowed to change the agent's own files." }, /not allowed to change/],
+    [500, { ok: false, error: "disk full" }, /disk full/],
+    [200, { ok: false }, /gave no reason/],
+    [401, { error: "locked" }, /login expired, so nothing was installed/],
+    [502, undefined, /HTTP 502.*does not know whether/],
+  ];
+  for (const [status, body, want] of cases) {
+    const { f, calls } = fakeFetch([{ status, body }]);
+    const r = await installUpdate(c.offer, f, 1000);
+    const where = `${status} ${JSON.stringify(body)}`;
+    assert.equal(r.ok, false, where);
+    assert.equal(calls.length, 1, `${where}: tried once`);
+    const text = failureText(r);
+    assert.match(text, want, where);
+    if (typeof body?.error === "string" && status !== 401) {
+      assert.equal(r.fromAgent, true, where);
+      assert.ok(text.startsWith("The agent said: ") && text.includes(body.error), where);
+    }
+    const line = updateLine(c, "failed", text);
+    assert.match(line.text, want, where);
+    assert.match(line.text, /reload this page/, where);
+    assert.equal(line.review, false, where);
+    assert.equal(badgeFor(c, "failed", true), null, where);
+  }
+  // no answer at all: the page can't say nothing was installed
+  const { f, calls } = fakeFetch([new TypeError("Failed to fetch")]);
+  const r = await installUpdate(c.offer, f, 1000);
+  assert.equal(calls.length, 1);
+  assert.equal(r.ok, false);
+  assert.match(r.text, /does not know whether the update was installed/);
+});
+
+test("update: the page reloads only once the agent is back after the restart", () => {
+  const T = "2026-11-10T14:00:00Z";
+  assert.equal(backOnNewVersion(T, false, { answered: true, startedAt: T }), false); // the old agent, still up
+  assert.equal(backOnNewVersion(T, false, { answered: false, startedAt: null }), false);
+  assert.equal(backOnNewVersion(T, true, { answered: false, startedAt: null }), false);
+  assert.equal(backOnNewVersion(T, false, { answered: true, startedAt: "2026-11-10T14:01:00Z" }), true); // restarted
+  assert.equal(backOnNewVersion(T, true, { answered: true, startedAt: T }), true); // gone, then back
+  assert.equal(backOnNewVersion(null, false, { answered: true, startedAt: null }), false); // setup mode: needs the gap
+  assert.equal(backOnNewVersion(null, true, { answered: true, startedAt: null }), true);
+});
+
+test("update: no badge in any state where this page can't reach the agent", { skip }, () => {
+  const c = readCheck(200, AVAILABLE);
+  for (const [name, s] of states)
+    for (const failing of [false, true]) {
+      const l = linkOf(s, failing);
+      const b = badgeFor(c, "idle", !isStale(l));
+      if (isStale(l)) assert.equal(b, null, `${name} ${failing}`);
+      else assert.deepEqual(b, { count: 3 }, `${name} ${failing}`);
+      clean(UPDATE.live(s.positions.filter((p) => p.real).length), name);
+    }
 });

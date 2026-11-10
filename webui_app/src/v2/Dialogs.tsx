@@ -5,11 +5,14 @@
 //   Stop the agent     -> "stop"
 // Nothing is assumed to have worked: the agent's own reply is shown, and the
 // band changes only when the next status says so.
-import { useState } from "react";
+// UpdateDialog is the one that does not send a command: it installs the
+// version the update check reported (POST /api/update/pull, see lib/update.ts).
+import { useEffect, useState } from "react";
 import type { Position, Status } from "../lib/viewModel";
-import { sellsHow } from "./lib/copy";
+import { UPDATE, sellsHow } from "./lib/copy";
 import { brokerLabel, paidFor, practicePositions, realPositions } from "./lib/derive";
 import { UNKNOWN, contractName, count, etTime, plural, usd } from "./lib/format";
+import type { Offer, Phase } from "./lib/update";
 import { Dialog, ExpiresFlag, Icon, WillWont } from "./ui";
 
 export type DialogKind = "pause" | "resume" | "to-practice" | "to-live" | "stop";
@@ -304,6 +307,97 @@ export function ActionDialog({
           "Answer this dashboard once it has stopped: this page will then say it can't reach the agent.",
         ]}
       />
+    </Dialog>
+  );
+}
+
+/** "Update the agent?": what will be installed (exactly the version the check
+ *  reported), what happens while it restarts, then Update now / Not now. On a
+ *  failure the agent's message is shown and only Close is left. */
+export function UpdateDialog({
+  offer,
+  s,
+  phase,
+  detail,
+  since,
+  onInstall,
+  onClose,
+}: {
+  offer: Offer;
+  s: Status;
+  phase: Phase;
+  detail: string;
+  since: number;
+  onInstall: () => void;
+  onClose: () => void;
+}) {
+  const installing = phase === "installing";
+  const [secs, setSecs] = useState(0);
+  useEffect(() => {
+    if (!installing) return;
+    const tick = () => setSecs(Math.round((Date.now() - since) / 1000));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [installing, since]);
+
+  if (phase === "failed")
+    return (
+      <Dialog
+        title={UPDATE.failedTitle}
+        lead={UPDATE.againHint}
+        onClose={onClose}
+        foot={
+          <button className="btn btn-primary" onClick={onClose} data-autofocus>
+            {UPDATE.close}
+          </button>
+        }
+      >
+        <div className="callout" role="alert">
+          <p className="upd-said">{detail || UPDATE.pullNoReason}</p>
+        </div>
+      </Dialog>
+    );
+
+  const real = realPositions(s).length;
+  return (
+    <Dialog
+      title={UPDATE.title}
+      lead={UPDATE.lead(offer.short)}
+      onClose={onClose}
+      foot={
+        <>
+          <button className="btn" onClick={onClose} disabled={installing} data-autofocus>
+            {UPDATE.notNow}
+          </button>
+          <button className="btn btn-primary" id="dlg-ok" disabled={installing || phase !== "idle"} onClick={onInstall}>
+            {UPDATE.install}
+          </button>
+        </>
+      }
+    >
+      <dl className="facts">
+        <dt>{UPDATE.versionLabel}</dt>
+        <dd>
+          <code>{offer.short}</code>
+        </dd>
+        <dt>{UPDATE.changesLabel}</dt>
+        <dd>{offer.count != null ? count(offer.count) : <small>{UPDATE.changesUncounted}</small>}</dd>
+      </dl>
+      <div className="upd-list">
+        <h4>{UPDATE.listLabel}</h4>
+        {offer.changes.length ? <pre tabIndex={0}>{offer.changes.join("\n")}</pre> : <p className="small muted">{UPDATE.noList}</p>}
+      </div>
+      {s.mode === "live" && (
+        <div className="callout callout-real">
+          <h4>{UPDATE.liveTitle}</h4>
+          <p className="small">{UPDATE.live(real)}</p>
+        </div>
+      )}
+      <WillWont will={UPDATE.will} wont={UPDATE.wont} />
+      <p className="small muted" role="status" aria-live="polite">
+        {installing ? UPDATE.installing(secs) : ""}
+      </p>
     </Dialog>
   );
 }
