@@ -135,7 +135,8 @@ This walks through, in order:
      agent controls buys a ~$10 day-pass each market day (only with
      "Recurring day-pass" ON). The one-click wallet is on demo.lnbits.com, a
      public test server — keep only a few days of passes there. Safety caps:
-     `max_autopay_sats` per invoice and `max_autopay_sats_per_day`.
+     `max_autopay_sats` per invoice, and one day-pass a day (more only if
+     the owner sets `max_autopay_sats_per_day`).
    - **Premium API key**: registers a free key
      (`POST https://api.traderhc.com/api/v1/agents/register`), then upgrade to
      Premium with sats (`https://api.traderhc.com/docs`,

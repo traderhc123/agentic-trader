@@ -49,9 +49,11 @@ def _zip(files, top=f"agentic-trader-{SHA_NEW}"):
 
 
 @pytest.fixture
-def install(tmp_path):
+def install(tmp_path, monkeypatch):
     d = tmp_path / "install"
     d.mkdir()
+    # as if this agent's last update check had found SHA_NEW on official main
+    monkeypatch.setitem(su._CHECKED, su._key(str(d)), SHA_NEW)
     # bytes, like a real zip install — write_text would add \r on Windows
     (d / "agent.py").write_bytes(b"old agent\n")
     (d / "keep.py").write_bytes(b"same\n")

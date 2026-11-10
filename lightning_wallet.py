@@ -49,10 +49,109 @@ class WalletError(RuntimeError):
     pass
 
 
+class PaymentRefused(WalletError):
+    """The wallet answered a pay request with an error (e.g. not enough
+    sats). Whether anything was sent is still read from payment_status."""
+
+
+class PaymentNotSent(WalletError):
+    """The pay request never left this computer: the connection to the
+    wallet could not be opened at all, so nothing can have been paid."""
+
+
+class WalletKeyRejected(PaymentNotSent):
+    """The wallet's server turned the pay request away before acting on it
+    (HTTP 401/403/404: it does not accept this wallet key — the wallet may
+    no longer exist). Nothing can have been paid."""
+
+
+def _never_left(exc):
+    """True only when a request provably never left this computer — the
+    wallet's name could not be looked up, the connection was refused, or
+    connecting timed out. A request that was cut off or timed out AFTER it
+    was sent is not that: the wallet may be acting on it."""
+    seen, todo = set(), [exc]
+    while todo:
+        e = todo.pop()
+        if not isinstance(e, BaseException) or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if type(e).__name__ in ("ConnectTimeout", "ConnectTimeoutError",
+                                "NewConnectionError", "NameResolutionError"):
+            return True
+        todo += [getattr(e, "reason", None), e.__cause__]
+        todo += list(e.args)
+    return False
+
+
+def _no_such_payment(resp):
+    """True when a 404 is LNbits itself saying it has no such payment
+    ({"detail": "Payment does not exist."}). A 404 from anything else — a
+    proxy in front of the wallet, a server that isn't LNbits — says nothing
+    about the payment."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    detail = body.get("detail") if isinstance(body, dict) else None
+    text = detail.lower() if isinstance(detail, str) else ""
+    return "payment" in text and ("not exist" in text or "not found" in text)
+
+
+def wallet_fingerprint(cfg):
+    """A short id for the wallet set up in `cfg` — a hash of its address and
+    admin key, never the key itself — or "" when no wallet is set up. Saved
+    with a payment so the agent can tell later whether the wallet it has now
+    is the one that was asked to pay."""
+    if not (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")):
+        return ""
+    import hashlib
+    ident = f"{str(cfg['lnbits_url']).rstrip('/')}\n{cfg['lnbits_admin_key']}"
+    return hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16]
+
+
 def wallet_from_cfg(cfg):
     if cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"):
         return LNbitsWallet(cfg["lnbits_url"], cfg["lnbits_admin_key"])
     return None
+
+
+def keep_old_wallet(cfg):
+    """Call BEFORE the agent's wallet is replaced. Writes the current
+    wallet's address, admin key and page link to a new file
+    (old-wallet-<date>-<time>.json) in the agent's private folder, so sats
+    left in that wallet can still be reached. Returns the file's path, or ""
+    when no wallet is set up. Raises OSError when the file can't be written
+    — the caller must then leave the wallet as it is."""
+    if not (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")):
+        return ""
+    import json
+    home = os.path.expanduser(os.getenv("AGENT_HOME", "~/.agentic-trader"))
+    os.makedirs(home, exist_ok=True)
+    kept = {
+        "note": ("This is a Lightning wallet your agent used before it was "
+                 "replaced. If sats are left in it, open lnbits_wallet_page "
+                 "in a browser (or add this wallet to any LNbits-compatible "
+                 "app with lnbits_url + lnbits_admin_key) and move them "
+                 "out. Anyone with this file can spend that wallet."),
+        "replaced_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "lnbits_url": cfg.get("lnbits_url"),
+        "lnbits_admin_key": cfg.get("lnbits_admin_key"),
+        "lnbits_wallet_page": cfg.get("lnbits_wallet_page", ""),
+    }
+    base = os.path.join(home, "old-wallet-" + time.strftime("%Y%m%d-%H%M%S"))
+    for n in range(1000):
+        path = f"{base}{'-' + str(n) if n else ''}.json"
+        try:  # never overwrite an earlier copy; private from the first byte
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(kept, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        return path
+    raise OSError("could not save the old wallet's details")
 
 
 def print_funding_invoice(wallet, sats):
@@ -131,18 +230,44 @@ def create_wallet(instance_url=None, name="agentic-trader"):
 
 def wallet_setup(cfg):
     """Attach a Lightning wallet the agent can pay from."""
+    if cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"):
+        # Re-running setup must not swap the wallet by accident: a new one
+        # starts empty and the sats in the current one would be left behind.
+        print("\nYour agent already has a Lightning wallet"
+              + (f": {cfg['lnbits_wallet_page']}" if cfg.get("lnbits_wallet_page")
+                 else f" on {cfg['lnbits_url']}") + ".")
+        print("Replacing it leaves any sats in it behind (its details would "
+              "be saved to a file so you can still move them out).")
+        if input("Type REPLACE to replace it, or press Enter to keep it: ").strip() != "REPLACE":
+            print("Kept your current wallet.")
+            return cfg
     print("\nThe agent needs a Lightning wallet to pay sats-priced feeds.")
     print("  1) Create one for me automatically (recommended)")
     print("  2) I already have an LNbits wallet")
     choice = input("Choose [1/2, default 1]: ").strip() or "1"
+
+    def _old_wallet_kept():
+        try:
+            path = keep_old_wallet(cfg)
+        except OSError as exc:
+            print(f"Could not save the old wallet's details ({exc}) — the "
+                  "wallet was not replaced.")
+            return False
+        if path:
+            print(f"Old wallet's details saved to: {path}")
+        return True
+
     if choice == "1":
         try:
             url, key, page = create_wallet()
         except WalletError as exc:
             print(f"Automatic wallet creation failed: {exc}")
             return cfg
+        if not _old_wallet_kept():
+            return cfg
         cfg["lnbits_url"] = url
         cfg["lnbits_admin_key"] = key
+        cfg.pop("lnbits_wallet_page", None)
         if page:
             cfg["lnbits_wallet_page"] = page
         cfg.setdefault("max_autopay_sats", 30_000)
@@ -175,7 +300,11 @@ def wallet_setup(cfg):
         print(f"Wallet check FAILED: {exc}")
         print("Fix the URL/key and re-run setup.")
         return cfg
+    if key != cfg.get("lnbits_admin_key") and not _old_wallet_kept():
+        return cfg
     cfg["lnbits_url"] = url
+    if key != cfg.get("lnbits_admin_key"):
+        cfg.pop("lnbits_wallet_page", None)  # that was the old wallet's page
     cfg["lnbits_admin_key"] = key
     print(f"Wallet connected ✓  balance: {bal:,} sats")
     if bal < 15_000:
@@ -225,15 +354,33 @@ class LNbitsWallet:
     def pay_invoice(self, bolt11: str, wait_seconds: int = 60) -> str:
         """Pay a bolt11 invoice; return the preimage (needed for L402 tokens).
 
-        Raises WalletError on failure or timeout.
+        Raises WalletError on failure or timeout. PaymentRefused means the
+        wallet said no; PaymentNotSent that the request never reached it,
+        or (WalletKeyRejected) that its server turned the request away
+        unread. Any other error leaves the outcome unknown (the payment may
+        still go through) — ask payment_status().
         """
-        resp = requests.post(f"{self.url}/api/v1/payments",
-                             headers=self._headers(),
-                             json={"out": True, "bolt11": bolt11},
-                             timeout=_TIMEOUT + 40)
+        try:
+            resp = requests.post(f"{self.url}/api/v1/payments",
+                                 headers=self._headers(),
+                                 json={"out": True, "bolt11": bolt11},
+                                 timeout=_TIMEOUT + 40)
+        except requests.RequestException as exc:
+            if _never_left(exc):
+                raise PaymentNotSent("could not connect to the wallet "
+                                     f"({str(exc)[:150]}) — nothing was sent")
+            raise WalletError("no answer from the wallet while paying "
+                              f"({str(exc)[:150]}) — the payment may or may "
+                              "not have been sent")
+        if resp.status_code in (401, 403, 404):
+            # turned away at the door (key not accepted / no such wallet):
+            # the request was never acted on, so no payment was started
+            raise WalletKeyRejected("the wallet's server did not accept the "
+                                    f"request, HTTP {resp.status_code}: "
+                                    f"{resp.text[:300]}")
         if resp.status_code not in (200, 201):
-            raise WalletError(f"payment failed HTTP {resp.status_code}: "
-                              f"{resp.text[:300]}")
+            raise PaymentRefused(f"payment failed HTTP {resp.status_code}: "
+                                 f"{resp.text[:300]}")
         payment_hash = resp.json().get("payment_hash", "")
         if not payment_hash:
             raise WalletError("payment accepted but no payment_hash returned")
@@ -252,3 +399,35 @@ class LNbitsWallet:
             time.sleep(2)
         raise WalletError("payment sent but preimage not available within "
                           f"{wait_seconds}s — check the wallet UI")
+
+    def payment_status(self, payment_hash: str):
+        """What the wallet says became of an outgoing payment, by its payment
+        hash: ("paid", preimage), ("pending", ""), ("failed", ""),
+        ("paid_no_proof", "") when the wallet says it paid but gives no
+        usable preimage (the receipt an L402 token is built from),
+        ("not_found", "") when LNbits itself says it has no such payment, or
+        ("unknown", "") when it can't be asked or the answer isn't LNbits'
+        own. Never raises."""
+        try:
+            check = requests.get(f"{self.url}/api/v1/payments/{payment_hash}",
+                                 headers=self._headers(), timeout=_TIMEOUT)
+            if check.status_code == 404:
+                return ("not_found" if _no_such_payment(check) else "unknown"), ""
+            if check.status_code != 200:
+                return "unknown", ""
+            body = check.json()
+        except (requests.RequestException, ValueError):
+            return "unknown", ""
+        if not isinstance(body, dict):
+            return "unknown", ""
+        details = body.get("details") if isinstance(body.get("details"), dict) else {}
+        paid = body.get("paid") or details.get("paid")
+        preimage = body.get("preimage") or details.get("preimage") or ""
+        if paid and isinstance(preimage, str) and preimage and set(preimage) != {"0"}:
+            return "paid", preimage
+        if paid:
+            return "paid_no_proof", ""
+        status = str(body.get("status") or details.get("status") or "").lower()
+        if status.endswith("failed"):
+            return "failed", ""
+        return "pending", ""

@@ -1444,12 +1444,25 @@ function showWallet(page,label){
   }).catch(function(){});
 }
 async function makeWallet(){
-  document.getElementById('mw-msg').textContent=' creating…';
-  const r=await api('/api/wallet/create',{});
+  const mw=document.getElementById('mw-msg');
+  mw.textContent=' creating…';
+  let r=await api('/api/wallet/create',{});
+  if(!r.ok&&r.exists){
+    // The agent already has a wallet: replace it only on a clear yes.
+    if(!confirm('Your agent already has a wallet. Replace it with a new, empty one?'
+        +' Sats in the current wallet are NOT moved to the new one. The current'
+        +" wallet's details are saved to a file in the agent's folder first, so"
+        +' you can still open it and move them yourself. If you only want to add'
+        +' sats, press Cancel. OK = replace the wallet. Cancel = keep it.')){
+      mw.textContent=' Kept your current wallet — nothing changed.';return;}
+    mw.textContent=' creating…';
+    r=await api('/api/wallet/create',{replace:true});
+  }
   if(r.ok){showWallet(r.page,'created ✓');
-    if(r.warning)document.getElementById('mw-msg').innerHTML+=
+    if(r.note)mw.innerHTML+='<div class="muted" style="margin-top:.5rem">'+esc(r.note)+'</div>';
+    if(r.warning)mw.innerHTML+=
       '<div class="err" style="margin-top:.5rem">⚠️ '+esc(r.warning)+'</div>';}
-  else document.getElementById('mw-msg').innerHTML=' <span class="err">'+r.error+'</span>';
+  else mw.innerHTML=' <span class="err">'+esc(r.error)+'</span>';
 }
 async function fundInvoice(){
   const sats=document.getElementById('fund-sats').value;
@@ -1610,17 +1623,21 @@ async function deploy(){
   const r=await api('/api/deploy',{token:document.getElementById('do-token').value,
     region:document.getElementById('do-region').value});
   if(!r.ok){el.innerHTML='<span class="err">'+r.error+'</span>';return;}
+  const here=r.here?'<br><b>'+esc(r.here)+'</b>':'';
   const poll2=async()=>{
-    const s=await api('/api/deploy/status');
+    let s;
+    try{s=await api('/api/deploy/status');}
+    catch(e){el.innerHTML='Server created. The agent on this computer has stopped, '
+      +'so find the server address under Droplets at cloud.digitalocean.com.'+here;return;}
     if(s.ip){el.innerHTML='<span class="ok">Server created at '+esc(s.ip)
       +' ✓</span><br><span class="muted">It is installing the agent now (about 5 '
       +'minutes); you get the "heartbeat started" notification when it is running. '
       +'No notification after 15 minutes? Log in with the command below and run: '
       +'sudo tail -50 /var/log/cloud-init-output.log. Dashboard from here: '
       +esc(s.ssh||('ssh -L 8721:127.0.0.1:8721 trader@'+s.ip))
-      +' then open http://127.0.0.1:8721/dash</span>';
+      +' then open http://127.0.0.1:8721/dash</span>'+here;
       api('/api/finish',{});}
-    else{el.textContent='server status: '+s.status+' — waiting…';setTimeout(poll2,5000);}
+    else{el.innerHTML='server status: '+esc(s.status)+' — waiting…'+here;setTimeout(poll2,5000);}
   };
   poll2();
 }
@@ -2646,6 +2663,254 @@ def _tip_status_route(_h, data):
     return {"ok": True, "status": status}
 
 
+_PASS_INVOICE_S = 3600 + 300    # a pass invoice can be paid for 1h (+ slack)
+_PASS_REUSE_S = 3000            # hand the same invoice back while 10+ min remain
+_MONEY_LOCK = threading.RLock()
+
+
+def _one_at_a_time(fn):
+    """Pass and wallet requests run one after the other (the server answers
+    each request on its own thread): the second click of a double click must
+    see what the first one did, and a status check must not write back a
+    list that a purchase changed in the meantime."""
+    def run(*args, **kwargs):
+        with _MONEY_LOCK:
+            return fn(*args, **kwargs)
+    run.__name__, run.__doc__ = fn.__name__, fn.__doc__
+    return run
+
+
+@_one_at_a_time
+def _pass_buy(cfg, save, data):
+    """Invoice for N prepaid signal days; the user pays from any wallet.
+
+    Asking again never loses an earlier invoice: the same size (a double
+    click) gets the invoice already made, and a different size is added
+    next to it — every unpaid invoice stays on file (feed_pass_pending =
+    the newest, feed_pass_extra = the others) until it is paid or expires,
+    so whichever one the owner pays, the agent finds the pass."""
+    from sources import agenthc_day_trade_ideas as hc
+    import time as _t
+    try:
+        days = int(data.get("days") or 0)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "pick 1, 5, 20 or 60 days"}
+    current = (cfg.get("feed_pass") or {}).get("token")
+    extends = hc._token_id(current) if current else ""
+    last = cfg.get("feed_pass_pending")
+    if (isinstance(last, dict) and last.get("days") == days
+            and last.get("extends") == extends
+            and isinstance(last.get("invoice"), dict)
+            and isinstance(last["invoice"].get("bolt11"), str)
+            and _t.time() - float(last.get("bought_at") or 0) < _PASS_REUSE_S):
+        return {**last["invoice"], "qr": _qr_matrix(last["invoice"]["bolt11"].upper())}
+    try:
+        body = hc.buy_pass(days, extend_token=current)
+    except hc.PassSizeRefilling as exc:
+        # Size briefly off sale (node refilling) — the wizard re-asks
+        # which sizes are on sale so the card disappears until it's back.
+        return {"ok": False, "error": str(exc), "refresh_sizes": True}
+    except hc.PassSizeUnavailable as exc:
+        return {"ok": False, "error": str(exc), "refresh_sizes": True}
+    except hc.PassUnavailable as exc:
+        return {"ok": False, "error": str(exc), "unavailable": True}
+    except Exception as exc:
+        return {"ok": False, "error": _net_error_text(exc)}
+    bolt11 = body["payment_request"]
+    reply = {"ok": True, "bolt11": bolt11,
+             "amount_sats": body.get("amount_sats"),
+             "amount_usd": body.get("amount_usd_approx"),
+             "extends": bool(body.get("extends_current_pass")),
+             "carried": body.get("carried_over_days") or 0,
+             "access_until": body.get("access_until")}
+    cfg["source"] = "agenthc"
+    if isinstance(last, dict) and last.get("token"):
+        # the earlier invoice may still get paid: keep watching its pass
+        cfg["feed_pass_extra"] = [last] + [
+            p for p in (cfg.get("feed_pass_extra") or []) if isinstance(p, dict)]
+    cfg["feed_pass_pending"] = {
+        "token": body["pass_token"], "days": days, "bought_at": _t.time(),
+        "access_until": body.get("access_until"),
+        "extends": extends, "invoice": reply}
+    save()
+    return {**reply, "qr": _qr_matrix(bolt11.upper())}
+
+
+@_one_at_a_time
+def _pass_status(cfg, save):
+    """Every purchase on file is checked with AgentHC. A paid one becomes
+    the pass (newest first); an unpaid one stays while its invoice can still
+    be paid; a paid pass that isn't the main one stays until AgentHC says it
+    is finished. Nothing paid for is ever dropped."""
+    from sources import agenthc_day_trade_ideas as hc
+    import time as _t
+    usable = ("active", "exits_only")
+
+    def _reply(st, status=None):
+        return {"ok": True, "status": status or st.get("status"),
+                "days_left": st.get("days_left", st.get("trading_days_left")),
+                "access_until": st.get("access_until")}
+
+    try:
+        pend = cfg.get("feed_pass_pending")
+        extra = [p for p in (cfg.get("feed_pass_extra") or [])
+                 if isinstance(p, dict) and p.get("token")]
+        unpaid = ([pend] if pend else []) + [p for p in extra if not p.get("paid")]
+        spare = [p for p in extra if p.get("paid")]   # paid, not the main pass
+        waiting, promoted = [], None
+        for p in unpaid:
+            st = hc.pass_status(p["token"])
+            if st.get("status") in usable:
+                paid = {k: v for k, v in p.items() if k != "invoice"}
+                paid["access_until"] = st.get("access_until")
+                if promoted is None:
+                    promoted = (paid, st)
+                else:
+                    spare.insert(0, {**paid, "paid": True})
+            elif (st.get("status") == "pending" and _t.time()
+                  - float(p.get("bought_at") or 0) < _PASS_INVOICE_S):
+                waiting.append(p)
+            # else: expired unpaid / invalid — nothing there to keep
+        spare = [p for p in spare
+                 if hc.pass_status(p["token"]).get("status") in usable]
+        reply = None
+        if promoted:
+            paid, st = promoted
+            old = cfg.get("feed_pass")
+            # Renewing replaces the pass it extends (its days moved over).
+            # Any other pass still on file was paid for separately: keep it.
+            if (isinstance(old, dict) and old.get("token") and "extends" in paid
+                    and paid["extends"] != hc._token_id(old["token"])):
+                spare.insert(0, {**old, "paid": True})
+            cfg["feed_pass"] = paid
+            reply = _reply(st, "active")
+        new_pend = waiting[0] if waiting else None
+        new_extra = waiting[1:] + spare
+        if (reply or new_pend != pend
+                or new_extra != (cfg.get("feed_pass_extra") or [])):
+            for key, val in (("feed_pass_pending", new_pend),
+                             ("feed_pass_extra", new_extra)):
+                if val:
+                    cfg[key] = val
+                else:
+                    cfg.pop(key, None)
+            save()
+        if reply:
+            return reply
+        if new_pend:
+            return {"ok": True, "status": "pending"}
+        cur = cfg.get("feed_pass")
+        if not cur:
+            return {"ok": True, "status": "unpaid" if pend else "none"}
+        st = hc.pass_status(cur["token"])
+        if st.get("status") not in usable and spare:
+            # the main pass is finished: the other paid one takes over
+            cfg["feed_pass"] = {k: v for k, v in spare[0].items() if k != "paid"}
+            rest = waiting[1:] + spare[1:]
+            if rest:
+                cfg["feed_pass_extra"] = rest
+            else:
+                cfg.pop("feed_pass_extra", None)
+            save()
+            st = hc.pass_status(cfg["feed_pass"]["token"])
+        return _reply(st)
+    except Exception as exc:
+        return {"ok": False, "status": "error", "error": _net_error_text(exc, cache_s=60)}
+
+
+_WALLET_EXISTS = ("Your agent already has a wallet, so no new one was created "
+                  "— a new wallet starts empty, and any sats in the one you "
+                  "have would be left behind. To keep using it, just add "
+                  "sats to it. To replace it anyway (for example because "
+                  "that wallet no longer exists): run `python agent.py "
+                  "setup` in the agent's folder and type REPLACE when it "
+                  "asks about the wallet. The old wallet's details are "
+                  "saved to a file first.")
+
+
+@_one_at_a_time
+def _wallet_create(cfg, save, data):
+    """Create the agent's own wallet. Never replaces one that is already set
+    up unless the request says {"replace": true} — and then the old wallet's
+    keys are saved to a file in the agent's private folder before the agent
+    switches, so sats left in it can still be moved out. No file, no
+    replacement. The file is only written once the new wallet exists: a
+    failed try leaves no file calling a wallet "replaced" that is still the
+    agent's."""
+    import lightning_wallet
+    had = bool(cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"))
+    if had and (data or {}).get("replace") is not True:
+        return {"ok": False, "exists": True, "error": _WALLET_EXISTS,
+                "page": cfg.get("lnbits_wallet_page", "")}
+    old_page, old_file = cfg.get("lnbits_wallet_page", ""), ""
+    try:
+        url, key, page = lightning_wallet.create_wallet()
+    except lightning_wallet.WalletError as exc:
+        return {"ok": False, "error": str(exc)[:200]
+                + (" Your current wallet was not changed." if had else "")}
+    if had:
+        try:
+            old_file = lightning_wallet.keep_old_wallet(cfg)
+        except OSError as exc:
+            # the new wallet is empty and simply goes unused
+            return {"ok": False, "error":
+                    "Your wallet was not replaced: its details could not be "
+                    f"saved first ({str(exc)[:120]}). Nothing changed — "
+                    "your agent still uses the wallet it had."}
+    cfg["source"] = "agenthc"
+    cfg["lnbits_url"] = url
+    cfg["lnbits_admin_key"] = key
+    cfg.pop("lnbits_wallet_page", None)   # never show the old wallet's page
+    if page:
+        cfg["lnbits_wallet_page"] = page
+    cfg.setdefault("max_autopay_sats", 30_000)
+    save()
+    out = {"ok": True, "page": page, "warning": lightning_wallet.demo_warning(url)}
+    if had:
+        out.update({
+            "old_wallet_file": old_file, "old_wallet_page": old_page,
+            "note": "New wallet created. It starts empty. Your old wallet "
+                    "was not deleted: if it still holds sats, open it"
+                    + (f" ({old_page})" if old_page else "")
+                    + " and send them to the new one. The old wallet's "
+                    f"details are saved in {old_file}."})
+    return out
+
+
+def _use_pasted_wallet(cfg, url, new_key):
+    """Point the agent at an LNbits wallet the owner pasted (address + admin
+    key). When that is a different wallet from the one the agent has, the
+    old one's details are saved to a file in the agent's private folder
+    first — sats may be left in it. Returns "" when done, or the reason
+    nothing was changed (the old details could not be saved)."""
+    if (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")
+            and cfg["lnbits_admin_key"] != new_key):
+        import lightning_wallet
+        try:
+            lightning_wallet.keep_old_wallet(cfg)
+        except OSError as exc:
+            return ("Your wallet was not changed: the current wallet's "
+                    f"details could not be saved first ({str(exc)[:120]}).")
+        cfg.pop("lnbits_wallet_page", None)  # the old wallet's page
+    cfg["lnbits_url"] = url
+    cfg["lnbits_admin_key"] = new_key
+    cfg.setdefault("max_autopay_sats", 30_000)
+    return ""
+
+
+def _set_recurring(cfg, save, on):
+    """Switch 'Recurring day-pass' on or off. Also notes when it was last
+    switched ON: that is the owner's "try again" for a wallet the agent
+    stopped buying with because it paid without giving a receipt (see
+    _no_receipt_stop in sources/agenthc_day_trade_ideas.py)."""
+    cfg["day_pass_recurring"] = bool(on)
+    if cfg["day_pass_recurring"]:
+        import time
+        cfg["day_pass_recurring_on_at"] = time.time()
+    save()
+    return {"ok": True, "on": cfg["day_pass_recurring"]}
+
+
 def _restore_notes(cfg, acceptance=None):
     """Per-tab 'already configured' summaries for the wizard restore path.
     Non-secret only — these render as plain text at the top of each completed
@@ -2856,9 +3121,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     bal = LNbitsWallet(url, str(data["lnbits_key"]).strip()).balance_sats()
                 except WalletError as exc:
                     return {"ok": False, "error": f"wallet check failed: {exc}"}
-                cfg["lnbits_url"] = url
-                cfg["lnbits_admin_key"] = str(data["lnbits_key"]).strip()
-                cfg.setdefault("max_autopay_sats", 30_000)
+                # a different wallet replaces the agent's: the old one's
+                # keys are kept on file first (sats may be left in it)
+                problem = _use_pasted_wallet(
+                    cfg, url, str(data["lnbits_key"]).strip())
+                if problem:
+                    return {"ok": False, "error": problem}
                 note = f"wallet connected ✓ balance {bal:,} sats"
             elif cfg.get("feed_pass"):
                 note = "prepaid pass ✓"
@@ -2947,7 +3215,22 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         save()
         return {"ok": True, "describe": llm_client.describe(cfg)}
 
+    deploy_lock = threading.Lock()
+
     def deploy(_h, data):
+        # One at a time. A second click while the first is still talking to
+        # DigitalOcean (nothing is marked as moved yet) would create a second
+        # server, and two servers place every order twice.
+        if not deploy_lock.acquire(blocking=False):
+            return {"ok": False, "error": (
+                "a server is already being created from the first click — "
+                "wait for it to finish. No second server was created.")}
+        try:
+            return deploy_once(data)
+        finally:
+            deploy_lock.release()
+
+    def deploy_once(data):
         import provision
         import llm_policy
         if llm_policy.entries_blocked(cfg):
@@ -2955,22 +3238,130 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         token = str(data.get("token", "")).strip()
         if not token:
             return {"ok": False, "error": "paste a DigitalOcean API token"}
+        import transfer
+        moved = transfer.moved_away()
+        if not moved and pending.get("deploy_unmarked"):
+            moved = {"moved_at": "a moment ago"}  # marker couldn't be saved
+        if moved:  # e.g. a second click: two servers would double every order
+            return {"ok": False, "error": (
+                "this setup was already moved to a server or another "
+                f"computer ({moved.get('moved_at', '?')}). A second copy "
+                "would place every order twice, so no new server was "
+                "created. If that one is gone (destroyed or stopped), run: "
+                "python agent.py resume-here — then deploy again.")}
+        import keep_running
+        running_here = get_status is not None
+        if not running_here and keep_running.is_running():
+            # This page can't hold an agent that runs in another process, so
+            # it could trade while its memory is being copied to the server.
+            return {"ok": False, "error": (
+                "the agent is running on this computer right now, in the "
+                "background or another window. Stop it first with: "
+                "python agent.py stop — then press the button again. That "
+                "way nothing can be traded here while its positions are "
+                "being copied to the server. No server was created.")}
+        # The server gets a copy of this computer's memory (positions, signals
+        # already handled, today's counters). Put the heartbeat on hold —
+        # "resume" can't lift this — and wait until the cycle it is in right
+        # now (maybe an order being placed) has finished and saved, so
+        # nothing is traded here that the server wouldn't know about.
+        was_paused = CONTROLS.get("paused", False)
+        transfer.HANDOFF["hold"] = True  # this is what stops the heartbeat
+        CONTROLS["paused"] = True  # what the dashboard shows
+
+        def carry_on_here():
+            transfer.HANDOFF["hold"] = False
+            CONTROLS["paused"] = was_paused
+        if not transfer.CYCLE_IDLE.wait(provision.CYCLE_WAIT_S):
+            carry_on_here()
+            return {"ok": False, "error": (
+                "the agent is in the middle of handling a trade signal, so "
+                "its positions can't be copied safely right now. No server "
+                "was created and nothing changed. Wait a minute, then press "
+                "the button again.")}
+        first_try = not provision.deployed_before()
         try:
             droplet_id, msg = provision.create_droplet(
                 token, str(data.get("region", "nyc3")))
-        except RuntimeError as exc:
-            return {"ok": False, "error": str(exc)[:250]}
+        except Exception as exc:
+            carry_on_here()  # nothing was created (or: not known)
+            if first_try and not isinstance(exc, provision.OutcomeUnknown):
+                provision.mark_deploy_checked()  # no earlier server to warn of
+            if not isinstance(exc, RuntimeError):
+                raise
+            return {"ok": False, "error": str(exc)[:500]}
+        # ── The server now runs this setup. From here on NOTHING may leave
+        # this computer trading as well (two copies on one broker account
+        # place every order twice), whatever else goes wrong. ──
         pending["deploy"] = (token, droplet_id)
-        return {"ok": True, "note": msg}
+        pending.pop("deploy_shown", None)
+        provision.mark_deploy_checked()
+        # Retire THIS computer exactly like "move to another computer" does.
+        try:
+            retired = transfer.mark_moved_away()
+        except Exception as exc:
+            retired = (
+                "IMPORTANT: this computer could not save its \"moved\" note "
+                f"({str(exc)[:120]}), so do NOT start the agent on this "
+                "computer again while the server exists, and turn off "
+                "start-at-login with: python agent.py autostart off")
+            pending["deploy_unmarked"] = True  # still refuse a second server
+            try:
+                keep_running.disable_autostart()
+            except Exception:
+                pass
+        if running_here:
+            # It stays on hold (no orders) and stops by itself — not at once,
+            # because this same process serves the page that is about to
+            # show the owner the server's address and login command.
+            def _stop_here():
+                import time as _time
+                end = _time.time() + provision.LOCAL_STOP_CAP_S
+                while _time.time() < end and not CONTROLS["stop"]:
+                    shown = pending.get("deploy_shown")
+                    if (shown and _time.time() - shown
+                            >= provision.LOCAL_STOP_AFTER_SHOWN_S):
+                        break
+                    _time.sleep(0.2)
+                CONTROLS["stop"] = True
+            threading.Thread(target=_stop_here, daemon=True).start()
+            retired += ("; the agent here is paused now (it places no more "
+                        "orders, and \"resume\" is switched off) and stops "
+                        "by itself about a minute after this page shows the "
+                        "server's address ("
+                        f"{max(1, round(provision.LOCAL_STOP_CAP_S / 60))} "
+                        "minutes from now at the latest) — this dashboard "
+                        "stops answering then")
+        else:
+            carry_on_here()  # nothing runs in this process
+        here = (f"This computer is now retired so the two can never both "
+                f"trade: {retired}. Until the server sends its \"heartbeat "
+                "started\" notification (about 5 minutes), nothing is "
+                "watching your open positions. To run the agent on this "
+                "computer again instead: destroy the server in DigitalOcean "
+                "first, then run: python agent.py resume-here")
+        note = f"{msg}. {here}"
+        try:
+            print(note)
+            A.notify(cfg, "agentic-trader: " + note)
+        except Exception:
+            pass
+        return {"ok": True, "note": note, "retired": True, "here": here}
 
     def deploy_status(_h):
         import provision
         if not pending.get("deploy"):
             return {"status": "no deploy in progress", "ip": ""}
         token, droplet_id = pending["deploy"]
+        if not droplet_id:  # created, but DigitalOcean's reply was unreadable
+            return {"status": "created — find its address under Droplets at "
+                              "cloud.digitalocean.com", "ip": ""}
         st = provision.droplet_status(token, droplet_id)
         if st.get("ip"):
             st["ssh"] = provision.ssh_command(st["ip"])
+            # the agent on this computer may stop once the page has this
+            import time as _time
+            pending.setdefault("deploy_shown", _time.time())
         return st
 
     def brokers_list(_h):
@@ -3087,91 +3478,19 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         """Invoice for N prepaid signal days; the user pays from any wallet."""
         if not A.consent_ok():
             return {"ok": False, "error": "accept the agreement first"}
-        from sources import agenthc_day_trade_ideas as hc
-        try:
-            days = int(data.get("days") or 0)
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "pick 1, 5, 20 or 60 days"}
-        current = (cfg.get("feed_pass") or {}).get("token")
-        try:
-            body = hc.buy_pass(days, extend_token=current)
-        except hc.PassSizeRefilling as exc:
-            # Size briefly off sale (node refilling) — the wizard re-asks
-            # which sizes are on sale so the card disappears until it's back.
-            return {"ok": False, "error": str(exc), "refresh_sizes": True}
-        except hc.PassSizeUnavailable as exc:
-            return {"ok": False, "error": str(exc), "refresh_sizes": True}
-        except hc.PassUnavailable as exc:
-            return {"ok": False, "error": str(exc), "unavailable": True}
-        except Exception as exc:
-            return {"ok": False, "error": _net_error_text(exc)}
-        import time as _t
-        cfg["source"] = "agenthc"
-        cfg["feed_pass_pending"] = {
-            "token": body["pass_token"], "days": days, "bought_at": _t.time(),
-            "access_until": body.get("access_until")}
-        save()
-        bolt11 = body["payment_request"]
-        return {"ok": True, "bolt11": bolt11, "qr": _qr_matrix(bolt11.upper()),
-                "amount_sats": body.get("amount_sats"),
-                "amount_usd": body.get("amount_usd_approx"),
-                "extends": bool(body.get("extends_current_pass")),
-                "carried": body.get("carried_over_days") or 0,
-                "access_until": body.get("access_until")}
+        return _pass_buy(cfg, save, data)
 
     def pass_options_route(_h):
         from sources import agenthc_day_trade_ideas as hc
         return {"options": hc.pass_options()}
 
     def pass_status_route(_h):
-        """Pending purchase first (promote it once paid), else the current pass."""
-        from sources import agenthc_day_trade_ideas as hc
-        import time as _t
-        pend = cfg.get("feed_pass_pending")
-        try:
-            if pend:
-                st = hc.pass_status(pend["token"])
-                if st.get("status") in ("active", "exits_only"):
-                    cfg["feed_pass"] = {**pend, "access_until": st.get("access_until")}
-                    cfg.pop("feed_pass_pending", None)
-                    save()
-                    return {"ok": True, "status": "active",
-                            "days_left": st.get("days_left", st.get("trading_days_left")),
-                            "access_until": st.get("access_until")}
-                if st.get("status") == "pending":
-                    if _t.time() - float(pend.get("bought_at") or 0) < 3600 + 300:
-                        return {"ok": True, "status": "pending"}
-                cfg.pop("feed_pass_pending", None)  # expired unpaid / invalid
-                save()
-                if not cfg.get("feed_pass"):
-                    return {"ok": True, "status": "unpaid"}
-            cur = cfg.get("feed_pass")
-            if not cur:
-                return {"ok": True, "status": "none"}
-            st = hc.pass_status(cur["token"])
-            return {"ok": True, "status": st.get("status"),
-                    "days_left": st.get("days_left", st.get("trading_days_left")),
-                    "access_until": st.get("access_until")}
-        except Exception as exc:
-            return {"ok": False, "status": "error", "error": _net_error_text(exc, cache_s=60)}
+        return _pass_status(cfg, save)
 
-    def wallet_create(_h, _data):
+    def wallet_create(_h, data):
         if not A.consent_ok():
             return {"ok": False, "error": "accept the agreement first"}
-        from lightning_wallet import create_wallet
-        try:
-            url, key, page = create_wallet()
-        except WalletError as exc:
-            return {"ok": False, "error": str(exc)[:200]}
-        cfg["source"] = "agenthc"
-        cfg["lnbits_url"] = url
-        cfg["lnbits_admin_key"] = key
-        if page:
-            cfg["lnbits_wallet_page"] = page
-        cfg.setdefault("max_autopay_sats", 30_000)
-        save()
-        from lightning_wallet import demo_warning
-        return {"ok": True, "page": page, "warning": demo_warning(url)}
+        return _wallet_create(cfg, save, data)
 
     def wallet_fund(_h, data):
         w = _wallet()
@@ -3225,9 +3544,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         # ~$10 pass from its wallet (still capped by max_autopay_sats);
         # OFF = it never spends without the operator. The run loop re-reads
         # config every poll, so this applies live without a restart.
-        cfg["day_pass_recurring"] = bool(data.get("on"))
-        save()
-        return {"ok": True, "on": cfg["day_pass_recurring"]}
+        return _set_recurring(cfg, save, data.get("on"))
 
     def wallet_balance(_h):
         w = _wallet()
@@ -3431,6 +3748,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 # in-flight event finish its state save, so nothing in memory
                 # overwrites the imported files. A restart then loads them.
                 import time as _t
+                was_paused = CONTROLS["paused"]
                 CONTROLS["paused"] = True
                 _t.sleep(2.0)
             try:
@@ -3438,7 +3756,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                               replace=bool(data.get("replace")))
             except Exception:
                 if running_here:
-                    CONTROLS["paused"] = False  # nothing changed: carry on
+                    # nothing changed: carry on as before — still paused if
+                    # the owner (or a damaged-memory start) had paused it
+                    CONTROLS["paused"] = was_paused
                 raise
         except transfer.TransferError as exc:
             if str(exc) == "NEEDS_REPLACE":
@@ -3702,6 +4022,49 @@ def _snapshot_mode():
             or shutil.which("git") is None)
 
 
+def _install_write_problem():
+    """None if the updater can change files in the install folder, else why
+    not, in the owner's words. Asked BEFORE anything is downloaded: under the
+    systemd unit shipped before 2026-11 (ProtectSystem=strict with only the
+    state folder writable) git and pip hit a read-only filesystem, so every
+    server stayed on its deploy-day code with only a raw git error to show."""
+    import errno
+    import os
+    import sys
+    import tempfile
+    repo = _repo_dir()
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".update-write-test-", dir=repo)
+        os.close(fd)
+        os.unlink(probe)
+        return None
+    except OSError as exc:
+        why = exc
+    if os.getenv("INVOCATION_ID") and why.errno == errno.EROFS:
+        paths = [os.path.expanduser(os.getenv("AGENT_HOME", "~/.agentic-trader")),
+                 repo]
+        venv = os.path.abspath(sys.prefix)
+        if (sys.prefix != sys.base_prefix
+                and not venv.startswith(os.path.join(repo, ""))):
+            paths.append(venv)  # pip installs there
+        return (
+            "Can't update: the background service on this server is not "
+            "allowed to change the agent's own files (its service file is "
+            "from an older version). Nothing was changed. To fix it once, "
+            "log in to the server, run this one line, then press Update "
+            "again:\n"
+            f"  sudo sed -i 's|^ReadWritePaths=.*|ReadWritePaths="
+            f"{' '.join(paths)}|' /etc/systemd/system/agentic-trader.service"
+            " && sudo systemctl daemon-reload"
+            " && sudo systemctl restart agentic-trader\n"
+            "It restarts the agent; your settings, positions and trade "
+            "history are kept.")
+    return (f"Can't update: the agent can't write to its own folder ({repo}): "
+            f"{why.strerror or why}. Nothing was changed. Run the agent as "
+            "the user who owns that folder (in Docker, rebuild the image "
+            "instead of using this button).")
+
+
 def _github_unreachable(raw):
     """Error text for a failed update download: the diagnosed cause + fix
     when it looks like a network problem, else the raw error."""
@@ -3770,6 +4133,9 @@ def check_code_updates():
     """Fetch origin and report how far behind HEAD is. Never raises.
     Returns the exact commit (`target`) the user is shown, so the pull can
     install THAT commit and nothing pushed after they looked."""
+    problem = _install_write_problem()
+    if problem:
+        return {"ok": False, "error": problem}
     if _snapshot_mode():
         import snapshot_update
         try:
@@ -3884,6 +4250,9 @@ def pull_code_updates(expect=None):
     merged over silently — a diverged tree is reported, not resolved.
     `expect` (the `target` from check_code_updates) pins the exact commit the
     user reviewed: if the remote moved since, nothing is installed."""
+    problem = _install_write_problem()
+    if problem:
+        return False, problem
     if _snapshot_mode():
         import snapshot_update
         try:

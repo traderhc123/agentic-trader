@@ -75,7 +75,9 @@ def test_weekend_skip_notifies_once_per_day(capsys):
         agenthc._pass_purchase_allowed({"day_pass_recurring": True}, state,
                                        saved.append, now=SAT)
     assert len(saved) == 1  # notice recorded once, not per poll
-    assert capsys.readouterr().out.count("weekend") == 1
+    out = capsys.readouterr().out
+    assert out.count("market is closed") == 1
+    assert "Monday Jul 20" in out  # says when it buys next
 
 
 def test_weekday_recurring_still_buys():
