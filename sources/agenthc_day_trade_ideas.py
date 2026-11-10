@@ -21,7 +21,8 @@ from zoneinfo import ZoneInfo
 
 import requests  # noqa: F401  (tests stub requests.get/post; _http calls them)
 
-from lightning_wallet import PaymentRefused, wallet_from_cfg, wallet_setup
+from lightning_wallet import (PaymentNotSent, PaymentRefused, WalletKeyRejected,
+                              wallet_fingerprint, wallet_from_cfg, wallet_setup)
 from net_check import http as _http  # steps around a broken proxy setting
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -53,7 +54,7 @@ _OPEN_MIN = 9 * 60 + 30         # regular session opens 9:30 AM ET
 _BUY_LEAD_MIN = 60              # earliest purchase: this long before the open
 _PAY_RETRY_S = 300              # after a purchase that failed: wait, then retry
 _REFUSED_RETRY_S = 120          # a refused paid pass is re-offered this often
-_PENDING_GRACE_S = 120          # "wallet has no record" is final after this
+_INVOICE_SLACK_S = 300          # clocks differ: an invoice is "expired" this much later
 _PENDING_ALERT_S = 600          # undecided this long: tell the owner
 _PENDING_MAX_AGE_S = 24 * 3600  # undecided this long: stop waiting for it
 
@@ -289,6 +290,34 @@ def bolt11_payment_hash(invoice):
     is the id the paying wallet files the payment under, so the agent can
     ask the wallet later what became of a payment. No checksum or signature
     check (the wallet does those before it pays)."""
+    for tag, vals in _bolt11_fields(invoice) or ():
+        if tag == 1 and len(vals) == 52:
+            bits = 0
+            for v in vals:
+                bits = (bits << 5) | v
+            return f"{bits >> 4:064x}"
+    return None
+
+
+def bolt11_expiry_s(invoice):
+    """Seconds a BOLT11 invoice stays payable after it was issued, from its
+    `x` field (3600 when it has none — the standard's default); None when
+    the text doesn't read as an invoice."""
+    fields = _bolt11_fields(invoice)
+    if fields is None:
+        return None
+    for tag, vals in fields:
+        if tag == 6:
+            secs = 0
+            for v in vals:
+                secs = (secs << 5) | v
+            return secs
+    return 3600
+
+
+def _bolt11_fields(invoice):
+    """The tagged fields of a BOLT11 invoice, in order, as (tag, [5-bit
+    values]); None when the text doesn't read as an invoice."""
     if not isinstance(invoice, str):
         return None
     s = invoice.strip().lower()
@@ -298,19 +327,15 @@ def bolt11_payment_hash(invoice):
     alphabet = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
     vals = [alphabet.index(c) for c in s[sep + 1:]]
     body = vals[7:-110]         # after the timestamp, before signature + checksum
-    i = 0
+    fields, i = [], 0
     while i + 3 <= len(body):
         tag, n = body[i], body[i + 1] * 32 + body[i + 2]
         i += 3
         if i + n > len(body):
-            return None
-        if tag == 1 and n == 52:
-            bits = 0
-            for v in body[i:i + 52]:
-                bits = (bits << 5) | v
-            return f"{bits >> 4:064x}"
+            break               # cut short: keep what was read so far
+        fields.append((tag, body[i:i + n]))
         i += n
-    return None
+    return fields
 
 
 def _tip_quote(q):
@@ -525,6 +550,23 @@ def _daypass_alert_clear(state):
     return True
 
 
+_NO_SIGNALS = ("no new entries, and no exit signals for positions it holds, so "
+               "watch those yourself")
+
+
+def _retry_text():
+    """When the agent next tries to buy a day-pass after a try that failed."""
+    start = _OPEN_MIN - _BUY_LEAD_MIN
+    opens = f"{start // 60 % 12 or 12}:{start % 60:02d} {'AM' if start < 720 else 'PM'} ET"
+    return (f"It tries again every {_PAY_RETRY_S // 60} minutes until today's "
+            f"market close; after that, from {opens} on the next market day.")
+
+
+class InvoiceRefused(RuntimeError):
+    """The agent decided not to pay a day-pass invoice. Nothing was sent to
+    the wallet. The message is plain words for the owner."""
+
+
 def _daypass_bought_day(tok):
     """The ET day a wallet day-pass token was bought (tokens from older
     versions carry no paid_day: they were bought 23h before they expire)."""
@@ -591,6 +633,9 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
     non-trading days server-side; this check keeps every consumer safe even
     against an older server.
 
+    Never buys while the wallet is known to pay without giving the receipt
+    the pass is made from (see _no_receipt_stop).
+
     One paid day-pass per day: never buys on a day the prepaid pass was
     already charged, and never buys a second day-pass the same day (the
     owner paid for today once already) — a lost or refused token is not a
@@ -622,6 +667,8 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
                   "(only if 'Recurring day-pass' is ON).")
         return False
     if cfg.get("day_pass_recurring"):
+        if _no_receipt_stop(cfg, state, save_state):
+            return False  # this wallet pays but can't give the receipt
         if time.time() < float(state.get("daypass_retry_at") or 0):
             return False  # the last try failed (already reported): wait a bit
         spent = _autopay_spent_today(state, now)
@@ -647,6 +694,44 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
               "OFF — turn ON 'Recurring day-pass' in the wizard Source tab "
               "to let the agent buy it each day.")
     return False
+
+
+def _no_receipt_text(sats):
+    return (f"Your agent's wallet paid {int(sats or 0):,} sats for a day-pass — the "
+            "sats left the wallet — but the wallet cannot give the payment "
+            "receipt (the \"preimage\") that AgentHC needs to open the feed, "
+            "so that pass could not be used. To stop this from costing you "
+            "every day, your agent will NOT buy another day-pass with this "
+            f"wallet. It gets no signals — {_NO_SIGNALS}. To start again: "
+            "connect a different Lightning wallet, or buy signal days with a "
+            "prepaid pass (dashboard → Settings → Signal source). If you "
+            "know the wallet is fixed, switch 'Recurring day-pass' off and "
+            "on again and the agent will try it once more.")
+
+
+def _no_receipt_stop(cfg, state, save_state):
+    """True while auto-buying is stopped because this wallet paid for a
+    day-pass without giving the receipt (preimage) the pass is made from —
+    buying again would lose the same sats every market day. The stop ends
+    when the owner connects a different wallet, or switches 'Recurring
+    day-pass' on again after it began. Reminds the owner once a day."""
+    stop = state.get("daypass_no_receipt")
+    if not isinstance(stop, dict):
+        return False
+    try:
+        switched_on_at = float(cfg.get("day_pass_recurring_on_at") or 0)
+    except (TypeError, ValueError):
+        switched_on_at = 0.0
+    if (stop.get("wallet") != wallet_fingerprint(cfg)
+            or switched_on_at > float(stop.get("at") or 0)):
+        state.pop("daypass_no_receipt", None)
+        if state.get("daypass_alert") == "daypass_noproof_notified":
+            _daypass_alert_clear(state)
+        save_state(state)
+        return False
+    _daypass_alert(cfg, state, save_state, "daypass_noproof_notified",
+                   _no_receipt_text(stop.get("sats")))
+    return True
 
 
 def _one_pass_a_day(cfg):
@@ -717,7 +802,7 @@ def _invoice_sats(invoice, claimed):
     establish."""
     msat = bolt11_amount_msat(invoice)
     if not msat or msat <= 0:
-        raise RuntimeError(
+        raise InvoiceRefused(
             "The feed sent a Lightning invoice with no readable amount, so "
             "the agent did not pay it. Nothing was paid.")
     sats = -(-msat // 1000)
@@ -727,7 +812,7 @@ def _invoice_sats(invoice, claimed):
         except (TypeError, ValueError):
             said = None
         if isinstance(claimed, bool) or said is None or abs(said * 1000 - msat) >= 1000:
-            raise RuntimeError(
+            raise InvoiceRefused(
                 f"The feed said the day-pass costs {str(claimed)[:20]} sats but "
                 f"its Lightning invoice asks for {sats:,} sats, so the agent "
                 "did not pay it. Nothing was paid.")
@@ -767,6 +852,7 @@ def _daypass_paid(state, pending, preimage):
                      "paid_day": pending.get("day")}
     state.pop("daypass_pending", None)
     state.pop("daypass_retry_at", None)
+    state.pop("daypass_no_receipt", None)   # this wallet does give receipts
     _daypass_alert_clear(state)
     if isinstance(pending.get("day"), str):
         _record_paid_day(state, pending["day"])
@@ -776,43 +862,70 @@ def _settle_daypass(cfg, state, save_state, wallet=None):
     """Ask the wallet what became of the saved day-pass purchase
     (state["daypass_pending"], written before the wallet was asked to pay).
 
-    "paid"    — the wallet has the proof of payment: the pass is ready to use.
-    "failed"  — nothing was paid; the record is dropped and its budget freed.
-    "unknown" — not decided yet (or the wallet can't be asked): the record
-                stays, counts against today's budget, and no other pass is
-                bought while it is there."""
+    "paid"       — the wallet has the proof of payment: the pass is ready.
+    "failed"     — nothing was paid; the record is dropped and its budget freed.
+    "unknown"    — not decided yet (or the wallet can't be asked): the record
+                   stays, counts against today's budget, and no other pass is
+                   bought while it is there.
+    "no_receipt" — the wallet paid but can't give the proof the pass is made
+                   from: counted as paid, and auto-buying stops for this
+                   wallet (see _no_receipt_stop).
+
+    Only the wallet that was asked to pay is believed. If the owner has
+    changed wallets since, the new one knows nothing about this payment, so
+    it is not asked and the purchase stays undecided. And "the wallet has no
+    record of it" only means "not paid" when the wallet itself turned the
+    payment down, or once the invoice has expired — before that, a pay
+    request that is merely stuck on its way could still go through."""
     pending = state.get("daypass_pending")
     if (not isinstance(pending, dict) or not pending.get("payment_hash")
             or not pending.get("macaroon")):
         state.pop("daypass_pending", None)
         save_state(state)
         return "failed"
-    wallet = wallet or wallet_from_cfg(cfg)
+    paid_from = pending.get("wallet")
+    other_wallet = bool(paid_from) and paid_from != wallet_fingerprint(cfg)
     status, preimage = "unknown", ""
-    check = getattr(wallet, "payment_status", None)
-    if check is not None:
-        try:
-            status, preimage = check(pending["payment_hash"])
-        except Exception:
-            status, preimage = "unknown", ""
+    if pending.get("not_sent"):
+        status = "failed"       # the pay request never left this computer
+    elif not other_wallet:
+        wallet = wallet or wallet_from_cfg(cfg)
+        check = getattr(wallet, "payment_status", None)
+        if check is not None:
+            try:
+                status, preimage = check(pending["payment_hash"])
+            except Exception:
+                status, preimage = "unknown", ""
     age = time.time() - float(pending.get("created_at") or 0)
     amount = int(pending.get("amount_sats") or 0)
     if status == "paid" and preimage:
         _daypass_paid(state, pending, preimage)
         save_state(state)
         return "paid"
-    # "No record" is only final once the wallet has had time to file the
-    # payment — unless the wallet itself answered the pay request with an error.
+    payable_s = max(_INVOICE_LIFETIME_S, bolt11_expiry_s(pending.get("invoice")) or 0)
     if status == "failed" or (status == "not_found" and (
-            pending.get("refused") or age > _PENDING_GRACE_S)):
+            pending.get("refused") or age > payable_s + _INVOICE_SLACK_S)):
         _uncount_autopay(state, pending)
         state.pop("daypass_pending", None)
-        _daypass_alert_clear(state)   # no longer "waiting for the wallet"
+        if state.get("daypass_alert") == "daypass_pending_notified":
+            _daypass_alert_clear(state)   # no longer "waiting for the wallet"
         save_state(state)
         return "failed"
+    if status == "paid_no_proof" and age > _PENDING_ALERT_S:
+        # The sats are gone and no receipt is coming. Buying again would
+        # lose the same amount every market day: stop, and say so.
+        _count_autopay(state, pending)
+        state.pop("daypass_pending", None)
+        state["daypass_no_receipt"] = {"wallet": wallet_fingerprint(cfg),
+                                       "at": time.time(), "sats": amount}
+        save_state(state)
+        _daypass_alert(cfg, state, save_state, "daypass_noproof_notified",
+                       _no_receipt_text(amount))
+        return "no_receipt"
     if age > _PENDING_MAX_AGE_S:
         state.pop("daypass_pending", None)
-        _daypass_alert_clear(state)
+        if state.get("daypass_alert") == "daypass_pending_notified":
+            _daypass_alert_clear(state)
         save_state(state)
         print(f"Day-pass payment of {amount:,} sats is still undecided after "
               "a day — the agent stops waiting for it. Check your wallet's "
@@ -822,15 +935,31 @@ def _settle_daypass(cfg, state, save_state, wallet=None):
         _count_autopay(state, pending)
         save_state(state)
     if age > _PENDING_ALERT_S:
-        _daypass_alert(
-            cfg, state, save_state, "daypass_pending_notified",
-            f"Your agent asked its wallet to pay {amount:,} sats for "
-            "today's day-pass, and the wallet has not said yet whether the "
-            "payment went through. The agent will not pay again while this "
-            "payment is undecided, so it gets no signals for now. It keeps "
-            "asking the wallet and uses the pass as soon as the payment is "
-            "confirmed; if the payment failed, the sats are still in the "
-            "wallet and the agent buys again.")
+        if other_wallet:
+            text = (
+                f"Your agent's wallet was changed while a day-pass payment of "
+                f"{amount:,} sats from the previous wallet was still "
+                "undecided. The agent can't ask the previous wallet about it "
+                "any more, so it will not pay again from the new wallet for "
+                "now — it might pay twice for the same day. Until this is "
+                f"sorted out it gets no signals — {_NO_SIGNALS}. It buys "
+                "again once a day has passed since that payment. If you "
+                "switch back to the previous wallet, the agent asks it again "
+                "and uses the pass if it was paid. (When a wallet is "
+                "replaced from the dashboard or setup, its details are saved "
+                "in an old-wallet file in the agent's folder.)")
+        else:
+            text = (
+                f"Your agent asked its wallet to pay {amount:,} sats for "
+                "today's day-pass, and the wallet has not said yet whether the "
+                "payment went through. The agent will not pay again while this "
+                "payment is undecided, so it gets no signals for now — "
+                f"{_NO_SIGNALS}. It keeps asking the wallet and uses the pass "
+                "as soon as the payment is confirmed. If the payment failed — "
+                "or the wallet still has no record of it once the invoice has "
+                "expired, about an hour after it was issued — the sats are "
+                "still in the wallet and the agent buys again.")
+        _daypass_alert(cfg, state, save_state, "daypass_pending_notified", text)
     return "unknown"
 
 
@@ -839,12 +968,21 @@ def _buy_day_pass(cfg, state, body, save_state):
     Returns True when the pass is ready to use, False when the payment was
     sent but isn't decided yet (it is settled on a later poll). Raises when
     nothing was paid; another try is then held off for _PAY_RETRY_S, because
-    every try makes the server create one more invoice."""
+    every try makes the server create one more invoice. An invoice the agent
+    refuses to pay is also reported to the owner (once a day): until it is
+    sorted out the agent has no pass, so no signals."""
     try:
         return _pay_day_pass(cfg, state, body, save_state)
-    except Exception:
+    except Exception as exc:
         state["daypass_retry_at"] = time.time() + _PAY_RETRY_S
         save_state(state)
+        if isinstance(exc, InvoiceRefused):
+            _daypass_alert(
+                cfg, state, save_state, "daypass_invoice_notified",
+                f"Your agent did not buy today's day-pass. {exc} Until a "
+                f"day-pass is paid the agent gets no signals — {_NO_SIGNALS}. "
+                f"{_retry_text()} If this keeps happening, update the agent "
+                "or contact AgentHC.")
         raise
 
 
@@ -858,41 +996,50 @@ def _pay_day_pass(cfg, state, body, save_state):
     invoice = payment.get("payment_request")
     macaroon = payment.get("macaroon")
     if not invoice or not macaroon:
-        raise RuntimeError(f"402 without payable invoice: {str(body)[:200]}")
+        print(f"402 without payable invoice: {str(body)[:200]}")
+        raise InvoiceRefused(
+            "AgentHC asked for payment but did not send a Lightning invoice "
+            "the agent can pay. Nothing was paid.")
     # The amount the wallet would actually pay is the one inside the
     # invoice; the amount_sats field next to it is only cross-checked.
     amount = _invoice_sats(invoice, payment.get("amount_sats"))
     payment_hash = bolt11_payment_hash(invoice)
     if not payment_hash:
-        raise RuntimeError(
+        raise InvoiceRefused(
             "The feed sent a Lightning invoice the agent can't keep track of "
             "(no payment id in it), so it did not pay it. Nothing was paid.")
     said_hash = payment.get("payment_hash")
     if said_hash and str(said_hash).lower() != payment_hash:
         # the pass (macaroon) is tied to one payment: paying a different
         # invoice would buy nothing
-        raise RuntimeError(
+        raise InvoiceRefused(
             "The feed sent a Lightning invoice that is not the one its "
             "day-pass belongs to, so the agent did not pay it. Nothing was paid.")
     cap = int(cfg.get("max_autopay_sats", 30_000))
     if amount > cap:
-        raise RuntimeError(
-            f"Day-pass costs {amount:,} sats which exceeds your auto-pay cap "
-            f"({cap:,}). Raise max_autopay_sats in config.json if intended.")
+        raise InvoiceRefused(
+            f"The day-pass costs {amount:,} sats, which is more than your "
+            f"auto-pay cap for one pass ({cap:,} sats), so the agent did not "
+            "pay. Nothing was paid. If that price is right, raise "
+            "max_autopay_sats in config.json.")
     spent = _autopay_spent_today(state)
     daily_cap = _daily_autopay_cap(cfg)
     if spent["sats"] + amount > daily_cap:
-        raise RuntimeError(
-            f"Day-pass ({amount:,} sats) would exceed today's auto-pay cap: "
-            f"{spent['sats']:,} of {daily_cap:,} sats already spent "
-            "(max_autopay_sats_per_day in config.json).")
+        raise InvoiceRefused(
+            f"A day-pass ({amount:,} sats) would take today's spending over "
+            f"your daily limit: {spent['sats']:,} of {daily_cap:,} sats are "
+            "already spent (max_autopay_sats_per_day in config.json), so the "
+            "agent did not pay. Nothing was paid.")
     # Save the purchase BEFORE paying: if the wallet's answer is lost (a
     # timeout, a crash, a restart) the payment may still go through, and
-    # only this record can turn it into the pass it paid for.
+    # only this record can turn it into the pass it paid for. It is as safe
+    # from a power cut as any other save of the agent's state (save_state).
+    # "wallet" says which wallet was asked — only that one can answer for it.
     pending = {"macaroon": macaroon, "payment_hash": payment_hash,
                "invoice": invoice, "amount_sats": amount,
                "created_at": time.time(),
-               "day": _now_et().strftime("%Y-%m-%d")}
+               "day": _now_et().strftime("%Y-%m-%d"),
+               "wallet": wallet_fingerprint(cfg)}
     state["daypass_pending"] = pending
     save_state(state)
     print(f"Buying 24h day-pass: paying {amount:,} sats "
@@ -900,25 +1047,45 @@ def _pay_day_pass(cfg, state, body, save_state):
     try:
         preimage = wallet.pay_invoice(invoice)
     except Exception as exc:
-        # Never assume: ask the wallet whether the payment exists.
+        # Never assume: ask the wallet whether the payment exists (unless
+        # the request provably never reached it).
         pending["refused"] = isinstance(exc, PaymentRefused)
+        if isinstance(exc, PaymentNotSent):
+            pending["not_sent"] = True
         outcome = _settle_daypass(cfg, state, save_state, wallet=wallet)
         if outcome == "failed":
-            reason = str(exc)[:200]
+            reason = str(exc)[:200]   # the wallet's own words: console only
+            short = (isinstance(exc, PaymentRefused) and re.search(
+                r"insufficient|not enough|balance", reason, re.I))
+            if isinstance(exc, WalletKeyRejected):
+                why = ("the wallet's server did not accept the agent's "
+                       "wallet key — the wallet may no longer exist (public "
+                       "test servers can be reset). Check it, or set up "
+                       "another wallet, in the dashboard (Settings → Signal "
+                       "source)")
+            elif isinstance(exc, PaymentNotSent):
+                why = ("the wallet could not be reached — check this "
+                       "computer's internet connection; the wallet's server "
+                       "may also be down")
+            elif short:
+                why = ("the wallet does not hold enough sats — add sats in "
+                       "the dashboard (Settings → Signal source)")
+            else:
+                why = "the wallet did not make the payment"
             _daypass_alert(
                 cfg, state, save_state, "daypass_failed_notified",
                 "Your agent's wallet could not pay for today's day-pass "
-                f"({amount:,} sats): {reason}. Nothing was paid. The agent "
-                "gets no signals until a pass is paid — if the wallet is "
-                "short, add sats in the dashboard (Settings → Signal "
-                f"source). It tries again every {_PAY_RETRY_S // 60} minutes.")
+                f"({amount:,} sats): {why}. Nothing was paid. Until a pass is "
+                f"paid the agent gets no signals — {_NO_SIGNALS}. "
+                f"{_retry_text()}")
             raise RuntimeError(f"Day-pass payment failed — nothing was paid: {reason}")
-        if outcome == "unknown":
-            print(f"Day-pass payment of {amount:,} sats: the wallet has "
-                  "not said yet whether it went through "
-                  f"({str(exc)[:120]}). The agent will not pay again "
-                  "meanwhile; it asks the wallet on every poll and uses "
-                  "this pass once the payment is confirmed.")
+        if outcome != "paid":
+            if outcome == "unknown":
+                print(f"Day-pass payment of {amount:,} sats: the wallet has "
+                      "not said yet whether it went through "
+                      f"({str(exc)[:120]}). The agent will not pay again "
+                      "meanwhile; it asks the wallet on every poll and uses "
+                      "this pass once the payment is confirmed.")
             return False
     else:
         _daypass_paid(state, pending, preimage)

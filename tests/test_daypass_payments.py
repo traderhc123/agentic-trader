@@ -25,14 +25,23 @@ HASH_B = "cd" * 32
 WED_1030 = datetime(2026, 7, 15, 10, 30, tzinfo=agenthc.MARKET_TZ)
 
 
-def bolt11(sats, payment_hash=HASH_A):
+def bolt11(sats, payment_hash=HASH_A, expiry=None):
     """Invoice-shaped text for `sats` (None = no amount) carrying
-    `payment_hash`: a real amount prefix and a real `p` field; the signature
-    is filler (nothing here verifies one)."""
+    `payment_hash`: a real amount prefix and a real `p` field (and an `x`
+    field when `expiry` seconds are given); the signature is filler (nothing
+    here verifies one)."""
     bits = int(payment_hash, 16) << 4
     p_field = "".join(_ALPHABET[(bits >> (5 * i)) & 31] for i in reversed(range(52)))
     amount = "" if sats is None else f"{sats * 10}n"
-    return "lnbc" + amount + "1" + "q" * 7 + "pp5" + p_field + "q" * 110
+    x_field = ""
+    if expiry is not None:
+        groups = []
+        while expiry:
+            groups.insert(0, expiry & 31)
+            expiry >>= 5
+        x_field = ("x" + _ALPHABET[len(groups) // 32] + _ALPHABET[len(groups) % 32]
+                   + "".join(_ALPHABET[g] for g in groups))
+    return "lnbc" + amount + "1" + "q" * 7 + "pp5" + p_field + x_field + "q" * 110
 
 
 class Resp:
@@ -55,13 +64,13 @@ class Feed:
     """Scripted AgentHC feed: 402 + invoice without a token, events with
     one. `refuse` makes it answer every token with that status."""
 
-    def __init__(self, sats=10_000, claimed="same", refuse=None):
+    def __init__(self, sats=10_000, claimed="same", refuse=None, expiry=None):
         self.sats, self.claimed, self.refuse = sats, claimed, refuse
-        self.gets, self.minted = [], 0
+        self.gets, self.minted, self.expiry = [], 0, expiry
 
     def invoice(self):
         self.minted += 1
-        return bolt11(self.sats, f"{self.minted:064x}")
+        return bolt11(self.sats, f"{self.minted:064x}", self.expiry)
 
     def get(self, url, params=None, headers=None, timeout=None):
         auth = (headers or {}).get("Authorization")
@@ -81,7 +90,8 @@ class Feed:
 class Wallet:
     """Fake LNbits wallet. `mode`: "ok" pays; "refuse" answers with an error
     and files nothing (e.g. not enough sats); "hang" sends the payment but
-    gives no answer in time (it stays pending until `settle()`)."""
+    gives no answer in time (it stays pending until `settle()`); "noproof"
+    pays — the sats leave — but never has the preimage (the receipt)."""
 
     def __init__(self, mode="ok"):
         self.mode, self.paid, self.status = mode, [], {}
@@ -94,6 +104,10 @@ class Wallet:
         self.paid.append(invoice)
         if self.mode == "hang":
             self.status[h] = ("pending", "")
+            raise lightning_wallet.WalletError(
+                "payment sent but preimage not available within 60s")
+        if self.mode == "noproof":
+            self.status[h] = ("paid_no_proof", "")
             raise lightning_wallet.WalletError(
                 "payment sent but preimage not available within 60s")
         self.status[h] = ("paid", "pre" + h[-4:])
@@ -153,7 +167,7 @@ def _poll(cfg, state, saves=None):
         else (lambda s: None)
     try:
         return agenthc.poll(cfg, state, save)
-    except Exception:
+    except RuntimeError:        # the agent's own "did not pay" / feed errors
         return None
 
 
@@ -425,10 +439,12 @@ def test_failed_purchase_waits_before_asking_for_another_invoice(monkeypatch, cl
     assert feed.minted == 2
 
 
-def test_wallet_with_no_record_after_a_lost_answer_is_not_trusted_at_once(
-        monkeypatch, clock):
-    """No answer from the wallet and no record of the payment yet: undecided
-    for two minutes (the wallet may still be working), then it never happened."""
+def test_wallet_with_no_record_after_a_lost_answer_waits_for_the_invoice_to_expire(
+        monkeypatch, clock, alerts):
+    """No answer from the wallet and no record of the payment: the request
+    may be stuck on its way and still go through. Only once the invoice can
+    no longer be paid (1 h, plus 5 min for clocks) is "no record" the same
+    as "not paid" — until then nothing else is bought."""
     class Lost(Wallet):
         def pay_invoice(self, invoice):
             raise lightning_wallet.WalletError("no answer from the wallet while paying")
@@ -438,12 +454,304 @@ def test_wallet_with_no_record_after_a_lost_answer_is_not_trusted_at_once(
     state = {}
     assert _poll(CFG, state) == []
     assert state["daypass_pending"]["payment_hash"] and state["autopay_spent"]["count"] == 1
-    clock.tick(seconds=60)
-    assert _poll(CFG, state) == [] and "daypass_pending" in state
-    clock.tick(seconds=90)
     wallet.pay_invoice = lambda invoice: Wallet.pay_invoice(wallet, invoice)
+    for _ in range(12):                        # an hour of polls: still waiting
+        clock.tick(minutes=5)
+        assert _poll(CFG, state) == [] and "daypass_pending" in state
+    assert wallet.paid == [] and feed.minted == 1
+    assert len(alerts) == 1 and "once the invoice has expired" in alerts[0]
+    assert "no exit signals" in alerts[0]
+    clock.tick(minutes=6)                      # 66 minutes: the invoice is dead
     assert len(_poll(CFG, state)) == 1         # released, bought for real
+    assert len(wallet.paid) == 1 and feed.minted == 2
     assert state["autopay_spent"] == {"day": "2026-07-15", "sats": 10_000, "count": 1}
+    assert "pass_notice" not in state          # the alert is off the dashboard
+
+
+def test_longer_lived_invoice_is_waited_out_in_full(monkeypatch, clock):
+    """The wait follows the invoice's own expiry when it is longer than 1 h."""
+    class Lost(Wallet):
+        def pay_invoice(self, invoice):
+            raise lightning_wallet.WalletError("no answer from the wallet while paying")
+
+    feed, wallet = Feed(sats=10_000, expiry=3 * 3600), Lost()
+    _setup(monkeypatch, feed, wallet)
+    state = {}
+    assert _poll(CFG, state) == []
+    clock.tick(hours=3)
+    assert _poll(CFG, state) == [] and "daypass_pending" in state
+    clock.tick(minutes=6)
+    wallet.pay_invoice = lambda invoice: Wallet.pay_invoice(wallet, invoice)
+    assert len(_poll(CFG, state)) == 1 and feed.minted == 2
+
+
+def test_bolt11_expiry_reads_the_x_field():
+    assert agenthc.bolt11_expiry_s(bolt11(10_000)) == 3600          # the default
+    assert agenthc.bolt11_expiry_s(bolt11(10_000, expiry=600)) == 600
+    assert agenthc.bolt11_expiry_s(bolt11(10_000, expiry=3 * 3600)) == 10_800
+    assert agenthc.bolt11_payment_hash(bolt11(10_000, HASH_B, expiry=7200)) == HASH_B
+    for junk in (None, "", "not an invoice", 12):
+        assert agenthc.bolt11_expiry_s(junk) is None
+
+
+def test_pay_request_that_never_left_is_not_waited_for(monkeypatch, clock, alerts):
+    """The wallet could not even be connected to: nothing was sent, so there
+    is nothing to wait for — the agent says so and tries again in 5 minutes."""
+    class Offline(Wallet):
+        def pay_invoice(self, invoice):
+            raise lightning_wallet.PaymentNotSent(
+                "could not connect to the wallet (HTTPSConnectionPool(...)) — "
+                "nothing was sent")
+
+        def payment_status(self, payment_hash):
+            return "unknown", ""               # it can't be asked either
+
+    feed, wallet = Feed(sats=10_000), Offline()
+    _setup(monkeypatch, feed, wallet)
+    state = {}
+    assert not _poll(CFG, state)
+    assert "daypass_pending" not in state
+    assert (state.get("autopay_spent") or {}).get("count", 0) == 0
+    assert len(alerts) == 1 and "could not be reached" in alerts[0]
+    assert "HTTPSConnectionPool" not in alerts[0]
+    clock.tick(minutes=6)
+    wallet.pay_invoice = lambda invoice: Wallet.pay_invoice(wallet, invoice)
+    wallet.payment_status = lambda h: Wallet.payment_status(wallet, h)
+    assert len(_poll(CFG, state)) == 1 and len(wallet.paid) == 1
+
+
+# ── review: only the wallet that was asked to pay is believed ───────────────
+
+WALLET_A = {"lnbits_url": "https://lnbits.example", "lnbits_admin_key": "key-a" * 6}
+WALLET_B = {"lnbits_url": "https://lnbits.example", "lnbits_admin_key": "key-b" * 6}
+
+
+def test_wallet_changed_while_a_payment_is_undecided_never_pays_twice(
+        monkeypatch, clock, alerts):
+    """Wallet A's payment hangs; the owner replaces the wallet. Wallet B has
+    never heard of that payment — its "no such payment" must not be taken as
+    "not paid", or B pays for a second pass while A's can still go through."""
+    feed, wallet_a, wallet_b = Feed(sats=10_000), Wallet(mode="hang"), Wallet()
+    by_key = {WALLET_A["lnbits_admin_key"]: wallet_a,
+              WALLET_B["lnbits_admin_key"]: wallet_b}
+    asked_b = []
+    wallet_b.payment_status = lambda h: (asked_b.append(h), ("not_found", ""))[1]
+    monkeypatch.setattr(agenthc.requests, "get", feed.get)
+    monkeypatch.setattr(agenthc, "wallet_from_cfg",
+                        lambda cfg: by_key[cfg["lnbits_admin_key"]])
+    cfg, state, saves = dict(CFG, **WALLET_A), {}, []
+    assert not _poll(cfg, state, saves)
+    saved = saves[-1]["daypass_pending"]
+    assert saved["wallet"] == lightning_wallet.wallet_fingerprint(cfg)
+    assert WALLET_A["lnbits_admin_key"] not in json.dumps(saved)   # an id, not the key
+    cfg = dict(CFG, **WALLET_B)                # the owner replaced the wallet
+    for _ in range(40):                        # the rest of the session and more
+        clock.tick(minutes=5)
+        assert not _poll(cfg, state)
+    assert wallet_b.paid == [] and asked_b == [] and feed.minted == 1
+    assert state["daypass_pending"]["macaroon"] == "MAC1"   # A's pass is kept
+    assert len(alerts) == 1 and "wallet was changed" in alerts[0]
+    assert "no exit signals" in alerts[0]
+    wallet_a.settle()                          # A's payment went through after all
+    cfg = dict(CFG, **WALLET_A)                # …and the owner switched back
+    assert len(agenthc.poll(cfg, state, lambda s: None)) == 1
+    assert state["l402"]["token"].startswith("L402 MAC1:pre")
+    assert len(wallet_a.paid) == 1 and wallet_b.paid == []
+
+
+def test_wallet_fingerprint_names_the_wallet_without_its_key():
+    fp = lightning_wallet.wallet_fingerprint
+    assert fp({}) == "" and fp({"lnbits_url": "https://x"}) == ""
+    a, b = fp(WALLET_A), fp(WALLET_B)
+    assert a and b and a != b and len(a) == 16
+    assert fp(dict(WALLET_A, lnbits_url="https://lnbits.example/")) == a
+    assert fp(dict(WALLET_A, lnbits_url="https://other.example")) != a
+    assert "key-a" not in a
+
+
+# ── review: a wallet that pays but has no receipt ───────────────────────────
+
+def test_wallet_that_pays_without_a_receipt_is_not_used_again(
+        monkeypatch, clock, alerts):
+    """The wallet says "paid" but can never give the preimage: the sats are
+    gone and no pass comes of it. Paying again every market day would lose
+    the same sats each time — so the agent stops and tells the owner what
+    really happened."""
+    feed, wallet = Feed(sats=10_000), Wallet(mode="noproof")
+    _setup(monkeypatch, feed, wallet)
+    cfg, state = dict(CFG, **WALLET_A), {}
+    for _ in range(3 * 24 * 12):               # Wed 10:30 → Sat 10:30, every 5 min
+        assert not _poll(cfg, state)
+        clock.tick(minutes=5)
+    assert len(wallet.paid) == 1 and feed.minted == 1
+    assert "daypass_pending" not in state
+    assert len(alerts) == 3                    # Wed, then a reminder Thu and Fri
+    for text in alerts:
+        assert "sats left the wallet" in text and "NOT buy another" in text
+        assert "10,000 sats" in text and "no exit signals" in text
+        assert "has not said yet" not in text
+    assert state["pass_notice"] == alerts[0]   # and it stays on the dashboard
+
+
+def test_no_receipt_stop_ends_when_recurring_is_switched_on_again(
+        monkeypatch, clock, alerts):
+    feed, wallet = Feed(sats=10_000), Wallet(mode="noproof")
+    _setup(monkeypatch, feed, wallet)
+    cfg, state = dict(CFG, **WALLET_A), {}
+    for _ in range(4):                         # 10:30 … 10:45
+        _poll(cfg, state)
+        clock.tick(minutes=5)
+    assert state["daypass_no_receipt"]["sats"] == 10_000
+    clock.tick(days=1)                         # Thursday: still stopped
+    assert not _poll(cfg, state) and len(wallet.paid) == 1
+    # the wallet was fixed; the owner switches Recurring day-pass off and on
+    wallet.mode = "ok"
+    cfg["day_pass_recurring_on_at"] = clock.time()
+    assert len(_poll(cfg, state)) == 1 and len(wallet.paid) == 2
+    assert "daypass_no_receipt" not in state and "pass_notice" not in state
+
+
+def test_no_receipt_stop_ends_when_a_different_wallet_is_connected(
+        monkeypatch, clock, alerts):
+    feed, wallet, other = Feed(sats=10_000), Wallet(mode="noproof"), Wallet()
+    by_key = {WALLET_A["lnbits_admin_key"]: wallet, WALLET_B["lnbits_admin_key"]: other}
+    monkeypatch.setattr(agenthc.requests, "get", feed.get)
+    monkeypatch.setattr(agenthc, "wallet_from_cfg",
+                        lambda cfg: by_key[cfg["lnbits_admin_key"]])
+    cfg, state = dict(CFG, **WALLET_A), {}
+    for _ in range(4):
+        _poll(cfg, state)
+        clock.tick(minutes=5)
+    assert "daypass_no_receipt" in state
+    cfg = dict(CFG, **WALLET_B)
+    assert not _poll(cfg, state)               # today was paid for (by A): not twice
+    assert other.paid == []
+    clock.tick(days=1)
+    assert len(_poll(cfg, state)) == 1 and len(other.paid) == 1
+    assert len(wallet.paid) == 1 and "daypass_no_receipt" not in state
+
+
+# ── review: every refusal reaches the owner, in plain words ─────────────────
+
+def _bad_invoice_feed(kind):
+    if kind == "amounts differ":
+        return Feed(sats=12_000, claimed=9_500), "asks for 12,000 sats"
+    if kind == "no amount":
+        return Feed(sats=None, claimed=9_500), "no readable amount"
+    if kind == "over the cap":
+        return Feed(sats=45_000), "more than your auto-pay cap for one pass (30,000 sats)"
+    feed = Feed(sats=10_000)
+    real = feed.get
+
+    def get(url, params=None, headers=None, timeout=None):
+        resp = real(url, params=params, headers=headers, timeout=timeout)
+        if resp.status_code == 402:
+            if kind == "another payment":
+                resp.json()["payment"]["payment_hash"] = HASH_B
+            else:                               # "no invoice"
+                del resp.json()["payment"]["payment_request"]
+        return resp
+    feed.get = get
+    return feed, ("not the one its day-pass belongs to" if kind == "another payment"
+                  else "did not send a Lightning invoice")
+
+
+@pytest.mark.parametrize("kind", ["amounts differ", "no amount", "over the cap",
+                                  "another payment", "no invoice"])
+def test_invoice_the_agent_refuses_is_reported_to_the_owner_once_a_day(
+        monkeypatch, clock, alerts, kind):
+    """A refused invoice means no pass, so no signals — including exits. The
+    owner must hear about it, not just the console."""
+    feed, words = _bad_invoice_feed(kind)
+    wallet = Wallet()
+    _setup(monkeypatch, feed, wallet)
+    state = {}
+    for _ in range(20):                        # 10:30 → 12:10
+        assert not _poll(CFG, state)
+        clock.tick(minutes=5)
+    assert wallet.paid == []
+    assert len(alerts) == 1
+    text = alerts[0]
+    assert text.startswith("Your agent did not buy today's day-pass.")
+    assert words in text and "Nothing was paid" in text
+    assert "no exit signals for positions it holds" in text
+    assert "8:30 AM ET on the next market day" in text
+    assert "{" not in text                     # no raw server text
+    assert state["pass_notice"] == text        # on the dashboard too
+    clock.tick(days=1)
+    assert not _poll(CFG, state)
+    assert len(alerts) == 2                    # once more the next day
+
+
+def test_failed_payment_alert_says_what_happens_next_in_plain_words(
+        monkeypatch, clock, alerts, capsys):
+    """An unfunded wallet shortly before the close: the alert must not
+    promise "every 5 minutes" (buying stops at the close) and must not carry
+    the wallet's raw error."""
+    clock.now = datetime(2026, 7, 15, 15, 58, tzinfo=agenthc.MARKET_TZ)
+
+    class Unfunded(Wallet):
+        def pay_invoice(self, invoice):
+            raise lightning_wallet.PaymentRefused(
+                'payment failed HTTP 520: {"detail":"Insufficient balance."}')
+
+    feed, wallet = Feed(sats=10_000), Unfunded()
+    _setup(monkeypatch, feed, wallet)
+    state = {}
+    with pytest.raises(RuntimeError, match="HTTP 520"):   # the console keeps the detail
+        agenthc.poll(CFG, state, lambda s: None)
+    assert len(alerts) == 1
+    text = alerts[0]
+    assert "does not hold enough sats" in text and "Nothing was paid" in text
+    assert "HTTP" not in text and "{" not in text and "detail" not in text
+    assert "every 5 minutes until today's market close" in text
+    assert "from 8:30 AM ET on the next market day" in text
+    assert "no exit signals for positions it holds" in text
+    # and that is what it does: funded at 4:10 PM, nothing is bought tonight
+    wallet.pay_invoice = lambda invoice: Wallet.pay_invoice(wallet, invoice)
+    clock.now = datetime(2026, 7, 15, 16, 10, tzinfo=agenthc.MARKET_TZ)
+    assert not _poll(CFG, state) and wallet.paid == []
+    clock.now = datetime(2026, 7, 16, 8, 31, tzinfo=agenthc.MARKET_TZ)
+    assert len(_poll(CFG, state)) == 1 and len(wallet.paid) == 1
+
+
+def test_failed_payment_alert_does_not_blame_the_balance_for_other_errors(
+        monkeypatch, clock, alerts):
+    class Broken(Wallet):
+        def pay_invoice(self, invoice):
+            raise lightning_wallet.PaymentRefused(
+                'payment failed HTTP 520: {"detail":"Payment failed: no route"}')
+
+    feed, wallet = Feed(sats=10_000), Broken()
+    _setup(monkeypatch, feed, wallet)
+    assert not _poll(CFG, {})
+    assert "the wallet did not make the payment" in alerts[0]
+    assert "enough sats" not in alerts[0] and "HTTP" not in alerts[0]
+
+
+def test_wallet_that_no_longer_exists_is_reported_and_not_waited_for(
+        monkeypatch, clock, alerts):
+    """A reset test server: the wallet's key is no longer accepted, and the
+    server answers every question about the payment with the same refusal.
+    Nothing was paid — the agent must not sit "undecided" for a day."""
+    class Gone(Wallet):
+        def pay_invoice(self, invoice):
+            raise lightning_wallet.WalletKeyRejected(
+                "the wallet's server did not accept the request, HTTP 404: "
+                '{"detail":"Wallet not found."}')
+
+        def payment_status(self, payment_hash):
+            return "unknown", ""               # a 404 that isn't about the payment
+
+    feed, wallet = Feed(sats=10_000), Gone()
+    _setup(monkeypatch, feed, wallet)
+    state = {}
+    assert not _poll(CFG, state)
+    assert "daypass_pending" not in state
+    assert (state.get("autopay_spent") or {}).get("count", 0) == 0
+    assert len(alerts) == 1 and "did not accept the agent's wallet key" in alerts[0]
+    assert "may no longer exist" in alerts[0] and "Nothing was paid" in alerts[0]
+    assert "HTTP" not in alerts[0] and "{" not in alerts[0]
 
 
 # ── P4: never buy a pass the market is closed for ───────────────────────────
@@ -548,12 +856,19 @@ class _Http:
 @pytest.mark.parametrize("resp, expected", [
     (_Http(200, {"paid": True, "preimage": "ab" * 32}), ("paid", "ab" * 32)),
     (_Http(200, {"paid": True, "details": {"preimage": "cd" * 32}}), ("paid", "cd" * 32)),
-    (_Http(200, {"paid": True, "preimage": "0" * 64}), ("pending", "")),   # no proof yet
+    (_Http(200, {"paid": True, "preimage": "0" * 64}), ("paid_no_proof", "")),
+    (_Http(200, {"paid": True}), ("paid_no_proof", "")),
+    (_Http(200, {"details": {"paid": True, "preimage": ""}}), ("paid_no_proof", "")),
     (_Http(200, {"paid": False, "status": "pending"}), ("pending", "")),
     (_Http(200, {"paid": False}), ("pending", "")),
     (_Http(200, {"paid": False, "status": "failed"}), ("failed", "")),
     (_Http(200, {"paid": False, "details": {"status": "PaymentState.FAILED"}}), ("failed", "")),
     (_Http(404, {"detail": "Payment does not exist."}), ("not_found", "")),
+    # a 404 that is not LNbits' own answer says nothing about the payment
+    (_Http(404, None, "<html><h1>404 Not Found</h1>nginx</html>"), ("unknown", "")),
+    (_Http(404, {"detail": "Not Found"}), ("unknown", "")),
+    (_Http(404, {"message": "no such app"}), ("unknown", "")),
+    (_Http(404, ["odd"]), ("unknown", "")),
     (_Http(500, None, "boom"), ("unknown", "")),
     (_Http(200, None, "<html>"), ("unknown", "")),
     (_Http(200, ["odd"]), ("unknown", "")),
@@ -578,6 +893,19 @@ def test_wallet_payment_status_never_raises_when_the_wallet_is_unreachable(monke
     assert wallet.payment_status(HASH_A) == ("unknown", "")
 
 
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_wallet_key_that_is_not_accepted_means_nothing_was_sent(monkeypatch, status):
+    wallet = lightning_wallet.LNbitsWallet("https://lnbits.example", "k")
+    monkeypatch.setattr(
+        lightning_wallet.requests, "post",
+        lambda *a, **kw: _Http(status, None, '{"detail":"Wallet not found."}'))
+    with pytest.raises(lightning_wallet.WalletKeyRejected, match="Wallet not found"):
+        wallet.pay_invoice(bolt11(10_000))
+    assert issubclass(lightning_wallet.WalletKeyRejected, lightning_wallet.PaymentNotSent)
+    assert not issubclass(lightning_wallet.WalletKeyRejected,
+                          lightning_wallet.PaymentRefused)
+
+
 def test_wallet_says_refused_only_when_it_answered_no(monkeypatch):
     wallet = lightning_wallet.LNbitsWallet("https://lnbits.example", "k")
     monkeypatch.setattr(lightning_wallet.requests, "post",
@@ -592,3 +920,35 @@ def test_wallet_says_refused_only_when_it_answered_no(monkeypatch):
         wallet.pay_invoice(bolt11(10_000))
     assert not isinstance(err.value, lightning_wallet.PaymentRefused)
     assert "may or may not have been sent" in str(err.value)
+
+
+def _connect_error(reason_cls, *args):
+    """A requests error shaped the way requests raises it: the urllib3
+    reason is wrapped in MaxRetryError, wrapped in ConnectionError."""
+    from urllib3 import exceptions as u3
+    reason = getattr(u3, reason_cls)(*args)
+    return lightning_wallet.requests.ConnectionError(
+        u3.MaxRetryError(None, "/api/v1/payments", reason))
+
+
+@pytest.mark.parametrize("exc, never_left", [
+    (_connect_error("NewConnectionError", None, "connection refused"), True),
+    (_connect_error("ConnectTimeoutError", None, "connect timed out"), True),
+    (lightning_wallet.requests.ConnectTimeout("connect timed out"), True),
+    # sent, then no answer: the wallet may be paying
+    (lightning_wallet.requests.ReadTimeout("read timed out"), False),
+    (lightning_wallet.requests.ConnectionError(
+        "Connection aborted.", ConnectionResetError(104, "reset by peer")), False),
+    (_connect_error("ProtocolError", "Connection aborted."), False),
+])
+def test_wallet_says_not_sent_only_when_the_request_never_left(
+        monkeypatch, exc, never_left):
+    def post(*a, **kw):
+        raise exc
+    monkeypatch.setattr(lightning_wallet.requests, "post", post)
+    wallet = lightning_wallet.LNbitsWallet("https://lnbits.example", "k")
+    with pytest.raises(lightning_wallet.WalletError) as err:
+        wallet.pay_invoice(bolt11(10_000))
+    assert isinstance(err.value, lightning_wallet.PaymentNotSent) is never_left
+    assert not isinstance(err.value, lightning_wallet.PaymentRefused)
+    assert ("nothing was sent" in str(err.value)) is never_left

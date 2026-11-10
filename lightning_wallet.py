@@ -54,6 +54,62 @@ class PaymentRefused(WalletError):
     sats). Whether anything was sent is still read from payment_status."""
 
 
+class PaymentNotSent(WalletError):
+    """The pay request never left this computer: the connection to the
+    wallet could not be opened at all, so nothing can have been paid."""
+
+
+class WalletKeyRejected(PaymentNotSent):
+    """The wallet's server turned the pay request away before acting on it
+    (HTTP 401/403/404: it does not accept this wallet key — the wallet may
+    no longer exist). Nothing can have been paid."""
+
+
+def _never_left(exc):
+    """True only when a request provably never left this computer — the
+    wallet's name could not be looked up, the connection was refused, or
+    connecting timed out. A request that was cut off or timed out AFTER it
+    was sent is not that: the wallet may be acting on it."""
+    seen, todo = set(), [exc]
+    while todo:
+        e = todo.pop()
+        if not isinstance(e, BaseException) or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if type(e).__name__ in ("ConnectTimeout", "ConnectTimeoutError",
+                                "NewConnectionError", "NameResolutionError"):
+            return True
+        todo += [getattr(e, "reason", None), e.__cause__]
+        todo += list(e.args)
+    return False
+
+
+def _no_such_payment(resp):
+    """True when a 404 is LNbits itself saying it has no such payment
+    ({"detail": "Payment does not exist."}). A 404 from anything else — a
+    proxy in front of the wallet, a server that isn't LNbits — says nothing
+    about the payment."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    detail = body.get("detail") if isinstance(body, dict) else None
+    text = detail.lower() if isinstance(detail, str) else ""
+    return "payment" in text and ("not exist" in text or "not found" in text)
+
+
+def wallet_fingerprint(cfg):
+    """A short id for the wallet set up in `cfg` — a hash of its address and
+    admin key, never the key itself — or "" when no wallet is set up. Saved
+    with a payment so the agent can tell later whether the wallet it has now
+    is the one that was asked to pay."""
+    if not (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")):
+        return ""
+    import hashlib
+    ident = f"{str(cfg['lnbits_url']).rstrip('/')}\n{cfg['lnbits_admin_key']}"
+    return hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16]
+
+
 def wallet_from_cfg(cfg):
     if cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"):
         return LNbitsWallet(cfg["lnbits_url"], cfg["lnbits_admin_key"])
@@ -298,9 +354,11 @@ class LNbitsWallet:
     def pay_invoice(self, bolt11: str, wait_seconds: int = 60) -> str:
         """Pay a bolt11 invoice; return the preimage (needed for L402 tokens).
 
-        Raises WalletError on failure or timeout. Only PaymentRefused means
-        the wallet said no; any other error leaves the outcome unknown (the
-        payment may still go through) — ask payment_status().
+        Raises WalletError on failure or timeout. PaymentRefused means the
+        wallet said no; PaymentNotSent that the request never reached it,
+        or (WalletKeyRejected) that its server turned the request away
+        unread. Any other error leaves the outcome unknown (the payment may
+        still go through) — ask payment_status().
         """
         try:
             resp = requests.post(f"{self.url}/api/v1/payments",
@@ -308,9 +366,18 @@ class LNbitsWallet:
                                  json={"out": True, "bolt11": bolt11},
                                  timeout=_TIMEOUT + 40)
         except requests.RequestException as exc:
+            if _never_left(exc):
+                raise PaymentNotSent("could not connect to the wallet "
+                                     f"({str(exc)[:150]}) — nothing was sent")
             raise WalletError("no answer from the wallet while paying "
                               f"({str(exc)[:150]}) — the payment may or may "
                               "not have been sent")
+        if resp.status_code in (401, 403, 404):
+            # turned away at the door (key not accepted / no such wallet):
+            # the request was never acted on, so no payment was started
+            raise WalletKeyRejected("the wallet's server did not accept the "
+                                    f"request, HTTP {resp.status_code}: "
+                                    f"{resp.text[:300]}")
         if resp.status_code not in (200, 201):
             raise PaymentRefused(f"payment failed HTTP {resp.status_code}: "
                                  f"{resp.text[:300]}")
@@ -336,13 +403,16 @@ class LNbitsWallet:
     def payment_status(self, payment_hash: str):
         """What the wallet says became of an outgoing payment, by its payment
         hash: ("paid", preimage), ("pending", ""), ("failed", ""),
-        ("not_found", "") when the wallet has no such payment, or
-        ("unknown", "") when it can't be asked. Never raises."""
+        ("paid_no_proof", "") when the wallet says it paid but gives no
+        usable preimage (the receipt an L402 token is built from),
+        ("not_found", "") when LNbits itself says it has no such payment, or
+        ("unknown", "") when it can't be asked or the answer isn't LNbits'
+        own. Never raises."""
         try:
             check = requests.get(f"{self.url}/api/v1/payments/{payment_hash}",
                                  headers=self._headers(), timeout=_TIMEOUT)
             if check.status_code == 404:
-                return "not_found", ""
+                return ("not_found" if _no_such_payment(check) else "unknown"), ""
             if check.status_code != 200:
                 return "unknown", ""
             body = check.json()
@@ -355,7 +425,9 @@ class LNbitsWallet:
         preimage = body.get("preimage") or details.get("preimage") or ""
         if paid and isinstance(preimage, str) and preimage and set(preimage) != {"0"}:
             return "paid", preimage
+        if paid:
+            return "paid_no_proof", ""
         status = str(body.get("status") or details.get("status") or "").lower()
-        if not paid and status.endswith("failed"):
+        if status.endswith("failed"):
             return "failed", ""
         return "pending", ""

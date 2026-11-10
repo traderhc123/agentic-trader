@@ -1444,12 +1444,25 @@ function showWallet(page,label){
   }).catch(function(){});
 }
 async function makeWallet(){
-  document.getElementById('mw-msg').textContent=' creating…';
-  const r=await api('/api/wallet/create',{});
+  const mw=document.getElementById('mw-msg');
+  mw.textContent=' creating…';
+  let r=await api('/api/wallet/create',{});
+  if(!r.ok&&r.exists){
+    // The agent already has a wallet: replace it only on a clear yes.
+    if(!confirm('Your agent already has a wallet. Replace it with a new, empty one?'
+        +' Sats in the current wallet are NOT moved to the new one. The current'
+        +" wallet's details are saved to a file in the agent's folder first, so"
+        +' you can still open it and move them yourself. If you only want to add'
+        +' sats, press Cancel. OK = replace the wallet. Cancel = keep it.')){
+      mw.textContent=' Kept your current wallet — nothing changed.';return;}
+    mw.textContent=' creating…';
+    r=await api('/api/wallet/create',{replace:true});
+  }
   if(r.ok){showWallet(r.page,'created ✓');
-    if(r.warning)document.getElementById('mw-msg').innerHTML+=
+    if(r.note)mw.innerHTML+='<div class="muted" style="margin-top:.5rem">'+esc(r.note)+'</div>';
+    if(r.warning)mw.innerHTML+=
       '<div class="err" style="margin-top:.5rem">⚠️ '+esc(r.warning)+'</div>';}
-  else document.getElementById('mw-msg').innerHTML=' <span class="err">'+r.error+'</span>';
+  else mw.innerHTML=' <span class="err">'+esc(r.error)+'</span>';
 }
 async function fundInvoice(){
   const sats=document.getElementById('fund-sats').value;
@@ -2804,32 +2817,42 @@ def _pass_status(cfg, save):
 _WALLET_EXISTS = ("Your agent already has a wallet, so no new one was created "
                   "— a new wallet starts empty, and any sats in the one you "
                   "have would be left behind. To keep using it, just add "
-                  "sats to it.")
+                  "sats to it. To replace it anyway (for example because "
+                  "that wallet no longer exists): run `python agent.py "
+                  "setup` in the agent's folder and type REPLACE when it "
+                  "asks about the wallet. The old wallet's details are "
+                  "saved to a file first.")
 
 
 @_one_at_a_time
 def _wallet_create(cfg, save, data):
     """Create the agent's own wallet. Never replaces one that is already set
     up unless the request says {"replace": true} — and then the old wallet's
-    keys are first saved to a file in the agent's private folder, so sats
-    left in it can still be moved out. No file, no replacement."""
+    keys are saved to a file in the agent's private folder before the agent
+    switches, so sats left in it can still be moved out. No file, no
+    replacement. The file is only written once the new wallet exists: a
+    failed try leaves no file calling a wallet "replaced" that is still the
+    agent's."""
     import lightning_wallet
     had = bool(cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"))
     if had and (data or {}).get("replace") is not True:
         return {"ok": False, "exists": True, "error": _WALLET_EXISTS,
                 "page": cfg.get("lnbits_wallet_page", "")}
     old_page, old_file = cfg.get("lnbits_wallet_page", ""), ""
+    try:
+        url, key, page = lightning_wallet.create_wallet()
+    except lightning_wallet.WalletError as exc:
+        return {"ok": False, "error": str(exc)[:200]
+                + (" Your current wallet was not changed." if had else "")}
     if had:
         try:
             old_file = lightning_wallet.keep_old_wallet(cfg)
         except OSError as exc:
+            # the new wallet is empty and simply goes unused
             return {"ok": False, "error":
                     "Your wallet was not replaced: its details could not be "
-                    f"saved first ({str(exc)[:120]}). Nothing changed."}
-    try:
-        url, key, page = lightning_wallet.create_wallet()
-    except lightning_wallet.WalletError as exc:
-        return {"ok": False, "error": str(exc)[:200]}
+                    f"saved first ({str(exc)[:120]}). Nothing changed — "
+                    "your agent still uses the wallet it had."}
     cfg["source"] = "agenthc"
     cfg["lnbits_url"] = url
     cfg["lnbits_admin_key"] = key
@@ -2848,6 +2871,40 @@ def _wallet_create(cfg, save, data):
                     + " and send them to the new one. The old wallet's "
                     f"details are saved in {old_file}."})
     return out
+
+
+def _use_pasted_wallet(cfg, url, new_key):
+    """Point the agent at an LNbits wallet the owner pasted (address + admin
+    key). When that is a different wallet from the one the agent has, the
+    old one's details are saved to a file in the agent's private folder
+    first — sats may be left in it. Returns "" when done, or the reason
+    nothing was changed (the old details could not be saved)."""
+    if (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")
+            and cfg["lnbits_admin_key"] != new_key):
+        import lightning_wallet
+        try:
+            lightning_wallet.keep_old_wallet(cfg)
+        except OSError as exc:
+            return ("Your wallet was not changed: the current wallet's "
+                    f"details could not be saved first ({str(exc)[:120]}).")
+        cfg.pop("lnbits_wallet_page", None)  # the old wallet's page
+    cfg["lnbits_url"] = url
+    cfg["lnbits_admin_key"] = new_key
+    cfg.setdefault("max_autopay_sats", 30_000)
+    return ""
+
+
+def _set_recurring(cfg, save, on):
+    """Switch 'Recurring day-pass' on or off. Also notes when it was last
+    switched ON: that is the owner's "try again" for a wallet the agent
+    stopped buying with because it paid without giving a receipt (see
+    _no_receipt_stop in sources/agenthc_day_trade_ideas.py)."""
+    cfg["day_pass_recurring"] = bool(on)
+    if cfg["day_pass_recurring"]:
+        import time
+        cfg["day_pass_recurring_on_at"] = time.time()
+    save()
+    return {"ok": True, "on": cfg["day_pass_recurring"]}
 
 
 def _restore_notes(cfg, acceptance=None):
@@ -3060,23 +3117,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     bal = LNbitsWallet(url, str(data["lnbits_key"]).strip()).balance_sats()
                 except WalletError as exc:
                     return {"ok": False, "error": f"wallet check failed: {exc}"}
-                new_key = str(data["lnbits_key"]).strip()
-                if (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")
-                        and cfg["lnbits_admin_key"] != new_key):
-                    # a different wallet replaces the agent's: keep the old
-                    # one's keys on file first (sats may be left in it)
-                    import lightning_wallet
-                    try:
-                        lightning_wallet.keep_old_wallet(cfg)
-                    except OSError as exc:
-                        return {"ok": False, "error":
-                                "Your wallet was not changed: the current "
-                                "wallet's details could not be saved first "
-                                f"({str(exc)[:120]})."}
-                    cfg.pop("lnbits_wallet_page", None)  # the old wallet's page
-                cfg["lnbits_url"] = url
-                cfg["lnbits_admin_key"] = new_key
-                cfg.setdefault("max_autopay_sats", 30_000)
+                # a different wallet replaces the agent's: the old one's
+                # keys are kept on file first (sats may be left in it)
+                problem = _use_pasted_wallet(
+                    cfg, url, str(data["lnbits_key"]).strip())
+                if problem:
+                    return {"ok": False, "error": problem}
                 note = f"wallet connected ✓ balance {bal:,} sats"
             elif cfg.get("feed_pass"):
                 note = "prepaid pass ✓"
@@ -3370,9 +3416,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         # ~$10 pass from its wallet (still capped by max_autopay_sats);
         # OFF = it never spends without the operator. The run loop re-reads
         # config every poll, so this applies live without a restart.
-        cfg["day_pass_recurring"] = bool(data.get("on"))
-        save()
-        return {"ok": True, "on": cfg["day_pass_recurring"]}
+        return _set_recurring(cfg, save, data.get("on"))
 
     def wallet_balance(_h):
         w = _wallet()

@@ -9,6 +9,9 @@
 
 import json
 import os
+import re
+import shutil
+import subprocess
 
 import pytest
 
@@ -310,13 +313,117 @@ def test_wallet_is_not_replaced_when_the_old_keys_cannot_be_saved(
     def broken(cfg):
         raise OSError("disk full")
     monkeypatch.setattr(lightning_wallet, "keep_old_wallet", broken)
+    before, n_saves = dict(cfg), len(saves)
     r = webui._wallet_create(cfg, save, {"replace": True})
     assert r["ok"] is False and "was not replaced" in r["error"]
+    assert "still uses the wallet it had" in r["error"]
     assert cfg["lnbits_admin_key"] == key
-    assert len(lnbits) == 1                            # no new wallet was made
+    # the new wallet was made (empty, and never used); nothing else changed
+    assert len(lnbits) == 2 and cfg == before and len(saves) == n_saves
 
 
-def test_pasting_a_different_wallet_key_keeps_the_old_one_too(home):
+def test_failed_wallet_creation_leaves_no_file_calling_the_wallet_replaced(
+        home, lnbits, monkeypatch):
+    """The owner confirms the replacement while the wallet server is down,
+    three times. The wallet was never replaced, so no old-wallet file (a
+    copy of a key that can spend it) may be left behind."""
+    cfg = {}
+    saves, save = _saver()
+    webui._wallet_create(cfg, save, {})
+    before, n_saves = dict(cfg), len(saves)
+
+    def down(instance_url=None, name="agentic-trader"):
+        raise lightning_wallet.WalletError("could not reach https://demo.lnbits.com")
+    monkeypatch.setattr(lightning_wallet, "create_wallet", down)
+    for _ in range(3):
+        r = webui._wallet_create(cfg, save, {"replace": True})
+        assert r["ok"] is False and "could not reach" in r["error"]
+        assert "current wallet was not changed" in r["error"]
+    assert _old_wallet_files(home) == []
+    assert cfg == before and len(saves) == n_saves
+
+
+def test_old_wallet_is_filed_after_the_new_one_exists_and_before_the_switch(
+        home, lnbits, monkeypatch):
+    cfg = {}
+    saves, save = _saver()
+    webui._wallet_create(cfg, save, {})
+    old_key = cfg["lnbits_admin_key"]
+    real_keep, seen = lightning_wallet.keep_old_wallet, []
+
+    def keep(c):
+        seen.append((len(lnbits), c["lnbits_admin_key"]))
+        return real_keep(c)
+    monkeypatch.setattr(lightning_wallet, "keep_old_wallet", keep)
+    assert webui._wallet_create(cfg, save, {"replace": True})["ok"]
+    assert seen == [(2, old_key)]      # new wallet made; agent still on the old one
+    assert cfg["lnbits_admin_key"] != old_key
+
+
+def test_wallet_exists_refusal_says_how_to_replace_it():
+    """The wallet may be gone (a reset test server): "just add sats to it"
+    alone would be a dead end."""
+    text = webui._WALLET_EXISTS
+    assert "already has a wallet" in text and "add sats" in text
+    assert "python agent.py setup" in text and "REPLACE" in text
+    assert "saved to a file first" in text
+
+
+def _wizard_fn(name):
+    """One top-level function from the built-in wizard page's script."""
+    m = re.search(r"^async function " + name + r"\(.*?^}$", webui._WIZARD_HTML,
+                  re.M | re.S)
+    assert m, name
+    return m.group(0)
+
+
+def test_classic_page_asks_before_it_replaces_a_wallet():
+    js = _wizard_fn("makeWallet")
+    assert "r.exists" in js and "confirm(" in js and "{replace:true}" in js
+    assert js.index("api('/api/wallet/create',{})") < js.index("{replace:true}")
+
+
+@pytest.mark.parametrize("answer, posts, shown", [
+    (True, [{}, {"replace": True}], "created"),
+    (False, [{}], "Kept your current wallet"),
+])
+def test_classic_page_replaces_a_wallet_only_on_a_yes(answer, posts, shown):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    js = """
+const posted = [], asked = [], mw = {textContent: '', innerHTML: ''};
+const document = {getElementById: () => mw};
+const esc = (s) => String(s);
+const confirm = (q) => { asked.push(q); return %s; };
+const showWallet = (page, label) => { mw.innerHTML = label + ' ' + page; };
+const api = async (path, body) => {
+  posted.push(body);
+  return body.replace === true
+    ? {ok: true, page: 'https://demo.lnbits.com/wallet?usr=new', warning: '',
+       note: 'New wallet created. The old wallet is saved in old-wallet-1.json.'}
+    : {ok: false, exists: true, error: 'Your agent already has a wallet'};
+};
+%s
+makeWallet().then(() => console.log(JSON.stringify(
+  {posted, asked, text: mw.textContent + mw.innerHTML})));
+""" % ("true" if answer else "false", _wizard_fn("makeWallet"))
+    # Keep the parent environment (node.exe needs SystemRoot on Windows);
+    # decode as UTF-8 on every platform.
+    r = subprocess.run([node, "-e", js], capture_output=True, text=True,
+                       encoding="utf-8", timeout=30, env={**os.environ})
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    out = json.loads(r.stdout)
+    assert out["posted"] == posts and len(out["asked"]) == 1
+    question = out["asked"][0]
+    assert "Replace it" in question and "NOT moved" in question
+    assert "Cancel = keep it" in question
+    assert shown in out["text"]
+    if answer:
+        assert "old-wallet-1.json" in out["text"]      # where the old one went
+
+
+def test_keep_old_wallet_writes_the_details_to_the_private_folder(home):
     cfg = {"lnbits_url": "https://demo.lnbits.com", "lnbits_admin_key": "oldkey" * 6,
            "lnbits_wallet_page": "https://demo.lnbits.com/wallet?usr=u&wal=w"}
     path = lightning_wallet.keep_old_wallet(cfg)
@@ -326,3 +433,59 @@ def test_pasting_a_different_wallet_key_keeps_the_old_one_too(home):
     assert kept["lnbits_admin_key"] == "oldkey" * 6
     assert "move" in kept["note"].lower()              # says what the file is for
     assert lightning_wallet.keep_old_wallet({}) == ""  # no wallet: nothing to keep
+
+
+PASTED_OLD = {"lnbits_url": "https://demo.lnbits.com", "lnbits_admin_key": "oldkey" * 6,
+              "lnbits_wallet_page": "https://demo.lnbits.com/wallet?usr=u&wal=w"}
+
+
+def test_pasting_a_different_wallet_key_keeps_the_old_one_on_file(home):
+    cfg = dict(PASTED_OLD)
+    assert webui._use_pasted_wallet(cfg, "https://my.lnbits.example", "newkey" * 6) == ""
+    assert cfg["lnbits_url"] == "https://my.lnbits.example"
+    assert cfg["lnbits_admin_key"] == "newkey" * 6
+    assert "lnbits_wallet_page" not in cfg             # that was the old wallet's page
+    assert cfg["max_autopay_sats"] == 30_000
+    files = _old_wallet_files(home)
+    assert len(files) == 1
+    with open(os.path.join(str(home), files[0]), encoding="utf-8") as f:
+        kept = json.load(f)
+    assert {k: kept[k] for k in PASTED_OLD} == PASTED_OLD
+
+
+def test_pasting_the_same_wallet_key_again_writes_nothing(home):
+    cfg = dict(PASTED_OLD, max_autopay_sats=20_000)
+    assert webui._use_pasted_wallet(cfg, PASTED_OLD["lnbits_url"], "oldkey" * 6) == ""
+    assert _old_wallet_files(home) == []
+    assert cfg == dict(PASTED_OLD, max_autopay_sats=20_000)   # page link kept too
+    first = {}                                         # and a first wallet: no file
+    assert webui._use_pasted_wallet(first, "https://my.lnbits.example", "k" * 32) == ""
+    assert first["lnbits_admin_key"] == "k" * 32 and _old_wallet_files(home) == []
+
+
+def test_pasted_wallet_is_not_used_when_the_old_keys_cannot_be_saved(home, monkeypatch):
+    cfg = dict(PASTED_OLD)
+
+    def broken(cfg):
+        raise OSError("disk full")
+    monkeypatch.setattr(lightning_wallet, "keep_old_wallet", broken)
+    problem = webui._use_pasted_wallet(cfg, "https://my.lnbits.example", "newkey" * 6)
+    assert "was not changed" in problem and "disk full" in problem
+    assert cfg == PASTED_OLD                           # nothing moved
+
+
+def test_switching_recurring_on_records_when(monkeypatch):
+    """The time it was last switched ON is what lets the owner restart a
+    wallet the agent stopped buying with (it paid, but gave no receipt)."""
+    import time
+    cfg = {}
+    saves, save = _saver()
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_000.0)
+    assert webui._set_recurring(cfg, save, True) == {"ok": True, "on": True}
+    assert cfg == {"day_pass_recurring": True,
+                   "day_pass_recurring_on_at": 1_800_000_000.0}
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_500.0)
+    assert webui._set_recurring(cfg, save, False) == {"ok": True, "on": False}
+    assert cfg["day_pass_recurring"] is False
+    assert cfg["day_pass_recurring_on_at"] == 1_800_000_000.0   # OFF doesn't move it
+    assert len(saves) == 2
