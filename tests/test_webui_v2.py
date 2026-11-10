@@ -267,13 +267,17 @@ def test_frontend_words_cover_every_code_and_every_state(tmp_path):
         "next_reasons": vm.NEXT_REASONS,
         "unmanaged_reasons": vm.UNMANAGED_REASONS}), encoding="utf-8")
     # Keep the parent environment: node.exe cannot start on Windows without
-    # SystemRoot. Decode as UTF-8 on every platform.
+    # SystemRoot. Decode as UTF-8 on every platform. Ask for TAP explicitly:
+    # newer Node versions print the "spec" summary ("ℹ fail 0") by default
+    # when stdout is not a terminal.
     r = subprocess.run(
         [node, "--experimental-strip-types", "--test",
+         "--test-reporter=tap",
          os.path.join(ROOT, "webui_app", "tests", "guardian.test.mjs")],
         capture_output=True, text=True, encoding="utf-8", timeout=180,
         env={**os.environ, "GUARDIAN_FIXTURES": str(tmp_path),
              "TZ": "Asia/Tokyo"})
     assert r.returncode == 0, r.stdout[-4000:] + r.stderr[-2000:]
-    assert re.search(r"^# fail 0$", r.stdout, re.M), r.stdout[-2000:]
-    assert re.search(r"^# skipped 0$", r.stdout, re.M), r.stdout[-2000:]
+    assert re.search(r"^(?:# |ℹ )fail 0$", r.stdout, re.M), r.stdout[-2000:]
+    assert re.search(r"^(?:# |ℹ )skipped 0$", r.stdout, re.M), r.stdout[-2000:]
+    assert re.search(r"^(?:# |ℹ )pass [1-9]", r.stdout, re.M), r.stdout[-2000:]
