@@ -178,9 +178,11 @@ with `python agent.py setup` (instance URL + Admin key), then fund it with
 `python agent.py fund 50000`. ⚠️ The one-click wallet lives on
 demo.lnbits.com, a public test server that can be reset — keep only a few
 days of passes there, or use your own LNbits instance. Safety rails: never
-pays an invoice above `max_autopay_sats` (30,000) or more than
-`max_autopay_sats_per_day` in a day; the Admin key is stored with `0600`
-perms.
+pays an invoice above `max_autopay_sats` (30,000 — the amount is read from
+the invoice itself); buys at most one day-pass a day (more only if you set
+`max_autopay_sats_per_day` yourself), and only on a market day, from 8:30 AM
+ET until the close; a pass that is lost or refused is never paid for twice —
+you get an alert instead; the Admin key is stored with `0600` perms.
 
 A Premium AgentHC API key also works (*Advanced* in the wizard).
 

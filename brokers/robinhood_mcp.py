@@ -23,6 +23,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import requests
 
 import broker_events
+from platform_compat import safe_print
+
+# The connection notes below are printed inside the call that talks to
+# Robinhood: a console that can't show "⚠️" or "✓" must not make that call
+# raise and lose its answer.
+print = safe_print
 
 MCP_URL = "https://agent.robinhood.com/mcp/trading"
 REGISTER_URL = "https://agent.robinhood.com/oauth/trading/register"
@@ -58,6 +64,7 @@ class RobinhoodMCP:
         self.last_ok_at = None
         self._down_since = None
         self._last_status = None
+        self.last_rpc_error = None
 
     # ── OAuth ────────────────────────────────────────────────────────────
 
@@ -213,6 +220,8 @@ class RobinhoodMCP:
         if notification:
             return resp.status_code, None
         msg = self._parse_body(resp.text, req_id)
+        err = msg.get("error") if isinstance(msg, dict) else None
+        self.last_rpc_error = err if isinstance(err, dict) else None
         if not isinstance(msg, dict) or msg.get("error"):
             return resp.status_code, None if not isinstance(msg, dict) else None
         return resp.status_code, msg.get("result")
@@ -274,6 +283,7 @@ class RobinhoodMCP:
 
     def _request(self, method, params):
         self._last_status = None
+        self.last_rpc_error = None  # the JSON-RPC error of this call, if any
         try:
             result, ok = self._request_inner(method, params)
         except requests.RequestException as exc:

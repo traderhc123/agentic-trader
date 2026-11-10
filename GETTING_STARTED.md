@@ -216,8 +216,9 @@ docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trad
   large purchase, and big passes (≈$200/$600) may exceed some wallets'
   Lightning send limits.
 - **Day-pass spend cap** (only if you chose the Advanced wallet auto-pay): at
-  most one day-pass's worth of sats per day (`max_autopay_sats_per_day`) — a
-  misbehaving paywall can't drain the wallet.
+  most one day-pass per day, bought only on a market day (from 8:30 AM ET
+  until the close) — a misbehaving paywall can't drain the wallet. Set
+  `max_autopay_sats_per_day` only if you want to allow more than one.
 - **Main pick only by default**: the AgentHC feed follows the single daily
   high-conviction pick unless you opt into "other trades" (the wider journal,
   several entries a day) during setup — or later via
