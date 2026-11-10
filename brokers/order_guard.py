@@ -17,18 +17,22 @@ happen:
   * state["unconfirmed_orders"][pos_key]: an order whose request got no
     clear answer and that the broker couldn't show right away. While it is
     there the adapter looks the order up before doing anything else with
-    that contract, and adopts it when it exists. A BUY is never sent again
+    that contract, and adopts it when it exists (a buy adopted on a later
+    loop is queued in state["adopted_buys"]; the agent logs it as the entry
+    it is, so the daily entry cap counts it). A BUY is never sent again
     (the signal is recorded as handled and the owner is told to check the
     broker app); a SELL goes out again only once the broker says the first
     one isn't there — or, at a broker whose sells can only close a position,
     when it can't be looked up.
 """
 
+import hashlib
 import time
 import uuid
 from datetime import datetime, timezone
 
 STATE_KEY = "unconfirmed_orders"
+ADOPTED_KEY = "adopted_buys"  # buys found on a later loop, for the agent to log
 BUY_KEEP_S = 600          # a buy the broker doesn't list: keep looking this long
 GIVE_UP_S = 24 * 3600     # ...and this long while the broker can't be asked
 SKEW_S = 900              # this computer's clock vs the broker's, generously
@@ -39,11 +43,16 @@ _NAMESPACE = uuid.UUID("6f1d3a52-8c0e-4b7e-9d53-2a4c1e7b9f10")
 def order_key(account, event, side, seq=0):
     """The id sent with the order this signal places: the same for every
     attempt of the same order. Without an event id (an order the adapter
-    re-places itself) there is nothing to derive it from: a fresh id."""
+    re-places itself) there is nothing to derive it from: a fresh id.
+
+    It has the form of the random (version 4) UUID the agent has always
+    sent, so a broker that checks the form sees nothing new."""
     event_id = (event or {}).get("event_id")
     if not event_id:
         return str(uuid.uuid4())
-    return str(uuid.uuid5(_NAMESPACE, f"{account}|{event_id}|{side}|{int(seq)}"))
+    name = f"{_NAMESPACE}|{account}|{event_id}|{side}|{int(seq)}"
+    digest = hashlib.sha256(name.encode("utf-8")).digest()
+    return str(uuid.UUID(bytes=digest[:16], version=4))
 
 
 def sell_seq(pos):
@@ -89,6 +98,29 @@ def drop(state, pos_key):
         notes.pop(pos_key, None)
         if not notes:
             state.pop(STATE_KEY, None)
+
+
+def adopted_buy(state, pos_key, rec, order_id):
+    """A buy whose request got no clear answer (note `rec`) was found at
+    the broker on a later loop. Queued for the agent, which logs it as the
+    entry it is (agent._log_adopted_buys): the daily entry cap and the P&L
+    estimate are counted from the trade log. A note with "replaces" set is
+    an order the adapter re-placed for an entry that is in the log already
+    ("logged": no second entry row)."""
+    queue = state.get(ADOPTED_KEY)
+    if not isinstance(queue, list):
+        queue = state[ADOPTED_KEY] = []
+    queue.append({"key": pos_key, "event_id": rec.get("event_id"),
+                  "order_id": str(order_id), "at": rec.get("at"),
+                  "logged": bool(rec.get("replaces"))})
+
+
+def take_adopted(state):
+    """The queued buys (adopted_buy), removed from state."""
+    queue = state.pop(ADOPTED_KEY, None)
+    if not isinstance(queue, list):
+        return []
+    return [r for r in queue if isinstance(r, dict) and isinstance(r.get("key"), str)]
 
 
 def age(rec, now=None):

@@ -60,6 +60,8 @@ class Feed:
     def poll(self, *events):
         if hasattr(self.broker, "reconcile"):
             self.broker.reconcile(self.client, self.cfg, self.state, lambda s: None)
+            agent._log_adopted_buys(self.cfg, self.state, lambda s: None,
+                                    self.broker, self.client)
         for ev in events:
             if ev["event_id"] in self.seen:
                 continue
@@ -275,6 +277,8 @@ def test_alpaca_an_old_order_under_the_same_id_is_never_taken_over_again(
     assert order_guard.unconfirmed(state) == {}
     (alert,) = [n for n in notes if "earlier order" in n]
     assert alert.startswith("agentic-trader: check this trade")
+    # (no order id in it: its digits can read as "HTTP 403" to the Fix: hints)
+    assert "a-1" not in alert and "Fix:" not in alert
     # ...and an order the ledger already knows is not a lost one either
     api.orders[0]["submitted_at"] = datetime.now(timezone.utc).isoformat()
     known, state = _alpaca_feed({"positions": {}, "seen": [],
@@ -378,13 +382,17 @@ class FakeRobinhood:
     "ok", "timeout" (order taken, answer lost), "cut" (the same, and
     Robinhood can't be reached from then on), "lost" (never arrives).
     `down` fails every other call. show_ref_id=False lists orders without
-    the ref_id the agent sent (the agent can't count on seeing it)."""
+    the ref_id the agent sent (the agent can't count on seeing it).
+    `holds`: contracts in the account before the test's own orders; when
+    set, a sell is close-only like the agent's sells at Robinhood (one for
+    more than the account holds is refused)."""
 
-    def __init__(self, plan=(), show_ref_id=True):
+    def __init__(self, plan=(), show_ref_id=True, holds=None):
         self.plan, self.orders, self.placed = list(plan), [], []
         self.down, self.show_ref_id = False, show_ref_id
         self.last_error = None
         self.dedupes_ref_id = False
+        self.holds = holds
         self.reports = True   # False behind the real client, which reports itself
 
     def call_tool(self, name, args):
@@ -421,6 +429,11 @@ class FakeRobinhood:
         if same and self.dedupes_ref_id:
             return _mcp({"data": {"id": same["id"]}})
         leg = dict(args["legs"][0])
+        if (self.holds is not None and leg.get("side") == "sell"
+                and int(args["quantity"]) > self.holds + self.held()):
+            self.last_error = None
+            return _mcp({"detail": "You can only close contracts you hold."},
+                        is_error=True)
         order = {"id": f"rh-{len(self.orders) + 1}", "ref_id": args["ref_id"],
                  "state": "filled", "type": args["type"],
                  "quantity": f"{int(args['quantity'])}.00000",
@@ -778,7 +791,8 @@ def test_robinhood_sell_with_no_answer_goes_out_again_and_cannot_double_count(
     assert rh.placed[0]["ref_id"] == rh.placed[1]["ref_id"]
 
 
-def test_reconcile_replacement_with_unknown_outcome_is_remembered(monkeypatch):
+def test_reconcile_replacement_with_unknown_outcome_is_remembered(
+        home, notes, monkeypatch):
     rh = FakeRobinhood(plan=["cut"])
     monkeypatch.setattr(robinhood, "_cancel_order", lambda rh_, a, oid: True)
     statuses = iter([("confirmed", 0), ("cancelled", 0)])
@@ -798,9 +812,18 @@ def test_reconcile_replacement_with_unknown_outcome_is_remembered(monkeypatch):
     rh.down = False
     broker_events.begin()
     robinhood.reconcile(rh, RH_CFG, state, lambda s: None)
-    broker_events.drain()
+    reported = broker_events.drain()
     assert len(rh.placed) == 1 and state["positions"][KEY]["qty"] == 2
     assert state["positions"][KEY]["opened_event"] == "test-1"
+    # its entry was logged when the first order went out: the agent fills
+    # in the row and tells the owner, but writes no second entry row
+    assert reported == []
+    assert agent._log_adopted_buys(RH_CFG, state, lambda s: None, robinhood, rh) == 1
+    assert _log(home) == [] and agent._entries_today() == 0
+    assert state["positions"][KEY]["entry_mark"] == 2.50
+    assert state["positions"][KEY]["opened_at"] > 0
+    (told,) = notes
+    assert "is at your broker after all" in told
 
 
 def test_owner_messages_fit_the_report_and_give_no_wrong_hint():
@@ -847,3 +870,281 @@ def test_state_from_the_current_release_needs_no_migration(home, no_policy, note
     assert api.posts == [] and state["positions"][KEY]["qty"] == 2
     feed.poll(make_event(event="EXITED", event_id="x-1"))
     assert [o["side"] for o in api.orders] == ["sell"] and state["positions"] == {}
+
+
+# ── found on a later loop: still an entry ───────────────────────────────────
+
+def test_the_run_loop_logs_buys_found_later():
+    """cmd_run must hand the buys an adapter found on a later loop to
+    _log_adopted_buys right after the order reconcile (the Feed above does
+    what that loop does)."""
+    import inspect
+    src = inspect.getsource(agent.cmd_run)
+    assert src.index("broker.reconcile(") < src.index("_log_adopted_buys(")
+
+
+def test_alpaca_buy_found_on_a_later_loop_is_logged_as_an_entry(
+        home, no_policy, notes, monkeypatch):
+    """The answer was lost and Alpaca couldn't be asked; the order is found
+    on a later loop. It must count like any other entry: against the
+    owner's daily entry cap, with an entry price for the P&L estimate (and
+    the max-daily-loss rail), and with a "did go through" alert that the
+    first alert doesn't swallow."""
+    api = FakeAlpaca(monkeypatch, plan=["cut"])
+    cfg = dict(ALP_CFG, max_entries_per_day=1)
+    state = {"positions": {}, "seen": []}
+    feed = Feed(alpaca, alpaca.client(cfg), cfg, state)
+    ev = make_event()
+    feed.poll(ev)
+    assert agent._entries_today() == 0 and len(notes) == 1
+    api.down = False
+    feed.poll()                                          # the per-loop look-up
+    pos = state["positions"][KEY]
+    assert pos["qty"] == 2
+    rows = _log(home)
+    assert [r["action"] for r in rows] == ["order_failed", "entry"]
+    assert rows[1]["event_id"] == ev["event_id"] and rows[1]["dry"] is False
+    assert rows[1]["contract"] == rows[0]["contract"] == "SPY 2026-07-10 $752.0 C"
+    assert agent._entries_today() == 1
+    assert pos["entry_mark"] == 2.50 and pos["opened_at"] > 0
+    assert pos["acct"] == agent.account_tag(cfg)
+    assert state["agent_bought"][OCC]["buy_ids"] == ["a-1"]
+    assert order_guard.ADOPTED_KEY not in state
+    assert len(notes) == 2
+    assert notes[1].startswith("agentic-trader: ENTRY: SPY 2026-07-10 $752.0 C")
+    assert "couldn't confirm" in notes[1] and "sells" in notes[1]
+    # the owner's cap of one entry a day holds
+    feed.poll(make_event(event_id="test-2", strike=753.0))
+    assert len(api.posts) == 1
+    assert _log(home)[-1]["action"] == "skip_daily_cap"
+    # ...and its exit is counted in the P&L estimate
+    feed.poll(make_event(event="EXITED", event_id="x-1"))
+    last = _log(home)[-1]
+    assert last["action"] == "exit" and last["est_pnl_usd"] == -20.0
+    assert state["positions"] == {}
+
+
+def test_robinhood_buy_found_on_a_later_loop_is_logged_as_an_entry(
+        home, no_policy, notes):
+    rh = FakeRobinhood(plan=["cut"])
+    cfg = dict(RH_CFG, max_entries_per_day=1)
+    state = {"positions": {}, "seen": []}
+    feed = Feed(robinhood, rh, cfg, state)
+    ev = make_event()
+    feed.poll(ev)
+    assert agent._entries_today() == 0 and len(notes) == 1
+    rh.down = False
+    feed.poll()
+    pos = state["positions"][KEY]
+    assert pos["qty"] == 2 and "pending" not in pos
+    rows = _log(home)
+    assert [r["action"] for r in rows] == ["order_failed", "entry"]
+    assert rows[1]["event_id"] == ev["event_id"]
+    assert agent._entries_today() == 1
+    assert pos["entry_mark"] == 2.50 and pos["opened_at"] > 0 and pos["acct"]
+    assert state["agent_bought"][OPT]["buy_ids"] == ["rh-1"]
+    assert len(notes) == 2 and notes[1].startswith("agentic-trader: ENTRY: SPY")
+    feed.poll(make_event(event_id="test-2", strike=753.0))
+    assert len(rh.placed) == 1
+    assert _log(home)[-1]["action"] == "skip_daily_cap"
+
+
+def test_buy_found_while_an_event_is_handled_is_logged_too(
+        home, no_policy, notes, monkeypatch):
+    """The look-up that finds the buy can also run inside an event's own
+    handling (no reconcile in between): the entry row is still written —
+    before the exit's row — and the generic "the broker gave no reason" row
+    is not."""
+    api = FakeAlpaca(monkeypatch, plan=["cut"])
+    state = {"positions": {}, "seen": []}
+    buy, sell = make_event(), make_event(event="EXITED", event_id="x-1")
+    save = lambda s: None
+    cl = alpaca.client(ALP_CFG)
+    agent.handle_event(dict(buy), ALP_CFG, state, alpaca, cl, save)
+    api.down = False
+    agent.handle_event(dict(sell), ALP_CFG, state, alpaca, cl, save)
+    assert [r["action"] for r in _log(home)] == ["order_failed", "entry", "exit"]
+    assert state["positions"] == {} and api.held() == 0
+    # a second signal for a contract whose first buy has just been found
+    api2 = FakeAlpaca(monkeypatch, plan=["cut"])
+    state = {"positions": {}, "seen": []}
+    agent.handle_event(make_event(event_id="test-5"), ALP_CFG, state, alpaca, cl, save)
+    api2.down = False
+    agent.handle_event(make_event(event_id="test-9"), ALP_CFG, state, alpaca, cl, save)
+    assert len(api2.posts) == 1 and state["positions"][KEY]["qty"] == 2
+    later = _log(home)[3:]
+    assert [r["action"] for r in later] == ["order_failed", "entry"]
+    assert later[1]["event_id"] == "test-5"
+
+
+def test_adopted_buy_queue_survives_junk(home, notes):
+    """A damaged state file must not stop the loop or log phantom entries."""
+    for junk in ("x", {"a": 1}, [None, "x", 5, {"key": 7}]):
+        state = {"positions": {}, order_guard.ADOPTED_KEY: junk}
+        assert agent._log_adopted_buys({}, state, lambda s: None, None, None) == 0
+        assert order_guard.ADOPTED_KEY not in state
+    assert _log(home) == [] and notes == []
+
+
+# ── an order the ledger already has is never booked again ──────────────────
+
+def test_robinhood_replayed_order_is_never_booked_again(home, no_policy, notes):
+    """If Robinhood answers a repeated ref_id with the EARLIER order, that
+    order must not become a new position: the account no longer holds
+    those contracts."""
+    rh = FakeRobinhood()
+    rh.dedupes_ref_id = True
+    feed, state = _rh_feed(rh)
+    ev = make_event()
+    feed.poll(ev)
+    feed.poll(make_event(event="EXITED", event_id="x-1"))
+    assert rh.held() == 0 and state["positions"] == {}
+    feed.seen.clear()                                    # the seen list was lost
+    feed.poll(ev)
+    assert len(rh.orders) == 2 and rh.held() == 0
+    assert state["positions"] == {}
+    assert [r["action"] for r in _log(home)].count("entry") == 1
+    (alert,) = [n for n in notes if "earlier order" in n]
+    assert alert.startswith("agentic-trader: check this trade")
+    assert "took no new buy order" in alert
+
+
+def test_robinhood_replayed_sell_is_not_booked_as_this_rows_sale(
+        home, no_policy, notes):
+    """The same for a sell: an old sell returned for a repeated ref_id must
+    not delete a row whose contracts are still held. The next loop sells
+    under a new id."""
+    rh = FakeRobinhood()
+    rh.dedupes_ref_id = True
+    feed, state = _rh_feed(rh, _held_rh_state())
+    ev = make_event(event="EXITED", event_id="x-1")
+    feed.poll(ev)
+    assert state["positions"] == {} and len(rh.orders) == 1
+    # a new row in the same contract, and the same exit id comes round again
+    state["positions"][KEY] = {"option_id": OPT, "qty": 2, "order_ids": ["b-9"],
+                               "opened_event": "test-7"}
+    feed.seen.clear()
+    feed.poll(ev)
+    assert len(rh.orders) == 1                            # nothing new went in
+    assert state["positions"][KEY]["qty"] == 2            # ...and nothing booked
+    assert ev["event_id"] not in feed.seen
+    feed.poll(ev)
+    assert len(rh.orders) == 2 and state["positions"] == {}
+    assert rh.placed[1]["ref_id"] != rh.placed[2]["ref_id"]
+
+
+# ── Robinhood sell: what the owner is told is what happens ──────────────────
+
+def test_robinhood_sell_landed_but_the_order_list_cannot_be_read(
+        home, no_policy, notes):
+    """The sell went in, the answer was lost AND the order list can't be
+    read. The agent does sell again on the next loop (an exit is never held
+    back at Robinhood) — and says so. Robinhood refuses the second sell
+    because nothing is left to close; once the list is readable the first
+    sell is found and booked."""
+    rh = FakeRobinhood(plan=["cut"], holds=2)
+    feed, state = _rh_feed(rh, _held_rh_state())
+    ev = make_event(event="EXITED", event_id="x-1")
+    feed.poll(ev)
+    (alert,) = notes
+    assert alert.startswith("agentic-trader: check this trade")
+    assert "sells again on the next loop" in alert
+    assert "only if it isn't there" not in alert
+    assert "can only close contracts you hold" in alert
+    feed.poll(ev)
+    assert len(rh.placed) == 2 and len(rh.orders) == 1    # refused: close-only
+    assert rh.holds + rh.held() == 0                      # flat, never short
+    assert KEY in state["positions"] and ev["event_id"] not in feed.seen
+    rh.down = False
+    feed.poll(ev)
+    assert len(rh.orders) == 1 and state["positions"] == {}
+    assert ev["event_id"] in feed.seen
+    assert [r["action"] for r in _log(home)][-1] == "exit"
+    assert not [n for n in notes if "trade NOT placed" in n]   # no false alarm
+
+
+# ── a refusal in JSON-RPC form is a refusal ─────────────────────────────────
+
+def _real_client(monkeypatch, tmp_path, order_reply):
+    """The real MCP client over a fake HTTP server that answers the order
+    call with `order_reply` (the JSON-RPC body, without its id)."""
+    from brokers import robinhood_mcp
+    backend = FakeRobinhood()
+    backend.reports = False
+
+    class Resp:
+        def __init__(self, status, body=None):
+            self.status_code, self._body = status, body
+            self.text = json.dumps(body) if body is not None else ""
+            self.headers = {"Mcp-Session-Id": "s1"}
+
+        def json(self):
+            return self._body
+
+    def post(url, json=None, headers=None, data=None, timeout=None):
+        if url == robinhood_mcp.TOKEN_URL:
+            return Resp(200, {"access_token": "new", "expires_in": 3600})
+        call = json or {}
+        if call.get("method") != "tools/call":
+            return Resp(200, {"jsonrpc": "2.0", "id": call.get("id"), "result": {}})
+        name = call["params"]["name"]
+        if name == "place_option_order":
+            backend.placed.append(call["params"]["arguments"])
+            return Resp(200, dict(order_reply, jsonrpc="2.0", id=call.get("id")))
+        result = backend.call_tool(name, call["params"]["arguments"])
+        return Resp(200, {"jsonrpc": "2.0", "id": call.get("id"), "result": result})
+    monkeypatch.setattr(robinhood_mcp.requests, "post", post)
+    token = tmp_path / "robinhood_oauth.json"
+    token.write_text(json.dumps({"access_token": "a", "refresh_token": "r",
+                                 "client_id": "c", "expires_at": time.time() + 3600}),
+                     encoding="utf-8")
+    return robinhood_mcp.RobinhoodMCP(str(token)), backend
+
+
+def test_robinhood_invalid_request_error_is_a_refusal(home, no_policy, notes,
+                                                     tmp_path, monkeypatch):
+    """HTTP 200 with a JSON-RPC "Invalid params" error: Robinhood turned
+    the request down before doing anything. That is a rejected order, not
+    a lost connection — and the contract is not blocked for new entries."""
+    rh, backend = _real_client(monkeypatch, tmp_path, {
+        "error": {"code": -32602, "message": "Invalid params: quantity"}})
+    feed, state = _rh_feed(rh)
+    feed.poll(make_event())
+    assert len(backend.placed) == 1 and state["positions"] == {}
+    assert order_guard.unconfirmed(state) == {}
+    (alert,) = notes
+    assert "trade NOT placed" in alert and "rejected the buy order" in alert
+    assert "Invalid params: quantity" in alert and "connection" not in alert
+    feed.poll(make_event(event_id="test-2"))             # not "still unconfirmed"
+    assert len(backend.placed) == 2
+    assert "unconfirmed" not in json.dumps(_log(home))
+
+
+def test_robinhood_internal_error_reply_stays_unknown(home, no_policy, notes,
+                                                     tmp_path, monkeypatch):
+    """A JSON-RPC "Internal error" can come after the order went in: it is
+    looked up, never assumed refused (an order assumed refused would sit in
+    the account with nothing ever selling it)."""
+    rh, backend = _real_client(monkeypatch, tmp_path, {
+        "error": {"code": -32603, "message": "Internal error"}})
+    feed, state = _rh_feed(rh)
+    feed.poll(make_event())
+    assert order_guard.get(state, KEY)["side"] == "buy"
+    (alert,) = notes
+    assert alert.startswith("agentic-trader: check this trade")
+    feed.poll(make_event(event_id="test-2"))
+    assert len(backend.placed) == 1                       # never bought on top
+
+
+# ── the id looks like the ones Robinhood has always been sent ───────────────
+
+def test_order_key_is_a_version_4_uuid_like_before():
+    """The released agent sent a random (version 4) UUID as ref_id. The id
+    made from the signal has the same form, so an endpoint that checks the
+    form sees nothing new."""
+    import uuid
+    ev = make_event()
+    for side, seq in (("buy", 0), ("sell", 0), ("sell", 3)):
+        key = uuid.UUID(order_guard.order_key("A1", ev, side, seq))
+        assert key.version == 4 and key.variant == uuid.RFC_4122
+        assert str(key) == order_guard.order_key("A1", ev, side, seq)

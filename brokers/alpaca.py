@@ -328,8 +328,8 @@ def _send(cfg, state, pos_key, event, contract, occ, side, qty, limit=None):
                   f"this same signal ({oid})")
             broker_events.report(
                 "order_failed" if side == "buy" else "exit_failed",
-                f"Alpaca already has an earlier order for this same signal "
-                f"({oid}), so it took no new {side} order for {contract} — "
+                "Alpaca already has an earlier order for this same signal, "
+                f"so it took no new {side} order for {contract} — "
                 "check your Alpaca dashboard", placed=True)
             oid = None
     if pos is not None:
@@ -399,11 +399,8 @@ def _settle_unconfirmed(cfg, state, pos_key):
                                        "qty": filled,
                                        "opened_event": unc.get("event_id")}
         _stamp_order(state["positions"][pos_key], oid)
-        broker_events.report(
-            "order_failed", f"the buy order for {contract} that the agent "
-            f"couldn't confirm did go through: {filled} contract(s) bought. The "
-            "agent tracks this position now and sells it on its exit signal.",
-            placed=True)
+        # the agent logs it as the entry it is and tells the owner
+        order_guard.adopted_buy(state, pos_key, unc, oid)
     return "adopted"
 
 

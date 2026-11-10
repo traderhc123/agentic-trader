@@ -76,7 +76,8 @@ order under an id derived from its signal, look the order up, adopt it when
 it is there, and otherwise remember it in state["unconfirmed_orders"]: a buy
 is reported (broker_events.report(..., placed=True)) and not sent again; a
 sell is retried only once that is safe (order_guard.py). Their reconcile()
-hook, called once per loop, keeps looking for such a buy.
+hook, called once per loop, keeps looking for such a buy; one found later
+is queued (order_guard.adopted_buy) and the agent logs it as the entry it is.
 
     VERIFIES_FILLS = False          module constant for adapters that book an
                                     entry when the order is accepted, without

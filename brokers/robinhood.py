@@ -483,6 +483,22 @@ def _turned_down(rh):
             and isinstance(status[1], int) and 400 <= status[1] < 500)
 
 
+# JSON-RPC error codes that turn the request itself down (parse error,
+# invalid request, unknown method, invalid params): nothing was done with it.
+_RPC_NOT_ACCEPTED = (-32700, -32600, -32601, -32602)
+
+
+def _rpc_refusal(rh):
+    """Robinhood's own words when it answered the last call with a JSON-RPC
+    error that turns the request itself down, so no order was made; ""
+    otherwise. Any other error (e.g. "Internal error") can come after the
+    order went in and is not a clear answer."""
+    err = getattr(rh, "last_rpc_error", None)
+    if not isinstance(err, dict) or err.get("code") not in _RPC_NOT_ACCEPTED:
+        return ""
+    return str(err.get("message") or f"error {err.get('code')}")[:300]
+
+
 def place(rh, cfg, option_id, side, effect, qty, marketable=False, ref_id=None):
     """Submit the order. Returns {"order_id": ..., "was_limit": bool}, or
     None when Robinhood refused it; raises OrderUnconfirmed when there is
@@ -525,10 +541,11 @@ def place(rh, cfg, option_id, side, effect, qty, marketable=False, ref_id=None):
     try:
         result = rh.call_tool("place_option_order", args)
         if (result is None and not getattr(rh, "last_error", None)
-                and not _turned_down(rh)):
+                and not _turned_down(rh) and not _rpc_refusal(rh)):
             # Robinhood was reached but the reply can't be read (e.g. a
             # gateway error after the order went in). With last_error set
-            # the request never got through; a 4xx is a refusal.
+            # the request never got through; a 4xx, or an error reply that
+            # turns the request itself down, is a refusal.
             unclear = "no readable answer"
     except Exception as exc:
         unclear = type(exc).__name__
@@ -541,7 +558,7 @@ def place(rh, cfg, option_id, side, effect, qty, marketable=False, ref_id=None):
         print(f"  ORDER FAILED: {str(result)[:300]}")
         broker_events.report("order_failed" if side == "buy" else "exit_failed",
                              f"Robinhood rejected the {side} order: "
-                             f"{_error_text(result)}")
+                             f"{_rpc_refusal(rh) or _error_text(result)}")
         return None
     oid = _extract_order_id(result)
     print(f"  order {side}/{effect} x{qty} -> {oid or 'submitted (no id)'}")
@@ -630,18 +647,19 @@ def _as_placed(order, unc):
 _BUY_NOT_AGAIN = (" It will NOT send this buy again. Check your Robinhood app: "
                   "if the order is there, the agent finds it on its own and "
                   "manages the position; if it isn't, this trade was missed.")
-_SELL_AGAIN = (" It looks for the order again on the next loop and sells again "
-               "only if it isn't there (a Robinhood sell from the agent can "
-               "only close contracts you hold, never open a short). Check your "
-               "Robinhood app.")
+_SELL_AGAIN = (" It sells again on the next loop unless it has found the first "
+               "order by then. A Robinhood sell from the agent can only close "
+               "contracts you hold, so it cannot sell more than you have or "
+               "open a short. Check your Robinhood app.")
 
 
-def _adopt_or_note(rh, cfg, state, pos_key, contract, exc, event_id=None):
+def _adopt_or_note(rh, cfg, state, pos_key, contract, exc, event_id=None,
+                   **more):
     """After place() got no clear answer: look for the order right away.
     Returns it in place()'s result shape when it is there; otherwise
     remembers it in state (order_guard), tells the owner, and returns None
-    — the caller must not place it again."""
-    unc = dict(exc.sent, event_id=event_id, contract=contract)
+    — the caller must not place it again. `more` is kept in the note."""
+    unc = dict(exc.sent, event_id=event_id, contract=contract, **more)
     found = _find_unanswered(rh, cfg, state, unc, pos_key)
     if found is False:
         time.sleep(_SETTLE_WAIT_S)  # Robinhood answers: give the order a moment
@@ -676,6 +694,8 @@ def _place_once(rh, cfg, state, pos_key, event, contract, option_id, side,
     pos = state["positions"].get(pos_key) if side == "sell" else None
     seq = order_guard.sell_seq(pos)
     ref = order_guard.order_key(cfg.get("robinhood_account", ""), event, side, seq)
+    known = {str(i) for i in (state.get("agent_order_ids") or [])
+             + ((state["positions"].get(pos_key) or {}).get("order_ids") or [])}
     try:
         placed = place(rh, cfg, option_id, side, effect, qty, ref_id=ref, **guard)
     except OrderUnconfirmed as exc:
@@ -683,6 +703,21 @@ def _place_once(rh, cfg, state, pos_key, event, contract, option_id, side,
                                 event.get("event_id"))
         if placed is None:
             return None
+    if placed and placed.get("order_id") and str(placed["order_id"]) in known:
+        # Robinhood answered this id with an order the ledger already has
+        # (an earlier order under the same id): nothing new went in. Booking
+        # it again would record contracts the account doesn't hold — or
+        # take an old sale for this row's.
+        print(f"  ORDER NOT PLACED: Robinhood returned an earlier order for "
+              f"this same signal ({placed['order_id']})")
+        broker_events.report(
+            "order_failed" if side == "buy" else "exit_failed",
+            "Robinhood already has an earlier order for this same signal, so "
+            f"it took no new {side} order for {contract}"
+            + (" — check your Robinhood app" if side == "buy" else
+               ". The agent sends a new sell order on the next loop."),
+            placed=True)
+        placed = None
     if pos is not None:
         # Robinhood answered: a later sell for this signal is a new order
         pos["sell_seq"] = seq + 1
@@ -721,10 +756,8 @@ def _settle_unconfirmed(rh, cfg, state, pos_key):
             state["positions"][pos_key] = {"option_id": unc.get("option_id"),
                                            "qty": 0,
                                            "opened_event": unc.get("event_id")}
-        broker_events.report(
-            "order_failed", f"the buy order for {contract} that the agent "
-            "couldn't confirm is at Robinhood after all. The agent tracks it "
-            "now and sells what it bought on its exit signal.", placed=True)
+        # the agent logs it as the entry it is and tells the owner
+        order_guard.adopted_buy(state, pos_key, unc, found["id"])
     else:
         qty = min(qty, int(pos.get("qty") or 0)) or qty
         pos["sell_seq"] = order_guard.sell_seq(pos) + 1
@@ -944,9 +977,12 @@ def reconcile(rh, cfg, state, save_state):
             except OrderUnconfirmed as exc:
                 # found right away: it is the row's order; otherwise it is
                 # remembered and looked up again, never placed a second time
+                # (replaces=True: this order's entry is in the trade log
+                # already — found later, it is not logged as a second entry)
                 replaced = _adopt_or_note(rh, cfg, state, pos_key,
                                           pos_key.replace("|", " "), exc,
-                                          pos.get("opened_event"))
+                                          pos.get("opened_event"),
+                                          replaces=True)
                 unclear = replaced is None
             if replaced:
                 if dead_unfilled:
