@@ -3,6 +3,7 @@
 // strip. Pausing never recolours the mode.
 import { useEffect, useRef, useState } from "react";
 import type { Status } from "../lib/viewModel";
+import { UPDATE } from "./lib/copy";
 import { bandModel, marketVital, vitals, type Link, type Vital } from "./lib/derive";
 import { addSeconds, ago } from "./lib/format";
 import { Icon } from "./ui";
@@ -73,11 +74,16 @@ export function Band({
   link,
   busy,
   onAction,
+  update,
+  onUpdate,
 }: {
   status: Status;
   link: Link;
   busy: boolean;
   onAction: (a: BandAction) => void;
+  /** "Update available": shown only when lib/update.badgeFor says so */
+  update?: { count: number | null } | null;
+  onUpdate?: () => void;
 }) {
   const m = bandModel(status, link);
   const ref = useRef<HTMLElement>(null);
@@ -123,6 +129,23 @@ export function Band({
           </span>
         </span>
         <div className="band-actions">
+          {update && onUpdate && (
+            <button
+              className="btn btn-ghost btn-upd"
+              data-act="update"
+              onClick={onUpdate}
+              disabled={busy}
+              aria-haspopup="dialog"
+              aria-label={UPDATE.badgeLabel(update.count)}
+            >
+              <Icon name="in" small />
+              <span>
+                {UPDATE.badgeShort}
+                <span className="desk">{UPDATE.badgeRest}</span>
+                {update.count != null && <span className="desk upd-n"> · {UPDATE.badgeCount(update.count)}</span>}
+              </span>
+            </button>
+          )}
           {a.retry && (
             <button className="btn" data-act="retry" onClick={() => onAction("retry")} disabled={busy}>
               Try again

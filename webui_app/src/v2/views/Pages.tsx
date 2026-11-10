@@ -4,7 +4,9 @@
 // anything itself.
 import type { ReactNode } from "react";
 import type { Status, TradeSize } from "../../lib/viewModel";
+import { UPDATE } from "../lib/copy";
 import { brokerLabel } from "../lib/derive";
+import { badgeFor, updateLine } from "../lib/update";
 import { UNKNOWN, count, etDayKey, etTime, etWhen, plural, usd } from "../lib/format";
 import { Icon, Stamp, type IconId } from "../ui";
 import type { Page, View } from "../App";
@@ -29,6 +31,26 @@ const plain = (t: string, strong = true) => (
     {t}
   </span>
 );
+/** The page load's update check, said quietly: a failed check is a line of
+ *  text here, never an alarm. The button opens the same dialog as the badge. */
+function UpdateRow({ page }: { page: Page }) {
+  const u = page.update;
+  const line = updateLine(u.check, u.phase, u.detail);
+  const offered = line.review && badgeFor(u.check, u.phase, !page.stale) != null;
+  return (
+    <Row
+      label={UPDATE.rowLabel}
+      exp={<span className="upd-said">{line.text}</span>}
+      act={
+        offered ? (
+          <button className="btn btn-sm" data-act="update" aria-haspopup="dialog" onClick={page.openUpdate}>
+            {UPDATE.review}
+          </button>
+        ) : undefined
+      }
+    />
+  );
+}
 const SetupLink = ({ children = "Change in Settings" }: { children?: ReactNode }) => (
   <a className="btn btn-sm" href={SETUP}>
     {children}
@@ -513,8 +535,9 @@ export function SettingsView({ page }: { page: Page }) {
             </span>
           }
         />
+        <UpdateRow page={page} />
         <Row
-          label="Start at login, keep awake, updates, move to another computer"
+          label="Start at login, keep awake, move to another computer"
           exp="These live in the settings pages and the classic dashboard."
           act={
             <a className="btn btn-sm" href={SETUP}>

@@ -4,6 +4,7 @@
 // dashboard and the chat box use.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { SCHEMA_VERSION, type Activity, type ActivityPage, type Status } from "../lib/viewModel";
+import { postJson } from "./lib/http";
 
 export const POLL_MS = 5000;
 const TIMEOUT_MS = 4000;
@@ -195,11 +196,7 @@ export function useStatus(): StatusFeed {
   const command = useCallback(
     async (text: string) => {
       try {
-        const r = await fetch("/api/command", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text }),
-        });
+        const r = await postJson("/api/command", { text });
         if (r.status === 401 || r.status === 403) {
           setFetching({ kind: "locked" });
           return { ok: false, reply: "Your dashboard login expired, so nothing was changed. Open the login link again (python agent.py link)." };

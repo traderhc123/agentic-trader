@@ -886,3 +886,89 @@ export function sellsHow(s: Status): string {
     ? "on exit signals, and at its expiry sell time on expiry day"
     : "on exit signals only (the expiry sell is off: sell expiring positions yourself before the close)";
 }
+
+// ── updating the agent's own code (/api/update/check, /api/update/pull) ─────
+// The same flow as the classic dashboard's Update button: the page checks
+// once, shows exactly which version it would install, and installs only
+// when the owner presses Update now. The agent's own messages are quoted.
+
+export const UPDATE_SOURCE = "github.com/traderhc123/agentic-trader";
+
+export const UPDATE = {
+  badge: "Update available",
+  /** on phones the badge says only "Update"; wider screens add the rest */
+  badgeShort: "Update",
+  badgeRest: " available",
+  /** the badge's count; null when the agent can't count the changes */
+  badgeCount: (n: number | null) => (n == null ? "" : plural(n, "change")),
+  badgeLabel: (n: number | null) =>
+    n == null ? "Update available. Review it before installing." : `Update available: ${plural(n, "change")}. Review it before installing.`,
+
+  title: "Update the agent?",
+  lead: (version: string) => `This downloads exactly version ${version} from ${UPDATE_SOURCE}, nothing newer, and restarts the agent onto it.`,
+  versionLabel: "Version",
+  changesLabel: "Changes",
+  changesUncounted: "Not counted: this install's version isn't recorded",
+  listLabel: "What changed",
+  noList: "The agent sent no list of changes.",
+  will: [
+    "Download and install exactly the version shown here.",
+    "Place no orders, buys or sells, while it restarts onto it. That usually takes under a minute. If an order is being placed right then, it finishes that order first.",
+    "Then carry on as before.",
+  ],
+  wont: [
+    "Change your Pause setting, Practice or LIVE, or any rule or limit.",
+    "Buy or sell anything because of the update.",
+    "Install any version other than the one shown here.",
+  ],
+  liveTitle: "Real money",
+  live: (realPositions: number) =>
+    realPositions > 0
+      ? `You are in LIVE mode. While it restarts, no real orders are sent, including sells of your ${plural(realPositions, "real position")}.`
+      : "You are in LIVE mode. While it restarts, no real orders are sent.",
+  notNow: "Not now",
+  install: "Update now",
+  installing: (seconds: number) =>
+    `Downloading and installing… ${seconds}s${seconds >= 20 ? ". Downloading from GitHub can take up to a minute." : ""}`,
+
+  failedTitle: "The update did not go through",
+  againHint: "To check for updates again, reload this page.",
+  close: "Close",
+
+  restarting: "Update installed. The agent is restarting onto it and places no orders until it is back. This page reloads when it is.",
+  /** the toast after the pull: the agent's note can say a dependency failed */
+  restartingSaid: (note: string) =>
+    note
+      ? `Update installed. The agent is restarting onto it and places no orders until it is back. This page reloads when it is. The agent said: ${note}`
+      : "Update installed. The agent is restarting onto it and places no orders until it is back. This page reloads when it is.",
+  installed: (note: string) => `Update installed. The agent said: ${note}`,
+  installedPlain: "Update installed.",
+  agentSaid: (text: string) => `The agent said: ${text}`,
+  slow: "The agent has not come back on the new version yet. If it could not restart, it sends you a message saying what to do. Reload this page to see where it stands.",
+
+  // the quiet line under Settings
+  rowLabel: "Updates",
+  checking: "Checking for a newer version…",
+  current: "This is the newest version.",
+  /** the agent's own reason, quoted */
+  unavailable: (why: string) => `Couldn't check for updates. The agent said: ${why}`,
+  /** a reason this page found itself */
+  unavailableHere: (why: string) => `Couldn't check for updates: ${why}`,
+  available: (n: number | null) =>
+    n == null ? "A newer version is available." : `A newer version is available: ${plural(n, "change")}.`,
+  review: "Review update",
+  busy: "Updating…",
+
+  // reasons this page finds itself (completing unavailableHere)
+  lockedCheck: "your dashboard login expired. Open the login link again (python agent.py link).",
+  unreadable: "the agent answered in a form this page can't read.",
+  noReason: "the agent gave no reason.",
+  noVersion: "the agent did not say exactly which version it would install, so nothing is offered.",
+  unreachable: "this page could not reach the agent.",
+  checkTimeout: (seconds: number) => `no answer after ${seconds}s. Your network may be blocking GitHub.`,
+  pullLocked: "Your dashboard login expired, so nothing was installed. Open the login link again (python agent.py link).",
+  pullNoAnswer: "No answer from the agent, so this page does not know whether the update was installed. Reload the page in a minute to see.",
+  pullUnreadable: (http: number) =>
+    `The agent answered in a form this page can't read (HTTP ${http}), so this page does not know whether the update was installed. Reload the page in a minute to see.`,
+  pullNoReason: "The agent did not install the update and gave no reason.",
+};

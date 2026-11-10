@@ -3,9 +3,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Activity, Iso, Position, Status } from "../lib/viewModel";
 import { Band, type BandAction } from "./Band";
-import { ActionDialog, type DialogKind } from "./Dialogs";
-import { describe, expiryWill } from "./lib/copy";
+import { ActionDialog, UpdateDialog, type DialogKind } from "./Dialogs";
+import { UPDATE, describe, expiryWill } from "./lib/copy";
 import { asOf, brokerLabel, isStale, linkOf, nextFor, type Link } from "./lib/derive";
+import { badgeFor, updateLine } from "./lib/update";
+import { useUpdate, type UpdateFeed } from "./useUpdate";
 import { UNKNOWN, contractName, count, dayLong, etDayKey, etTime, etWhen, usd } from "./lib/format";
 import { Drawer, ExpiresFlag, Icon, Tag, WillWont, type IconId } from "./ui";
 import { useStatus, type StatusFeed } from "./useStatus";
@@ -34,6 +36,9 @@ export interface Page {
   openEv: (n: number) => void;
   openPos: (id: string) => void;
   act: (a: BandAction | "stop") => void;
+  /** the page load's update check, and the dialog that installs it */
+  update: UpdateFeed;
+  openUpdate: () => void;
 }
 
 function viewFromHash(): View {
@@ -184,9 +189,10 @@ function PositionDrawer({ p, page, onClose }: { p: Position; page: Page; onClose
   );
 }
 
-function Shell({ feed, status }: { feed: StatusFeed; status: Status }) {
+function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: UpdateFeed }) {
   const [view, setView] = useState<View>(viewFromHash);
   const [dialog, setDialog] = useState<DialogKind | null>(null);
+  const [updOpen, setUpdOpen] = useState(false);
   const [evN, setEvN] = useState<number | null>(null);
   const [posId, setPosId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -238,6 +244,21 @@ function Shell({ feed, status }: { feed: StatusFeed; status: Status }) {
   );
 
   const stale = isStale(link);
+  const badge = badgeFor(upd.check, upd.phase, !stale);
+  const openUpdate = useCallback(() => {
+    if (upd.check.kind === "available" && upd.phase === "idle") setUpdOpen(true);
+  }, [upd.check, upd.phase]);
+  // the install answered: the dialog closes and the toast says what happens
+  // next; a failure stays in the dialog until the owner closes it
+  useEffect(() => {
+    if (upd.phase === "restarting") {
+      setUpdOpen(false);
+      say(true, UPDATE.restartingSaid(upd.detail));
+    } else if (upd.phase === "installed" || upd.phase === "slow") {
+      setUpdOpen(false);
+      say(true, updateLine(upd.check, upd.phase, upd.detail).text);
+    }
+  }, [upd.phase]); // eslint-disable-line react-hooks/exhaustive-deps
   const page: Page = {
     s: status,
     link,
@@ -253,6 +274,8 @@ function Shell({ feed, status }: { feed: StatusFeed; status: Status }) {
     openEv: setEvN,
     openPos: setPosId,
     act,
+    update: upd,
+    openUpdate,
   };
   const ev = evN != null ? feed.rows.find((e) => e.n === evN) : undefined;
   const pos = posId != null ? status.positions.find((p) => p.id === posId) : undefined;
@@ -268,7 +291,7 @@ function Shell({ feed, status }: { feed: StatusFeed; status: Status }) {
           Skip to content
         </a>
         <div className="frame" aria-hidden="true" />
-        <Band status={status} link={link} busy={busy} onAction={act} />
+        <Band status={status} link={link} busy={busy} onAction={act} update={badge} onUpdate={openUpdate} />
         <div className="app">
           <aside className="side" aria-label="Sections">
             <div className="brand">
@@ -354,9 +377,20 @@ function Shell({ feed, status }: { feed: StatusFeed; status: Status }) {
           ))}
         </nav>
       </div>
-      {ev && !dialog && <EventDrawer e={ev} page={page} onClose={() => setEvN(null)} />}
-      {pos && !dialog && !ev && <PositionDrawer p={pos} page={page} onClose={() => setPosId(null)} />}
+      {ev && !dialog && !updOpen && <EventDrawer e={ev} page={page} onClose={() => setEvN(null)} />}
+      {pos && !dialog && !updOpen && !ev && <PositionDrawer p={pos} page={page} onClose={() => setPosId(null)} />}
       {dialog && <ActionDialog kind={dialog} s={status} busy={busy} onConfirm={send} onClose={() => !busy && setDialog(null)} />}
+      {updOpen && !dialog && upd.check.kind === "available" && (
+        <UpdateDialog
+          offer={upd.check.offer}
+          s={status}
+          phase={upd.phase}
+          detail={upd.detail}
+          since={upd.since}
+          onInstall={() => upd.install(status.agent.started_at)}
+          onClose={() => upd.phase !== "installing" && setUpdOpen(false)}
+        />
+      )}
       <div className={`toast ${toast ? "open" : ""} ${toast && !toast.ok ? "toast-bad" : ""}`} role="status" aria-live="polite">
         {toast && (
           <>
@@ -432,6 +466,8 @@ function Waiting({ feed }: { feed: StatusFeed }) {
 
 export function App() {
   const feed = useStatus();
+  // here, not in the shell: one check per page load, whatever is on screen
+  const upd = useUpdate();
   if (!feed.status) return <Waiting feed={feed} />;
-  return <Shell feed={feed} status={feed.status} />;
+  return <Shell feed={feed} status={feed.status} upd={upd} />;
 }
