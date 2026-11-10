@@ -194,10 +194,14 @@ def test_broker_problems_on_an_entry_stop_at_the_broker_check(home, no_policy):
             return False
     run(make_event(), {"dry_run": False}, broker=Rejects(), client=None)
     failed, unfilled = rows(home)[-2:]
-    assert failed["ui"] == {"mode": "live", "check": "broker_order"}
+    # a problem with an order records the account kind (a Robinhood
+    # account is never a paper-trading one)
+    assert failed["ui"] == {"mode": "live", "check": "broker_order",
+                            "paper": False}
     # placed=True: it may have (partly) filled — never "nothing was bought"
     assert unfilled["ui"] == {"mode": "live", "check": "broker_order",
-                              "sent": True, "code": "buy_partly_filled"}
+                              "sent": True, "code": "buy_partly_filled",
+                              "paper": False}
 
 
 def test_broker_that_gives_no_reason(home, no_policy):
@@ -222,7 +226,8 @@ def test_a_failed_exit_is_not_an_entry_check(home, no_policy):
                                          "position_sync": False},
             state, broker=DeadSell(), client=None)
     row = last(home)
-    assert row["action"] == "order_failed" and row["ui"] == {"mode": "live"}
+    assert row["action"] == "order_failed" and row["ui"] == {"mode": "live",
+                                                             "paper": False}
 
 
 # ── entries and exits ───────────────────────────────────────────────────────

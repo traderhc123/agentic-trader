@@ -156,6 +156,71 @@ def test_the_pass_notice_is_not_repeated_while_a_pass_has_days_left():
     assert not [n for n in build(PREPAID, st)["notices"] if n["code"] == "pass"]
 
 
+WALLET = {**LIVE, "lnbits_url": "https://wallet.example",
+          "day_pass_recurring": True}
+
+
+def test_a_running_wallet_day_pass_is_the_pass_the_agent_reads_with():
+    # prepaid pass used up, wallet auto-pay on and today's day-pass running:
+    # hc.poll reads with the day-pass (hc._live_daypass comes first)
+    st = {**lapsed_state(), "l402": {"token": "t",
+                                     "expires_at": NOW.timestamp() + 3600}}
+    s = build({**WALLET, "feed_pass": {"token": "tok"}}, st)
+    assert s["signals"]["pass"] == {"kind": "day_pass", "status": "active",
+                                    "days_left": None, "auto_pay": True}
+    assert s["positions"][0]["next"]["action"] == "sell_on_exit"
+    assert s["real_positions_managed"] is True
+    caps = s["capabilities"]
+    assert caps["closing"]["state"] == caps["listening"]["state"] == "yes"
+    # the lapse notice from before is not shown while the feed is read
+    assert not [n for n in s["notices"] if n["code"] == "pass"]
+    # an expired day-pass (or one with no token) is not "running"
+    for l402 in ({"token": "t", "expires_at": NOW.timestamp() - 1},
+                 {"expires_at": NOW.timestamp() + 3600}):
+        s = build({**WALLET, "feed_pass": {"token": "tok"}},
+                  {**lapsed_state(), "l402": l402},
+                  rt=runtime(feed_access=False))
+        assert s["signals"]["pass"]["status"] == "waiting"
+
+
+def test_a_pass_that_could_not_be_checked_is_not_called_used_up():
+    # the status check failed: no record, and hc.poll reads nothing
+    st = {"positions": {SPY: real_pos()}, "pass_status": {}}
+    s = build(PREPAID, st, rt=runtime(feed_access=False))
+    assert s["signals"]["pass"]["status"] == "unknown"
+    assert s["positions"][0]["next"]["action"] == "unknown"
+    assert s["positions"][0]["next"]["reason_code"] == "pass_unchecked"
+    assert s["unmanaged_reason"] == "pass_unchecked"
+    for which in ("opening", "closing", "listening"):
+        assert s["capabilities"][which] == {"state": "cant",
+                                            "reason_code": "pass_unchecked"}
+    # one pass checked and used up, another not checked: still not known
+    two = {**PREPAID, "feed_pass_pending": {"token": "new"}}
+    st = {"positions": {}, "pass_status": {tid("tok"): {"status": "used_up"}}}
+    assert build(two, st, rt=runtime(feed_access=False))[
+        "signals"]["pass"]["status"] == "unknown"
+
+
+def test_a_stale_pass_notice_is_not_shown_once_it_is_no_longer_true():
+    def pass_notes(cfg, st, **rt):
+        return [n for n in build(cfg, st, rt=runtime(**rt))["notices"]
+                if n["code"] == "pass"]
+    # an API key now
+    assert not pass_notes({**PREPAID, "agenthc_api_key": "k"},
+                          lapsed_state(), feed_access=False)
+    # the feed was read with entry access
+    assert not pass_notes(PREPAID, lapsed_state(), feed_access=True)
+    # wallet auto-pay switched on since: the wallet buys the day-pass
+    assert not pass_notes({**WALLET, "feed_pass": {"token": "tok"}},
+                          lapsed_state(), feed_access=False)
+    # ...but a current day-pass alert is shown
+    alert = {**lapsed_state(), "daypass_alert": "daypass_refused_notified"}
+    assert pass_notes({**WALLET, "feed_pass": {"token": "tok"}}, alert,
+                      feed_access=False)
+    # and the lapse itself, with no wallet, is shown
+    assert pass_notes(PREPAID, lapsed_state(), feed_access=False)
+
+
 # ── 2. an order with no clear answer is not "rejected" ──────────────────────
 
 def test_a_placed_problem_is_recorded_as_unconfirmed(home, monkeypatch):
@@ -255,6 +320,53 @@ def test_paper_account_fills_are_booked_apart():
     assert s["results"]["paper_account"]["total"] == 50.0
     assert s["results"]["real"]["total"] == -20.0
     assert [r["paper_account"] for r in s["activity"]["rows"]] == [False, True]
+
+
+def test_problem_rows_record_a_paper_account(home, monkeypatch):
+    monkeypatch.setattr(agent, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_problems_logged", set())
+    paper = {**LIVE, "broker": "alpaca", "alpaca_paper": True}
+    real = {**LIVE, "broker": "alpaca", "alpaca_paper": False}
+    agent._report_problem(paper, {}, lambda s: None, "order_failed", "SPY",
+                          "x", placed=True)
+    agent._report_problem(paper, {}, lambda s: None, "entry_unfilled", "SPY",
+                          "x", placed=True)
+    agent._report_problem(real, {}, lambda s: None, "exit_failed", "SPY",
+                          "x", placed=True)
+    agent._report_problem({**paper, "dry_run": True}, {}, lambda s: None,
+                          "order_failed", "SPY", "x", dry=True)
+    # a skipped signal sent nothing: no account to record
+    agent._report_problem(paper, {}, lambda s: None, "skip_stale", "SPY", "x")
+    rows = agent._read_trade_log()
+    assert [r["ui"].get("paper") for r in rows] == [True, True, False, None,
+                                                    None]
+    a = [vm.activity_row(r) for r in rows]
+    assert [x["paper_account"] for x in a] == [True, True, False, None, None]
+    # an account tag that can't be read records nothing, and never raises
+    monkeypatch.setattr(agent, "_account_tag",
+                        lambda *a, **k: (_ for _ in ()).throw(ValueError()))
+    assert agent._paper_account(paper) is None
+    agent._report_problem(paper, {}, lambda s: None, "exit_failed", "QQQ",
+                          "y", placed=True)
+    last = agent._read_trade_log()[-1]
+    assert last["action"] == "exit_failed" and "paper" not in last["ui"]
+
+
+def test_today_reads_the_paper_account_book_in_live_mode():
+    c = "QQQ 2026-11-13 $600.0 C"
+    paper = {**LIVE, "broker": "alpaca", "alpaca_paper": True}
+    rows = [{"action": "entry", "contract": c, "dry": False, "ts": at(9),
+             "ui": {"mode": "live", "paper": True, "sent": True}},
+            {"action": "exit", "contract": c, "dry": False, "ts": at(10),
+             "est_pnl_usd": 50.0,
+             "ui": {"mode": "live", "paper": True, "sent": True}}]
+    s = build(paper, rows=rows,
+              rt=runtime(broker={"id": "alpaca", "account_tag": "alpaca:paper",
+                                 "connected": True}))
+    assert s["broker"]["paper_account"] is True
+    assert s["results"]["real"]["days"] == []
+    assert s["results"]["paper_account"]["days"] == [
+        {"day": TODAY, "pnl": 50.0, "closed": 1}]
 
 
 # ── robustness: damaged values degrade a field, never the page ──────────────

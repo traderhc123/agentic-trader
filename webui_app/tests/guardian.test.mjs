@@ -38,6 +38,7 @@ import {
   bandModel,
   bookToday,
   bookTodayNote,
+  dayBooks,
   dayTally,
   isStale,
   linkOf,
@@ -45,6 +46,7 @@ import {
   notes,
   paidFor,
   realBookCaption,
+  showPaperBook,
   statement,
   unwatched,
   vitals,
@@ -218,6 +220,31 @@ test("a broker paper account is never real money", () => {
   assert.equal(tagOf({ ...e, paper_account: null }), "real");
   assert.match(realBookCaption(S({ broker: { name: "Alpaca", paper_account: true, account_mask: null } })), /paper-trading/);
   assert.equal(realBookCaption(S()), "Orders filled at Robinhood");
+  // problem rows from a paper account are not real money either
+  for (const [action, code] of [["order_failed", "buy_unconfirmed"], ["exit_failed", "sell_unconfirmed"], ["entry_unfilled", "buy_partly_filled"]]) {
+    const p = describe(row({ action, reason_code: code, real: true, mode_at_time: "live", paper_account: true, order_sent: true, filled: null, stopped_at_check: null }), "Alpaca");
+    assert.equal(p.tag, "paper", code);
+    const said = [p.money, p.title, p.sub, p.what].join(" ");
+    assert.ok(!/Real money|real position|a real (buy|sell)/.test(said), `${code}: ${said}`);
+  }
+  // a paper-account line that did not record whether an order was sent
+  const rej = describe(row({ action: "order_failed", reason_code: "order_rejected", real: true, paper_account: true, order_sent: null, filled: null }), "Alpaca");
+  assert.match(rej.money, /not recorded/);
+  assert.ok(!/An order was sent/.test(rej.money), rej.money);
+});
+
+test("an order the broker refused as a repeat is not 'no clear answer'", () => {
+  for (const [action, code, note] of [
+    ["order_failed", "buy_unconfirmed", "Alpaca already has an earlier order for this same signal, so it took no new buy order for SPY"],
+    ["order_failed", "buy_unconfirmed", "an earlier buy order for SPY is still unconfirmed (the agent can't tell whether it went through), so it did not buy again"],
+    ["exit_failed", "sell_unconfirmed", "Robinhood already has an earlier order for this same signal, so it took no new sell order for SPY"],
+  ]) {
+    const d = describe(row({ action, reason_code: code, real: true, order_sent: true, filled: null, reason_text: note, stopped_at_check: null }), "Alpaca");
+    const said = [d.title, d.sub, d.what].join(" ");
+    assert.ok(!/no clear answer/i.test(said), said);
+    assert.match(d.what, /now or earlier/);
+    assert.match(d.why, /earlier/);
+  }
 });
 
 test("money and times", () => {
@@ -375,8 +402,8 @@ test("the review states say what the agent can and can't do", { skip }, () => {
   // unclear orders, a working sell, a sale with no estimate
   const c = get("check-these-orders");
   const said = c.activity.rows.map((e) => describe(e, c.broker.name));
-  assert.ok(said.some((d) => d.title.startsWith("No clear answer on a buy")));
-  assert.ok(said.some((d) => d.title.startsWith("No clear answer on a sell")));
+  assert.ok(said.some((d) => d.title.startsWith("Buy not confirmed")));
+  assert.ok(said.some((d) => d.title.startsWith("Sell not confirmed")));
   assert.ok(said.some((d) => d.title.startsWith("Sell order sent")));
   assert.ok(bookToday(c.results.real, etDayKey(c.as_of)).unmeasured >= 1);
   // a paper account
@@ -384,6 +411,56 @@ test("the review states say what the agent can and can't do", { skip }, () => {
   assert.equal(pa.results.paper_account.total, 64);
   assert.ok(pa.activity.rows.filter((e) => e.action === "exit" && etDayKey(e.at) === etDayKey(pa.as_of)).every((e) => tagOf(e) === "paper"));
   assert.match(realBookCaption(pa), /paper-trading/);
+});
+
+test("the pass note and the agent's pass notice only say what is true now", { skip }, () => {
+  const get = (n) => states.find(([x]) => x === n)[1];
+  // the prepaid pass is used up, but the agent reads with today's wallet day-pass
+  const w = get("wallet-over-lapsed-pass");
+  assert.equal(w.signals.pass.status, "active");
+  assert.equal(w.real_positions_managed, true);
+  const wn = notes(w, "ok");
+  assert.ok(!wn.some((n) => n.key === "pass"), JSON.stringify(wn));
+  assert.ok(!wn.some((n) => /receives no signals|gets no signals|has run out/.test(n.text)), JSON.stringify(wn));
+  // a waiting pass while the last read saw entry signals: never "no signals"
+  const lapsed = get("pass-lapsed");
+  const reading = { ...lapsed, signals: { ...lapsed.signals, entry_access: true } };
+  assert.ok(!notes(reading, "ok").some((n) => n.key === "pass"));
+  for (const status of ["waiting", "none", "unknown"]) {
+    const s = { ...reading, signals: { ...reading.signals, pass: { ...reading.signals.pass, status } } };
+    assert.ok(!notes(s, "ok").some((n) => n.key === "pass"), status);
+  }
+  // a pass that could not be checked is not called used up or expired
+  const u = get("pass-unchecked");
+  assert.equal(u.signals.pass.status, "unknown");
+  assert.equal(u.unmanaged_reason, "pass_unchecked");
+  const note = notes(u, "ok").find((n) => n.key === "pass");
+  assert.ok(note, "pass note");
+  assert.match(note.title, /could not be checked/);
+  const words = [note.text, UNMANAGED_WHY.pass_unchecked, answerWhy("closing", u.capabilities.closing, u), ...u.positions.filter((p) => p.real).map((p) => nextSay(p, u).text)];
+  for (const t of words) assert.ok(!/used up|expired|waiting for payment|no usable/.test(t), t);
+});
+
+test("today's sales in a broker paper account are shown in LIVE mode", { skip }, () => {
+  const pa = states.find(([x]) => x === "paper-account")[1];
+  const d = dayBooks(pa);
+  assert.equal(d.opened, "live trade");
+  assert.equal(d.closed[0].word, "paper-account trade");
+  assert.equal(d.closed[0].day.closed, 1);
+  assert.equal(d.closed[0].day.pnl, 64);
+  assert.ok(showPaperBook(pa));
+  // a real-money account whose paper book has sales today: both lines
+  const live = states.find(([x]) => x === "live")[1];
+  assert.ok(!showPaperBook(live));
+  assert.equal(dayBooks(live).closed.length, 1);
+  const both = { ...live, results: { ...live.results, paper_account: pa.results.paper_account } };
+  const lines = dayBooks(both).closed;
+  assert.deepEqual(lines.map((x) => x.label), ["Closed", "Closed in a paper account"]);
+  assert.equal(lines[0].word, "real-money trade");
+  assert.ok(showPaperBook(both));
+  // practice mode reads the practice book only
+  const prac = states.find(([x]) => x === "practice")[1];
+  assert.deepEqual(dayBooks(prac).closed.map((x) => x.word), ["practice trade"]);
 });
 
 test("amounts paid are never a partial sum", { skip }, () => {

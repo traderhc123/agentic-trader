@@ -1647,6 +1647,25 @@ _PLACED_CODES = {"order_failed": "buy_unconfirmed",
                  "entry_unfilled": "buy_partly_filled"}
 
 
+# problem kinds about an order sent to the broker: their rows record whether
+# that was a paper-trading account (a skipped signal sent nothing)
+_ORDER_KINDS = ("order_failed", "exit_failed", "entry_unfilled",
+                "exit_partial")
+
+
+def _paper_account(cfg):
+    """True / False: the account the agent trades now is / is not a broker's
+    paper-trading account (its account tag, e.g. "alpaca:paper"); None when
+    that can't be told. A dashboard fact only. Never raises."""
+    try:
+        tag = _account_tag(cfg)
+        if isinstance(tag, str) and ":" in tag:
+            return tag.endswith(":paper")
+    except Exception:
+        pass
+    return None
+
+
 def _report_problem(cfg, state, save_state, kind, contract, message,
                     event_id=None, dry=False, book=None, placed=False,
                     check=None, params=None, code=None):
@@ -1677,7 +1696,9 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
         # call it "rejected" / "did not go through"
         code = _PLACED_CODES.get(kind)
     _log_trade(_row_facts(rec, cfg, check, params=params, code=code,
-                          sent=True if placed else None))
+                          sent=True if placed else None,
+                          paper=(_paper_account(cfg) if not dry and (
+                              placed or kind in _ORDER_KINDS) else None)))
     if kind not in broker_events.NOTIFY or dry:
         return
     today = datetime.now(timezone.utc).date().isoformat()

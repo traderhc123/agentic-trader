@@ -87,6 +87,9 @@ const nothing = () => "Nothing needed.";
 const ownLimit = "Nothing needed. This is your own limit doing its job.";
 const bookWord = (e: Activity) => (e.book === "other" ? "other trades" : e.book === "main" ? "main pick" : "");
 const withNote = (c: Ctx, lead: string) => (c.note ? `${lead} ${c.note}` : lead);
+/** "paper-account" for an order the row records as sent to a broker's
+ *  paper-trading account, else "real" */
+const acctWord = (c: Ctx) => (c.e.paper_account === true ? "paper-account" : "real");
 const qtyOf = (c: Ctx) => (c.e.qty != null ? plural(c.e.qty, "contract") : "an unrecorded number of contracts");
 const result = (c: Ctx) =>
   c.e.est_pnl_usd != null
@@ -444,24 +447,28 @@ export const REASONS: Record<ReasonCode, Entry> = {
       c.e.hint ??
       `The agent sells the rest by itself. Look for a later "Sold the rest" line; if there is none, check the position at ${c.broker}.`,
   },
+  // The agent records these for every order that went in and may have
+  // filled: no clear answer from the broker, an earlier order for the same
+  // signal that the broker already has, or an earlier buy still unconfirmed.
+  // The agent's note (`why`) says which; the words here fit all three.
   buy_unconfirmed: {
     cat: "problem",
     icon: "alert",
-    title: (c) => `No clear answer on a buy: ${c.name}`,
-    sub: (c) => `${c.broker} gave no clear answer. The order may have gone through`,
+    title: (c) => `Buy not confirmed: ${c.name}`,
+    sub: () => "Not confirmed by the broker. A buy may have gone through",
     what: (c) =>
-      `The agent sent a real buy order for ${c.name} and got no clear answer from ${c.broker}. It may have gone through: whether anything was bought is not known.`,
-    why: (c) => c.note || "The broker neither confirmed nor rejected the order.",
-    can: (c) => c.e.hint ?? `Check your ${c.broker} account for ${c.name}. The order may have filled even though the agent could not confirm it.`,
+      `The agent could not confirm a ${acctWord(c)} buy of ${c.name} at ${c.broker}. A buy order for it went in, now or earlier, and may have filled: whether anything was bought is not known.`,
+    why: (c) => c.note || "The broker did not confirm the order either way.",
+    can: (c) => c.e.hint ?? `Check your ${c.broker} account for ${c.name}. A buy may have filled even though the agent could not confirm it.`,
   },
   sell_unconfirmed: {
     cat: "problem",
     icon: "alert",
-    title: (c) => `No clear answer on a sell: ${c.name}`,
-    sub: (c) => `${c.broker} gave no clear answer. The sell may have gone through`,
+    title: (c) => `Sell not confirmed: ${c.name}`,
+    sub: () => "Not confirmed by the broker. A sell may have gone through",
     what: (c) =>
-      `The agent sent a real sell order for ${c.name} and got no clear answer from ${c.broker}. It may have gone through: whether anything was sold is not known.`,
-    why: (c) => c.note || "The broker neither confirmed nor rejected the order.",
+      `The agent could not confirm a ${acctWord(c)} sell of ${c.name} at ${c.broker}. A sell order for it went in, now or earlier, and may have filled: whether anything was sold is not known.`,
+    why: (c) => c.note || "The broker did not confirm the order either way.",
     can: (c) =>
       c.e.hint ?? `Check ${c.name} in your ${c.broker} account before you sell anything yourself: it may already be sold.`,
   },
@@ -469,9 +476,9 @@ export const REASONS: Record<ReasonCode, Entry> = {
     cat: "problem",
     icon: "alert",
     title: (c) => `Buy order partly filled: ${c.name}`,
-    sub: () => "The order did not fill in full. Part of it may be a real position",
+    sub: (c) => `The order did not fill in full. Part of it may be a ${c.e.paper_account === true ? "position in the paper-trading account" : "real position"}`,
     what: (c) =>
-      `The agent's real buy order for ${c.name} did not fill in full. The part that filled is a real position in your account.`,
+      `The agent's ${acctWord(c)} buy order for ${c.name} did not fill in full. The part that filled is ${c.e.paper_account === true ? `a position in your ${c.broker} paper-trading account (not real money)` : "a real position in your account"}.`,
     why: (c) => withNote(c, "There were not enough sellers at the order's price for all of it."),
     can: (c) => c.e.hint ?? `Check what your ${c.broker} account holds of ${c.name}. The agent looks after the part it finds there.`,
   },
@@ -560,6 +567,8 @@ function moneyLine(e: Activity, tag: TagKind, broker: string): string {
       return `Real money. ${orderFate(e, `at ${broker}`, `to ${broker}`)}`;
     case "paper":
       if (e.reason_code === "closed_outside") return `Not real money: sold in ${broker}'s paper-trading account by an order the agent did not send.`;
+      if (e.order_sent !== true) return `Not real money: ${broker}'s paper-trading account. Whether an order was sent was not recorded for this line.`;
+      if (e.reason_code === "exit_failed") return `Not real money: ${broker}'s paper-trading account. A sell order was sent and did not go through.`;
       return `Not real money: ${broker}'s paper-trading account. ${orderFate(e, "in that account", "to that account")}`;
     case "prac":
       return `Practice. Recorded only; nothing was sent to ${broker}.`;
@@ -705,6 +714,10 @@ export function answerWhy(which: Which, a: Answer, s: Status): string {
       return which === "closing"
         ? `The last check of the signal feed failed, so an exit signal can't reach the agent right now. It keeps trying; if this lasts, watch your real positions at ${b}.`
         : "The last check of the signal feed failed. The agent keeps trying.";
+    case "pass_unchecked":
+      if (which === "closing")
+        return `The agent could not check your signal pass with AgentHC, so it reads no signals for now and an exit signal can't reach it. It checks again on each read; if this lasts, watch your real positions at ${b}.${s.expiry_guard_on ? " The expiry sell on expiry day still runs." : ""}`;
+      return "The agent could not check your signal pass with AgentHC, so it reads no signals until it can. It checks again on each read.";
     case "ai_needed":
       return "Your written rules need the AI helper, and it is not connected, so every new trade is skipped.";
     case "practice_holds_real_sells":
@@ -751,9 +764,13 @@ const NEXT_UNMANAGED: Record<string, (p: Position, b: string) => string> = {
     p.real
       ? `Unknown for now: the last check of the signal feed failed, so an exit signal can't reach the agent. It keeps trying; if this lasts, watch it at ${b}.${guardStill(p)}`
       : "Not updated while the signal feed can't be reached. Pretend, so nothing is at risk.",
+  pass_unchecked: (p, b) =>
+    p.real
+      ? `Unknown for now: the agent could not check your signal pass with AgentHC, and it reads no signals until it can, so an exit signal can't reach it. It checks again on each read; if this lasts, watch it at ${b}.${guardStill(p)}`
+      : "Not updated until the agent can check your signal pass. Pretend, so nothing is at risk.",
   no_bid: (p, b) =>
     p.real
-      ? `Not being sold: nobody is bidding for it, so the expiry sell left it (a contract with no bid is usually worthless). The agent checks again each loop. If it is in the money, sell it yourself at ${b} before the close, or it may be exercised.`
+      ? `Not sold so far: when the expiry sell looked today, nobody was bidding for it, so it left it (a contract with no bid is usually worthless). It looks again each loop and tries to sell it if a bid appears. If it is in the money, sell it yourself at ${b} before the close, or it may be exercised.`
       : "No bid on its expiry day. Pretend, so nothing is at risk.",
 };
 
@@ -764,7 +781,7 @@ function guardStill(p: Position): string {
 }
 /** Reasons whose own sentence already says what happens on expiry day. */
 const SAYS_EXPIRY = ["expired", "no_bid"];
-const GUARD_STILL = ["no_exit_signals", "feed_unreachable"];
+export const GUARD_STILL = ["no_exit_signals", "feed_unreachable", "pass_unchecked"];
 
 /** What the agent will do with a position, from its `next` alone. */
 export function nextSay(p: Position, s: Status): NextSay {
@@ -825,7 +842,8 @@ export const UNMANAGED_SHORT: Record<NonNullable<Status["unmanaged_reason"]>, st
   expired: "One is past its expiry.",
   no_exit_signals: "No exit signals reach the agent.",
   feed_unreachable: "The signal feed can't be reached right now.",
-  no_bid: "One has no bid on its expiry day.",
+  no_bid: "One had no bid on its expiry day.",
+  pass_unchecked: "The signal pass could not be checked.",
 };
 /** The same reasons as a full sentence, for the needs-you note. */
 export const UNMANAGED_WHY: Record<NonNullable<Status["unmanaged_reason"]>, string> = {
@@ -843,7 +861,9 @@ export const UNMANAGED_WHY: Record<NonNullable<Status["unmanaged_reason"]>, stri
   feed_unreachable:
     "The last check of the signal feed failed, so an exit signal can't reach the agent right now. It keeps trying.",
   no_bid:
-    "A position that expires today has no bid, so the expiry sell is not selling it. If it is in the money it can be exercised.",
+    "A position that expires today had no bid when the expiry sell looked, so it was not sold then. It looks again each loop. If it is in the money it can be exercised.",
+  pass_unchecked:
+    "The agent could not check your signal pass with AgentHC, and it reads no signals until it can, so an exit signal can't reach it right now. It checks again on each read.",
 };
 export const UNMANAGED_FALLBACK = "Not being watched.";
 

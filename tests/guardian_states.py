@@ -362,6 +362,19 @@ STATES.update({
                     True), filled=False),
         exit_(("META", "2026-11-13", 750, "C"), at(14, 35), 1, None, True),
     ], runtime()),
+    # the prepaid pass is used up, but the wallet's auto-pay bought today's
+    # day-pass and the agent reads the feed with it; the old lapse notice is
+    # still in its memory
+    "wallet-over-lapsed-pass": (
+        {**LIVE, "lnbits_url": "https://wallet.example",
+         "day_pass_recurring": True},
+        {**_state(True), **_pass_state(0, "used_up"),
+         "l402": {"token": "t", "expires_at": _T + 3600},
+         "pass_notice": _LAPSED},
+        _history(True), runtime(feed_access=True)),
+    # the agent could not check the prepaid pass with AgentHC
+    "pass-unchecked": (LIVE, {**_state(True), "pass_status": {}},
+                       _history(True), runtime(feed_access=False)),
     # LIVE on a broker's paper-trading account
     "paper-account": (
         {**LIVE, "broker": "alpaca", "alpaca_paper": True},

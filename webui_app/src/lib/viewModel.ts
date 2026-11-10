@@ -82,7 +82,7 @@ export interface Status {
   /** are the real positions being sold on their exit signal / at expiry right now */
   real_positions_managed: boolean;
   /** why not, for the first real position that isn't */
-  unmanaged_reason: "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "broker_down" | "practice_holds_real_sells" | "other_account" | "expired" | "no_exit_signals" | "feed_unreachable" | "no_bid" | null;
+  unmanaged_reason: "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "broker_down" | "practice_holds_real_sells" | "other_account" | "expired" | "no_exit_signals" | "feed_unreachable" | "no_bid" | "pass_unchecked" | null;
   /** false: the expiry sell is switched off in the settings, so nothing sells a position on its expiry day but an exit signal */
   expiry_guard_on: boolean;
   broker: Broker;
@@ -154,7 +154,8 @@ export interface Signals {
 
 export interface Pass {
   kind: "prepaid" | "day_pass" | "subscription" | "not_needed" | "none";
-  status: "active" | "exits_only" | "waiting" | "none";
+  /** unknown: a prepaid pass the agent could not check with AgentHC yet (it reads no signals until it can); a wallet day-pass that is running counts as active */
+  status: "active" | "exits_only" | "waiting" | "none" | "unknown";
   days_left: number | null;
   auto_pay: boolean;
 }
@@ -236,7 +237,7 @@ export interface Capabilities {
 
 export interface Answer {
   state: "yes" | "practice_only" | "not_today" | "paused" | "cant" | "unknown";
-  reason_code: "ok" | "practice_mode" | "nothing_open" | "only_practice_positions" | "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "owner_pause" | "pause_feed_not_read" | "broker_down" | "daily_cap_reached" | "daily_loss_reached" | "position_cap_reached" | "market_closed" | "no_signal_access" | "feed_unreachable" | "ai_needed" | "practice_holds_real_sells";
+  reason_code: "ok" | "practice_mode" | "nothing_open" | "only_practice_positions" | "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "owner_pause" | "pause_feed_not_read" | "broker_down" | "daily_cap_reached" | "daily_loss_reached" | "position_cap_reached" | "market_closed" | "no_signal_access" | "feed_unreachable" | "ai_needed" | "practice_holds_real_sells" | "pass_unchecked";
 }
 
 export interface Contract {
@@ -271,7 +272,7 @@ export interface NextAction {
   action: "sell_on_exit" | "sell_at_expiry_guard" | "selling_now" | "paper_close" | "unmanaged" | "unknown";
   /** when, if the agent acts at a set time */
   at: Iso | null;
-  reason_code: "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "broker_down" | "practice_holds_real_sells" | "other_account" | "expired" | "no_exit_signals" | "feed_unreachable" | "no_bid" | "exit_signal" | "expiry_guard" | "sell_working" | "exit_remainder" | "pause_feed_not_read";
+  reason_code: "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "broker_down" | "practice_holds_real_sells" | "other_account" | "expired" | "no_exit_signals" | "feed_unreachable" | "no_bid" | "pass_unchecked" | "exit_signal" | "expiry_guard" | "sell_working" | "exit_remainder" | "pause_feed_not_read";
   /** when the expiry guard would sell it on its expiry day, if it is still open then */
   expiry_guard_at: Iso | null;
 }

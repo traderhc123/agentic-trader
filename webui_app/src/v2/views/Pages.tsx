@@ -292,6 +292,7 @@ const PASS_STATUS: Record<Status["signals"]["pass"]["status"], string> = {
   exits_only: "Exit signals only",
   waiting: "Waiting",
   none: "None",
+  unknown: "Not checked",
 };
 
 export function SignalsView({ page }: { page: Page }) {
@@ -360,7 +361,9 @@ export function SignalsView({ page }: { page: Page }) {
                   ? "The agent is waiting for a pass to become usable (a payment that has not arrived, or a day pass it will buy on the next market day)."
                   : p.status === "none"
                     ? "Without a pass the agent receives no signals."
-                    : "If access runs out, the agent stops taking new trades."}
+                    : p.status === "unknown"
+                      ? "The agent could not check this pass with AgentHC yet, so it reads no signals until it can. It checks again on each read."
+                      : "If access runs out, the agent stops taking new trades."}
             </p>
             <div style={{ marginTop: 12 }}>
               <a className="btn" href={SETUP}>

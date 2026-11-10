@@ -4,14 +4,15 @@
 import type { Activity, Position, Status } from "../../lib/viewModel";
 import { answerLook, answerWhy, describe, sellsHow } from "../lib/copy";
 import {
-  bookToday,
   brokerLabel,
+  dayBooks,
   dayTally,
   nextFor,
   notes,
   paidFor,
   practicePositions,
   realPositions,
+  showPaperBook,
   statement,
   type Note,
 } from "../lib/derive";
@@ -478,10 +479,8 @@ function DayPanel({ page }: { page: Page }) {
   const t = dayTally(page.rows, today, page.hasOlder, s.broker.name);
   const anyToday = page.rows.some((e) => etDayKey(e.at) === today);
   if (!anyToday) return null;
-  const book = live ? s.results.real : s.results.practice;
-  const day = bookToday(book, today);
+  const books = dayBooks(s);
   const opened = live ? s.limits.used_today.real : s.limits.used_today.practice;
-  const word = live ? "real-money trade" : "practice trade";
   const least = t.complete ? "" : "at least ";
   return (
     <section className={`panel a-day ${page.stale ? "stale" : ""}`}>
@@ -498,23 +497,25 @@ function DayPanel({ page }: { page: Page }) {
         <ul className="tally">
           <li>
             <span>Opened</span>
-            <b>{plural(opened, word)}</b>
+            <b>{plural(opened, books.opened)}</b>
           </li>
-          <li>
-            <span>Closed</span>
-            <b>
-              {day.closed ? (
-                <>
-                  {plural(day.closed, word)}, <span className={tone(day.pnl)}>{signed(day.pnl)}</span>
-                  {day.unmeasured ? `, plus ${plural(day.unmeasured, "sale")} not measured` : ""}
-                </>
-              ) : day.unmeasured ? (
-                `${plural(day.unmeasured, "sale")}, not measured`
-              ) : (
-                "none"
-              )}
-            </b>
-          </li>
+          {books.closed.map(({ label, word, day }) => (
+            <li key={label}>
+              <span>{label}</span>
+              <b>
+                {day.closed ? (
+                  <>
+                    {plural(day.closed, word)}, <span className={tone(day.pnl)}>{signed(day.pnl)}</span>
+                    {day.unmeasured ? `, plus ${plural(day.unmeasured, "sale")} not measured` : ""}
+                  </>
+                ) : day.unmeasured ? (
+                  `${plural(day.unmeasured, "sale")}, not measured`
+                ) : (
+                  "none"
+                )}
+              </b>
+            </li>
+          ))}
         </ul>
         <p className="tally-h">
           {t.stoppedTotal
@@ -572,6 +573,7 @@ function MoneyPanel({ page }: { page: Page }) {
   const s = page.s;
   const R = s.results.real;
   const P = s.results.practice;
+  const A = s.results.paper_account;
   const c = s.results.signal_cost;
   const net = c.applies && c.usd_paid != null ? R.total - c.usd_paid : null;
   return (
@@ -593,6 +595,7 @@ function MoneyPanel({ page }: { page: Page }) {
               <small>
                 {plural(R.closed, "closed trade")}, all time. Estimated from quoted prices.
                 {R.unmeasured > 0 ? ` ${plural(R.unmeasured, "sale")} could not be measured.` : ""}
+                {s.broker.paper_account ? " Older lines that did not record the account may include paper-account sales." : ""}
               </small>
             </span>
             <b className={tone(R.total)}>{signed(R.total)}</b>
@@ -604,6 +607,18 @@ function MoneyPanel({ page }: { page: Page }) {
                 <strong>Real money after signal cost</strong>
               </span>
               <b className={tone(net)}>{signed(net)}</b>
+            </li>
+          )}
+          {showPaperBook(s) && (
+            <li className="sep">
+              <span>
+                <Tag kind="paper" />
+                <small>
+                  {plural(A.closed, "closed trade")} in a broker's paper-trading account. Not real money.
+                  {A.unmeasured > 0 ? ` ${plural(A.unmeasured, "sale")} could not be measured.` : ""}
+                </small>
+              </span>
+              <b className={`${tone(A.total)} soft`}>{signed(A.total)}</b>
             </li>
           )}
           <li className="sep">

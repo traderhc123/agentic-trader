@@ -11,7 +11,7 @@
 //     presented as current: the mode is "unknown" and every panel is stamped
 //     "as of" the last report.
 import type { Activity, Book, Iso, Position, Status } from "../../lib/viewModel";
-import { UNMANAGED_FALLBACK, UNMANAGED_SHORT, UNMANAGED_WHY, answerWhy, describe, leftToday, nextSay, own, sizeEach, type IconName, type NextSay } from "./copy.ts";
+import { GUARD_STILL, UNMANAGED_FALLBACK, UNMANAGED_SHORT, UNMANAGED_WHY, answerWhy, describe, leftToday, nextSay, own, sizeEach, type IconName, type NextSay } from "./copy.ts";
 import { contractName, etDayKey, etTime, etWhen, dayLong, plural, span, secondsBetween, usd } from "./format.ts";
 
 /** How this page is connected to the agent. Independent of mode and pause.
@@ -330,7 +330,7 @@ export function notes(s: Status, l: Link): Note[] {
     const lost = unwatched(s);
     // with no exit signals the expiry sell still acts: not "nobody is selling it"
     const exp = lost.find(
-      (p) => p.expires_today && !(p.next.expiry_guard_at && (p.next.reason_code === "no_exit_signals" || p.next.reason_code === "feed_unreachable")),
+      (p) => p.expires_today && !(p.next.expiry_guard_at && GUARD_STILL.includes(p.next.reason_code)),
     );
     const k = lost.length;
     out.push({
@@ -385,7 +385,12 @@ export function notes(s: Status, l: Link): Note[] {
       });
     }
     const p = s.signals.pass;
-    if (l === "ok" && (p.status === "exits_only" || p.status === "none" || p.status === "waiting") && p.kind !== "not_needed") {
+    // a last read of the feed that saw entry signals saw the exits too: the
+    // agent is reading with some pass (a running wallet day-pass, say), so
+    // "no signals" would be false whatever the prepaid pass says
+    const reading = s.signals.entry_access === true;
+    const lacking = p.status === "exits_only" || p.status === "none" || p.status === "waiting" || p.status === "unknown";
+    if (l === "ok" && lacking && !reading && p.kind !== "not_needed") {
       const held = n ? ` Until then, watch your ${plural(n, "real position")} and sell ${their(n, "it", "them")} yourself at ${b}.` : "";
       out.push({
         key: "pass",
@@ -394,19 +399,23 @@ export function notes(s: Status, l: Link): Note[] {
         title:
           p.status === "exits_only"
             ? "No signal days left for new trades"
-            : p.status === "waiting"
-              ? p.auto_pay
-                ? "No signal pass for today yet"
-                : "No usable signal pass"
-              : "No signal pass",
+            : p.status === "unknown"
+              ? "Your signal pass could not be checked"
+              : p.status === "waiting"
+                ? p.auto_pay
+                  ? "No signal pass for today yet"
+                  : "No usable signal pass"
+                : "No signal pass",
         text:
           p.status === "exits_only"
             ? "The agent still receives exit signals for what it holds, so open positions are still sold. It takes no new trades until you add signal days."
-            : p.status === "waiting" && p.auto_pay
-              ? "Your wallet's auto-pay buys a day-pass on the agent's next read of the feed on a market day. Until it has one, the agent receives no signals: no new trades, and no exit signals for what it holds."
-              : p.status === "waiting"
-                ? `Your signal pass is used up, expired or waiting for payment, so the agent receives no signals: no new trades, and no exit signals for what it holds.${held}`
-                : `Without a pass the agent receives no signals: no new trades, and no exit signals for what it holds.${held}`,
+            : p.status === "unknown"
+              ? `The agent could not check your signal pass with AgentHC (the check failed, or has not run yet). Until it can, it reads no signals: no new trades, and no exit signals for what it holds. It checks again on each read.${held}`
+              : p.status === "waiting" && p.auto_pay
+                ? "Your wallet's auto-pay buys a day-pass on the agent's next read of the feed on a market day. Until it has one, the agent receives no signals: no new trades, and no exit signals for what it holds."
+                : p.status === "waiting"
+                  ? `Your signal pass is used up, expired or waiting for payment, so the agent receives no signals: no new trades, and no exit signals for what it holds.${held}`
+                  : `Without a pass the agent receives no signals: no new trades, and no exit signals for what it holds.${held}`,
         actions: ["signals"],
       });
     }
@@ -546,6 +555,36 @@ export function realBookCaption(s: Status): string {
   return `Orders filled at ${brokerName(s)}. Sales in its paper-trading account, the one the agent trades now, are counted apart; older lines that did not record the account are counted here and may include paper ones.`;
 }
 export const PAPER_BOOK_CAPTION = "Orders filled in a broker's paper-trading account. Not real money.";
+
+/** Whether the broker paper-account book is shown: when the agent trades a
+ *  paper account now, or that book holds sales. */
+export const showPaperBook = (s: Status) =>
+  s.broker.paper_account || s.results.paper_account.closed > 0 || s.results.paper_account.unmeasured > 0;
+
+export interface DayClosed {
+  label: string;
+  word: string;
+  day: BookToday;
+}
+
+/** "Today so far": what the Opened count is called, and the Closed lines.
+ *  Practice mode reads the practice book. LIVE reads the book its account
+ *  books sales into (a broker's paper-trading account has its own), plus
+ *  the other one when it has sales today (the account was switched). The
+ *  Opened count is the agent's own (its limits count paper fills as live). */
+export function dayBooks(s: Status): { opened: string; closed: DayClosed[] } {
+  const today = etDayKey(s.as_of);
+  if (s.mode !== "live")
+    return { opened: "practice trade", closed: [{ label: "Closed", word: "practice trade", day: bookToday(s.results.practice, today) }] };
+  const paper = s.broker.paper_account;
+  const real = { word: "real-money trade", B: s.results.real, other: "Closed for real money" };
+  const pap = { word: "paper-account trade", B: s.results.paper_account, other: "Closed in a paper account" };
+  const [main, second] = paper ? [pap, real] : [real, pap];
+  const closed: DayClosed[] = [{ label: "Closed", word: main.word, day: bookToday(main.B, today) }];
+  const o = bookToday(second.B, today);
+  if (o.closed || o.unmeasured) closed.push({ label: second.other, word: second.word, day: o });
+  return { opened: paper ? "live trade" : "real-money trade", closed };
+}
 
 /** The line under a book's "Today" figure. */
 export function bookTodayNote(x: BookToday): string {

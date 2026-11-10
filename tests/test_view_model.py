@@ -929,10 +929,16 @@ def test_signal_pass_states():
     assert used["capabilities"]["opening"] == {
         "state": "cant", "reason_code": "no_signal_access"}
     assert used["capabilities"]["listening"]["state"] == "yes"  # exits still come
-    waiting = p(prepaid, feed_access=False)
+    waiting = p(prepaid, {"pass_status": {tid: {"status": "used_up"}}},
+                feed_access=False)
     assert waiting["signals"]["pass"]["status"] == "waiting"
     assert waiting["capabilities"]["listening"] == {
         "state": "cant", "reason_code": "no_signal_access"}
+    # no record of the pass (its check failed): not known, never "waiting"
+    unchecked = p(prepaid, feed_access=False)
+    assert unchecked["signals"]["pass"]["status"] == "unknown"
+    assert unchecked["capabilities"]["listening"] == {
+        "state": "cant", "reason_code": "pass_unchecked"}
     wallet = {**base, "lnbits_url": "https://wallet.example", "day_pass_recurring": True}
     assert p(wallet, feed_access=None)["signals"]["pass"] == {
         "kind": "day_pass", "status": "waiting", "days_left": None,
