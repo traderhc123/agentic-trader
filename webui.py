@@ -2646,6 +2646,210 @@ def _tip_status_route(_h, data):
     return {"ok": True, "status": status}
 
 
+_PASS_INVOICE_S = 3600 + 300    # a pass invoice can be paid for 1h (+ slack)
+_PASS_REUSE_S = 3000            # hand the same invoice back while 10+ min remain
+_MONEY_LOCK = threading.RLock()
+
+
+def _one_at_a_time(fn):
+    """Pass and wallet requests run one after the other (the server answers
+    each request on its own thread): the second click of a double click must
+    see what the first one did, and a status check must not write back a
+    list that a purchase changed in the meantime."""
+    def run(*args, **kwargs):
+        with _MONEY_LOCK:
+            return fn(*args, **kwargs)
+    run.__name__, run.__doc__ = fn.__name__, fn.__doc__
+    return run
+
+
+@_one_at_a_time
+def _pass_buy(cfg, save, data):
+    """Invoice for N prepaid signal days; the user pays from any wallet.
+
+    Asking again never loses an earlier invoice: the same size (a double
+    click) gets the invoice already made, and a different size is added
+    next to it — every unpaid invoice stays on file (feed_pass_pending =
+    the newest, feed_pass_extra = the others) until it is paid or expires,
+    so whichever one the owner pays, the agent finds the pass."""
+    from sources import agenthc_day_trade_ideas as hc
+    import time as _t
+    try:
+        days = int(data.get("days") or 0)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "pick 1, 5, 20 or 60 days"}
+    current = (cfg.get("feed_pass") or {}).get("token")
+    extends = hc._token_id(current) if current else ""
+    last = cfg.get("feed_pass_pending")
+    if (isinstance(last, dict) and last.get("days") == days
+            and last.get("extends") == extends
+            and isinstance(last.get("invoice"), dict)
+            and isinstance(last["invoice"].get("bolt11"), str)
+            and _t.time() - float(last.get("bought_at") or 0) < _PASS_REUSE_S):
+        return {**last["invoice"], "qr": _qr_matrix(last["invoice"]["bolt11"].upper())}
+    try:
+        body = hc.buy_pass(days, extend_token=current)
+    except hc.PassSizeRefilling as exc:
+        # Size briefly off sale (node refilling) — the wizard re-asks
+        # which sizes are on sale so the card disappears until it's back.
+        return {"ok": False, "error": str(exc), "refresh_sizes": True}
+    except hc.PassSizeUnavailable as exc:
+        return {"ok": False, "error": str(exc), "refresh_sizes": True}
+    except hc.PassUnavailable as exc:
+        return {"ok": False, "error": str(exc), "unavailable": True}
+    except Exception as exc:
+        return {"ok": False, "error": _net_error_text(exc)}
+    bolt11 = body["payment_request"]
+    reply = {"ok": True, "bolt11": bolt11,
+             "amount_sats": body.get("amount_sats"),
+             "amount_usd": body.get("amount_usd_approx"),
+             "extends": bool(body.get("extends_current_pass")),
+             "carried": body.get("carried_over_days") or 0,
+             "access_until": body.get("access_until")}
+    cfg["source"] = "agenthc"
+    if isinstance(last, dict) and last.get("token"):
+        # the earlier invoice may still get paid: keep watching its pass
+        cfg["feed_pass_extra"] = [last] + [
+            p for p in (cfg.get("feed_pass_extra") or []) if isinstance(p, dict)]
+    cfg["feed_pass_pending"] = {
+        "token": body["pass_token"], "days": days, "bought_at": _t.time(),
+        "access_until": body.get("access_until"),
+        "extends": extends, "invoice": reply}
+    save()
+    return {**reply, "qr": _qr_matrix(bolt11.upper())}
+
+
+@_one_at_a_time
+def _pass_status(cfg, save):
+    """Every purchase on file is checked with AgentHC. A paid one becomes
+    the pass (newest first); an unpaid one stays while its invoice can still
+    be paid; a paid pass that isn't the main one stays until AgentHC says it
+    is finished. Nothing paid for is ever dropped."""
+    from sources import agenthc_day_trade_ideas as hc
+    import time as _t
+    usable = ("active", "exits_only")
+
+    def _reply(st, status=None):
+        return {"ok": True, "status": status or st.get("status"),
+                "days_left": st.get("days_left", st.get("trading_days_left")),
+                "access_until": st.get("access_until")}
+
+    try:
+        pend = cfg.get("feed_pass_pending")
+        extra = [p for p in (cfg.get("feed_pass_extra") or [])
+                 if isinstance(p, dict) and p.get("token")]
+        unpaid = ([pend] if pend else []) + [p for p in extra if not p.get("paid")]
+        spare = [p for p in extra if p.get("paid")]   # paid, not the main pass
+        waiting, promoted = [], None
+        for p in unpaid:
+            st = hc.pass_status(p["token"])
+            if st.get("status") in usable:
+                paid = {k: v for k, v in p.items() if k != "invoice"}
+                paid["access_until"] = st.get("access_until")
+                if promoted is None:
+                    promoted = (paid, st)
+                else:
+                    spare.insert(0, {**paid, "paid": True})
+            elif (st.get("status") == "pending" and _t.time()
+                  - float(p.get("bought_at") or 0) < _PASS_INVOICE_S):
+                waiting.append(p)
+            # else: expired unpaid / invalid — nothing there to keep
+        spare = [p for p in spare
+                 if hc.pass_status(p["token"]).get("status") in usable]
+        reply = None
+        if promoted:
+            paid, st = promoted
+            old = cfg.get("feed_pass")
+            # Renewing replaces the pass it extends (its days moved over).
+            # Any other pass still on file was paid for separately: keep it.
+            if (isinstance(old, dict) and old.get("token") and "extends" in paid
+                    and paid["extends"] != hc._token_id(old["token"])):
+                spare.insert(0, {**old, "paid": True})
+            cfg["feed_pass"] = paid
+            reply = _reply(st, "active")
+        new_pend = waiting[0] if waiting else None
+        new_extra = waiting[1:] + spare
+        if (reply or new_pend != pend
+                or new_extra != (cfg.get("feed_pass_extra") or [])):
+            for key, val in (("feed_pass_pending", new_pend),
+                             ("feed_pass_extra", new_extra)):
+                if val:
+                    cfg[key] = val
+                else:
+                    cfg.pop(key, None)
+            save()
+        if reply:
+            return reply
+        if new_pend:
+            return {"ok": True, "status": "pending"}
+        cur = cfg.get("feed_pass")
+        if not cur:
+            return {"ok": True, "status": "unpaid" if pend else "none"}
+        st = hc.pass_status(cur["token"])
+        if st.get("status") not in usable and spare:
+            # the main pass is finished: the other paid one takes over
+            cfg["feed_pass"] = {k: v for k, v in spare[0].items() if k != "paid"}
+            rest = waiting[1:] + spare[1:]
+            if rest:
+                cfg["feed_pass_extra"] = rest
+            else:
+                cfg.pop("feed_pass_extra", None)
+            save()
+            st = hc.pass_status(cfg["feed_pass"]["token"])
+        return _reply(st)
+    except Exception as exc:
+        return {"ok": False, "status": "error", "error": _net_error_text(exc, cache_s=60)}
+
+
+_WALLET_EXISTS = ("Your agent already has a wallet, so no new one was created "
+                  "— a new wallet starts empty, and any sats in the one you "
+                  "have would be left behind. To keep using it, just add "
+                  "sats to it.")
+
+
+@_one_at_a_time
+def _wallet_create(cfg, save, data):
+    """Create the agent's own wallet. Never replaces one that is already set
+    up unless the request says {"replace": true} — and then the old wallet's
+    keys are first saved to a file in the agent's private folder, so sats
+    left in it can still be moved out. No file, no replacement."""
+    import lightning_wallet
+    had = bool(cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"))
+    if had and (data or {}).get("replace") is not True:
+        return {"ok": False, "exists": True, "error": _WALLET_EXISTS,
+                "page": cfg.get("lnbits_wallet_page", "")}
+    old_page, old_file = cfg.get("lnbits_wallet_page", ""), ""
+    if had:
+        try:
+            old_file = lightning_wallet.keep_old_wallet(cfg)
+        except OSError as exc:
+            return {"ok": False, "error":
+                    "Your wallet was not replaced: its details could not be "
+                    f"saved first ({str(exc)[:120]}). Nothing changed."}
+    try:
+        url, key, page = lightning_wallet.create_wallet()
+    except lightning_wallet.WalletError as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+    cfg["source"] = "agenthc"
+    cfg["lnbits_url"] = url
+    cfg["lnbits_admin_key"] = key
+    cfg.pop("lnbits_wallet_page", None)   # never show the old wallet's page
+    if page:
+        cfg["lnbits_wallet_page"] = page
+    cfg.setdefault("max_autopay_sats", 30_000)
+    save()
+    out = {"ok": True, "page": page, "warning": lightning_wallet.demo_warning(url)}
+    if had:
+        out.update({
+            "old_wallet_file": old_file, "old_wallet_page": old_page,
+            "note": "New wallet created. It starts empty. Your old wallet "
+                    "was not deleted: if it still holds sats, open it"
+                    + (f" ({old_page})" if old_page else "")
+                    + " and send them to the new one. The old wallet's "
+                    f"details are saved in {old_file}."})
+    return out
+
+
 def _restore_notes(cfg, acceptance=None):
     """Per-tab 'already configured' summaries for the wizard restore path.
     Non-secret only — these render as plain text at the top of each completed
@@ -2856,8 +3060,22 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     bal = LNbitsWallet(url, str(data["lnbits_key"]).strip()).balance_sats()
                 except WalletError as exc:
                     return {"ok": False, "error": f"wallet check failed: {exc}"}
+                new_key = str(data["lnbits_key"]).strip()
+                if (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")
+                        and cfg["lnbits_admin_key"] != new_key):
+                    # a different wallet replaces the agent's: keep the old
+                    # one's keys on file first (sats may be left in it)
+                    import lightning_wallet
+                    try:
+                        lightning_wallet.keep_old_wallet(cfg)
+                    except OSError as exc:
+                        return {"ok": False, "error":
+                                "Your wallet was not changed: the current "
+                                "wallet's details could not be saved first "
+                                f"({str(exc)[:120]})."}
+                    cfg.pop("lnbits_wallet_page", None)  # the old wallet's page
                 cfg["lnbits_url"] = url
-                cfg["lnbits_admin_key"] = str(data["lnbits_key"]).strip()
+                cfg["lnbits_admin_key"] = new_key
                 cfg.setdefault("max_autopay_sats", 30_000)
                 note = f"wallet connected ✓ balance {bal:,} sats"
             elif cfg.get("feed_pass"):
@@ -3086,91 +3304,19 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         """Invoice for N prepaid signal days; the user pays from any wallet."""
         if not A.consent_ok():
             return {"ok": False, "error": "accept the agreement first"}
-        from sources import agenthc_day_trade_ideas as hc
-        try:
-            days = int(data.get("days") or 0)
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "pick 1, 5, 20 or 60 days"}
-        current = (cfg.get("feed_pass") or {}).get("token")
-        try:
-            body = hc.buy_pass(days, extend_token=current)
-        except hc.PassSizeRefilling as exc:
-            # Size briefly off sale (node refilling) — the wizard re-asks
-            # which sizes are on sale so the card disappears until it's back.
-            return {"ok": False, "error": str(exc), "refresh_sizes": True}
-        except hc.PassSizeUnavailable as exc:
-            return {"ok": False, "error": str(exc), "refresh_sizes": True}
-        except hc.PassUnavailable as exc:
-            return {"ok": False, "error": str(exc), "unavailable": True}
-        except Exception as exc:
-            return {"ok": False, "error": _net_error_text(exc)}
-        import time as _t
-        cfg["source"] = "agenthc"
-        cfg["feed_pass_pending"] = {
-            "token": body["pass_token"], "days": days, "bought_at": _t.time(),
-            "access_until": body.get("access_until")}
-        save()
-        bolt11 = body["payment_request"]
-        return {"ok": True, "bolt11": bolt11, "qr": _qr_matrix(bolt11.upper()),
-                "amount_sats": body.get("amount_sats"),
-                "amount_usd": body.get("amount_usd_approx"),
-                "extends": bool(body.get("extends_current_pass")),
-                "carried": body.get("carried_over_days") or 0,
-                "access_until": body.get("access_until")}
+        return _pass_buy(cfg, save, data)
 
     def pass_options_route(_h):
         from sources import agenthc_day_trade_ideas as hc
         return {"options": hc.pass_options()}
 
     def pass_status_route(_h):
-        """Pending purchase first (promote it once paid), else the current pass."""
-        from sources import agenthc_day_trade_ideas as hc
-        import time as _t
-        pend = cfg.get("feed_pass_pending")
-        try:
-            if pend:
-                st = hc.pass_status(pend["token"])
-                if st.get("status") in ("active", "exits_only"):
-                    cfg["feed_pass"] = {**pend, "access_until": st.get("access_until")}
-                    cfg.pop("feed_pass_pending", None)
-                    save()
-                    return {"ok": True, "status": "active",
-                            "days_left": st.get("days_left", st.get("trading_days_left")),
-                            "access_until": st.get("access_until")}
-                if st.get("status") == "pending":
-                    if _t.time() - float(pend.get("bought_at") or 0) < 3600 + 300:
-                        return {"ok": True, "status": "pending"}
-                cfg.pop("feed_pass_pending", None)  # expired unpaid / invalid
-                save()
-                if not cfg.get("feed_pass"):
-                    return {"ok": True, "status": "unpaid"}
-            cur = cfg.get("feed_pass")
-            if not cur:
-                return {"ok": True, "status": "none"}
-            st = hc.pass_status(cur["token"])
-            return {"ok": True, "status": st.get("status"),
-                    "days_left": st.get("days_left", st.get("trading_days_left")),
-                    "access_until": st.get("access_until")}
-        except Exception as exc:
-            return {"ok": False, "status": "error", "error": _net_error_text(exc, cache_s=60)}
+        return _pass_status(cfg, save)
 
-    def wallet_create(_h, _data):
+    def wallet_create(_h, data):
         if not A.consent_ok():
             return {"ok": False, "error": "accept the agreement first"}
-        from lightning_wallet import create_wallet
-        try:
-            url, key, page = create_wallet()
-        except WalletError as exc:
-            return {"ok": False, "error": str(exc)[:200]}
-        cfg["source"] = "agenthc"
-        cfg["lnbits_url"] = url
-        cfg["lnbits_admin_key"] = key
-        if page:
-            cfg["lnbits_wallet_page"] = page
-        cfg.setdefault("max_autopay_sats", 30_000)
-        save()
-        from lightning_wallet import demo_warning
-        return {"ok": True, "page": page, "warning": demo_warning(url)}
+        return _wallet_create(cfg, save, data)
 
     def wallet_fund(_h, data):
         w = _wallet()
