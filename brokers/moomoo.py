@@ -12,9 +12,9 @@ requires options approval on the account plus your trade password to unlock
 REAL orders. Long single-leg only, matching the agent's contract: buy-to-open
 on ENTERED, sell on EXITED for positions this agent opened.
 
-Orders are placed as marketable LIMIT at the ask (market orders on options
-are not reliably accepted through OpenD), qty from the same budget sizing as
-the other brokers.
+Orders are placed as marketable LIMIT orders — buys at the ask, sells at
+the bid (market orders on options are not reliably accepted through OpenD)
+— qty from the same budget sizing as the other brokers.
 """
 
 import time
@@ -23,6 +23,11 @@ import broker_events
 import platform_compat
 
 from .pricing import exit_qty, marketable_limit
+
+# Every status line in this module goes through safe_print: a console that
+# can't show a character ("→" on a Windows cp1252 stdout) must never stop an
+# order by making print() raise.
+print = platform_compat.safe_print
 
 _TIMEOUT = 15
 _DEFAULT_HOST = "127.0.0.1"
@@ -93,9 +98,12 @@ def connect(cfg, values):
 class _Client:
     """Thin holder so broker.client(cfg) has the same shape as the others.
 
-    Orders, quotes and holdings reads use this startup copy of the config,
-    so a paper/real switch in the dashboard applies after a restart (the
-    agent tags positions from it too: agent._account_tag)."""
+    Orders, quotes and holdings reads use this startup copy of the config
+    for the gateway address and the paper/real account, so a paper/real
+    switch in the dashboard applies after a restart (the agent tags
+    positions from it too: agent._account_tag). How much to buy is NOT
+    taken from it: sizing comes from the config passed with each event
+    (execute)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -173,15 +181,44 @@ def _moomoo_code(event):
             f"{int(round(float(event['strike']) * 1000))}")
 
 
+# Why the last quote read came back empty — read by execute() so a gateway
+# that isn't running is reported as that, not as a missing quote.
+# "down": OpenD couldn't be reached; "said": OpenD's own reason.
+_QUOTE_FAIL = {}
+
+
+def _quote_ctx(cfg, sdk):
+    """A quote connection to OpenD. A failure to connect is noted in
+    _QUOTE_FAIL before it is raised."""
+    _QUOTE_FAIL.clear()
+    host, port = _host_port(cfg)
+    try:
+        return sdk.OpenQuoteContext(host=host, port=port)
+    except Exception as exc:
+        _QUOTE_FAIL["down"] = str(exc)[:150] or type(exc).__name__
+        raise
+
+
+def _gateway_down_text(cfg):
+    """Plain words for "OpenD isn't reachable", or "" when the last quote
+    read did reach it."""
+    if "down" not in _QUOTE_FAIL:
+        return ""
+    host, port = _host_port(cfg)
+    return (f"can't reach the moomoo OpenD gateway at {host}:{port} — is "
+            f"OpenD running and logged in? ({_QUOTE_FAIL['down']})")
+
+
 def _ask_price(cfg, sdk, code):
     """Latest ask via OpenD quotes; 0.0 when unavailable. An options quote
     subscription on the moomoo account is required for live quotes."""
     ctx = None
     try:
-        host, port = _host_port(cfg)
-        ctx = sdk.OpenQuoteContext(host=host, port=port)
+        ctx = _quote_ctx(cfg, sdk)
         ret, data = ctx.get_market_snapshot([code])
         if ret != sdk.RET_OK or data is None or not len(data):
+            if ret != sdk.RET_OK and isinstance(data, str) and data.strip():
+                _QUOTE_FAIL["said"] = data.strip()[:150]
             return 0.0
         row = data.iloc[0]
         return float(row.get("ask_price") or 0) or float(row.get("last_price") or 0)
@@ -196,8 +233,12 @@ def _ask_price(cfg, sdk, code):
 
 
 def mark_price(cl, cfg, event, side="buy"):
-    """Per-share quote for the agent's P&L estimate (0.0 when unavailable)."""
+    """Per-share quote for the agent's P&L estimate (0.0 when unavailable):
+    the ask for a buy, the bid for a sell — a sale fills at the bid, so
+    marking it at the ask would understate a loss."""
     cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    if side == "sell":
+        return _bid_price(cfg, _sdk(), _moomoo_code(event)) or 0.0
     return _ask_price(cfg, _sdk(), _moomoo_code(event))
 
 
@@ -206,8 +247,7 @@ def _bid_price(cfg, sdk, code):
     quote can't be read (unknown)."""
     ctx = None
     try:
-        host, port = _host_port(cfg)
-        ctx = sdk.OpenQuoteContext(host=host, port=port)
+        ctx = _quote_ctx(cfg, sdk)
         ret, data = ctx.get_market_snapshot([code])
         if ret != sdk.RET_OK or data is None or not len(data):
             return None
@@ -362,6 +402,12 @@ def _order(cfg, sdk, code, side, qty, price):
 
 def execute(cl, cfg, event, state):
     """Act on one normalized event. Returns True if state changed."""
+    # Sizing comes from the cfg the caller passed, like the other adapters:
+    # it is the live config (a budget changed in the dashboard), with the
+    # per-track overrides and % of account already resolved to a budget.
+    # The gateway address and the paper/real account stay the client's
+    # startup copy (_Client).
+    sizing = cfg or (cl.cfg if isinstance(cl, _Client) else {})
     cfg = cl.cfg if isinstance(cl, _Client) else cfg
     try:
         sdk = _sdk()
@@ -378,13 +424,21 @@ def execute(cl, cfg, event, state):
             return False
         ask = _ask_price(cfg, sdk, code)
         if ask <= 0:
+            down = _gateway_down_text(cfg)
+            if down:
+                print(f"SKIPPED {contract}: {down}")
+                broker_events.report("broker_disconnected",
+                                     f"couldn't get a price for {contract}: {down}")
+                return False
+            said = (f" (OpenD said: {_QUOTE_FAIL['said']})"
+                    if _QUOTE_FAIL.get("said") else "")
             print(f"SKIPPED {contract}: no quote from OpenD (options quote "
-                  "subscription active on the moomoo account?)")
+                  f"subscription active on the moomoo account?){said}")
             broker_events.report("skip_no_quote",
                                  f"no quote from OpenD for {contract} — is the "
-                                 "options quote subscription active?")
+                                 f"options quote subscription active?{said}")
             return False
-        qty, note = _size(cfg, ask)
+        qty, note = _size(sizing, ask)
         if qty < 1:
             print(f"SKIPPED {contract}: {note}")
             broker_events.report(
@@ -408,15 +462,26 @@ def execute(cl, cfg, event, state):
             return False
         code = pos.get("option_id", code)
         # sell marketable: at the bid if we can get one, else last/ask
+        # (a sell limit AT THE ASK just rests on the book unfilled)
+        bid = _bid_price(cfg, sdk, code)
         price = 0.0
         if event.get("exit_limit") == "marketable":
             # expiry guard / exit remainder: bid-5% on a valid tick (pricing.py)
-            price = marketable_limit(_bid_price(cfg, sdk, code), "sell") or 0.0
+            price = marketable_limit(bid, "sell") or 0.0
             if price > 0:
                 print(f"  marketable sell — limit @ ${price:.2f}")
+        elif bid:
+            price = bid
         if price <= 0:
             price = _ask_price(cfg, sdk, code)
         if price <= 0:
+            down = _gateway_down_text(cfg)
+            if down:
+                print(f"SKIPPED {contract}: {down} — will retry on the next poll")
+                broker_events.report("broker_disconnected",
+                                     f"couldn't get a price to exit {contract}: "
+                                     f"{down}")
+                return False
             print(f"SKIPPED {contract}: no quote from OpenD for exit — "
                   "will retry on the next poll")
             broker_events.report("exit_failed",
