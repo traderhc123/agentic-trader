@@ -347,6 +347,10 @@ export function LimitsPanel({ page, linkLabel = "Change limits" }: { page: Page;
   const n = rp + pp;
   const slots = Math.max(L.max_positions, n, 1);
   const many = (x: number) => (x > 24 ? "many" : "");
+  // at most 60 segments: beyond that the bar is drawn to scale
+  const shown = Math.min(slots, 60);
+  const rpShown = slots > 60 ? Math.ceil((rp / slots) * 60) : rp;
+  const nShown = slots > 60 ? Math.ceil((n / slots) * 60) : n;
   const b = s.broker;
   const bname = b.name || "your broker";
   const m = L.trade_size.main;
@@ -415,8 +419,8 @@ export function LimitsPanel({ page, linkLabel = "Change limits" }: { page: Page;
             </b>
           </div>
           <div className={`meter ${many(slots)}`} role="img" aria-label={`${rp} real money, ${pp} practice, of ${L.max_positions} allowed`}>
-            {Array.from({ length: Math.min(slots, 60) }, (_, i) => (
-              <i key={i} className={i < rp ? "on real" : i < n ? "on prac" : ""} />
+            {Array.from({ length: shown }, (_, i) => (
+              <i key={i} className={i < rpShown ? "on real" : i < nShown ? "on prac" : ""} />
             ))}
           </div>
           <p>

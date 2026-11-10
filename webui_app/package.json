@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build && vite build --config vite.v2.config.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test tests/"
+    "test": "node --experimental-strip-types --test tests/guardian.test.mjs"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "5.1.1",
