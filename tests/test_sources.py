@@ -193,6 +193,13 @@ def test_agenthc_feed_not_live_returns_empty(monkeypatch):
     assert agenthc.poll({"agenthc_api_key": "k"}, {}) == []
 
 
+def _invoice(sats):
+    """Invoice-shaped text asking for `sats`: the agent reads the amount (and
+    the payment id) from the invoice itself, so a placeholder won't do."""
+    return (f"lnbc{sats * 10}n1" + "q" * 7 + "pp5" + "q" * 51 + "s"
+            + "q" * 110)
+
+
 class FakeWallet:
     def __init__(self):
         self.paid = []
@@ -211,7 +218,7 @@ def test_agenthc_402_buys_day_pass_and_retries(monkeypatch):
     def fake_get(url, params=None, headers=None, timeout=None):
         calls.append(headers or {})
         if len(calls) == 1:
-            return FakeResp({"payment": {"payment_request": "lnbc1...",
+            return FakeResp({"payment": {"payment_request": _invoice(9500),
                                          "macaroon": "MAC",
                                          "amount_sats": 9500}}, status=402)
         return FakeResp({"events": [_feed_event()]})
@@ -220,7 +227,7 @@ def test_agenthc_402_buys_day_pass_and_retries(monkeypatch):
     state = {}
     events = agenthc.poll({"day_pass_recurring": True}, state,
                           save_state=lambda s: None)
-    assert wallet.paid == ["lnbc1..."]
+    assert wallet.paid == [_invoice(9500)]
     assert state["l402"]["token"] == "L402 MAC:preimage-abc"
     assert calls[1]["Authorization"] == "L402 MAC:preimage-abc"
     assert len(events) == 1
@@ -230,7 +237,7 @@ def test_agenthc_402_buys_day_pass_and_retries(monkeypatch):
 
 def test_agenthc_402_respects_autopay_cap(monkeypatch):
     monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: FakeWallet())
-    resp = FakeResp({"payment": {"payment_request": "lnbc1...",
+    resp = FakeResp({"payment": {"payment_request": _invoice(999_999),
                                  "macaroon": "MAC",
                                  "amount_sats": 999_999}}, status=402)
     monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
@@ -252,7 +259,7 @@ def test_agenthc_402_recurring_off_does_not_pay(monkeypatch):
     empty events, once-per-day notify flag persisted."""
     wallet = FakeWallet()
     monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
-    resp = FakeResp({"payment": {"payment_request": "lnbc1...",
+    resp = FakeResp({"payment": {"payment_request": _invoice(9500),
                                  "macaroon": "MAC",
                                  "amount_sats": 9500}}, status=402)
     monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
@@ -273,14 +280,14 @@ def test_agenthc_402_recurring_on_pays(monkeypatch):
     def fake_get(url, params=None, headers=None, timeout=None):
         calls.append(1)
         if len(calls) == 1:
-            return FakeResp({"payment": {"payment_request": "lnbc1...",
+            return FakeResp({"payment": {"payment_request": _invoice(9500),
                                          "macaroon": "MAC",
                                          "amount_sats": 9500}}, status=402)
         return FakeResp({"events": [_feed_event()]})
 
     monkeypatch.setattr(agenthc.requests, "get", fake_get)
     events = agenthc.poll({"day_pass_recurring": True}, {}, lambda s: None)
-    assert wallet.paid == ["lnbc1..."]
+    assert wallet.paid == [_invoice(9500)]
     assert len(events) == 1
 
 
@@ -310,7 +317,7 @@ def test_agenthc_weekend_skips_network_entirely(monkeypatch):
                             AssertionError("no network on weekend skip")))
     state = {}
     assert agenthc.poll({"day_pass_recurring": True}, state, lambda s: None) == []
-    assert state.get("weekend_skip_notified")
+    assert state.get("market_closed_skip_notified")
 
 
 def test_agenthc_live_token_still_polls(monkeypatch):
@@ -374,7 +381,7 @@ def test_agenthc_daily_autopay_cap_stops_rebuy_loop(monkeypatch):
     one pass per day by default, then polls go quiet until tomorrow."""
     wallet = FakeWallet()
     monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
-    resp = FakeResp({"payment": {"payment_request": "lnbc1...",
+    resp = FakeResp({"payment": {"payment_request": _invoice(16_000),
                                  "macaroon": "MAC",
                                  "amount_sats": 16_000}}, status=402)
     monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
@@ -386,14 +393,14 @@ def test_agenthc_daily_autopay_cap_stops_rebuy_loop(monkeypatch):
         except Exception:
             pass
         state.pop("l402", None)  # as if the token were rejected/expired
-    assert wallet.paid == ["lnbc1..."]
+    assert wallet.paid == [_invoice(16_000)]
     assert state["autopay_spent"]["sats"] == 16_000
 
 
 def test_agenthc_daily_autopay_cap_is_configurable(monkeypatch):
     wallet = FakeWallet()
     monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
-    resp = FakeResp({"payment": {"payment_request": "lnbc1...",
+    resp = FakeResp({"payment": {"payment_request": _invoice(16_000),
                                  "macaroon": "MAC",
                                  "amount_sats": 16_000}}, status=402)
     monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
@@ -597,7 +604,7 @@ class _PassAndWalletServer(_PassServer):
             raise ConnectionError("pass status unavailable")
         if not url.endswith("/pass") and not (headers or {}).get("Authorization"):
             self.calls.append((url, dict(headers or {})))
-            return FakeResp({"payment": {"payment_request": "lnbc1...",
+            return FakeResp({"payment": {"payment_request": _invoice(12_000),
                                          "macaroon": "MAC",
                                          "amount_sats": 12_000}}, status=402)
         return super().get(url, params, headers, timeout)
@@ -631,7 +638,7 @@ def test_wallet_never_buys_on_a_day_the_pass_was_charged(monkeypatch):
     # next market day the wallet may buy again
     state["pass_charged_day"] = "2026-07-14"
     agenthc.poll(_wallet_cfg(), state, lambda s: None)
-    assert wallet.paid == ["lnbc1..."]
+    assert wallet.paid == [_invoice(12_000)]
 
 
 def test_ended_pass_still_falls_back_to_wallet(monkeypatch):
@@ -643,7 +650,7 @@ def test_ended_pass_still_falls_back_to_wallet(monkeypatch):
     monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
     state = {}
     events = agenthc.poll(_wallet_cfg(), state, lambda s: None)
-    assert wallet.paid == ["lnbc1..."]
+    assert wallet.paid == [_invoice(12_000)]
     assert len(events) == 1
 
 
@@ -692,7 +699,7 @@ def test_refused_wallet_daypass_falls_back_to_prepaid_pass(monkeypatch):
     def get(url, params=None, headers=None, timeout=None):
         if (headers or {}).get("Authorization") == "L402 MAC:pre":
             srv.calls.append((url, dict(headers)))
-            return FakeResp({"payment": {"payment_request": "lnbc1...",
+            return FakeResp({"payment": {"payment_request": _invoice(12_000),
                                          "macaroon": "MAC",
                                          "amount_sats": 12_000}}, status=402)
         return orig(url, params, headers, timeout)
