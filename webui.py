@@ -3051,13 +3051,14 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         # state save before the exec; all durable state (config, positions,
         # seen-events, trade log, daily cap) already lives on disk. CONTROLS
         # resets on restart, so polling resumes automatically.
+        was_paused = CONTROLS["paused"]
         CONTROLS["paused"] = True
 
         def _restart():
-            _time.sleep(3.0)  # response flush + in-flight event grace
-            os.environ["AGENT_UPDATE_RESTARTED"] = "1"  # skip browser popup
-            import platform_compat
-            platform_compat.restart_self(list(sys.argv), APP_PORT)
+            _time.sleep(3.0)  # response flush
+            # waits for an order that is still being placed (never restarts
+            # in the middle of one)
+            _restart_after_update(list(sys.argv), was_paused)
         threading.Thread(target=_restart, daemon=True).start()
         return {"ok": True, "restarting": True,
                 "note": note + " — restarting with the new code; this page "
@@ -3798,6 +3799,33 @@ def check_code_updates():
                 "summary": summary, "target": target}
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:200]}
+
+
+def _restart_after_update(argv, was_paused=False):
+    """Restart onto the freshly downloaded code. restart_self waits for an
+    order that is still being placed; if that order is stuck and it gives up,
+    the agent carries on as before (the update paused it for the restart)
+    and the owner is told — it must not sit paused with nobody knowing."""
+    import platform_compat
+    os.environ["AGENT_UPDATE_RESTARTED"] = "1"  # skip browser popup
+    if platform_compat.restart_self(argv, APP_PORT) is not False:
+        return True
+    os.environ.pop("AGENT_UPDATE_RESTARTED", None)
+    CONTROLS["paused"] = was_paused
+    msg = ("agentic-trader: the update was downloaded, but the agent did NOT "
+           "restart, because an order was still being placed and restarting "
+           "in the middle of an order could lose track of it. It keeps "
+           "running the previous version"
+           + (" and stays paused, as it was before the update."
+              if was_paused else " and keeps trading as before.")
+           + " To finish the update, restart it once that order shows in the "
+           "dashboard: python agent.py stop, then python agent.py start")
+    try:  # restart_self already printed why to the log
+        import agent as A
+        A.notify(A._load(A.CONFIG_PATH, {}) or {}, msg)
+    except Exception:
+        pass
+    return False
 
 
 def pull_code_updates(expect=None):

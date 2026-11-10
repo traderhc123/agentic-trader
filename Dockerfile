@@ -14,5 +14,11 @@ ENV AGENT_HOME=/data
 # First run (interactive consent + setup):
 #   docker run -it -v agentic-trader-data:/data agentic-trader python agent.py setup
 # Then the heartbeat:
-#   docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trader
+#   docker run -d --name agentic-trader --restart on-failure -v agentic-trader-data:/data agentic-trader
+#
+# --restart on-failure, NOT unless-stopped/always: the agent exits with code 0
+# when the owner stops it (dashboard Stop, `agent.py stop`) and non-zero when
+# it crashes. on-failure restarts crashes and leaves a deliberate stop
+# stopped; unless-stopped/always would start it trading again seconds after
+# the owner pressed Stop. Start it again with: docker start agentic-trader
 CMD ["python", "agent.py", "run"]

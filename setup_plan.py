@@ -13,6 +13,9 @@ Deliberately impossible from a plan (each needs the human, in the wizard or
 dashboard):
   - accepting DISCLAIMER.md (the plan refuses to run until it is accepted)
   - going live: dry_run can only be turned OFF by the owner (`dry off`)
+  - making an agent that is ALREADY live bigger or pointing it at another
+    broker account: the owner switches to dry-run first (`dry on`), the plan
+    is applied, and the owner goes live again (`dry off`) after checking it
   - turning on self-edit
   - logging in to Robinhood (OAuth in the owner's browser)
   - paying for the feed (the owner pays the invoice from their own wallet)
@@ -43,7 +46,7 @@ EXAMPLE_PLAN = {
 
 _FORBIDDEN = {
     "dry_run": "going live is the owner's own decision — they say `dry off` "
-               "in the dashboard when ready (plans always keep dry-run ON)",
+               "in the dashboard when ready (a plan never changes the mode)",
     "self_edit_enabled": "self-edit can only be turned on by the owner "
                          "(`self-edit on` in the dashboard)",
     "consent": "the owner accepts DISCLAIMER.md themselves in the wizard",
@@ -79,6 +82,59 @@ def _find_forbidden(obj, path=""):
     return out
 
 
+_SIZE_KEY = {"contracts": "contracts_per_trade",
+             "budget": "budget_per_trade_usd",
+             "percent": "percent_per_trade"}
+# what the agent uses when a cap was never set (agent.py)
+_CAP_DEFAULT = {"max_entries_per_day": 5, "max_open_positions": 10,
+                "max_contracts_per_trade": 100}
+
+
+def _num(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _size_words(cfg):
+    mode = str(cfg.get("sizing_mode") or "contracts")
+    if mode == "budget":
+        return f"${_num(cfg.get('budget_per_trade_usd')):,.0f} per trade"
+    if mode == "percent":
+        return f"{_num(cfg.get('percent_per_trade')):g}% of the account per trade"
+    return f"{int(_num(cfg.get('contracts_per_trade'), 1) or 1)} contract(s) per trade"
+
+
+def _live_increases(cfg, new, broker_changed):
+    """What applying `new` over `cfg` would make bigger or more live. Only
+    asked for an agent that is already placing real orders."""
+    out = []
+    if broker_changed:
+        out.append("switch the broker account its real orders go to")
+    old_mode = str(cfg.get("sizing_mode") or "contracts")
+    new_mode = str(new.get("sizing_mode") or "contracts")
+    if old_mode != new_mode:
+        grew = True   # different units can't be compared: the owner decides
+    else:
+        key = _SIZE_KEY.get(new_mode)
+        floor = 1.0 if new_mode == "contracts" else 0.0
+        grew = key is not None and ((_num(new.get(key), floor) or floor)
+                                    > (_num(cfg.get(key), floor) or floor))
+    if grew:
+        out.append(f"change the trade size from {_size_words(cfg)} to "
+                   f"{_size_words(new)}")
+    for cap, default in _CAP_DEFAULT.items():
+        was, now = _num(cfg.get(cap, default), default), _num(new.get(cap, default), default)
+        if now > was:
+            out.append(f"raise {cap} from {was:g} to {now:g}")
+    was, now = _num(cfg.get("max_daily_loss_usd")), _num(new.get("max_daily_loss_usd"))
+    if was > 0 and (now <= 0 or now > was):
+        out.append("loosen max_daily_loss_usd from "
+                   f"${was:,.0f} to " + (f"${now:,.0f}" if now > 0 else "no limit"))
+    return out
+
+
 def apply(plan, cfg, consent_ok, home):
     """Validate + apply. Returns (new_cfg or None, report). `report` =
     {"ok", "applied": [...], "errors": [...], "owner_steps": [...]}."""
@@ -102,6 +158,10 @@ def apply(plan, cfg, consent_ok, home):
 
     new = dict(cfg)
     applied = report["applied"]
+    # LIVE = the owner turned dry-run off; the agent places real orders and
+    # reads its settings again on every loop, so a plan takes effect at once
+    was_live = "dry_run" in cfg and not cfg.get("dry_run")
+    broker_changed = False
 
     # ── source ──
     src = plan.get("source")
@@ -162,6 +222,7 @@ def apply(plan, cfg, consent_ok, home):
 
     # ── broker ──
     br = plan.get("broker")
+    before_broker = dict(new)
     if br is not None:
         from brokers import BROKERS
         kind = (br or {}).get("type")
@@ -180,6 +241,8 @@ def apply(plan, cfg, consent_ok, home):
         else:
             errors.append("broker.type must be robinhood, " + ", ".join(
                 k for k in BROKERS if k != "robinhood"))
+
+    broker_changed = new != before_broker
 
     # ── sizing (the owner's own choice) ──
     sz = plan.get("sizing")
@@ -269,13 +332,30 @@ def apply(plan, cfg, consent_ok, home):
             errors.append("policy needs a connected AI to check it (add an "
                           "\"ai\" section) — without one every entry is skipped")
 
+    if was_live and not errors:
+        bigger = _live_increases(cfg, new, broker_changed)
+        if bigger:
+            errors.append(
+                "this agent is LIVE (it places real orders), and this plan "
+                "would " + "; ".join(bigger) + ". A plan can never do that "
+                "to a live agent. The OWNER first switches it to dry-run "
+                "themselves (`dry on` in the dashboard — while dry-run is on "
+                "the agent places no orders at all, not even exits for "
+                "positions it holds), then the plan can be applied, and it "
+                "stays in dry-run until the owner has checked the new "
+                "settings and says `dry off`")
+
     if errors:
         report["applied"] = []
         return None, report
 
-    # Plans never go live: dry-run stays ON unless the owner already chose LIVE.
+    # A plan never changes the mode: a new install starts in dry-run, and an
+    # install the owner already took LIVE stays live (it can only be made
+    # smaller, see _live_increases).
     if "dry_run" not in new:
         new["dry_run"] = True
+    report["mode"] = "DRY-RUN" if new.get("dry_run") else "LIVE"
+    report["sizing"] = _size_words(new)
     new.setdefault("max_event_age_s", 300)
     new.setdefault("max_entries_per_day", 5)
     new.setdefault("poll_seconds", 30)

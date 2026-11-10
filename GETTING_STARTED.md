@@ -153,8 +153,23 @@ DigitalOcean's browser **Web Console** also works.
 ```bash
 docker build -t agentic-trader .
 docker run -it -v agentic-trader-data:/data agentic-trader python agent.py setup
-docker run -d --restart unless-stopped -v agentic-trader-data:/data agentic-trader
+docker run -d --name agentic-trader --restart on-failure -v agentic-trader-data:/data agentic-trader
 ```
+
+- **Stopping:** press Stop in the dashboard, or run
+  `docker exec agentic-trader python agent.py stop`. It stays stopped until
+  you run `docker start agentic-trader`.
+- **Crashes:** `--restart on-failure` makes Docker start the agent again if
+  it crashes. Do **not** use `--restart unless-stopped` or `always` here:
+  with those, Docker starts the agent again a few seconds after you press
+  Stop, and it goes back to trading.
+- **After the server or Docker itself restarts,** check that the agent came
+  back: `docker ps`. If it is not listed, start it with
+  `docker start agentic-trader` (Docker does not promise to restart
+  `on-failure` containers after its own restart).
+- **Already running a container started with `--restart unless-stopped`?**
+  Switch it without recreating it:
+  `docker update --restart on-failure <container name or id>`.
 
 ## The safety rails are on by default
 

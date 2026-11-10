@@ -67,7 +67,13 @@ and apply them in one step. Order:
 4. **Apply**: `python agent.py setup --from plan.json --json`.
    All-or-nothing — nothing is saved unless every part passes, including a
    real test call to the AI model and the broker's own key check. Then
-   **delete the plan file** (it holds keys).
+   **delete the plan file** (it holds keys). The report's `mode` and
+   `sizing` say what the agent is set to now. If the agent is already
+   **LIVE**, a plan may only leave trading as it is or make it smaller: it
+   is refused if it would change the broker account, raise the per-trade
+   size or raise a safety cap. For those, the human first says `dry on` in
+   the dashboard, you apply the plan, and they say `dry off` once they have
+   checked the new settings.
 5. **Hand the `owner_steps` to the human.** Plans can never do these; the
    human does them in the wizard: log in to Robinhood (if chosen), buy and
    pay for AgentHC signal days from their own wallet (if the AgentHC feed),

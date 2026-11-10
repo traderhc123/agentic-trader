@@ -8,8 +8,17 @@ venvs use `.venv\\Scripts`).
 import os
 import subprocess
 import sys
+import threading
 
 IS_WINDOWS = os.name == "nt"
+
+# Held by the agent from the moment it starts handling a signal until the
+# order it sent to the broker is saved in its ledger (agent.handle_event).
+# restart_self takes it before replacing the process, so an update or
+# self-edit restart can never cut an order off between "placed at the broker"
+# and "saved" — the agent would forget the position, or buy it twice.
+ORDER_LOCK = threading.RLock()
+ORDER_WAIT_SECONDS = 120   # a broker call takes 5-20 s; this is stuck
 
 # Set by keep_running's supervisor on the agent it runs. A supervised agent
 # that needs a restart exits with RESTART_EXIT and the supervisor re-runs it,
@@ -127,17 +136,32 @@ def restart_self(argv, port):
     Windows: there is no real exec, so spawn a successor that waits for our
     port to free, then hard-exit. An interactive console gets a fresh window
     (our console returns to its prompt when we exit); a detached/logging
-    process hands its inherited stdout/stderr to the successor."""
-    if not IS_WINDOWS:
-        os.execv(sys.executable, [sys.executable, *argv])
-        return  # pragma: no cover — execv does not return
-    if os.environ.get(SUPERVISED_ENV):
-        os._exit(RESTART_EXIT)  # the supervisor runs us again
-        return  # pragma: no cover — _exit does not return
-    interactive = False
+    process hands its inherited stdout/stderr to the successor.
+
+    Never restarts while an order is in flight: waits up to
+    ORDER_WAIT_SECONDS for ORDER_LOCK and, if the order still isn't finished,
+    returns False WITHOUT restarting (the caller tells the owner)."""
+    if not ORDER_LOCK.acquire(timeout=ORDER_WAIT_SECONDS):
+        print("Not restarting: an order was still being placed after "
+              f"{int(ORDER_WAIT_SECONDS)} seconds, and restarting now could "
+              "lose track of it. The agent keeps running as it was. Restart "
+              "it yourself once the order shows in the dashboard: "
+              "python agent.py stop, then python agent.py start")
+        return False
     try:
-        interactive = sys.stdout is not None and sys.stdout.isatty()
-    except Exception:
-        pass
-    spawn_after_port_free(argv[0], argv[1:], port, new_console=interactive)
-    os._exit(0)
+        # held until the process is replaced, so no new order can start
+        if not IS_WINDOWS:
+            os.execv(sys.executable, [sys.executable, *argv])
+            return  # pragma: no cover — execv does not return
+        if os.environ.get(SUPERVISED_ENV):
+            os._exit(RESTART_EXIT)  # the supervisor runs us again
+            return  # pragma: no cover — _exit does not return
+        interactive = False
+        try:
+            interactive = sys.stdout is not None and sys.stdout.isatty()
+        except Exception:
+            pass
+        spawn_after_port_free(argv[0], argv[1:], port, new_console=interactive)
+        os._exit(0)
+    finally:
+        ORDER_LOCK.release()

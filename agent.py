@@ -1752,6 +1752,21 @@ def _note_stale_exit(state, event_id):
     state["stale_exits"] = (ids + [str(event_id)])[-_STALE_EXITS_KEPT:]
 
 
+def _order_in_flight(fn):
+    """Hold platform_compat.ORDER_LOCK while `fn` runs, so a restart (update,
+    self-edit, import) waits until an order that was sent to the broker is
+    also saved in the ledger."""
+    import functools
+
+    @functools.wraps(fn)
+    def held(*args, **kwargs):
+        import platform_compat
+        with platform_compat.ORDER_LOCK:
+            return fn(*args, **kwargs)
+    return held
+
+
+@_order_in_flight
 def handle_event(ev, cfg, state, broker, client, save_state):
     """Run one new event through the safety pipeline. Returns a log line or None."""
     contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
@@ -3707,6 +3722,9 @@ def cmd_run(app_window=False):
         print("Stop it with: python agent.py stop")
         sys.exit(0)
     keep_running.clear_stop()
+    # Not "running" yet: the checks below can still fail. The first loop's
+    # touch_alive() is what tells `start`/`status` that it really started.
+    keep_running.clear_alive()
     import transfer
     moved = transfer.moved_away()
     if moved:
@@ -4057,8 +4075,19 @@ def cmd_netcheck():
 def cmd_status():
     import keep_running
     pid = keep_running.running_pid()
-    print(f"agent running    : " + (f"yes (pid {pid})" if pid else
-          "yes" if keep_running.is_running() else "no"))
+    if keep_running.is_ready():
+        running = f"yes (pid {pid})" if pid else "yes"
+    elif keep_running.is_running():
+        running = "starting — not trading yet (still in its startup checks)"
+    elif keep_running.supervisor_running():
+        why = keep_running.start_failure()
+        running = ("NO — it stopped with an error and will be started again "
+                   "automatically (cancel: python agent.py stop)"
+                   + (f"\n                   what it said: "
+                      + why.replace("\n", " / ") if why else ""))
+    else:
+        running = "no"
+    print(f"agent running    : {running}")
     auto = keep_running.autostart_status()
     print(f"start at login   : {'on' if auto['enabled'] else 'off'}"
           + (f" ({auto['path']})" if auto["enabled"] else ""))
@@ -4396,6 +4425,7 @@ def cmd_setup_from(path, as_json=False):
         new, report = setup_plan.apply(plan, cfg, consent_ok(), HOME)
     if new is not None:
         _save(CONFIG_PATH, new, private=True)
+        report["sizing"] = _sizing_desc(new)  # incl. the other-trades book
         checks, _ = doctor_checks()
         report["owner_steps"] = [c["fix"] for c in checks
                                  if not c["ok"] and c["who"] == "owner"]
@@ -4405,9 +4435,17 @@ def cmd_setup_from(path, as_json=False):
         print(json.dumps(report, indent=2))
     else:
         if report["ok"]:
-            print("Plan applied (dry-run stays ON):")
+            print("Plan applied:")
             for a in report["applied"]:
                 print(f"  ✓ {a}")
+            if report.get("mode") == "LIVE":
+                print("\nMode: LIVE — this agent places REAL orders. It was "
+                      "already live before the plan; the plan did not change "
+                      "that.")
+            else:
+                print("\nMode: DRY-RUN — no real orders. Only the owner can "
+                      "go live (`dry off` in the dashboard).")
+            print(f"Trade size now: {report.get('sizing', '?')}")
             if report["owner_steps"]:
                 print("\nStill needs the OWNER:")
                 for s_ in report["owner_steps"]:
@@ -4469,7 +4507,7 @@ def cmd_start(open_dashboard=False, app_window=False):
     it, and it restarts itself after a crash."""
     import keep_running
     import webui
-    if keep_running.is_running():
+    if keep_running.is_ready():
         print("The agent is already running.")
         print(f"Dashboard: {_dashboard_link()}")
         if open_dashboard:
@@ -4484,9 +4522,19 @@ def cmd_start(open_dashboard=False, app_window=False):
               "To run it here again (stop the other one first): "
               "python agent.py resume-here")
         sys.exit(1)
-    proc = keep_running.start_background(port=webui.APP_PORT)
-    print("Starting the agent in the background…")
-    if keep_running.wait_until_running(timeout=40, proc=proc):
+    before = keep_running.supervisor_status()
+    proc = None
+    if keep_running.is_running():
+        # holds the one-copy lock but isn't up yet: a copy is starting now
+        print("The agent is already starting — waiting for it…")
+    else:
+        if keep_running.supervisor_running():
+            print("An earlier start failed and the agent was waiting to try "
+                  "again — trying again now…")
+        # a waiting supervisor is asked to retry now (never a second one)
+        proc = keep_running.start_background(port=webui.APP_PORT)
+        print("Starting the agent in the background…")
+    if keep_running.wait_until_running(timeout=40, proc=proc, before=before):
         print("Running. You can close this window — the agent keeps going.")
         print(f"Dashboard: {_dashboard_link()}")
         if open_dashboard:
@@ -4496,10 +4544,33 @@ def cmd_start(open_dashboard=False, app_window=False):
         if not keep_running.autostart_enabled():
             print("Start it automatically at login: python agent.py autostart on")
         return
-    print("It didn't start. Last lines of the log "
-          f"({keep_running.log_path()}):")
-    for line in keep_running.last_log_lines():
-        print("  " + line)
+    why = keep_running.start_failure(before)
+    if why is None and (keep_running.is_running()
+                        or keep_running.supervisor_running()):
+        # no failure, just slow (e.g. the broker is slow to answer)
+        print("It is still starting — it is NOT trading yet. Check in a "
+              "minute:  python agent.py status")
+        print(f"Log:       {keep_running.log_path()}")
+        print("Stop:      python agent.py stop")
+        return
+    print("It did NOT start — the agent is not running.")
+    if why:
+        print("What it said:")
+        for line in why.splitlines():
+            print("  " + line)
+    else:
+        print(f"Last lines of the log ({keep_running.log_path()}):")
+        for line in keep_running.last_log_lines():
+            print("  " + line)
+    if keep_running.is_running() or keep_running.supervisor_running():
+        # don't leave it retrying behind the owner's back with a problem
+        # they have just been told to fix
+        if not keep_running.stop(out=lambda *_: None):
+            print("It is still retrying in the background and could not be "
+                  "stopped — run: python agent.py stop")
+            sys.exit(1)
+    print("Nothing is left running in the background. Fix the problem above, "
+          "then run: python agent.py start")
     sys.exit(1)
 
 
@@ -4582,7 +4653,11 @@ def cmd_supervise():
     on_first = None
     if keep_running.AT_LOGIN_FLAG in sys.argv and _open_at_login_wanted():
         on_first = _open_dashboard_when_ready
-    sys.exit(keep_running.supervise(port=port, on_first_start=on_first))
+
+    def tell_owner(text):  # the agent keeps failing to start / keeps crashing
+        notify(_load(CONFIG_PATH, {}) or {}, text, priority="high")
+    sys.exit(keep_running.supervise(port=port, on_first_start=on_first,
+                                    notify=tell_owner))
 
 
 def _open_at_login_wanted(cfg=None):
