@@ -2146,7 +2146,7 @@ function spark(points){
     '<path d="'+d+'" fill="none" stroke="'+col+'" stroke-width="1.75" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>';
   wrap.style.display='';
 }
-function setMode(kind,live,paused,note){
+function setMode(kind,live,paused,note,pauseNote,restarting){
   // kind: 'ok' | 'off' | 'unreachable'
   // #modebar is a live region polled every 5s: only touch the DOM when the
   // text actually changes, or screen readers re-announce it on every poll.
@@ -2159,7 +2159,9 @@ function setMode(kind,live,paused,note){
     note?'<b>Dry-run.</b> '+esc(note):
     '<b>Dry-run.</b> The agent logs every decision but places no orders.')+
     (paused?' <b class="pz">Paused</b> — no new entries. Exit signals and the expiry guard keep'+
-      ' running for positions you already have. Stays paused, also after a restart, until you press Resume.':''));
+      ' running for positions you already have. Stays paused, also after a restart, until you press Resume.'+
+      (pauseNote?' '+esc(pauseNote):''):'')+
+    (restarting?' <b class="pz">Restarting</b> — the agent reads no signals and places no orders until it is back (a few seconds).':''));
   const st=live?'Switch to dry-run any time to stop new trades (positions already open are still sold on their exit signal) — your decision, not advice.':
     'Going live sends real orders with real money — your decision, not advice.';
   if(sub.textContent!==st)sub.textContent=st;
@@ -2188,7 +2190,7 @@ async function refresh(){
     mk.innerHTML=open?'<span class="dot"></span>Market open':'Market closed';
     mk.className='pill'+(open?' open':'');mk.style.display='';
     $('b-paused').style.display=s.paused?'':'none';
-    setMode('ok',live,!!s.paused,note);
+    setMode('ok',live,!!s.paused,note,s.pause_note||'',!!s.restarting);
     const qp=$('q-pause');
     qp.innerHTML=s.paused?ICON('play')+'Resume':ICON('pause')+'Pause';
     qp.dataset.cmd=s.paused?'resume':'pause';qp.className=s.paused?'btn-primary':'';
@@ -2837,7 +2839,6 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     from brokers.robinhood import RobinhoodMCP, _token_path, content_json
     from lightning_wallet import LNbitsWallet, WalletError
 
-    cfg = A._load(A.CONFIG_PATH, {}) or {}
     pending = {"oauth": None, "broker_last4": "", "rh_warning": "",
                "finished": threading.Event()}
 
@@ -2848,11 +2849,55 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     # the file as it is at that moment, under the lock the commands use.
     # (Saving the whole copy undid the owner's commands: a settings save
     # after "dry on" put the agent back in LIVE mode.)
+    # What a request changed in the copy and did not save is taken out again
+    # when that request ends, so a rejected form (a broker whose keys were
+    # refused, a feed address that was not accepted) can never ride along
+    # with the next save — not even one made by a request that was running
+    # at the same time.
     import copy
-    synced = {"cfg": copy.deepcopy(cfg)}  # config.json as of the last sync
-    flight = {"n": 0}                     # requests being handled right now
-    flight_lock = threading.Lock()
+    touched = {}  # request thread -> the keys it has changed in the copy
     _gone = object()
+
+    class _WorkingCopy(dict):
+        """A dict that notes which request changed which key."""
+
+        def _note(self, *keys):
+            mine = touched.get(threading.get_ident())
+            if mine is not None:
+                mine.update(keys)
+
+        def __setitem__(self, k, v):
+            self._note(k)
+            dict.__setitem__(self, k, v)
+
+        def __delitem__(self, k):
+            self._note(k)
+            dict.__delitem__(self, k)
+
+        def pop(self, k, *default):
+            self._note(k)
+            return dict.pop(self, k, *default)
+
+        def setdefault(self, k, default=None):
+            self._note(k)
+            return dict.setdefault(self, k, default)
+
+        def update(self, *a, **kw):
+            new = dict(*a, **kw)
+            self._note(*new)
+            dict.update(self, new)
+
+        def __ior__(self, other):
+            self.update(other)
+            return self
+
+        def clear(self):
+            self._note(*self)
+            dict.clear(self)
+
+    on_file = A._load(A.CONFIG_PATH, {})
+    cfg = _WorkingCopy(on_file if isinstance(on_file, dict) else {})
+    synced = {"cfg": copy.deepcopy(dict(cfg))}  # config.json as of the last sync
 
     def _own_changes():
         """What this server changed in its copy and hasn't saved yet:
@@ -2862,11 +2907,18 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                    if k not in base or base[k] != v}
         return changed, [k for k in list(base) if k not in cfg]
 
+    def _put(k, src):
+        """cfg[k] = what `src` has for it (no note: not a request's change)."""
+        if k in src:
+            dict.__setitem__(cfg, k, copy.deepcopy(src[k]))
+        else:
+            dict.pop(cfg, k, None)
+
     def _pull(disk, keep_own=True):
         """Bring `cfg` up to date with config.json (`disk`), one key at a
         time so another request never sees it empty. keep_own: leave this
         server's unsaved changes in place (a request is still working on
-        them); False drops them (leftovers of a request that failed)."""
+        them); False drops them all (a whole new config was imported)."""
         base = synced["cfg"]
         if keep_own:
             changed, removed = _own_changes()
@@ -2877,38 +2929,80 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             keys = [k for k in set(cfg) | set(disk)
                     if cfg.get(k, _gone) != disk.get(k, _gone)]
         for k in keys:
-            if k in disk:
-                cfg[k] = copy.deepcopy(disk[k])
-            else:
-                cfg.pop(k, None)
+            _put(k, disk)
         synced["cfg"] = copy.deepcopy(disk)
 
+    def _drop_unsaved(mine):
+        """A request is over: what it changed in the copy and did not save
+        goes back to what is on file. Keys another request is still working
+        on are left to that request; with no other request running, nothing
+        unsaved stays at all."""
+        base = synced["cfg"]
+        if touched:
+            busy = set().union(*touched.values())
+            keys = [k for k in mine if k not in busy]
+        else:
+            changed, removed = _own_changes()
+            keys = list(changed) + removed
+        for k in keys:
+            if cfg.get(k, _gone) != base.get(k, _gone):
+                _put(k, base)
+
+    def _setup_restart_from():
+        """Setup wizard only, with no agent running on this computer: the
+        settings to start again from when config.json can't be read (a
+        typo) — the ones this wizard last read. The damaged file is kept
+        next to the new one. A running agent never does this (None): its
+        settings pages refuse to save until the file is fixed."""
+        if get_status is not None:
+            return None
+        try:
+            import keep_running
+            if keep_running.is_running():
+                return None
+        except Exception:
+            return None
+        return copy.deepcopy(synced["cfg"])
+
     def save():
+        """Write what THIS request changed in the copy onto config.json as
+        it is now. Another request's unfinished changes are not written."""
+        mine = touched.get(threading.get_ident())
+
         def own_keys_only(disk):
             changed, removed = _own_changes()
             for k in removed:
-                disk.pop(k, None)
-            disk.update(copy.deepcopy(changed))
+                if mine is None or k in mine:
+                    disk.pop(k, None)
+            disk.update(copy.deepcopy({k: v for k, v in changed.items()
+                                       if mine is None or k in mine}))
         with A.CONFIG_LOCK:
-            _pull(A.update_config(own_keys_only))
+            _pull(A.update_config(own_keys_only, if_damaged=_setup_restart_from))
 
-    def _fresh(fn):
-        """A route that starts from the settings as they are on disk now."""
+    def _fresh(fn, plain_errors=True):
+        """A route that starts from the settings as they are on disk now,
+        and leaves nothing unsaved behind in the copy when it ends."""
         def run(*args):
-            with flight_lock:
-                alone = flight["n"] == 0
-                flight["n"] += 1
-            try:
-                try:
-                    with A.CONFIG_LOCK:
-                        _pull(A._read_config(), keep_own=not alone)
-                except OSError:
-                    pass  # unreadable right now: answer from the copy; a
-                    # save in this request fails rather than guess
+            me = threading.get_ident()
+            if me in touched:  # already inside a request on this thread
                 return fn(*args)
+            with A.CONFIG_LOCK:
+                touched[me] = set()
+                try:
+                    _pull(A._read_config())
+                except OSError:
+                    pass  # unreadable right now (locked, or a typo): answer
+                    # from the copy; a save in this request is refused
+            try:
+                return fn(*args)
+            except A.ConfigUnreadable as exc:
+                if not plain_errors:
+                    raise
+                # a save was refused: say why, in full (nothing was changed)
+                return {"ok": False, "error": str(exc)}
             finally:
-                with flight_lock:
-                    flight["n"] -= 1
+                with A.CONFIG_LOCK:
+                    _drop_unsaved(touched.pop(me, set()))
         return run
 
     class W(_Handler):
@@ -3435,7 +3529,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"ok": False, "error": f"shadow book: {err}"}
         for k in [k for k in list(cfg) if k not in new]:
             cfg.pop(k, None)  # (never clear(): another request may be reading)
-        cfg.update(new)
+        cfg.update({k: v for k, v in new.items()
+                    if k not in cfg or cfg[k] != v})  # only what sizing changed
         save()
         return {"ok": True}
 
@@ -3613,8 +3708,14 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         except Exception as exc:
             return {"ok": False, "error": f"import failed: {str(exc)[:150]}"}
         # the wizard keeps a copy of the config: reload it from the imported file
-        with A.CONFIG_LOCK:
-            _pull(A._read_config(), keep_own=False)
+        try:
+            with A.CONFIG_LOCK:
+                _pull(A._read_config(), keep_own=False)
+        except OSError:
+            # The file is busy this instant (antivirus, a sync program).
+            # Never stop here: the import is done and the agent is on hold
+            # until it restarts. The copy is refreshed by the next request.
+            pass
         if running_here:
             import sys as _sys
 
@@ -3623,8 +3724,14 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 _t.sleep(1.5)  # let this response reach the browser
                 os.environ["AGENT_UPDATE_RESTARTED"] = "1"
                 import platform_compat
-                platform_compat.restart_self(list(_sys.argv), APP_PORT)
-            threading.Thread(target=_restart, daemon=True).start()
+                try:
+                    platform_compat.restart_self(list(_sys.argv), APP_PORT)
+                except Exception as exc:
+                    _leave_after_import(exc)
+            try:
+                threading.Thread(target=_restart, daemon=True).start()
+            except Exception:
+                _restart()  # no new thread to be had: restart from this one
             info["restarting"] = True
         return {"ok": True, **info}
 
@@ -3789,7 +3896,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             if not self._guard(check_origin=False):
                 return
             try:
-                rh_callback(self)
+                _fresh(rh_callback, plain_errors=False)(self)
             except _Redirect:
                 pass
             except Exception as exc:
@@ -4004,6 +4111,26 @@ def pull_code_updates(expect=None):
         return True, f"updated to {upstream}"
     except Exception as exc:
         return False, str(exc)[:200]
+
+
+def _leave_after_import(exc):
+    """The moved setup is on disk but the restart onto it failed. This
+    process still has the OLD setup in memory and is on hold (no signals,
+    no orders, for good): it must neither carry on like that nor save its
+    memory over the imported files. Leaving is the only safe way out — the
+    background supervisor starts the agent again on the imported setup;
+    without one the owner starts it."""
+    import os
+    import platform_compat
+    try:
+        print("The move file was imported, but the agent could not restart "
+              f"by itself ({str(exc)[:120]}). It is stopping now so it can't "
+              "keep running on the old setup. If it does not come back by "
+              "itself within a minute, start it again: python agent.py start",
+              flush=True)
+    except Exception:
+        pass
+    os._exit(platform_compat.RESTART_EXIT)
 
 
 # ── the dashboard (served BY the running agent) ──────────────────────────────

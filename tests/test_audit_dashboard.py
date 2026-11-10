@@ -157,13 +157,17 @@ def test_w1_command_refuses_to_save_over_settings_it_could_not_read(home, monkey
     assert (home / "config.json").read_text(encoding="utf-8") == before
 
 
-def test_w1_read_config_tells_unreadable_from_empty(home, monkeypatch):
-    assert agent._read_config() == {}                    # no file yet
-    (home / "config.json").write_text("{not json", encoding="utf-8")
-    assert agent._read_config() == {}                    # setup can rewrite it
+def test_w1_read_config_tells_unreadable_and_damaged_from_empty(home, monkeypatch):
+    monkeypatch.setattr(agent.time, "sleep", lambda s: None)
+    assert agent._read_config() == {}                    # no file yet: the only {}
+    for text in ("{not json", '{"dry_run": true,}', "", "[1, 2]", "null"):
+        (home / "config.json").write_text(text, encoding="utf-8")
+        with pytest.raises(agent.ConfigDamaged) as err:  # a typo is not "empty"
+            agent._read_config()
+        assert "Nothing was changed" in str(err.value)
+        assert str(home / "config.json") in str(err.value)
     _write_cfg(home, LIVE)
     assert agent._read_config()["max_entries_per_day"] == 2
-    monkeypatch.setattr(agent.time, "sleep", lambda s: None)
     real_open = open
 
     def flaky(path, *a, **k):
@@ -171,8 +175,213 @@ def test_w1_read_config_tells_unreadable_from_empty(home, monkeypatch):
             raise PermissionError("locked")
         return real_open(path, *a, **k)
     monkeypatch.setattr("builtins.open", flaky)
-    with pytest.raises(OSError):
+    with pytest.raises(OSError) as err:
         agent._read_config()
+    assert not isinstance(err.value, agent.ConfigDamaged)
+    assert "nothing was changed" in str(err.value)
+
+
+WITH_KEYS = {**LIVE, "dry_run": True, "lnbits_url": "https://demo.lnbits.com",
+             "lnbits_admin_key": "adm-k3y-51",
+             "lnbits_wallet_page": "https://demo.lnbits.com/wallet?usr=u-1",
+             "rule_tickers": ["SPY"]}
+
+
+def _hand_edit_with_a_typo(home, cfg):
+    """config.json as an owner leaves it after a manual edit: a trailing
+    comma. Returns the file's text."""
+    text = json.dumps(cfg, indent=2).rstrip().rstrip("}") + ",\n}\n"
+    (home / "config.json").write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError):
+        json.loads(text)
+    return text
+
+
+def test_w1_a_typo_in_config_json_is_never_saved_over(home, app, monkeypatch):
+    """The reviewer's scenario: dry-run owner, agent running, a trailing
+    comma left in config.json. No button or command may then replace the
+    file with its own few keys (which lost the wallet key, the limits and
+    dry-run, so the agent went LIVE on defaults)."""
+    monkeypatch.setattr(agent.time, "sleep", lambda s: None)
+    h = app(WITH_KEYS)                                   # the agent is running
+    broken = _hand_edit_with_a_typo(home, WITH_KEYS)
+
+    r = h.routes_post["/api/wallet/recurring"](None, {"on": True})
+    assert r["ok"] is False and "typo" in r["error"]
+    assert "Nothing was changed" in r["error"]
+    for cmd in ("pause", "resume", "dry off", "set cap 9", "tickers QQQ"):
+        handled, reply = agent._apply_command(cmd)
+        assert handled and "Nothing was changed" in reply and "typo" in reply, cmd
+    assert h.routes_post["/api/safety"](None, {"rule_tickers": "QQQ"})["ok"] is False
+    assert (home / "config.json").read_text(encoding="utf-8") == broken
+    assert not [p.name for p in home.iterdir() if ".damaged" in p.name]
+
+    # the owner fixes the typo: everything is still there, and saves work again
+    _write_cfg(home, WITH_KEYS)
+    assert h.routes_post["/api/wallet/recurring"](None, {"on": True})["ok"]
+    assert agent._apply_command("pause")[0]
+    assert _cfg(home) == {**WITH_KEYS, "day_pass_recurring": True, "paused": True}
+
+
+def test_w1_a_refused_save_leaves_nothing_behind_in_the_settings_pages(
+        home, app, monkeypatch):
+    monkeypatch.setattr(agent.time, "sleep", lambda s: None)
+    h = app(WITH_KEYS)
+    _hand_edit_with_a_typo(home, WITH_KEYS)
+    assert not h.routes_post["/api/wallet/recurring"](None, {"on": True})["ok"]
+    _write_cfg(home, WITH_KEYS)                          # fixed
+    assert h.routes_get["/api/state"](None)["recurring"] is False
+    assert h.routes_post["/api/source/scope"](None, {"scope": "all"})["ok"]
+    assert "day_pass_recurring" not in _cfg(home)        # the refused change is gone
+
+
+def test_w1_setup_wizard_may_start_over_a_damaged_config_and_keeps_a_copy(
+        home, app, monkeypatch, capsys):
+    """Only the setup wizard, with no agent running, writes a new file —
+    from the settings it last read — and the damaged one is kept."""
+    import keep_running
+    monkeypatch.setattr(agent.time, "sleep", lambda s: None)
+    monkeypatch.setattr(keep_running, "is_running", lambda: False)
+    h = app(WITH_KEYS, running=False)
+    broken = _hand_edit_with_a_typo(home, WITH_KEYS)
+
+    assert h.routes_post["/api/wallet/recurring"](None, {"on": True})["ok"]
+
+    assert _cfg(home) == {**WITH_KEYS, "day_pass_recurring": True}
+    kept = [p for p in home.iterdir() if p.name.startswith("config.json.damaged-")]
+    assert len(kept) == 1 and kept[0].read_text(encoding="utf-8") == broken
+    assert kept[0].name in capsys.readouterr().out       # the owner is told where
+
+
+def test_w1_setup_wizard_leaves_a_damaged_config_alone_while_an_agent_runs(
+        home, app, monkeypatch):
+    import keep_running
+    monkeypatch.setattr(agent.time, "sleep", lambda s: None)
+    monkeypatch.setattr(keep_running, "is_running", lambda: True)
+    h = app(WITH_KEYS, running=False)
+    broken = _hand_edit_with_a_typo(home, WITH_KEYS)
+    assert h.routes_post["/api/wallet/recurring"](None, {"on": True})["ok"] is False
+    assert (home / "config.json").read_text(encoding="utf-8") == broken
+
+
+def test_w1_main_loop_keeps_its_settings_when_config_json_has_a_typo(home):
+    """What the reply promises: the agent keeps running on the last settings
+    it could read (the loop's own re-read, unchanged from before)."""
+    _hand_edit_with_a_typo(home, WITH_KEYS)
+    running_on = dict(WITH_KEYS)
+    assert (agent._load(agent.CONFIG_PATH, running_on) or running_on) is running_on
+
+
+def test_w1_stop_works_even_when_settings_cannot_be_read(home, monkeypatch):
+    monkeypatch.setitem(webui.CONTROLS, "stop", False)
+
+    def locked(*a, **k):
+        raise PermissionError("file is locked by another program")
+    monkeypatch.setattr(agent, "_read_config", locked)
+    handled, reply = agent._apply_command("stop")
+    assert handled and reply.startswith("Stopping")
+    assert webui.CONTROLS["stop"] is True
+    # and a command that does need the settings says how to stop
+    assert "type: stop" in agent._apply_command("pause")[1]
+
+
+def _in_thread(fn):
+    """Run fn() in a thread; returns (thread, result box)."""
+    import threading
+    box = {}
+
+    def run():
+        try:
+            box["result"] = fn()
+        except Exception as exc:  # surfaced by the test
+            box["error"] = exc
+    t = threading.Thread(target=run)
+    t.start()
+    return t, box
+
+
+def test_w1_a_failed_request_cannot_ride_along_with_a_request_still_running(
+        home, app, monkeypatch):
+    """The reviewer's scenario: a slow pass-status poll is in flight; a bad
+    feed address is rejected after "url" was already put in the copy; the
+    poll's own save must not write it."""
+    import threading
+    from sources import agenthc_day_trade_ideas as hc
+    monkeypatch.setattr(agent, "consent_ok", lambda: True)
+    h = app({**LIVE, "feed_pass_pending": {"token": "tok-1", "days": 5,
+                                           "bought_at": 0}})
+    asked, answer = threading.Event(), threading.Event()
+
+    def slow_status(token):
+        asked.set()
+        assert answer.wait(30)
+        return {"status": "active", "days_left": 5, "access_until": "2026-12-01"}
+    monkeypatch.setattr(hc, "pass_status", slow_status)
+    poll, box = _in_thread(lambda: h.routes_get["/api/pass/status"](None))
+    assert asked.wait(30)
+
+    assert not h.routes_post["/api/source"](
+        None, {"source": "url", "source_url": "ftp://nope"})["ok"]
+    answer.set()
+    poll.join(30)
+
+    assert box.get("result", {}).get("status") == "active", box
+    saved = _cfg(home)
+    assert saved["feed_pass"]["token"] == "tok-1"        # the poll's own change
+    assert saved["source"] == "agenthc"                  # not the rejected one
+    assert h.routes_post["/api/wallet/recurring"](None, {"on": True})["ok"]
+    assert _cfg(home)["source"] == "agenthc"
+
+
+def test_w1_a_save_never_writes_what_another_request_is_still_working_on(
+        home, app, monkeypatch):
+    """A broker connect puts the new broker and keys in the copy, then
+    checks them with the broker (seconds). A save by another request in
+    that time must not write them — the check may still fail."""
+    import threading
+    import brokers
+    monkeypatch.setattr(agent, "consent_ok", lambda: True)
+    checking, verdict = threading.Event(), threading.Event()
+
+    class SlowBroker:
+        @staticmethod
+        def connect(cfg, values):
+            cfg["broker"] = "slow"
+            cfg["slow_key"] = values.get("key")
+            checking.set()
+            assert verdict.wait(30)
+            return False, "the broker rejected that key"
+    monkeypatch.setitem(brokers.BROKERS, "slow", SlowBroker)
+    h = app(LIVE)
+    conn, box = _in_thread(lambda: h.routes_post["/api/broker/connect"](
+        None, {"broker": "slow", "values": {"key": "bad-key"}}))
+    assert checking.wait(30)
+
+    assert h.routes_post["/api/wallet/recurring"](None, {"on": True})["ok"]
+    mid = _cfg(home)
+    verdict.set()
+    conn.join(30)
+
+    assert box.get("result", {}).get("ok") is False, box
+    for saved in (mid, _cfg(home)):
+        assert saved["broker"] == "stub" and "slow_key" not in saved
+    assert mid["day_pass_recurring"] is True
+    assert h.routes_post["/api/source/scope"](None, {"scope": "all"})["ok"]
+    assert _cfg(home)["broker"] == "stub" and "slow_key" not in _cfg(home)
+    assert h.routes_get["/api/state"](None)["broker"] == "stub"
+
+
+def test_w1_sizing_save_still_saves_and_clears(home, app):
+    """/api/sizing rebuilds its keys from a copy: what it changes and what
+    it removes are both still written."""
+    h = app({**LIVE, "other_sizing_mode": "budget",
+             "other_budget_per_trade_usd": 50.0})
+    assert h.routes_post["/api/sizing"](None, {
+        "main": {"mode": "contracts", "value": "2"}, "other": {"mode": "same"}})["ok"]
+    saved = _cfg(home)
+    assert saved["sizing_mode"] == "contracts" and saved["contracts_per_trade"] == 2
+    assert "other_sizing_mode" not in saved and "other_budget_per_trade_usd" not in saved
+    assert saved["dry_run"] is False and saved["max_entries_per_day"] == 2
 
 
 # ── W2: the Safety form keeps the mode and cap it didn't change ──────────────
@@ -363,6 +572,51 @@ def test_w3_decision_flipped_keeps_the_position_and_tells_the_owner(
     assert "I will NOT sell it" in note
 
 
+def test_w3_startup_line_does_not_promise_no_orders_with_real_positions_open():
+    real = {"positions": {KEY: {"option_id": "opt-1", "qty": 1, "live": True}}}
+    paper = {"positions": {KEY: {"option_id": "dry", "qty": 1, "dry": True}}}
+    assert agent._mode_label({"dry_run": False}, real) == "LIVE"
+    assert agent._mode_label({"dry_run": True}, paper) == "DRY-RUN (no orders)"
+    assert agent._mode_label({"dry_run": True}, {"positions": {}}) == "DRY-RUN (no orders)"
+    label = agent._mode_label({"dry_run": True}, real)
+    assert "no orders" not in label
+    assert label == "DRY-RUN (no new trades; real positions still get sold)"
+
+
+def test_w3_decision_flipped_startup_line_says_no_orders(monkeypatch):
+    monkeypatch.setattr(agent, "_dry_run_keeps_selling_real_positions",
+                        lambda cfg: False)
+    real = {"positions": {KEY: {"option_id": "opt-1", "qty": 1, "live": True}}}
+    assert agent._mode_label({"dry_run": True}, real) == "DRY-RUN (no orders)"
+
+
+def test_w3_moved_setup_copy_says_real_positions_are_still_sold(
+        home, monkeypatch, capsys):
+    """A moved setup starts in dry-run, which does not stop it selling the
+    real positions that came with it: every place that says "starts in
+    dry-run" also says to switch the old computer off first."""
+    import os
+    import keep_running
+    import transfer
+    note = agent.MOVED_POSITIONS_NOTE
+    assert "still sold on their exit signal" in note and "old computer is off" in note
+    move_file = home / "move.bin"
+    move_file.write_bytes(b"x")
+    monkeypatch.setattr(keep_running, "is_running", lambda: False)
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "passphrase")
+    monkeypatch.setattr(transfer, "import_bundle", lambda blob, pw, replace=False: {
+        "files": 3, "from_os": "Windows", "created_at": "2026-11-01", "was_live": True})
+    agent.cmd_import(str(move_file))
+    out = capsys.readouterr().out
+    assert "It starts in DRY-RUN: no new trades." in out and note in out
+    root = os.path.dirname(os.path.abspath(agent.__file__))
+    for rel in (("webui_app", "src", "wizard", "MoveImport.tsx"),
+                ("webui_app", "src", "dash", "MovePanel.tsx"), ("README.md",)):
+        with open(os.path.join(root, *rel), encoding="utf-8") as f:
+            text = " ".join(f.read().split())
+        assert "still sold" in text and "exit signal" in text, rel
+
+
 # ── W4: paused = no new entries; everything else keeps running ──────────────
 
 def test_w4_paused_skips_entries_but_exits_still_sell(home, broker, no_policy):
@@ -395,17 +649,42 @@ def test_w4_pause_is_saved_and_survives_other_saves(home, app):
     assert not agent._paused(_cfg(home))
 
 
-def test_w4_paused_with_nothing_open_does_not_use_up_a_signal_day():
+REAL_ROW = {"option_id": "opt-1", "qty": 1, "live": True}
+PAPER_ROW = {"option_id": "dry", "qty": 1, "dry": True}
+
+
+def test_w4_paused_with_no_real_position_does_not_use_up_a_signal_day():
     paid = {"source": "agenthc", "paused": True}
     assert agent._pause_skips_feed(paid, {"positions": {}})
-    # an open position needs its exit signal: keep reading
+    # a REAL open position needs its exit signal: keep reading
+    assert not agent._pause_skips_feed(paid, {"positions": {KEY: REAL_ROW}})
     assert not agent._pause_skips_feed(paid, {"positions": {KEY: {"qty": 1}}})
+    # a dry-run (paper) position is no reason to spend a signal day
+    assert agent._pause_skips_feed(paid, {"positions": {KEY: PAPER_ROW}})
+    assert not agent._pause_skips_feed(
+        paid, {"positions": {KEY: PAPER_ROW, "QQQ|2026-07-10|500.0|P": REAL_ROW}})
     assert not agent._pause_skips_feed({**paid, "paused": False}, {"positions": {}})
     # feeds that cost nothing per day are always read (entries logged as skipped)
     assert not agent._pause_skips_feed({**paid, "agenthc_api_key": "k"},
                                        {"positions": {}})
     assert not agent._pause_skips_feed({"source": "manual", "paused": True},
                                        {"positions": {}})
+
+
+def test_w4_pause_says_when_a_paused_agent_still_uses_a_signal_day(home):
+    _write_cfg(home, {**LIVE, "source": "agenthc"})
+    reply = agent._apply_command("pause")[1]
+    assert ("While a real position is open the agent still reads the signal "
+            "feed to get its exit signal, which uses a signal day") in reply
+    assert "With no real position open it stops reading the feed" in reply
+    paid = {"source": "agenthc", "paused": True}
+    assert "uses a signal day." in agent._pause_note(paid, {"positions": {KEY: REAL_ROW}})
+    assert "uses no signal day" in agent._pause_note(paid, {"positions": {KEY: PAPER_ROW}})
+    assert agent._pause_note({**paid, "paused": False}, {"positions": {}}) == ""
+    # a feed that costs nothing per day: nothing to say
+    assert agent._pause_note({**paid, "agenthc_api_key": "k"}, {"positions": {}}) == ""
+    _write_cfg(home, {**LIVE, "source": "manual"})
+    assert "signal day" not in agent._apply_command("pause")[1]
 
 
 def _one_loop(home, monkeypatch, cfg, state, events=(), now=None, feed="stub"):
@@ -415,6 +694,7 @@ def _one_loop(home, monkeypatch, cfg, state, events=(), now=None, feed="stub"):
     import brokers
     import keep_running
     calls = []
+    calls_status = _one_loop.status = []    # the dashboard's get_status()
 
     class Broker(StubBroker):
         def client(self, cfg):
@@ -433,7 +713,8 @@ def _one_loop(home, monkeypatch, cfg, state, events=(), now=None, feed="stub"):
             calls.append("poll")
             return list(events)
 
-    def no_dashboard(*a, **k):
+    def no_dashboard(get_status, *a, **k):
+        calls_status.append(get_status)
         raise OSError("no dashboard in tests")
 
     def stop(*a, **k):
@@ -499,6 +780,35 @@ def test_w4_paused_on_the_paid_feed_with_nothing_open_does_not_read_it(
     assert "poll" not in calls and "reconcile" in calls
 
 
+def test_w4_paused_on_the_paid_feed_with_only_a_paper_position_does_not_read_it(
+        home, monkeypatch, no_policy):
+    """The reviewer's scenario: trialling in dry-run, Pause before a week
+    away with one paper position open. No signal day may be used for it."""
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    far = "2099-12-18"
+    state = {"seen": [], "positions": {f"SPY|{far}|752.0|C": dict(PAPER_ROW)}}
+    calls, _b, saved = _one_loop(home, monkeypatch,
+                                 {"paused": True, "dry_run": True, "source": "agenthc"},
+                                 state, feed="agenthc")
+    assert "poll" not in calls and "reconcile" in calls
+    assert f"SPY|{far}|752.0|C" in saved["positions"]      # still listed, on paper
+    status = _one_loop.status[0]()
+    assert status["paused"] is True and "uses no signal day" in status["pause_note"]
+
+
+def test_w4_paused_on_the_paid_feed_with_a_real_position_still_reads_it(
+        home, monkeypatch, no_policy):
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    far = "2099-12-18"
+    key = f"SPY|{far}|752.0|C"
+    state = {"seen": [], "positions": {key: dict(REAL_ROW)}}
+    calls, _b, saved = _one_loop(
+        home, monkeypatch, {"paused": True, "source": "agenthc"}, state,
+        [make_event(event="EXITED", expiry=far, event_id="x-1")], feed="agenthc")
+    assert "poll" in calls and ("order", "EXITED", "SPY") in calls
+    assert saved["positions"] == {}
+
+
 def test_w4_paused_loop_expiry_guard_still_sells(home, monkeypatch, no_policy):
     monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
     now = datetime(2026, 10, 30, 15, 46, tzinfo=agent.MARKET_TZ)
@@ -529,6 +839,115 @@ def test_w4_held_loop_places_no_orders(home, monkeypatch, no_policy):
     calls, _b, saved = _one_loop(home, monkeypatch, {}, state,
                                  [make_event(event="EXITED", event_id="x-1")])
     assert calls == [] and KEY in saved["positions"]
+
+
+def test_w4_status_says_restarting_while_the_restart_hold_is_on(
+        home, monkeypatch, no_policy):
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    _one_loop(home, monkeypatch, {}, {"seen": [], "positions": {}})
+    get_status = _one_loop.status[0]
+    assert get_status()["restarting"] is False
+    webui.hold_orders()
+    assert get_status()["restarting"] is True
+    # both dashboards show it
+    assert "s.restarting" in webui._DASH_HTML and "Restarting" in webui._DASH_HTML
+
+
+def test_w4_status_shows_the_settings_the_agent_runs_on_when_config_has_a_typo(
+        home, monkeypatch, no_policy):
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    _one_loop(home, monkeypatch, {"dry_run": True, "max_entries_per_day": 2},
+              {"seen": [], "positions": {}})
+    get_status = _one_loop.status[0]
+    (home / "config.json").write_text('{"dry_run": true,}', encoding="utf-8")
+    status = get_status()
+    assert status["mode"] == "DRY-RUN"                     # not "LIVE" from {}
+    assert status["fields"]["entries today"].endswith("cap 2")
+
+
+def _import_route(home, app, monkeypatch, restart):
+    """/api/move/import on a running agent, with the bundle itself faked.
+    `restart` stands in for platform_compat.restart_self."""
+    import platform_compat
+    import transfer
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    monkeypatch.setenv("AGENT_UPDATE_RESTARTED", "")     # the route sets it: undo after
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setattr(transfer, "decrypt", lambda blob, pw: b"")
+    monkeypatch.setattr(transfer, "existing_setup", lambda: False)
+    monkeypatch.setattr(transfer, "import_bundle", lambda blob, pw, replace=False: {
+        "files": 3, "from_os": "Windows", "created_at": "2026-11-01", "was_live": True})
+    monkeypatch.setattr(platform_compat, "restart_self", restart)
+    return app(LIVE).routes_post["/api/move/import"]
+
+
+def test_w4_import_restarts_even_if_the_settings_file_is_busy_right_after(
+        home, app, monkeypatch):
+    """The reviewer's scenario: config.json is locked for a moment just
+    after the import (antivirus, a sync program). The agent is on hold
+    with no time limit by then — the restart must still happen."""
+    import threading
+    restarted = threading.Event()
+    route = _import_route(home, app, monkeypatch, lambda argv, port: restarted.set())
+
+    def locked(*a, **k):
+        raise agent.ConfigUnreadable("config.json is locked by another program")
+    monkeypatch.setattr(agent, "_read_config", locked)
+
+    r = route(None, {"data": "", "passphrase": "pw"})
+
+    assert r["ok"] is True and r["restarting"] is True
+    assert webui.orders_held()                           # held until the restart…
+    assert restarted.wait(30)                            # …which does come
+
+
+def test_w4_import_restarts_from_this_thread_when_no_thread_can_be_started(
+        home, app, monkeypatch):
+    done = []
+    route = _import_route(home, app, monkeypatch, lambda argv, port: done.append(port))
+
+    class NoThreads:
+        def __init__(self, *a, **k):
+            raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(webui.threading, "Thread", NoThreads)
+    assert route(None, {"data": "", "passphrase": "pw"})["ok"] is True
+    assert done == [webui.APP_PORT]
+
+
+def test_w4_import_that_cannot_restart_leaves_instead_of_staying_on_hold(
+        home, app, monkeypatch, capsys):
+    """A restart that fails after the files were replaced: the process must
+    not stay alive on hold for good (looking fine, selling nothing), and
+    must not carry on with the old setup in memory. It exits; the
+    supervisor starts it again."""
+    import threading
+    import platform_compat
+    left = threading.Event()
+    codes = []
+
+    def cannot(argv, port):
+        raise OSError("exec failed")
+
+    def fake_exit(code):
+        codes.append(code)
+        left.set()
+    monkeypatch.setattr("os._exit", fake_exit)
+    route = _import_route(home, app, monkeypatch, cannot)
+    assert route(None, {"data": "", "passphrase": "pw"})["ok"] is True
+    assert left.wait(30)
+    assert codes == [platform_compat.RESTART_EXIT]
+    assert "python agent.py start" in capsys.readouterr().out
+
+
+def test_w4_import_that_fails_releases_the_hold(home, app, monkeypatch):
+    import transfer
+    route = _import_route(home, app, monkeypatch, lambda argv, port: None)
+
+    def bad(blob, pw, replace=False):
+        raise transfer.TransferError("that isn't an agentic-trader move file")
+    monkeypatch.setattr(transfer, "import_bundle", bad)
+    r = route(None, {"data": "", "passphrase": "pw"})
+    assert r["ok"] is False and not webui.orders_held()
 
 
 # ── W5: a question is never a command ───────────────────────────────────────
@@ -565,13 +984,73 @@ def test_w5_a_question_changes_nothing_and_goes_to_qa(home, text):
     "set percent two",
     "set other budget 100 200",
     "set other contracts 1.5",
+    # sentences made of short words that are not in any word list
+    "tickers look wrong",
+    "ticker rule help",
+    "tickers got reset",
+    "tickers help",
+    "tickers fine",
+    "tickers ok",
+    "skip tickers like tsla",
+    "tickers spy qqq thanks",
+    "TICKERS LOOK WRONG",               # caps lock: capitals mean nothing
+    "tickers Look Wrong",
+    # a percent sign on a command that is not a percent
+    "set budget 500%",
+    "set cap 3%",
+    "set max loss 5%",
+    "set positions 4%",
+    "set contracts 2%",
+    "set other budget 100%",
+    "set percent $2",
+    "set cap $3",
 ])
 def test_w5_a_sentence_that_is_not_a_whole_command_changes_nothing(home, text):
-    _write_cfg(home, LIVE)
+    _write_cfg(home, {**LIVE, "rule_tickers": ["NVDA"], "rule_skip_tickers": ["GME"]})
     before = (home / "config.json").read_text(encoding="utf-8")
     handled, reply = agent._apply_command(text)
     assert handled and reply.startswith("Nothing was changed.")
     assert (home / "config.json").read_text(encoding="utf-8") == before
+
+
+def test_w5_an_unsure_ticker_list_gets_the_exact_command_to_confirm(home):
+    _write_cfg(home, LIVE)
+    reply = agent._apply_command("tickers look wrong")[1]
+    assert reply.startswith("Nothing was changed. To trade only LOOK and WRONG, "
+                            "type: tickers LOOK WRONG")
+    assert "question mark" in reply
+    reply = agent._apply_command("skip tickers like tsla")[1]
+    assert "To never trade LIKE and TSLA, type: skip tickers LIKE TSLA" in reply
+    # ordinary words are left out of the suggestion
+    reply = agent._apply_command("tickers spy and qqq")[1]
+    assert "To trade only SPY and QQQ, type: tickers SPY QQQ" in reply
+    # typing the suggested command does it
+    assert agent._apply_command("tickers LOOK WRONG")[1].startswith("Ticker list updated.")
+    assert _cfg(home)["rule_tickers"] == ["LOOK", "WRONG"]
+
+
+def test_w5_lower_case_is_a_ticker_only_when_the_agent_knows_it(home):
+    """Known: the common list, the owner's rule lists, open positions and
+    the trade log. Anything else must be typed in CAPITALS (or with $)."""
+    _write_cfg(home, {**LIVE, "rule_skip_tickers": ["ZETA"]})
+    (home / "state.json").write_text(json.dumps({"positions": {
+        "HIMS|2026-07-10|50.0|C": {"option_id": "opt-1", "qty": 1}}}), encoding="utf-8")
+    agent._log_trade({"action": "exit", "contract": "OKLO 2026-07-10 $90 CALL"})
+    assert agent._known_tickers(_cfg(home)) >= {"SPY", "ZETA", "HIMS", "OKLO"}
+    assert agent._apply_command("tickers hims oklo zeta spy")[1].startswith(
+        "Ticker list updated.")
+    assert _cfg(home)["rule_tickers"] == ["HIMS", "OKLO", "ZETA", "SPY"]
+    # an unknown one among them: nothing changes
+    assert agent._apply_command("tickers hims abcd")[1].startswith("Nothing was changed.")
+    assert _cfg(home)["rule_tickers"] == ["HIMS", "OKLO", "ZETA", "SPY"]
+    assert agent._apply_command("tickers hims $abcd")[1].startswith("Ticker list updated.")
+    assert _cfg(home)["rule_tickers"] == ["HIMS", "ABCD"]
+    # an ordinary word stays a word even when a ticker of that name is known
+    agent._apply_command("tickers NOW")
+    assert agent._apply_command("skip tickers now")[1].startswith("Nothing was changed.")
+    # the whole command in capitals: known tickers still work
+    assert agent._apply_command("TICKERS SPY QQQ")[1].startswith("Ticker list updated.")
+    assert _cfg(home)["rule_tickers"] == ["SPY", "QQQ"]
 
 
 @pytest.mark.parametrize("text,key,want", [

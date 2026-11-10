@@ -61,6 +61,10 @@ export interface StatusResp {
   real_positions?: number;
   /** what dry-run does with those positions, in plain words ("" when there are none) */
   dry_run_note?: string;
+  /** while paused on the pay-per-day feed: whether the agent still reads it ("" otherwise) */
+  pause_note?: string;
+  /** an update or a move is about to restart the agent: no signals read, no orders, until it is back */
+  restarting?: boolean;
   fields: Record<string, string>;
   cash_warning?: string;
   expiry_warnings?: ExpiryWarning[];

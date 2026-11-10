@@ -42,7 +42,7 @@ export function MoveImport({ running = false }: { running?: boolean }) {
       if (!r.ok) return setMsg(err(r.error || "Import failed."));
       setMsg(
         ok(
-          "Your setup is here. It starts in dry-run: once the old computer is off, say 'dry off' in the dashboard" +
+          "Your setup is here. It starts in dry-run: no new trades. Real positions you moved over are still sold on their exit signal, so make sure the old computer is off first. Then say 'dry off' in the dashboard" +
             (r.was_live ? " to go live again." : " when you're ready.") +
             (r.restarting ? " Your agent is restarting with it…" : " Opening the last step…"),
         ),

@@ -212,6 +212,8 @@ export function Dashboard() {
   const paused = !!status?.paused;
   // what dry-run does with the real positions that are open now ("" = none open)
   const dryNote = status?.dry_run_note || "";
+  const pauseNote = status?.pause_note || "";
+  const restarting = !!status?.restarting;
   const f = status?.fields || {};
   const rail = conn === "ok" ? (paused ? "paused" : live ? "live" : "dry") : conn === "loading" ? "none" : "off";
 
@@ -315,7 +317,7 @@ export function Dashboard() {
       </ConfirmDialog>
 
       <main className="mx-auto max-w-[1440px] px-6 pb-10 pt-5 max-sm:px-4 max-sm:pt-4">
-        <ModeBanner conn={conn} live={live} paused={paused} dryNote={dryNote} />
+        <ModeBanner conn={conn} live={live} paused={paused} dryNote={dryNote} pauseNote={pauseNote} restarting={restarting} />
         {conn === "ok" && <ExpiryBanner items={status?.expiry_warnings || []} />}
         <StatusStrip conn={conn} f={f} />
         {conn === "ok" && <WhyNoTrades warning={status?.cash_warning || ""} problems={status?.problems || []} hints={status?.budget_hints || []} live={live} onCommand={send} />}
@@ -524,7 +526,21 @@ function ExpiryBanner({ items }: { items: ExpiryWarning[] }) {
 }
 
 // ── mode banner ─────────────────────────────────────────────────────────────
-function ModeBanner({ conn, live, paused, dryNote }: { conn: Conn; live: boolean; paused: boolean; dryNote: string }) {
+function ModeBanner({
+  conn,
+  live,
+  paused,
+  dryNote,
+  pauseNote,
+  restarting,
+}: {
+  conn: Conn;
+  live: boolean;
+  paused: boolean;
+  dryNote: string;
+  pauseNote: string;
+  restarting: boolean;
+}) {
   if (conn === "loading") return <div className="h-10" />;
   const off = conn !== "ok";
   const tone = off ? "border-down/45 bg-down/[0.07]" : live ? "border-live/50 bg-live/[0.07]" : paused ? "border-warn/45 bg-warn/[0.07]" : "border-accent/40 bg-accent/[0.06]";
@@ -560,6 +576,14 @@ function ModeBanner({ conn, live, paused, dryNote }: { conn: Conn; live: boolean
                   {" "}
                   <b className="text-warn">Paused:</b> no new entries. Exit signals and the expiry guard keep running for
                   positions you already have. Stays paused, also after a restart, until you press Resume.
+                  {pauseNote ? " " + pauseNote : ""}
+                </>
+              )}
+              {restarting && (
+                <>
+                  {" "}
+                  <b className="text-warn">Restarting:</b> the agent reads no signals and places no orders until it is back (a
+                  few seconds).
                 </>
               )}
             </span>

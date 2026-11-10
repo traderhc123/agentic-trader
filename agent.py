@@ -122,33 +122,90 @@ def _save(path, payload, private=False):
 CONFIG_LOCK = __import__("threading").RLock()
 
 
+class ConfigUnreadable(OSError):
+    """config.json is there but can't be used as settings right now. The
+    text is what the owner is told. `damaged`: it is not valid JSON (a typo
+    from editing it by hand), as opposed to locked or busy."""
+    damaged = False
+
+
+class ConfigDamaged(ConfigUnreadable):
+    damaged = True
+
+
+def _config_damaged_text():
+    return ("Nothing was changed: your settings file has a typo, so I can't "
+            f"read it ({CONFIG_PATH}). This usually happens after editing it "
+            "by hand — look for a missing or extra comma or quote mark, fix "
+            "it and try again. Until then no setting can be changed; the "
+            "agent keeps running on the last settings it could read, but it "
+            "can't start again after a stop. To stop the agent right now, "
+            "type: stop")
+
+
+_CONFIG_BUSY_TEXT = ("I couldn't read your settings file just now, so nothing "
+                     "was changed. Try again in a moment. To stop the agent "
+                     "right now, type: stop")
+
+
 def _read_config():
-    """config.json as it is on disk right now; {} when there is none yet (or
-    it isn't valid JSON, so setup can write a good one). Raises OSError when
-    the file is there but can't be read at this moment — a caller about to
-    save must never take "couldn't read it" for "empty" and wipe the
-    owner's settings."""
+    """config.json as it is on disk right now; {} ONLY when there is no file
+    yet. Raises ConfigUnreadable (an OSError) when the file is there but
+    can't be read at this moment, and ConfigDamaged when it is there but is
+    not a JSON object — a caller about to save must never take "couldn't
+    read it" or "has a typo" for "empty" and replace the owner's settings
+    (wallet key, broker keys, limits, dry-run) with its own few keys."""
     for attempt in (0, 1):
         try:
             with open(CONFIG_PATH, encoding="utf-8") as f:
                 cfg = json.load(f)
-            return cfg if isinstance(cfg, dict) else {}
+            if isinstance(cfg, dict):
+                return cfg
+            problem = ConfigDamaged(_config_damaged_text())
         except FileNotFoundError:
             return {}
         except ValueError:
-            return {}
+            problem = ConfigDamaged(_config_damaged_text())
         except OSError:
-            if attempt:
-                raise
-            time.sleep(0.05)
+            problem = ConfigUnreadable(_CONFIG_BUSY_TEXT)
+        if attempt:
+            raise problem
+        time.sleep(0.05)  # an editor or a sync program may be mid-save
 
 
-def update_config(change):
+def _set_damaged_config_aside():
+    """Copy a config.json that can't be read next to itself before setup
+    writes a new one — it may hold the only copy of a wallet key. Returns
+    the copy's path, or "" when no copy could be made."""
+    import platform_compat
+    dst = f"{CONFIG_PATH}.damaged-{time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        with open(CONFIG_PATH, "rb") as src, open(dst, "wb") as out:
+            out.write(src.read())
+        if not platform_compat.IS_WINDOWS:
+            os.chmod(dst, 0o600)  # Windows: inherits the locked directory's ACL
+    except OSError:
+        return ""
+    print(f"Your settings file could not be read (a typo?). It was kept as "
+          f"{dst} and setup is writing a new one.")
+    return dst
+
+
+def update_config(change, if_damaged=None):
     """Apply change(cfg) to the config that is on disk now and save it, all
     under CONFIG_LOCK. `change` should touch only the keys it owns. Returns
-    the saved config."""
+    the saved config. A file that can't be read is never written over
+    (ConfigUnreadable) — except by setup: `if_damaged` is a function that
+    returns the settings to start again from when the file is damaged (the
+    setup wizard, with no agent running), or None to refuse. The damaged
+    file is kept next to the new one."""
     with CONFIG_LOCK:
-        cfg = _read_config()
+        try:
+            cfg = _read_config()
+        except ConfigDamaged:
+            cfg = if_damaged() if if_damaged else None
+            if not isinstance(cfg, dict) or not _set_damaged_config_aside():
+                raise
         change(cfg)
         _save(CONFIG_PATH, cfg, private=True)
         return cfg
@@ -824,6 +881,23 @@ def _dry_run_note(cfg, state):
             "trades will be placed.")
 
 
+# shown wherever a moved setup is described: it starts in dry-run, but that
+# does not stop it selling the real positions that came with it
+MOVED_POSITIONS_NOTE = ("Real positions you moved over are still sold on their "
+                        "exit signal, so make sure the old computer is off first.")
+
+
+def _mode_label(cfg, state):
+    """The mode as the startup line and notification show it. In dry-run
+    with real positions open, "no orders" would be untrue: those are still
+    sold (_dry_run_keeps_selling_real_positions)."""
+    if not cfg.get("dry_run"):
+        return "LIVE"
+    if _real_positions(state) and _dry_run_keeps_selling_real_positions(cfg):
+        return "DRY-RUN (no new trades; real positions still get sold)"
+    return "DRY-RUN (no orders)"
+
+
 def _paused(cfg):
     """The owner pressed Pause (saved in config.json, so it survives a
     restart): no NEW entries. Exits, the expiry guard and the broker checks
@@ -831,15 +905,34 @@ def _paused(cfg):
     return bool((cfg or {}).get("paused"))
 
 
-def _pause_skips_feed(cfg, state):
-    """Paused with nothing open, on a feed that is paid per day (AgentHC
-    without a Premium key): don't read the feed. There is no exit to wait
-    for, and a read could use up a prepaid signal day or buy a day-pass.
-    In every other case the feed is read as usual while paused: exit
-    signals are acted on, entry signals are logged as skipped."""
-    return (_paused(cfg) and not state.get("positions")
-            and cfg.get("source", "agenthc") == "agenthc"
+def _feed_paid_per_day(cfg):
+    """The AgentHC feed without a Premium key: each day it is read uses a
+    prepaid signal day or buys a day-pass."""
+    return (cfg.get("source", "agenthc") == "agenthc"
             and not cfg.get("agenthc_api_key"))
+
+
+def _pause_skips_feed(cfg, state):
+    """Paused with no REAL position open, on a feed that is paid per day:
+    don't read the feed. There is no exit order to wait for, and a read
+    could use up a prepaid signal day or buy a day-pass — a pause must not
+    spend money just to book the exit of a dry-run (paper) position. In
+    every other case the feed is read as usual while paused: exit signals
+    are acted on, entry signals are logged as skipped."""
+    return (_paused(cfg) and not _real_positions(state)
+            and _feed_paid_per_day(cfg))
+
+
+def _pause_note(cfg, state):
+    """What a pause means for the paid signal feed right now, in the owner's
+    words ("" when not paused, or the feed costs nothing per day)."""
+    if not _paused(cfg) or not _feed_paid_per_day(cfg):
+        return ""
+    if _real_positions(state):
+        return ("While a real position is open the agent still reads the "
+                "signal feed to get its exit signal, which uses a signal day.")
+    return ("No real position is open, so the agent is not reading the signal "
+            "feed: the pause uses no signal day.")
 
 
 def _execute_dry(cfg, event, state, broker=None, client=None, on_skip=None):
@@ -3600,8 +3693,8 @@ def set_book_sizing(cfg, book, mode, value):
 # SKIPPED, TODAY, AND — and every signal after it was skipped.
 _NOTHING_CHANGED = "Nothing was changed. "
 _CMD_TICKER_RE = re.compile(r"\$?[A-Za-z]{1,5}(?:\.[A-Za-z]{1,2})?")
-# Ordinary words: in lower case they show a sentence, not a ticker list.
-# Typed in CAPITALS they are taken as tickers ("tickers ALL ON").
+# Ordinary words are never read as tickers in lower case, even when a ticker
+# of that name is known. Typed in CAPITALS they are ("tickers ALL ON").
 _CMD_NOT_TICKERS = frozenset(
     "a an and or the is are was were be been do does did why what which when "
     "where who how my me i you it its to of in on at for with from not no yes "
@@ -3609,40 +3702,100 @@ _CMD_NOT_TICKERS = frozenset(
     "skipped only just also but if then than that this these those can could "
     "should would will there their them they we us our your about so too very "
     "trade trades ticker tickers".split())
+# The only words read as tickers in lower case ("tickers spy qqq"), besides
+# the owner's own (rule lists, open positions, trade log): widely traded
+# names of three letters or more that are not ordinary words. Anything else
+# has to be typed in CAPITALS — "tickers look wrong" is a sentence, and a
+# sentence must never replace the ticker list.
+_CMD_COMMON_TICKERS = frozenset(
+    "SPY QQQ IWM DIA SPX NDX XSP TLT GLD SLV USO XLF XLE XLK XLV XLI XLP XLU "
+    "XLY XBI SMH SOXX SOXL SOXS TQQQ SQQQ UVXY VXX ARKK EEM EFA FXI HYG KRE GDX "
+    "AAPL MSFT NVDA AMZN GOOG GOOGL TSLA AMD INTC NFLX AVGO ORCL CRM ADBE CSCO "
+    "QCOM TXN IBM PYPL UBER LYFT ABNB PLTR SOFI RIVN LCID NIO BABA PDD BIDU "
+    "TSM ASML SMCI HPQ DDOG CRWD PANW OKTA MDB DOCU ROKU RBLX DKNG MSTR CLSK "
+    "GME AMC NOK JPM BAC WFC SCHW BLK AXP COF PNC BRK.B UNH JNJ PFE MRK LLY "
+    "ABBV BMY AMGN MRNA CVS XOM CVX SLB HON LMT RTX FDX UAL DAL AAL CCL RCL "
+    "NCLH CMCSA WMT TGT NKE SBUX MCD CMG TMUS CVNA CHWY ETSY EBAY AFRM UPST "
+    "ENPH FSLR NEE IONQ RKLB ASTS LULU ULTA WDAY INTU ISRG TMO DHR ABT MDT "
+    "BKNG EXPE WYNN LVS MGM".split())
 _CMD_MAX_TICKERS = 50
 
 
-def _command_tickers(raw):
-    """The tickers of a 'tickers …' command when its argument is nothing but
-    a list of plausible tickers (spaces or commas between them), else None.
-    `raw` is the argument as the owner typed it (capitals matter)."""
+def _known_tickers(cfg):
+    """Tickers the agent can recognise in lower case: the common ones plus
+    the owner's own — in the rule lists, open positions or the trade log."""
+    import rules
+    known = set(_CMD_COMMON_TICKERS)
+    known.update(rules.parse_tickers(cfg.get("rule_tickers")))
+    known.update(rules.parse_tickers(cfg.get("rule_skip_tickers")))
+    rows = (_load(STATE_PATH, {}) or {}).get("positions")
+    known.update(str(k).split("|")[0].upper()
+                 for k in (rows if isinstance(rows, dict) else ()))
+    known.update(str(r.get("contract") or "").split(" ")[0].upper()
+                 for r in _recent_trades(500) if isinstance(r, dict))
+    return {k for k in known if _CMD_TICKER_RE.fullmatch(k)}
+
+
+def _command_tickers(raw, known=(), capitals_count=True):
+    """Reads the argument of a 'tickers …' command, as the owner typed it.
+    (tickers, None) when it is nothing but a list of tickers the agent can
+    be sure of: each word is in CAPITALS (when `capitals_count` — not when
+    the whole command was typed in capitals), starts with $, or is a
+    `known` ticker that isn't an ordinary word. Otherwise (None, guess):
+    nothing may be changed; `guess` is the list the owner may have meant,
+    to show them the exact command ([] when it reads as no list at all)."""
     import rules
     tokens = [x for x in re.split(r"[\s,;]+", str(raw).strip()) if x]
     if not tokens or len(tokens) > _CMD_MAX_TICKERS:
-        return None
+        return None, []
+    if not all(_CMD_TICKER_RE.fullmatch(tok) for tok in tokens):
+        return None, []
+    sure = True
     for tok in tokens:
-        if not _CMD_TICKER_RE.fullmatch(tok):
-            return None
-        if tok.lstrip("$").lower() in _CMD_NOT_TICKERS and tok != tok.upper():
-            return None
-    return rules.parse_tickers(tokens)
+        if tok.startswith("$") or (capitals_count and tok == tok.upper()):
+            continue  # typed as a ticker on purpose
+        if tok.lower() in _CMD_NOT_TICKERS or tok.upper() not in known:
+            sure = False
+    if sure:
+        return rules.parse_tickers(tokens), None
+    return None, rules.parse_tickers(
+        [tok for tok in tokens if tok.lower() not in _CMD_NOT_TICKERS])
 
 
-def _command_number(t, name):
+def _ticker_list_reply(guess, command, purpose, example, clear):
+    """The reply to a 'tickers …' line that was not a sure ticker list."""
+    if guess:
+        named = (guess[0] if len(guess) == 1
+                 else ", ".join(guess[:-1]) + " and " + guess[-1])
+        lead = (f"To {purpose} {named}, type: {command} {' '.join(guess)}   "
+                "(tickers in CAPITALS, so I know it is a list and not a "
+                "sentence). ")
+    else:
+        lead = ("I couldn't read that as a list of tickers. To "
+                f"{purpose} some tickers, type: {command} {example}   "
+                f"({clear}). A ticker that is also an ordinary word goes in "
+                f"CAPITALS: {command} NOW. ")
+    return (_NOTHING_CHANGED + lead + "To ask me a question, end it with a "
+            "question mark.")
+
+
+def _command_number(t, name, unit="$"):
     """The number of a '<name> N' command when that is ALL it says ("set
-    budget 500", "set budget to $1,500", "set percent 2%"), else None."""
-    m = re.fullmatch(re.escape(name) + r"(?:\s+to)?\s+\$?(\d[\d,]*(?:\.\d+)?)\s?%?", t)
-    if not m:
+    budget 500", "set budget to $1,500", "set percent 2%"), else None.
+    `unit`: "$" allows a dollar sign in front, "%" a percent sign after,
+    "" neither — "set budget 500%" is not a dollar budget."""
+    m = re.fullmatch(re.escape(name) + r"(?:\s+to)?\s+(\$?)(\d[\d,]*(?:\.\d+)?)(\s?%)?", t)
+    if not m or (m.group(1) and unit != "$") or (m.group(3) and unit != "%"):
         return None
     try:
-        return float(m.group(1).replace(",", ""))
+        return float(m.group(2).replace(",", ""))
     except ValueError:
         return None
 
 
 def _command_whole(t, name):
-    """_command_number, for a count: whole numbers only."""
-    val = _command_number(t, name)
+    """_command_number, for a count: whole numbers only, no $ or %."""
+    val = _command_number(t, name, unit="")
     return int(val) if val is not None and val == int(val) else None
 
 
@@ -3660,36 +3813,30 @@ def _rule_command(t, cfg, text=None):
                       "with: tickers SPY QQQ / tickers any, skip tickers TSLA / "
                       "skip tickers none, calls only / puts only / calls and puts, "
                       "min strike 10, no 0dte on|off, loss stop 2 (0 = off).")
-    m = re.match(r"^(?:set |only )?tickers?(?:\s+(.+))?$", typed, re.I | re.S)
+    m = re.match(r"^((?:set |only )?tickers?)(?:\s+(.+))?$", typed, re.I | re.S)
     if m:
-        val = (m.group(1) or "").strip()
+        val = (m.group(2) or "").strip()
         if val.lower() in ("any", "all", "none", "off"):
             cfg["rule_tickers"] = []
             return saved("Ticker list updated.")
-        tickers = _command_tickers(val)
+        tickers, guess = _command_tickers(val, _known_tickers(cfg),
+                                          m.group(1) != m.group(1).upper())
         if not tickers:
-            return True, (_NOTHING_CHANGED + "I couldn't read that as a list of "
-                          "tickers. To trade only some tickers, type: tickers SPY "
-                          "QQQ   (any ticker again: tickers any). A ticker "
-                          "that is also an ordinary word goes in CAPITALS: "
-                          "tickers NOW. To ask me a question, end it with a "
-                          "question mark.")
+            return True, _ticker_list_reply(guess, "tickers", "trade only",
+                                            "SPY QQQ", "any ticker again: tickers any")
         cfg["rule_tickers"] = tickers
         return saved("Ticker list updated.")
-    m = re.match(r"^skip tickers?(?:\s+(.+))?$", typed, re.I | re.S)
+    m = re.match(r"^(skip tickers?)(?:\s+(.+))?$", typed, re.I | re.S)
     if m:
-        val = (m.group(1) or "").strip()
+        val = (m.group(2) or "").strip()
         if val.lower() in ("none", "off"):
             cfg["rule_skip_tickers"] = []
             return saved("Skip list updated.")
-        tickers = _command_tickers(val)
+        tickers, guess = _command_tickers(val, _known_tickers(cfg),
+                                          m.group(1) != m.group(1).upper())
         if not tickers:
-            return True, (_NOTHING_CHANGED + "I couldn't read that as a list of "
-                          "tickers. To never trade some tickers, type: skip "
-                          "tickers TSLA   (clear the list: skip tickers none). "
-                          "A ticker that is also an ordinary word goes in "
-                          "CAPITALS: skip tickers NOW. To ask me a question, "
-                          "end it with a question mark.")
+            return True, _ticker_list_reply(guess, "skip tickers", "never trade",
+                                            "TSLA", "clear the list: skip tickers none")
         cfg["rule_skip_tickers"] = tickers
         return saved("Skip list updated.")
     if t in ("calls only", "puts only", "calls and puts", "both sides"):
@@ -3730,14 +3877,22 @@ def _apply_command(text):
         if t.rstrip("? ") not in _SHOW_COMMANDS or "?" in t.rstrip("? "):
             return False, ""
         t = t.rstrip("? ")
+    if t == "stop":
+        # changes no setting, so it needs none: Stop must work even when
+        # config.json can't be read
+        import webui
+        webui.CONTROLS["stop"] = True
+        return True, ("Stopping after this cycle. Open positions remain in your "
+                      "brokerage account — close them there if needed.")
     # One change at a time, each starting from the settings on disk NOW
     # (the settings pages save under the same lock).
     with CONFIG_LOCK:
         try:
             cfg = _read_config()
+        except ConfigUnreadable as exc:
+            return True, str(exc)  # says what is wrong; nothing was changed
         except OSError:
-            return True, ("I couldn't read your settings file just now, so "
-                          "nothing was changed. Try again in a moment.")
+            return True, _CONFIG_BUSY_TEXT
         return _command(t, cfg, text.strip())
 
 
@@ -3749,7 +3904,6 @@ _SHOW_COMMANDS = ("status", "rules", "my rules", "show rules", "autostart",
 def _command(t, cfg, text):
     """_apply_command's allowlist, under CONFIG_LOCK. `t`: the command in
     lower case; `text`: as typed."""
-    import webui
     if t == "pause":
         cfg["paused"] = True
         _save(CONFIG_PATH, cfg, private=True)
@@ -3757,18 +3911,18 @@ def _command(t, cfg, text):
                       "guard and the broker checks keep running for positions "
                       "you already have. The agent stays paused, also after a "
                       "restart, until you say 'resume'."
-                      + (" With nothing open it also stops reading the signal "
-                         "feed, so the pause doesn't use up a paid signal day."
-                         if cfg.get("source", "agenthc") == "agenthc"
-                         and not cfg.get("agenthc_api_key") else ""))
+                      + (" While a real position is open the agent still "
+                         "reads the signal feed to get its exit signal, which "
+                         "uses a signal day (or buys a day-pass, if you turned "
+                         "that on). With no real position open it stops "
+                         "reading the feed, so the pause costs nothing; dry-run "
+                         "(paper) positions are then not updated until you "
+                         "resume."
+                         if _feed_paid_per_day(cfg) else ""))
     if t == "resume":
         cfg.pop("paused", None)
         _save(CONFIG_PATH, cfg, private=True)
         return True, "Resumed — the agent takes new entries again."
-    if t == "stop":
-        webui.CONTROLS["stop"] = True
-        return True, ("Stopping after this cycle. Open positions remain in your "
-                      "brokerage account — close them there if needed.")
     handled, reply = _rule_command(t, cfg, text)
     if handled:
         return True, reply
@@ -3834,7 +3988,9 @@ def _command(t, cfg, text):
     if t.startswith("set budget"):
         val = _command_number(t, "set budget")
         if val is None or val <= 0:
-            return True, _NOTHING_CHANGED + "Usage: set budget 500"
+            return True, (_NOTHING_CHANGED + "Usage: set budget 500   (dollars "
+                          "per trade; for a percent of your account, type: set "
+                          "percent 2)")
         cfg["sizing_mode"] = "budget"
         cfg["budget_per_trade_usd"] = val
         _save(CONFIG_PATH, cfg, private=True)
@@ -3842,7 +3998,9 @@ def _command(t, cfg, text):
     if t.startswith("set other budget"):
         val = _command_number(t, "set other budget")
         if val is None or val <= 0:
-            return True, _NOTHING_CHANGED + "Usage: set other budget 100"
+            return True, (_NOTHING_CHANGED + "Usage: set other budget 100   "
+                          "(dollars per trade; for a percent of your account, "
+                          "type: set other percent 2)")
         cfg["other_sizing_mode"] = "budget"
         cfg["other_budget_per_trade_usd"] = val
         _save(CONFIG_PATH, cfg, private=True)
@@ -3861,7 +4019,7 @@ def _command(t, cfg, text):
         book = "other" if t.startswith("set other") else "main"
         usage = f"Usage: set {'other ' if book == 'other' else ''}percent 2"
         val = _command_number(t, "set other percent" if book == "other"
-                              else "set percent")
+                              else "set percent", unit="%")
         if val is None:
             return True, _NOTHING_CHANGED + usage
         ok, err = set_book_sizing(cfg, book, "percent", val)
@@ -3873,7 +4031,7 @@ def _command(t, cfg, text):
                       " — sized from your account value at each entry "
                       "(your decision — see DISCLAIMER.md).")
     if t.startswith("set contracts"):
-        val = _command_number(t, "set contracts")
+        val = _command_number(t, "set contracts", unit="")
         if val is None:
             return True, _NOTHING_CHANGED + "Usage: set contracts 1"
         ok, err = set_book_sizing(cfg, "main", "contracts", val)
@@ -4020,11 +4178,18 @@ def cmd_run(app_window=False):
             return None
 
     def get_status():
-        c = _load(CONFIG_PATH, {}) or {}
+        # config.json unreadable right now (a typo from a manual edit)?
+        # Show the settings the agent is really running on, not defaults.
+        c = _load(CONFIG_PATH, None)
+        c = c if c and isinstance(c, dict) else cfg
         st = _load(STATE_PATH, {"positions": {}})
         return {
             "mode": "DRY-RUN" if c.get("dry_run") else "LIVE",
             "paused": _paused(c),
+            "pause_note": _pause_note(c, st),
+            # an update or a move is about to restart the agent: until then
+            # it reads no signals and places no orders
+            "restarting": webui.orders_held(),
             # real positions the agent holds, and what dry-run does with them
             "real_positions": len(_real_positions(st)),
             "dry_run_note": _dry_run_note(c, st),
@@ -4075,7 +4240,7 @@ def cmd_run(app_window=False):
         print("Updated the start-at-login entry.")
 
     _refresh_cash(cfg, state, save_state, broker, client, cash)
-    mode = "DRY-RUN (no orders)" if cfg.get("dry_run") else "LIVE"
+    mode = _mode_label(cfg, state)
     if _paused(cfg):  # saved in config.json: still paused after a restart
         mode += ", PAUSED — no new entries until you press Resume"
     if cfg.get("dry_run") and _dry_run_note(cfg, state):
@@ -4833,7 +4998,7 @@ def cmd_import(path):
             sys.exit(1)
     print(f"Imported your setup ({info['files']} files, from {info['from_os']}, "
           f"{info['created_at']}).")
-    print("It starts in DRY-RUN. Make sure the old computer is off, then say "
+    print("It starts in DRY-RUN: no new trades. " + MOVED_POSITIONS_NOTE + " Then say "
           "`dry off` in the dashboard" + (" to go live again." if info["was_live"]
                                          else " when you want to go live."))
     print("Start it: python agent.py start")
