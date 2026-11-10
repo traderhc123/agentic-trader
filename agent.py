@@ -5248,6 +5248,125 @@ def _command(t, cfg, text):
     return False, ""
 
 
+# ── the dashboard's view-model (GET /api/v2/status) ─────────────────────────
+# What only the running loop knows, for the dashboard: when it last started
+# a cycle, how long it then sleeps, when it last read the signal feed and
+# whether that worked. Written by cmd_run (_loop_note), read by its status
+# closure; nothing in the agent decides anything from it.
+LOOP = {}
+
+
+def _loop_note(**facts):
+    """Remember facts about the running loop for the dashboard. Never raises."""
+    try:
+        LOOP.update(facts)
+    except Exception:
+        pass
+
+
+def _loop_note_poll(source, events, poll_error):
+    """The loop just read the signal feed (or failed to): note when, whether
+    it worked, whether it could see entry signals, and when the newest
+    signal it listed happened. Never raises."""
+    try:
+        ok = poll_error is None
+        newest = _newest_signal_time(events) if ok else None
+        before = LOOP.get("signal_at")
+        _loop_note(poll_at=time.time(), poll_ok=ok,
+                   feed_access=_poll_had_access(source) if ok else None,
+                   signal_at=(max(before or 0.0, newest or 0.0) or None))
+    except Exception:
+        pass
+
+
+def _newest_signal_time(events):
+    """Epoch seconds of the newest signal in a poll's events that says when
+    it happened, or None."""
+    newest = None
+    try:
+        for ev in events or ():
+            ts = ev.get("occurred_at") if isinstance(ev, dict) else None
+            if not ts:
+                continue
+            try:
+                at = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            newest = at.timestamp() if newest is None else max(newest, at.timestamp())
+    except Exception:
+        return newest
+    return newest
+
+
+_VIEW_LOG = {"key": None, "rows": []}
+
+
+def _view_rows():
+    """Every trade-log row for the view-model, oldest first, each with its
+    line number; rows this run could not write yet come last, numbered on.
+    The dashboard asks every few seconds and the log only grows by appends,
+    so the parsed rows are kept until the file's size or time changes."""
+    try:
+        st = os.stat(TRADES_PATH)
+        key = (TRADES_PATH, st.st_size, st.st_mtime_ns)
+    except OSError:
+        key = None
+    if key is None or _VIEW_LOG["key"] != key:
+        _VIEW_LOG["rows"] = _read_trade_log()
+        _VIEW_LOG["key"] = key
+    rows = list(_VIEW_LOG["rows"])
+    n = rows[-1]["n"] + 1 if rows else 0
+    for i, r in enumerate(_unwritten_rows()):
+        rows.append({**r, "n": n + i})
+    return rows
+
+
+def _view_hold():
+    """(kind, since, recorded) of the full hold the loop is on — the same
+    three cases cmd_run's `held` is made of — or (None, None, None)."""
+    import webui
+    if _handed_off():
+        return "handoff_hold", None, None
+    if _state_held():
+        rec = _state_hold()
+        return "state_hold", (rec or {}).get("at"), rec is not None
+    if webui.orders_held():
+        return "restarting", None, None
+    return None, None, None
+
+
+def view_snapshot(runtime=None, cfg=None):
+    """The dashboard's whole state as data (view_model.build_status). Reads
+    the settings, the agent's memory and the trade log; `runtime` is what
+    only a running loop knows (None: no agent behind this server). `cfg`:
+    the settings the agent runs on, shown when config.json can't be read."""
+    import view_model
+    c = _load(CONFIG_PATH, None)
+    readable = isinstance(c, dict) and bool(c)
+    if not readable:
+        c = cfg if isinstance(cfg, dict) else {}
+    st = _load(STATE_PATH, {}) or {}
+    rt = dict(runtime) if isinstance(runtime, dict) else {"running": False}
+    rt.setdefault("settings_readable",
+                  readable or not os.path.exists(CONFIG_PATH))
+    if callable(rt.get("notices")):  # the banners, from the same c and st
+        try:
+            rt["notices"] = rt["notices"](c, st)
+        except Exception:
+            rt["notices"] = []
+    return view_model.build_status(c, st, _view_rows(), rt)
+
+
+def view_activity(before=None, limit=None):
+    """One page of the trade log as view-model Activity rows."""
+    import view_model
+    return view_model.activity_page(
+        _view_rows(), before=before,
+        limit=view_model.ACTIVITY_LIMIT if limit is None else limit)
+
+
 def cmd_run(app_window=False):
     import keep_running
     # One copy only: two heartbeats on the same config would place every
@@ -5405,11 +5524,61 @@ def cmd_run(app_window=False):
                 {"level": "warn", "text": "Check for a second copy: " + deploy_warn}]
         return s
 
+    def get_view():
+        # the same facts as get_status, as data (view_model.py)
+        hold, hold_since, hold_recorded = _view_hold()
+        err = getattr(client, "last_error", None)
+        tracked = client is not None and hasattr(client, "last_error")
+
+        try:
+            ai_blocked = llm_policy.entries_blocked(cfg)
+        except Exception:
+            ai_blocked = False
+
+        def notices(c, st):
+            # the banners get_status shows, each with a code
+            out = [{**w, "code": "records"} for w in _durability_banner()]
+            out += [{**w, "code": "expiry"} for w in expiry_banner(
+                c, st, paused=bool(_full_hold_note()), acct=_status_acct(c))]
+            if cash.get("warning"):
+                out.append({"level": "warn", "code": "low_cash",
+                            "text": cash["warning"]})
+            if deploy_warn:
+                out.append({"level": "warn", "code": "second_copy",
+                            "text": "Check for a second copy: " + deploy_warn})
+            return out
+
+        return view_snapshot({
+            "running": True,
+            "stopping": bool(webui.CONTROLS["stop"]),
+            "started_at": LOOP.get("started_at"),
+            "heartbeat_at": LOOP.get("beat_at"),
+            "wait_s": LOOP.get("wait_s"),
+            "hold": hold, "hold_since": hold_since,
+            "hold_recorded": hold_recorded,
+            "poll_at": LOOP.get("poll_at"), "poll_ok": LOOP.get("poll_ok"),
+            "signal_at": LOOP.get("signal_at"),
+            "feed_access": LOOP.get("feed_access"),
+            "ai_blocked": ai_blocked,
+            "broker": {
+                "id": _broker_name(cfg, broker),
+                "account_tag": _status_acct(cfg),
+                "connected": (not err) if tracked else None,
+                "down_since": getattr(client, "down_since", None),
+                "last_ok_at": getattr(client, "last_ok_at", None),
+                "last_error": err,
+                "buying_power": cash.get("bp"),
+                "buying_power_at": cash.get("at"),
+            },
+            "notices": notices,
+        }, cfg)
+
     def start_dash():
         return webui.start_dashboard(
             status_with_deploy_warning,
             lambda: _rows_without_facts(list(reversed(_recent_trades(25)))),
-            _apply_command, lambda: _load(CONFIG_PATH, {}) or {})
+            _apply_command, lambda: _load(CONFIG_PATH, {}) or {},
+            get_view=get_view)
 
     dash_url = None
     try:
@@ -5466,9 +5635,12 @@ def cmd_run(app_window=False):
     # "at" = when the previous loop STARTED, so a loop that hangs (not only
     # a sleep) shows up as a gap at the next start
     beat = {"at": _now(), "wait": 0.0, "saved": 0.0}
+    _loop_note(started_at=beat["at"], beat_at=None, wait_s=None, poll_at=None,
+               poll_ok=None, feed_access=None, signal_at=None)
     while True:
         keep_running.touch_alive()
         now_beat = _now()
+        _loop_note(beat_at=now_beat)
         if now_beat - beat["at"] - beat["wait"] > EXPIRY_WAKE_GAP_S:
             # the computer slept (or the loop hung): same check as at startup
             print(f"heartbeat resumed after {(now_beat - beat['at']) / 60:.0f} "
@@ -5578,6 +5750,7 @@ def cmd_run(app_window=False):
                     try:
                         events = source.poll(cfg, state, save_state)
                     except Exception as exc:
+                        _loop_note_poll(source, None, exc)  # (dashboard)
                         if not _exits_to_retry(state):
                             raise
                         # the feed can't be read, but the exits the agent
@@ -5585,6 +5758,7 @@ def cmd_run(app_window=False):
                         poll_error, events = exc, []
                     if poll_error is None:
                         note_watching(cfg, access=_poll_had_access(source))
+                        _loop_note_poll(source, events, None)  # (dashboard)
                     else:
                         feed_read = False
                 # Also while paused and when the feed wasn't read: the exits
@@ -5637,6 +5811,7 @@ def cmd_run(app_window=False):
             if expiry_guard_busy(cfg, state):
                 wait = min(wait, EXPIRY_GUARD_POLL_S)
         beat["wait"] = wait
+        _loop_note(wait_s=wait)
         try:
             _sleep_unless_stopped(wait, webui.CONTROLS)
         except KeyboardInterrupt:
