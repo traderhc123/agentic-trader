@@ -23,7 +23,7 @@ import {
 } from "../lib/api";
 import { cn } from "../lib/cn";
 import { copyToClipboard, useInterval } from "../lib/hooks";
-import { cap1, hhmm, isToday, money, parseContract, parsePositions, shortDate, whenShort, type Contract } from "../lib/format";
+import { cap1, eventWhen, eventWhenParts, hhmm, isToday, localWhen, money, parseContract, parsePositions, shortDate, type Contract } from "../lib/format";
 import { MovePanel } from "./MovePanel";
 import { PnlChart, type PnlPoint } from "./PnlChart";
 import { TipPanel } from "./TipPanel";
@@ -966,7 +966,9 @@ function Blotter({
                 {rows.map((r, i) => (
                   <tr key={i} className="border-t border-line align-top hover:bg-panel2">
                     <Td className="font-mono text-xs leading-5 text-muted">
-                      <span title={trades[i].ts ? new Date(trades[i].ts!).toLocaleString() : ""}>{whenShort(trades[i].ts)}</span>
+                      <time dateTime={trades[i].event_at || undefined} title={localWhen(trades[i].event_at)}>
+                        {eventWhenParts(trades[i]).map((p, j) => p && <span key={j} className="block">{p}</span>)}
+                      </time>
                     </Td>
                     <Td>
                       <span className="inline-flex items-center gap-2">
@@ -1003,7 +1005,13 @@ function Blotter({
                   {r.pnl == null ? "—" : money(r.pnl)}
                 </span>
                 <div className="col-span-2 text-xs text-muted [overflow-wrap:anywhere]">
-                  <span className="font-mono">{whenShort(trades[i].ts)}</span>
+                  <time
+                    className="whitespace-nowrap font-mono"
+                    dateTime={trades[i].event_at || undefined}
+                    title={localWhen(trades[i].event_at)}
+                  >
+                    {eventWhen(trades[i])}
+                  </time>
                   {r.detail ? ` · ${r.detail}` : ""}
                 </div>
               </li>

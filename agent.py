@@ -284,6 +284,54 @@ def _et_day(ts):
     return d.astimezone(MARKET_TZ).date().isoformat()
 
 
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _et_stamp(ts, now=None):
+    """'Nov 6, 3:55:17 PM ET': an ISO timestamp as market time (ET), for the
+    dashboard's Activity list. DST-correct per instant (zoneinfo), so rows
+    from before a clock change keep their own offset. The year is added when
+    it isn't the current ET year ('Dec 30, 2025, 3:55:17 PM ET'), and the
+    hour repeated when clocks fall back says EDT / EST instead. No tz on
+    the timestamp means UTC (the log writes UTC). '' if missing/unreadable.
+    Built by hand, not strftime, so the server's locale can't change it."""
+    try:
+        # OverflowError: a stamp at the edge of the calendar (year 1 / 9999)
+        # parses but can't be shifted to UTC / ET — blank, not a crash
+        iso = _utc_iso(ts) if isinstance(ts, str) else None
+        if not iso:
+            return ""
+        e = datetime.fromisoformat(iso).astimezone(MARKET_TZ)
+    except (ValueError, OverflowError):
+        return ""
+    year = (now or datetime.now(timezone.utc)).astimezone(MARKET_TZ).year
+    day = f"{_MONTHS[e.month - 1]} {e.day}" + (f", {e.year}" if e.year != year else "")
+    # the hour repeated when clocks fall back (1:00–1:59 AM) reads twice as
+    # "ET": name the offset there so the two stay apart
+    zone = ("ET" if e.replace(fold=1 - e.fold).utcoffset() == e.utcoffset()
+            else e.tzname())
+    return (f"{day}, {e.hour % 12 or 12}:{e.minute:02d}:{e.second:02d} "
+            f"{'AM' if e.hour < 12 else 'PM'} {zone}")
+
+
+def _event_time(t):
+    """(UTC ISO, ET label) of when a trade-log row's event happened: when
+    the broker filled the sale for a close found in the account
+    (`closed_at`), else when the agent logged it (`ts`). ('', '') if the row
+    has neither."""
+    for k in ("closed_at", "ts"):
+        try:
+            iso = _utc_iso(t.get(k)) if isinstance(t.get(k), str) else None
+        except OverflowError:  # year-1 / year-9999 edge: try the next field
+            iso = None
+        if iso:
+            label = _et_stamp(iso)
+            if label:
+                return iso, label
+    return "", ""
+
+
 def _read_trade_log():
     """Every trade-log row, oldest first. Each row gets `n`, its line number
     in trades.jsonl — stable, because the log is only ever appended to."""
@@ -328,6 +376,9 @@ def trade_page(before=None, limit=50):
             pass
     page = rows[-limit:]
     more = len(rows) > len(page)
+    for t in page:
+        # Activity shows each row's date + time in ET; "—" when unknown
+        t["event_at"], t["event_at_et"] = _event_time(t)
     return {"trades": list(reversed(page)), "total": len(rows),
             "next": page[0]["n"] if page and more else None, "oldest": oldest}
 

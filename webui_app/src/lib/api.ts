@@ -117,6 +117,10 @@ export interface Trade {
   reason?: string;
   /** line number in trades.jsonl (stable id; pages go by it) */
   n?: number;
+  /** when the event happened (UTC ISO; a broker-app sale's fill time) — "" if unknown */
+  event_at?: string;
+  /** the same, labelled in ET: "Nov 6, 3:55:17 PM ET" — "" if unknown */
+  event_at_et?: string;
   [k: string]: unknown;
 }
 export interface TradePage {
