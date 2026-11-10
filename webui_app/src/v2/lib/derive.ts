@@ -171,6 +171,8 @@ export interface Vital {
   icon: IconName | "sq-real" | "sq-none" | "beat";
   bold: string;
   text: string;
+  /** the risk, in bold after the text ("They can't be sold right now.") */
+  tail?: string;
   /** shown only on wide windows */
   wide?: string;
   /** the per-second counter: seconds since the last signal check at as_of */
@@ -199,7 +201,8 @@ export function vitals(s: Status, l: Link): Vital[] {
       look: risk ? "bad" : "",
       icon: risk ? "alert" : "sq-real",
       bold: `${plural(n, "real position")} open`,
-      text: `${paidText}${stale ? " (last report)" : ""}.${risk}`,
+      text: `${paidText}${stale ? " (last report)" : ""}.`,
+      tail: risk.trim(),
     };
   }
   const b = s.broker;

@@ -82,8 +82,11 @@ export default function ResultsChart({ model, label }: { model: ChartModel; labe
         grid: { vertLines: { visible: false }, horzLines: { color: css("line") } },
         crosshair: { vertLine: { color: css("line2"), labelBackgroundColor: css("ink") } },
       });
-      real.applyOptions({ color: css("real") });
-      practice.applyOptions({ color: css("prac") });
+      // on a narrow chart the end labels would cover the lines: the legend
+      // above the chart carries the same two totals
+      const small = (el.current?.clientWidth ?? 0) < 560;
+      real.applyOptions({ color: css("real"), title: small ? "" : "Real money" });
+      practice.applyOptions({ color: css("prac"), title: small ? "" : "Practice" });
       setMarks();
     };
     const setMarks = () => {
@@ -103,6 +106,7 @@ export default function ResultsChart({ model, label }: { model: ChartModel; labe
     mq.addEventListener("change", paint);
     const mo = new MutationObserver(paint);
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    addEventListener("resize", paint);
     c.subscribeCrosshairMove((p) => {
       const i = typeof p.time === "string" ? modelRef.current.days.indexOf(p.time) : -1;
       setCur(i);
@@ -111,6 +115,7 @@ export default function ResultsChart({ model, label }: { model: ChartModel; labe
     return () => {
       mq.removeEventListener("change", paint);
       mo.disconnect();
+      removeEventListener("resize", paint);
       c.remove();
       chart.current = null;
       series.current = null;

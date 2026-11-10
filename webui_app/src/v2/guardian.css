@@ -743,8 +743,15 @@ a.btn{text-decoration:none}
 .h-paid small{white-space:nowrap}
 .limit-top b,.money li b,.periods dd,.setrow .val{overflow-wrap:anywhere}
 .tally li b{white-space:normal;text-align:right;overflow-wrap:anywhere;min-width:0}
-.tally li > span{min-width:0}
+.tally li > span{min-width:min-content}
 .toast{width:max-content}
 @media (max-width:760px){
   .toast{left:12px;right:12px;transform:none;width:auto;max-width:none}
+}
+/* a row with no action: the value sits at the right edge */
+.setrow > .act:empty{display:none}
+@media (min-width:761px){.setrow:has(> .act:empty){grid-template-columns:minmax(0,1fr) auto}}
+@media (max-width:760px){
+  /* room for the fixed tab bar under the last panel */
+  main{padding-bottom:calc(88px + env(safe-area-inset-bottom))}
 }

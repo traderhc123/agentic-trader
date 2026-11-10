@@ -49,6 +49,12 @@ function VitalItem({ v, status, frozen }: { v: Vital; status: Status; frozen: bo
             {m.text}
           </>
         )}
+        {m.tail && (
+          <>
+            {" "}
+            <b>{m.tail}</b>
+          </>
+        )}
         {m.sinceCheck !== undefined && (
           <>
             {/* the ticking counter is not announced: the band's status line is */}

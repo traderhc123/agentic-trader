@@ -181,7 +181,7 @@ test("every state: nothing undefined, and the band keeps to its rules", { skip }
       const where = `${name}${failing ? " (fetch failing)" : ""}`;
       const b = bandModel(s, l);
       for (const t of [b.word, b.say[1], b.run.text, b.title, b.announce, statement(s, l).h, statement(s, l).lead]) clean(t, where);
-      for (const v of vitals(s, l)) clean(v.bold + v.text, `${where} vital ${v.key}`);
+      for (const v of vitals(s, l)) clean(v.bold + v.text + (v.tail ?? ""), `${where} vital ${v.key}`);
       for (const n of notes(s, l)) {
         clean(n.title, `${where} note`);
         clean(n.text, `${where} note`);
