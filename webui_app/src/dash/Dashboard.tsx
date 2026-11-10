@@ -271,6 +271,9 @@ export function Dashboard() {
             <Settings className="h-4 w-4" />
             <span className="max-lg:hidden">Settings</span>
           </LinkButton>
+          <LinkButton href="/v2" variant="ghost" size="sm" className="text-accent" title="A redesigned dashboard. You can come back here at any time.">
+            Try the new dashboard
+          </LinkButton>
         </div>
         {conn === "ok" && (
           <div className="flex items-center gap-2 max-sm:order-5 max-sm:w-full max-sm:[&>*]:flex-1">

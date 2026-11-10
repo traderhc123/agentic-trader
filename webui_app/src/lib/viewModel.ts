@@ -61,6 +61,9 @@ export const REASON_CODES = [
   "expiry_guard",
   "exit_remainder",
   "closed_outside",
+  "buy_unconfirmed",
+  "sell_unconfirmed",
+  "buy_partly_filled",
   "unknown",
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
@@ -79,7 +82,9 @@ export interface Status {
   /** are the real positions being sold on their exit signal / at expiry right now */
   real_positions_managed: boolean;
   /** why not, for the first real position that isn't */
-  unmanaged_reason: "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "broker_down" | "practice_holds_real_sells" | "other_account" | "expired" | null;
+  unmanaged_reason: "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "broker_down" | "practice_holds_real_sells" | "other_account" | "expired" | "no_exit_signals" | "feed_unreachable" | "no_bid" | "pass_unchecked" | null;
+  /** false: the expiry sell is switched off in the settings, so nothing sells a position on its expiry day but an exit signal */
+  expiry_guard_on: boolean;
   broker: Broker;
   signals: Signals;
   market: Market;
@@ -149,7 +154,8 @@ export interface Signals {
 
 export interface Pass {
   kind: "prepaid" | "day_pass" | "subscription" | "not_needed" | "none";
-  status: "active" | "exits_only" | "waiting" | "none";
+  /** unknown: a prepaid pass the agent could not check with AgentHC yet (it reads no signals until it can); a wallet day-pass that is running counts as active */
+  status: "active" | "exits_only" | "waiting" | "none" | "unknown";
   days_left: number | null;
   auto_pay: boolean;
 }
@@ -231,7 +237,7 @@ export interface Capabilities {
 
 export interface Answer {
   state: "yes" | "practice_only" | "not_today" | "paused" | "cant" | "unknown";
-  reason_code: "ok" | "practice_mode" | "nothing_open" | "only_practice_positions" | "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "owner_pause" | "pause_feed_not_read" | "broker_down" | "daily_cap_reached" | "daily_loss_reached" | "position_cap_reached" | "market_closed" | "no_signal_access" | "feed_unreachable" | "ai_needed" | "practice_holds_real_sells";
+  reason_code: "ok" | "practice_mode" | "nothing_open" | "only_practice_positions" | "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "owner_pause" | "pause_feed_not_read" | "broker_down" | "daily_cap_reached" | "daily_loss_reached" | "position_cap_reached" | "market_closed" | "no_signal_access" | "feed_unreachable" | "ai_needed" | "practice_holds_real_sells" | "pass_unchecked";
 }
 
 export interface Contract {
@@ -266,7 +272,7 @@ export interface NextAction {
   action: "sell_on_exit" | "sell_at_expiry_guard" | "selling_now" | "paper_close" | "unmanaged" | "unknown";
   /** when, if the agent acts at a set time */
   at: Iso | null;
-  reason_code: "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "broker_down" | "practice_holds_real_sells" | "other_account" | "expired" | "exit_signal" | "expiry_guard" | "sell_working" | "exit_remainder" | "pause_feed_not_read";
+  reason_code: "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "broker_down" | "practice_holds_real_sells" | "other_account" | "expired" | "no_exit_signals" | "feed_unreachable" | "no_bid" | "pass_unchecked" | "exit_signal" | "expiry_guard" | "sell_working" | "exit_remainder" | "pause_feed_not_read";
   /** when the expiry guard would sell it on its expiry day, if it is still open then */
   expiry_guard_at: Iso | null;
 }
@@ -291,6 +297,8 @@ export interface Activity {
   book: "main" | "other" | null;
   /** which book the row belongs to; null = not recorded */
   real: boolean | null;
+  /** true: the order went to a broker's paper-trading account (not real money); null = not recorded */
+  paper_account: boolean | null;
   /** the mode NEW trades used then; null = not recorded */
   mode_at_time: "live" | "practice" | null;
   order_sent: boolean | null;
@@ -311,8 +319,11 @@ export interface Activity {
 }
 
 export interface Results {
+  /** orders the agent sent to a real-money account (or one not recorded as a paper-trading account) */
   real: Book;
   practice: Book;
+  /** orders filled in a broker's paper-trading account (recorded on each line since this version): not real money */
+  paper_account: Book;
   signal_cost: SignalCost;
 }
 
@@ -326,6 +337,8 @@ export interface Book {
   won: number;
   lost: number;
   unmeasured: number;
+  /** sales today (ET) with no estimate: not in `today`, and not in `days` */
+  unmeasured_today: number;
   days: BookDay[];
 }
 

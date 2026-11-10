@@ -364,10 +364,12 @@ def test_empty_first_run():
     assert s["real_positions_managed"] is True
     assert s["activity"] == {"rows": [], "total": 0, "next": None,
                              "oldest": None}
-    for book in ("real", "practice"):
+    for book in ("real", "practice", "paper_account"):
         assert s["results"][book] == {
             "today": 0.0, "last_7_days": 0.0, "total": 0.0, "closed": 0,
-            "won": 0, "lost": 0, "unmeasured": 0, "days": []}
+            "won": 0, "lost": 0, "unmeasured": 0, "unmeasured_today": 0,
+            "days": []}
+    assert s["expiry_guard_on"] is True
     assert s["signals"]["last_poll"] is None
     assert s["signals"]["last_signal"] is None
     assert s["signals"]["pass"] == {"kind": "none", "status": "none",
@@ -850,14 +852,14 @@ def test_results_never_mix_real_and_practice():
     r = build(rows=rows)["results"]
     assert r["real"] == {
         "today": 64.0, "last_7_days": -326.0, "total": -138.0, "closed": 4,
-        "won": 2, "lost": 2, "unmeasured": 2,
+        "won": 2, "lost": 2, "unmeasured": 2, "unmeasured_today": 2,
         "days": [{"day": "2026-11-09", "pnl": 64.0, "closed": 1},
                  {"day": "2026-11-06", "pnl": -74.0, "closed": 1},
                  {"day": "2026-11-03", "pnl": -316.0, "closed": 1},
                  {"day": "2026-11-02", "pnl": 188.0, "closed": 1}]}
     assert r["practice"] == {
         "today": -20.0, "last_7_days": -20.0, "total": -20.0, "closed": 2,
-        "won": 0, "lost": 1, "unmeasured": 0,
+        "won": 0, "lost": 1, "unmeasured": 0, "unmeasured_today": 0,
         "days": [{"day": "2026-11-09", "pnl": -20.0, "closed": 1},
                  {"day": "2026-11-02", "pnl": 0.0, "closed": 1}]}
 
@@ -927,10 +929,16 @@ def test_signal_pass_states():
     assert used["capabilities"]["opening"] == {
         "state": "cant", "reason_code": "no_signal_access"}
     assert used["capabilities"]["listening"]["state"] == "yes"  # exits still come
-    waiting = p(prepaid, feed_access=False)
+    waiting = p(prepaid, {"pass_status": {tid: {"status": "used_up"}}},
+                feed_access=False)
     assert waiting["signals"]["pass"]["status"] == "waiting"
     assert waiting["capabilities"]["listening"] == {
         "state": "cant", "reason_code": "no_signal_access"}
+    # no record of the pass (its check failed): not known, never "waiting"
+    unchecked = p(prepaid, feed_access=False)
+    assert unchecked["signals"]["pass"]["status"] == "unknown"
+    assert unchecked["capabilities"]["listening"] == {
+        "state": "cant", "reason_code": "pass_unchecked"}
     wallet = {**base, "lnbits_url": "https://wallet.example", "day_pass_recurring": True}
     assert p(wallet, feed_access=None)["signals"]["pass"] == {
         "kind": "day_pass", "status": "waiting", "days_left": None,

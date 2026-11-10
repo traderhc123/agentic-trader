@@ -172,6 +172,9 @@ DASH_PORT = APP_PORT
 # webui_dist/, which is committed so users never need Node. /setup and /dash
 # serve webui_dist/index.html; /assets/* serves its hashed files. If the build
 # is missing (or the user opens ?ui=classic) the built-in pages below are used.
+# /v2 serves webui_dist/v2.html: the redesigned dashboard, built from the same
+# source folder as a second entry and read from /api/v2/status. /dash stays
+# the default; the two link to each other.
 _DIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui_dist")
 _ASSET_TYPES = {
     ".js": "text/javascript; charset=utf-8",
@@ -195,6 +198,15 @@ def _app_index():
     """The built app's index.html, or None when no build is present."""
     try:
         with open(os.path.join(_DIST_DIR, "index.html"), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _app_v2():
+    """The built /v2 dashboard page, or None when the build has none."""
+    try:
+        with open(os.path.join(_DIST_DIR, "v2.html"), encoding="utf-8") as f:
             return f.read()
     except OSError:
         return None
@@ -2336,6 +2348,7 @@ class _Handler(BaseHTTPRequestHandler):
     routes_post = {}
     pages = {}
     landing = "/setup"
+    v2 = False  # serve the redesigned dashboard at /v2 (start_app turns it on)
 
     def log_message(self, *a):  # quiet
         pass
@@ -2425,6 +2438,19 @@ class _Handler(BaseHTTPRequestHandler):
             app = None if "ui=classic" in self.path else _app_index()
             if app is None:
                 return self._send(None, html=self.pages[path])
+            return self._send_raw(app.encode(), "text/html; charset=utf-8",
+                                  extra={"Content-Security-Policy": _APP_CSP,
+                                         "X-Frame-Options": "DENY",
+                                         "Referrer-Policy": "no-referrer"})
+        if path == "/v2" and self.v2:
+            app = _app_v2()
+            if app is None:
+                # a build without it: the dashboard that is there
+                self.send_response(302)
+                self.send_header("Location", self.landing)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
             return self._send_raw(app.encode(), "text/html; charset=utf-8",
                                   extra={"Content-Security-Policy": _APP_CSP,
                                          "X-Frame-Options": "DENY",
@@ -3285,6 +3311,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     class W(_Handler):
         pages = {"/setup": _WIZARD_HTML, "/dash": _DASH_HTML}
         landing = "/dash" if get_status else "/setup"
+        v2 = True
         routes_get, routes_post = {}, {}
 
     def state(_h):

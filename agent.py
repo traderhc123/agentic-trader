@@ -1056,12 +1056,22 @@ def _event_time(t):
 def _read_trade_log():
     """Every trade-log row, oldest first. Each row gets `n`, its line number
     in trades.jsonl — stable, because the log is only ever appended to."""
+    return _scan_trade_log()[0]
+
+
+def _scan_trade_log(strict=False):
+    """(rows as _read_trade_log, the file's line count — blank and
+    unreadable lines included: the `n` the next appended row gets).
+    strict=True: a failed read raises OSError instead of returning what was
+    read so far (the dashboard's cache must not keep a failed read)."""
     rows = []
+    lines = 0
     try:
         # errors="replace": one bad byte (a hand edit, a disk hiccup) must not
         # take the whole history and P&L down — that line just fails to parse
         with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
             for n, line in enumerate(f):
+                lines = n + 1
                 if not line.strip():
                     continue
                 try:
@@ -1072,8 +1082,9 @@ def _read_trade_log():
                     t["n"] = n
                     rows.append(t)
     except OSError:
-        pass
-    return rows
+        if strict:
+            raise
+    return rows, lines
 
 
 def trade_page(before=None, limit=50):
@@ -1629,6 +1640,30 @@ class ExitNotDone(Exception):
 
 
 _problems_logged = set()  # (event_id, kind) already written this run
+# the dashboard's reason code for a problem whose order went in and may have
+# filled (_report_problem placed=True) — only ever a fact on the row (_row_facts)
+_PLACED_CODES = {"order_failed": "buy_unconfirmed",
+                 "exit_failed": "sell_unconfirmed",
+                 "entry_unfilled": "buy_partly_filled"}
+
+
+# problem kinds about an order sent to the broker: their rows record whether
+# that was a paper-trading account (a skipped signal sent nothing)
+_ORDER_KINDS = ("order_failed", "exit_failed", "entry_unfilled",
+                "exit_partial")
+
+
+def _paper_account(cfg):
+    """True / False: the account the agent trades now is / is not a broker's
+    paper-trading account (its account tag, e.g. "alpaca:paper"); None when
+    that can't be told. A dashboard fact only. Never raises."""
+    try:
+        tag = _account_tag(cfg)
+        if isinstance(tag, str) and ":" in tag:
+            return tag.endswith(":paper")
+    except Exception:
+        pass
+    return None
 
 
 def _report_problem(cfg, state, save_state, kind, contract, message,
@@ -1656,8 +1691,14 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
         rec["dry"] = True
     if book:
         rec["book"] = book
+    if placed and code is None and isinstance(kind, str):
+        # the order went in and may have filled: the dashboard must not
+        # call it "rejected" / "did not go through"
+        code = _PLACED_CODES.get(kind)
     _log_trade(_row_facts(rec, cfg, check, params=params, code=code,
-                          sent=True if placed else None))
+                          sent=True if placed else None,
+                          paper=(_paper_account(cfg) if not dry and (
+                              placed or kind in _ORDER_KINDS) else None)))
     if kind not in broker_events.NOTIFY or dry:
         return
     today = datetime.now(timezone.utc).date().isoformat()
@@ -2790,9 +2831,21 @@ def _trade_facts(record, cfg, book, dry, row, prior_pos, mark, sold):
         else:
             qty = (_int0((prior_pos or {}).get("qty")) if dry
                    else _int0(sold))
-            facts["filled"] = (not dry) and qty >= 1
+            # a sell still working at the broker isn't filled yet: `sold` is
+            # then the quantity it asked for (_contracts_sold)
+            pend = (row or {}).get("pending")
+            selling = isinstance(pend, dict) and pend.get("side") == "sell"
+            facts["filled"] = (not dry) and qty >= 1 and not selling
         if qty >= 1:
             facts["qty"] = qty
+        if not dry:
+            # a broker paper-trading account is not real money (the
+            # account tag the row was opened in, e.g. "alpaca:paper")
+            for src in (row, prior_pos):
+                acct = (src or {}).get("acct")
+                if isinstance(acct, str) and ":" in acct:
+                    facts["paper"] = acct.endswith(":paper")
+                    break
         if isinstance(mark, (int, float)) and mark > 0:
             facts["mark"] = round(float(mark), 4)
         _row_facts(record, cfg, **facts)
@@ -5300,25 +5353,43 @@ def _newest_signal_time(events):
     return newest
 
 
-_VIEW_LOG = {"snap": (None, [])}  # (the file's size and time, its rows)
+# (the file's size and time, its rows, its line count)
+_VIEW_LOG = {"snap": (None, [], 0)}
+
+
+def _log_key():
+    try:
+        st = os.stat(TRADES_PATH)
+        return (TRADES_PATH, st.st_size, st.st_mtime_ns)
+    except OSError:
+        return None
 
 
 def _view_rows():
     """Every trade-log row for the view-model, oldest first, each with its
-    line number; rows this run could not write yet come last, numbered on.
-    The dashboard asks every few seconds and the log only grows by appends,
-    so the parsed rows are kept until the file's size or time changes."""
-    try:
-        st = os.stat(TRADES_PATH)
-        key = (TRADES_PATH, st.st_size, st.st_mtime_ns)
-    except OSError:
-        key = None
-    kept_key, kept = _VIEW_LOG["snap"]
+    line number; rows this run could not write yet come last, numbered from
+    the line they will be written to. The dashboard asks every few seconds
+    and the log only grows by appends, so the parsed rows are kept until
+    the file's size or time changes — but only a read that worked, of a
+    file that did not change while it was read. A read that failed (a lock,
+    a disk error) shows the last good read, and is tried again next time."""
+    key = _log_key()
+    kept_key, kept, lines = _VIEW_LOG["snap"]
     if key is None or kept_key != key:
-        kept = _read_trade_log()
-        _VIEW_LOG["snap"] = (key, kept)  # one assignment: other threads read it
+        try:
+            kept, lines = _scan_trade_log(strict=True)
+        except FileNotFoundError:
+            kept, lines = [], 0  # no log yet (or moved away): nothing to show
+        except OSError:
+            pass  # keep showing the last good read; nothing new is kept
+        else:
+            if key is not None and _log_key() == key:
+                # one assignment: other threads read it
+                _VIEW_LOG["snap"] = (key, kept, lines)
     rows = list(kept)
-    n = rows[-1]["n"] + 1 if rows else 0
+    # _append_trade_rows starts a torn last line's row on a fresh line, so
+    # the next row is written at line `lines` either way
+    n = max(lines, rows[-1]["n"] + 1 if rows else 0)
     for i, r in enumerate(_unwritten_rows()):
         rows.append({**r, "n": n + i})
     return rows
@@ -5641,7 +5712,10 @@ def cmd_run(app_window=False):
     while True:
         keep_running.touch_alive()
         now_beat = _now()
-        _loop_note(beat_at=now_beat)
+        # the last cycle's sleep is over: until this cycle sleeps (below),
+        # "answering" is measured against the work alone, so a cycle that
+        # hangs shows after EXPIRY_WAKE_GAP_S, not that plus the old sleep
+        _loop_note(beat_at=now_beat, wait_s=None)
         if now_beat - beat["at"] - beat["wait"] > EXPIRY_WAKE_GAP_S:
             # the computer slept (or the loop hung): same check as at startup
             print(f"heartbeat resumed after {(now_beat - beat['at']) / 60:.0f} "

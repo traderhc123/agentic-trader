@@ -234,10 +234,10 @@ def test_a_log_that_cannot_be_written_still_counts_and_shows(home, monkeypatch):
 def test_view_rows_are_read_again_only_when_the_log_changes(home, monkeypatch):
     agent._log_trade({"action": "entry", "contract": "A", "dry": False})
     reads = []
-    real = agent._read_trade_log
-    monkeypatch.setattr(agent, "_read_trade_log",
-                        lambda: reads.append(1) or real())
-    monkeypatch.setattr(agent, "_VIEW_LOG", {"snap": (None, [])})
+    real = agent._scan_trade_log
+    monkeypatch.setattr(agent, "_scan_trade_log",
+                        lambda strict=False: reads.append(1) or real(strict))
+    monkeypatch.setattr(agent, "_VIEW_LOG", {"snap": (None, [], 0)})
     first = agent._view_rows()
     assert agent._view_rows() == first and len(reads) == 1
     first.append("mine")                      # a caller's list is its own
@@ -251,6 +251,69 @@ def test_view_rows_are_read_again_only_when_the_log_changes(home, monkeypatch):
     agent._log_trade({"action": "entry", "contract": "B", "dry": False})
     assert agent.view_activity(limit=1)["rows"][0]["n"] == 0
     assert agent.view_activity()["total"] == 1 and len(reads) == 5
+
+
+def test_a_failed_read_of_the_log_is_never_kept(home, monkeypatch):
+    """A read that fails (a lock held by a backup tool, a disk error) shows
+    the last good read and is tried again on the next ask — it is never
+    kept as "the log is empty" until the next append."""
+    monkeypatch.setattr(agent, "_VIEW_LOG", {"snap": (None, [], 0)})
+    agent._log_trade({"action": "entry", "contract": "A", "dry": False})
+    assert [r["contract"] for r in agent._view_rows()] == ["A"]
+    agent._log_trade({"action": "entry", "contract": "B", "dry": False})
+    real_open = open
+    lock = {"on": True}
+
+    def locked(path, *a, **k):
+        if lock["on"] and str(path) == agent.TRADES_PATH:
+            raise PermissionError("locked by another program")
+        return real_open(path, *a, **k)
+    monkeypatch.setattr(agent, "open", locked, raising=False)
+    assert [r["contract"] for r in agent._view_rows()] == ["A"]  # last good
+    assert agent.view_snapshot({"running": True})["limits"]["used_today"][
+        "real"] == 1
+    lock["on"] = False
+    # the file did not change since: read again all the same
+    assert [r["contract"] for r in agent._view_rows()] == ["A", "B"]
+
+
+def test_a_failed_first_read_shows_nothing_and_keeps_nothing(home, monkeypatch):
+    monkeypatch.setattr(agent, "_VIEW_LOG", {"snap": (None, [], 0)})
+    agent._log_trade({"action": "entry", "contract": "A", "dry": False})
+
+    def broken(strict=False):
+        raise OSError("I/O error")
+    real = agent._scan_trade_log
+    monkeypatch.setattr(agent, "_scan_trade_log", broken)
+    assert agent._view_rows() == []
+    monkeypatch.setattr(agent, "_scan_trade_log", real)
+    assert [r["contract"] for r in agent._view_rows()] == ["A"]
+
+
+def test_rows_kept_in_memory_are_numbered_by_the_line_they_get(home, monkeypatch):
+    """After a torn last line or blank lines, a row the agent could not
+    write yet is numbered with the line it is later written to — the page
+    keys rows by that number, so it must not show the row twice."""
+    (home / "trades.jsonl").write_text(
+        json.dumps({"action": "entry", "contract": "A", "dry": False,
+                    "ts": "2026-11-09T15:00:00+00:00"})
+        + "\n\n\n{\"action\": \"exi", encoding="utf-8")  # torn by a crash
+    monkeypatch.setattr(agent, "_VIEW_LOG", {"snap": (None, [], 0)})
+    monkeypatch.setattr(agent, "_UNWRITTEN", [])
+    monkeypatch.setattr(agent, "_LOG_FAIL", {"day": datetime.now(
+        timezone.utc).date().isoformat()})
+    real = agent._append_trade_rows
+
+    def full(path, rows):
+        raise OSError("disk full")
+    monkeypatch.setattr(agent, "_append_trade_rows", full)
+    agent._log_trade({"action": "entry", "contract": "B", "dry": False})
+    shown = {r["contract"]: r["n"] for r in agent._view_rows()}
+    monkeypatch.setattr(agent, "_append_trade_rows", real)
+    agent._log_trade({"action": "entry", "contract": "C", "dry": False})
+    written = {r["contract"]: r["n"] for r in agent._read_trade_log()}
+    assert written["B"] == shown["B"] == 4
+    assert [r["n"] for r in agent._view_rows()] == [0, 4, 5]
 
 
 # ── what the loop notes for the dashboard ───────────────────────────────────
@@ -419,6 +482,31 @@ def test_running_loop_serves_a_live_view_model(home, monkeypatch, no_policy):
     assert third["results"]["real"]["unmeasured"] == 1  # the stub has no quotes
     assert [p["rows"][0]["action"] for p in pages] == ["entry", "entry", "exit"]
     assert all(vm.validate(p, "ActivityPage") == [] for p in pages)
+
+
+def test_a_cycle_is_measured_without_the_last_cycles_sleep(home, monkeypatch,
+                                                          no_policy):
+    """While a cycle works, `answering` must not be stretched by the sleep
+    before it: a cycle that hangs right after a 5-minute sleep would read as
+    answering for 5 more minutes."""
+    during_work = []
+
+    class Peek(list):
+        def __iter__(self):
+            during_work.append(agent.LOOP.get("wait_s"))
+            return super().__iter__()
+
+    seen = []
+    run_agent(home, monkeypatch, [Peek(), Peek()], {"dry_run": True},
+              lambda i, view, status: seen.append(view()["agent"]))
+    assert during_work == [None, None]          # cleared at each cycle's start
+    assert all(a["heartbeat_every_s"] is not None for a in seen)  # the sleep
+    # a status taken while a cycle works: measured against the work alone
+    t = datetime(2026, 11, 9, 19, 41, 7, tzinfo=timezone.utc)
+    hung = vm.build_status({}, {}, [], {
+        "running": True, "heartbeat_at": t.timestamp() - 200, "wait_s": None},
+        now=t)
+    assert hung["agent"]["answering"] is False
 
 
 def test_running_loop_reports_each_kind_of_pause(home, monkeypatch, no_policy):

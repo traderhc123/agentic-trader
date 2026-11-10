@@ -74,7 +74,9 @@ PAUSE_SCOPES = ("none", "entries", "all")
 # why a real position is not being sold for the owner right now
 UNMANAGED_REASONS = ("agent_stopped", "agent_not_answering", "state_hold",
                      "handoff_hold", "restarting", "broker_down",
-                     "practice_holds_real_sells", "other_account", "expired")
+                     "practice_holds_real_sells", "other_account", "expired",
+                     "no_exit_signals", "feed_unreachable", "no_bid",
+                     "pass_unchecked")
 ANSWER_STATES = ("yes", "practice_only", "not_today", "paused", "cant",
                  "unknown")
 ANSWER_REASONS = (
@@ -83,14 +85,16 @@ ANSWER_REASONS = (
     "restarting", "owner_pause", "pause_feed_not_read", "broker_down",
     "daily_cap_reached", "daily_loss_reached", "position_cap_reached",
     "market_closed", "no_signal_access", "feed_unreachable", "ai_needed",
-    "practice_holds_real_sells")
+    "practice_holds_real_sells", "pass_unchecked")
 NEXT_ACTIONS = ("sell_on_exit", "sell_at_expiry_guard", "selling_now",
                 "paper_close", "unmanaged", "unknown")
 NEXT_REASONS = UNMANAGED_REASONS + (
     "exit_signal", "expiry_guard", "sell_working", "exit_remainder",
     "pause_feed_not_read")
 PASS_KINDS = ("prepaid", "day_pass", "subscription", "not_needed", "none")
-PASS_STATES = ("active", "exits_only", "waiting", "none")
+# unknown: a prepaid pass the agent could not check with AgentHC (the check
+# failed, or it has not run yet); it reads no signals until it can
+PASS_STATES = ("active", "exits_only", "waiting", "none", "unknown")
 
 # trade-log kinds ("action") -> the reason code a row of that kind gets when
 # the row itself doesn't carry a more exact one. Anything else is "unknown".
@@ -114,7 +118,10 @@ _KIND_CODES = {
 _ROW_CODES = ("past_expiry_guard", "exit_already_arrived",
               "rule_not_in_list", "rule_skip_list", "rule_side",
               "rule_min_strike", "rule_0dte", "rule_loss_streak",
-              "expiry_guard", "exit_remainder", "closed_outside")
+              "expiry_guard", "exit_remainder", "closed_outside",
+              # an order that went in and may have filled (agent
+              # _report_problem placed=True): never "rejected"/"failed"
+              "buy_unconfirmed", "sell_unconfirmed", "buy_partly_filled")
 REASON_CODES = tuple(dict.fromkeys(tuple(_KIND_CODES.values()) + _ROW_CODES
                                    + ("unknown",)))
 
@@ -145,6 +152,7 @@ def _types():
             "real_positions": "int",
             "real_positions_managed": "bool",
             "unmanaged_reason": Opt(Enum(*UNMANAGED_REASONS)),
+            "expiry_guard_on": "bool",
             "broker": Ref("Broker"),
             "signals": Ref("Signals"),
             "market": Ref("Market"),
@@ -288,6 +296,7 @@ def _types():
             "contract_text": Opt("str"),
             "book": Opt(book),
             "real": Opt("bool"),
+            "paper_account": Opt("bool"),
             "mode_at_time": Opt(Enum(*MODES)),
             "order_sent": Opt("bool"),
             "filled": Opt("bool"),
@@ -305,6 +314,7 @@ def _types():
         "Results": {
             "real": Ref("Book"),
             "practice": Ref("Book"),
+            "paper_account": Ref("Book"),
             "signal_cost": Ref("SignalCost"),
         },
         "Book": {
@@ -315,6 +325,7 @@ def _types():
             "won": "int",
             "lost": "int",
             "unmeasured": "int",
+            "unmeasured_today": "int",
             "days": List(Ref("BookDay")),
         },
         "BookDay": {"day": "str", "pnl": "num", "closed": "int"},
@@ -343,6 +354,9 @@ _DOC = {
     "Status.real_positions_managed": "are the real positions being sold on "
                                      "their exit signal / at expiry right now",
     "Status.unmanaged_reason": "why not, for the first real position that isn't",
+    "Status.expiry_guard_on": "false: the expiry sell is switched off in the "
+                              "settings, so nothing sells a position on its "
+                              "expiry day but an exit signal",
     "Status.entry_checks": "the checks an entry signal passes, in the order "
                            "the agent runs them (agent.ENTRY_CHECKS)",
     "Agent.running": "false: this server has no agent loop behind it (setup, "
@@ -365,6 +379,9 @@ _DOC = {
                             "signals (false: no pass or day-pass, or it "
                             "ran out); null = not read yet",
     "Signals.last_signal": "when the newest signal the agent has seen happened",
+    "Pass.status": "unknown: a prepaid pass the agent could not check with "
+                   "AgentHC yet (it reads no signals until it can); a wallet "
+                   "day-pass that is running counts as active",
     "Signals.last_signal_from": "feed = the feed's own time; activity_log = "
                                 "when the agent last logged handling a signal",
     "Market.opens_at": "this session's open while the market is open, else "
@@ -394,12 +411,22 @@ _DOC = {
     "Activity.n": "line number in the trade log: a stable row id",
     "Activity.known": "false: a kind this version can't describe",
     "Activity.real": "which book the row belongs to; null = not recorded",
+    "Activity.paper_account": "true: the order went to a broker's "
+                              "paper-trading account (not real money); "
+                              "null = not recorded",
     "Activity.mode_at_time": "the mode NEW trades used then; null = not recorded",
     "Activity.fill_price": "per share, only when the broker reported the fill",
     "Activity.quote_price": "per-share quote the estimate used",
     "Activity.stopped_at_check": "the entry check that stopped it",
     "Book.today": "estimated result of trades closed today (ET)",
     "Book.last_7_days": "the last 7 calendar days (ET), today included",
+    "Book.unmeasured_today": "sales today (ET) with no estimate: not in "
+                             "`today`, and not in `days`",
+    "Results.real": "orders the agent sent to a real-money account (or one "
+                    "not recorded as a paper-trading account)",
+    "Results.paper_account": "orders filled in a broker's paper-trading "
+                             "account (recorded on each line since this "
+                             "version): not real money",
     "BookDay.day": "ET day the trades were closed",
     "SignalCost.applies": "false: this signal source has no per-day charge",
     "SignalCost.days_used": "signal days recorded as paid for",
@@ -577,9 +604,20 @@ def _num(v):
         return None
     try:
         f = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # an int of 309+ digits
         return None
     return f if math.isfinite(f) else None
+
+
+# An estimate past this (a trillion dollars) is damage, not a trade: such a
+# row counts as not measured, so a sum of estimates is always finite.
+_PNL_MAX = 1e12
+
+
+def _pnl(v):
+    """A trade's estimated result as a finite float, or None."""
+    f = _num(v)
+    return f if f is not None and abs(f) < _PNL_MAX else None
 
 
 def _int(v, default=None):
@@ -769,6 +807,7 @@ def activity_row(row):
 
     sent = ui.get("sent") if isinstance(ui.get("sent"), bool) else None
     filled = ui.get("filled") if isinstance(ui.get("filled"), bool) else None
+    paper = ui.get("paper") if isinstance(ui.get("paper"), bool) else None
     if sent is None and known:
         if is_trade:
             # a real entry or exit row is only ever logged after its order
@@ -803,6 +842,7 @@ def activity_row(row):
         "contract_text": _text(text, _NAME),
         "book": _book_of(row, ui),
         "real": real,
+        "paper_account": paper if real is not False else None,
         "mode_at_time": mode,
         "order_sent": sent,
         "filled": filled,
@@ -869,25 +909,38 @@ def _row_day(row):
     return ""
 
 
+def _book_key(t):
+    """Which Results book an exit row belongs to: practice (its "dry"), a
+    broker's paper-trading account (recorded on the row), or real."""
+    if t.get("dry"):
+        return "practice"
+    return "paper_account" if _facts(t).get("paper") is True else "real"
+
+
 def _results(rows, now):
     """Each book's estimated closed-trade results, in one pass over the log.
     Real and practice are never added together: a row belongs to the book
-    its "dry" says."""
+    its "dry" says, and a sale in a broker's paper-trading account (as the
+    row recorded it) is never counted as real money."""
     import agent as A
     today = _et_day(now)
     week_from = (now.astimezone(A.MARKET_TZ).date()
                  - timedelta(days=6)).isoformat()
-    books = {dry: {"today": 0.0, "last_7_days": 0.0, "total": 0.0,
-                   "closed": 0, "won": 0, "lost": 0, "unmeasured": 0,
-                   "days": {}} for dry in (False, True)}
+    books = {k: {"today": 0.0, "last_7_days": 0.0, "total": 0.0,
+                 "closed": 0, "won": 0, "lost": 0, "unmeasured": 0,
+                 "unmeasured_today": 0, "days": {}}
+             for k in ("real", "practice", "paper_account")}
     for t in rows:
         if t.get("action") != "exit":
             continue
-        b = books[bool(t.get("dry"))]
-        v = _num(t.get("est_pnl_usd"))
+        b = books[_book_key(t)]
+        v = _pnl(t.get("est_pnl_usd"))
         if v is None:
             if not A._counted_before(t):
                 b["unmeasured"] += 1
+                # a sale today that has no estimate is still a sale today:
+                # never shown as "nothing closed"
+                b["unmeasured_today"] += _row_day(t) == today
             continue
         day = _row_day(t)
         b["total"] += v
@@ -909,7 +962,7 @@ def _results(rows, now):
                            reverse=True)
         for d in b["days"]:
             d["pnl"] = round(d["pnl"], 2)
-    return {"real": books[False], "practice": books[True]}
+    return books
 
 
 def _signal_cost(cfg, state, rows, now):
@@ -959,9 +1012,9 @@ def _today_counts(rows, now):
             out["entries"][book] += 1
         elif a == "exit" and str(t.get("closed_at")
                                  or t.get("ts", "")).startswith(today):
-            v = t.get("est_pnl_usd")
-            if isinstance(v, (int, float)) and math.isfinite(v):
-                out["pnl"][book] += float(v)
+            v = _pnl(t.get("est_pnl_usd"))
+            if v is not None:
+                out["pnl"][book] += v
             elif not A._counted_before(t):
                 out["unmeasured"][book] += 1
     return out
@@ -1002,8 +1055,11 @@ def _cash(cfg, bp):
             reason = "under_minimum"
         elif budget is not None and budget > bp:
             reason = "under_trade_size"
-    afford = (int(bp // budget) if bp is not None and budget and budget > 0
-              and bp >= 0 else None)
+    try:
+        afford = (int(bp // budget) if bp is not None and budget and budget > 0
+                  and bp >= 0 else None)
+    except (OverflowError, ValueError):  # a hand-edited, absurd trade size
+        afford = None
     return {"low": reason is not None, "low_reason": reason,
             "trades_affordable": afford}
 
@@ -1083,8 +1139,9 @@ def _opened(rows):
     position with the entry that opened it (agent.pnl_summary)."""
     out = {}
     for t in rows:
-        if t.get("action") == "entry":
-            out[(bool(t.get("dry")), t.get("contract"))] = t
+        # a damaged row's "contract" can be a list or an object: not a key
+        if t.get("action") == "entry" and isinstance(t.get("contract"), str):
+            out[(bool(t.get("dry")), t["contract"])] = t
     return out
 
 
@@ -1145,9 +1202,19 @@ def _next_action(key, row, c):
     if isinstance(pending, dict) and pending.get("side") == "sell":
         return out("selling_now", "sell_working")
     if guard_today and now_m >= guard:
+        if row.get("expiry_no_bid") == today:
+            # the guard found no bid and deliberately did not sell it; it
+            # looks again each loop (agent._expiry_guard_sell)
+            return out("unmanaged", "no_bid")
         return out("selling_now", "expiry_guard")
     if row.get("exiting"):
         return out("selling_now", "exit_remainder")
+    if c.get("exits"):
+        # no exit signal can reach the agent right now: only the expiry
+        # sell (expiry_guard_at) still acts on it
+        return out("unknown" if c["exits"] in ("feed_unreachable",
+                                               "pass_unchecked")
+                   else "unmanaged", c["exits"])
     if guard_today:
         return out("sell_at_expiry_guard", "expiry_guard", guard_at)
     return out("sell_on_exit", "exit_signal")
@@ -1162,7 +1229,8 @@ def _position(key, row, opened, c):
     ui = _facts(entry)
     qty = max(0, _int(row.get("qty"), 0) or 0)
     price = _num(row.get("entry_mark"))
-    price = price if price is not None and price > 0 else None
+    price = price if price is not None and 0 < price < _PNL_MAX else None
+    cost = price * qty * 100 if price is not None and qty else None
     pending = row.get("pending")
     side = pending.get("side") if isinstance(pending, dict) else None
     return {
@@ -1172,8 +1240,8 @@ def _position(key, row, opened, c):
                   else _text(key, _NAME)) or "",
         "qty": qty,
         "entry_price": price,
-        "entry_cost_usd": (round(price * qty * 100, 2)
-                           if price is not None and qty else None),
+        "entry_cost_usd": (round(cost, 2) if cost is not None
+                           and math.isfinite(cost) else None),
         "opened_at": (_iso(row.get("opened_at")) if _num(row.get("opened_at"))
                       else _iso(entry.get("ts"))),
         "real": real,
@@ -1236,9 +1304,11 @@ def _pass(cfg, state, now):
         cache = state.get("pass_status")
         cache = cache if isinstance(cache, dict) else {}
         best = None
+        statuses = set()
         for token in tokens:
             rec = cache.get(hc._token_id(token))
             rec = rec if isinstance(rec, dict) else {}
+            statuses.add(rec.get("status"))
             if rec.get("status") in hc._USABLE and (
                     best is None or (rec.get("status") == "active"
                                      and best.get("status") != "active")):
@@ -1246,22 +1316,33 @@ def _pass(cfg, state, now):
     except Exception:
         return none
     auto = bool(cfg.get("day_pass_recurring"))
+    # a wallet day-pass that is paid and still running: the agent reads the
+    # feed with it before any prepaid pass (hc.poll, hc._live_daypass)
+    l402 = state.get("l402")
+    l402 = l402 if isinstance(l402, dict) else {}
+    until = _num(l402.get("expires_at"))
+    live = bool(l402.get("token")) and until is not None \
+        and until > now.timestamp()
+    if live and not (best and best.get("status") == "active"):
+        return {"kind": "day_pass", "status": "active", "days_left": None,
+                "auto_pay": auto}
     if best:
         left = _int(best.get("days_left"))
         return {"kind": "prepaid", "status": best["status"],
                 "days_left": left if left is not None and left >= 0 else None,
                 "auto_pay": auto}
     if tokens:
-        return {"kind": "prepaid", "status": "waiting", "days_left": None,
-                "auto_pay": auto}
+        # no record for a pass: its check with AgentHC failed (or has not
+        # run yet), and hc.poll reads nothing until it knows — never "used
+        # up" on a guess
+        return {"kind": "prepaid",
+                "status": "unknown" if None in statuses else "waiting",
+                "days_left": None, "auto_pay": auto}
     if cfg.get("lnbits_url"):
-        l402 = state.get("l402")
-        until = _num(l402.get("expires_at")) if isinstance(l402, dict) else None
-        live = until is not None and until > now.timestamp()
         # no day-pass in hand: with auto-pay on, the agent buys one on its
         # next read of the feed on a market day
         return {"kind": "day_pass",
-                "status": "active" if live else "waiting" if auto else "none",
+                "status": "waiting" if auto else "none",
                 "days_left": None, "auto_pay": auto}
     return none
 
@@ -1283,6 +1364,39 @@ def _last_signal(rows, rt):
             if when:
                 return when, "activity_log"
     return None, None
+
+
+def _exits_cut_off(state, signals, market_open, now):
+    """Why no exit signal can reach the agent right now — "no_exit_signals"
+    (no usable pass: used up past its exits-only days, expired, waiting for
+    payment with no wallet auto-pay, or a paid day-pass AgentHC refused),
+    "pass_unchecked" (a prepaid pass it could not check with AgentHC) or
+    "feed_unreachable" (its last read of the feed failed) — else None. The
+    cases where sources.agenthc_day_trade_ideas.poll returns no events
+    without raising."""
+    if not signals["reading"]:
+        return None  # not reading at all: the hold / pause says why
+    p = signals["pass"]
+    # a last read that could see entry signals saw the exits too
+    if p["kind"] in ("prepaid", "day_pass", "none") \
+            and signals["entry_access"] is not True:
+        if p["status"] == "unknown":
+            return "pass_unchecked"
+        l402 = state.get("l402")
+        l402 = l402 if isinstance(l402, dict) else {}
+        until = _num(l402.get("expires_at"))
+        refused = (_num(l402.get("refused_at")) is not None
+                   and until is not None and until > now.timestamp())
+        if (refused or p["status"] == "none"
+                or (p["status"] == "waiting"
+                    and (not p["auto_pay"]
+                         # auto-pay buys on a market day: open, and the last
+                         # read still had no access
+                         or (market_open and signals["entry_access"] is False)))):
+            return "no_exit_signals"
+    if signals["last_poll_ok"] is False:
+        return "feed_unreachable"
+    return None
 
 
 def _answer(state, reason):
@@ -1313,7 +1427,8 @@ def _capabilities(c, limits, market, signals, positions):
     elif c["entries_paused"]:
         opening = _answer("paused", "owner_pause")
     elif not access:
-        opening = _answer("cant", "no_signal_access")
+        opening = _answer("cant", "pass_unchecked" if p["status"] == "unknown"
+                          else "no_signal_access")
     elif c["ai_blocked"]:
         opening = _answer("cant", "ai_needed")
     elif c["broker_down"] and not practice:
@@ -1339,6 +1454,10 @@ def _capabilities(c, limits, market, signals, positions):
         closing = _answer("cant", "practice_holds_real_sells")
     elif real_open and c["broker_down"]:
         closing = _answer("cant", "broker_down")
+    elif real_open and c["exits"] == "no_exit_signals":
+        closing = _answer("cant", "no_signal_access")
+    elif real_open and c["exits"] in ("feed_unreachable", "pass_unchecked"):
+        closing = _answer("cant", c["exits"])
     elif not real_open and not signals["reading"]:
         closing = _answer("paused", "pause_feed_not_read")
     elif not real_open:
@@ -1350,7 +1469,10 @@ def _capabilities(c, limits, market, signals, positions):
         listening = stopped
     elif not signals["reading"]:
         listening = _answer("paused", "pause_feed_not_read")
-    elif not exits_readable:
+    elif c["exits"] == "pass_unchecked" or (
+            not exits_readable and p["status"] == "unknown"):
+        listening = _answer("cant", "pass_unchecked")
+    elif not exits_readable or c["exits"] == "no_exit_signals":
         listening = _answer("cant", "no_signal_access")
     elif signals["last_poll_ok"] is False:
         listening = _answer("cant", "feed_unreachable")
@@ -1359,7 +1481,37 @@ def _capabilities(c, limits, market, signals, positions):
     return {"opening": opening, "closing": closing, "listening": listening}
 
 
-def _notices(rt):
+def _pass_notice(cfg, state, signals=None):
+    """The signal-pass message the agent saved for the owner (a pass that
+    ran out, a day-pass AgentHC refused…), shown when the classic page
+    shows it (agent._feed_access: not while a pass has days left) and only
+    while it can still be true. The agent clears it only when a day-pass
+    alert ends, so a lapse notice can outlive the lapse: it is not shown
+    once the feed is read with entry access, with an API key or a source
+    that needs no pass, or (unless a day-pass alert is current) once wallet
+    auto-pay buys the day-pass."""
+    text = _text(state.get("pass_notice"))
+    if not text:
+        return None
+    p = signals.get("pass") if isinstance(signals, dict) else None
+    if isinstance(p, dict):
+        if signals.get("entry_access") is True \
+                or p.get("kind") in ("subscription", "not_needed"):
+            return None
+        if (p.get("auto_pay") and cfg.get("lnbits_url")
+                and p.get("status") != "exits_only"
+                and not state.get("daypass_alert")):
+            return None  # a prepaid lapse: the wallet buys the day-pass now
+    try:
+        from sources import agenthc_day_trade_ideas as hc
+        if "left" in hc.pass_summary(cfg, state):
+            return None
+    except Exception:
+        pass
+    return {"level": "warn", "code": "pass", "text": text}
+
+
+def _notices(rt, cfg=None, state=None, signals=None):
     out = []
     raw = rt.get("notices")
     for n in (raw if isinstance(raw, (list, tuple)) else ())[:50]:
@@ -1369,7 +1521,19 @@ def _notices(rt):
             else "info"
         out.append({"level": level, "code": _text(n.get("code"), 40) or "note",
                     "text": _text(n.get("text"))})
+    note = _pass_notice(cfg or {}, state or {}, signals)
+    if note and not any(n["text"] == note["text"] for n in out):
+        out.append(note)
     return out
+
+
+def _guard_on(cfg, now_et):
+    """Whether the expiry sell is switched on (agent._expiry_times)."""
+    import agent as A
+    try:
+        return A._expiry_times(cfg, now_et.date().isoformat())[0] is not None
+    except Exception:
+        return False  # can't tell: never promise a sale
 
 
 def build_status(cfg, state, rows, runtime=None, now=None,
@@ -1444,15 +1608,8 @@ def build_status(cfg, state, rows, runtime=None, now=None,
          "broker_down": broker["connected"] is False,
          "holds_real_sells": A._dry_run_holds_real_sells(cfg),
          "past_close": False,
+         "exits": None,
          "ai_blocked": bool(rt.get("ai_blocked"))}
-
-    opened = _opened(rows)
-    pos = [_position(str(k), r, opened, c)
-           for k, r in sorted(positions.items(), key=lambda kv: str(kv[0]))
-           if isinstance(r, dict)]
-    unmanaged = [p for p in pos if p["real"]
-                 and p["next"]["action"] in ("unmanaged", "unknown")]
-    why = unmanaged[0]["next"]["reason_code"] if unmanaged else None
 
     feed_skipped = A._pause_skips_feed(cfg, state)
     last_signal, signal_from = _last_signal(rows, rt)
@@ -1471,6 +1628,15 @@ def build_status(cfg, state, rows, runtime=None, now=None,
     market = _market(cfg, now)
     c["past_close"] = (c["now_et"].hour * 60 + c["now_et"].minute
                        >= A._close_min(cfg, c["now_et"].date().isoformat()))
+    c["exits"] = _exits_cut_off(state, signals, market["open"], now)
+
+    opened = _opened(rows)
+    pos = [_position(str(k), r, opened, c)
+           for k, r in sorted(positions.items(), key=lambda kv: str(kv[0]))
+           if isinstance(r, dict)]
+    unmanaged = [p for p in pos if p["real"]
+                 and p["next"]["action"] in ("unmanaged", "unknown")]
+    why = unmanaged[0]["next"]["reason_code"] if unmanaged else None
     limits = _limits(cfg, state, rows, mode, broker["buying_power"], now)
     return {
         "schema": SCHEMA_VERSION,
@@ -1489,6 +1655,7 @@ def build_status(cfg, state, rows, runtime=None, now=None,
         "real_positions": sum(1 for p in pos if p["real"]),
         "real_positions_managed": not unmanaged,
         "unmanaged_reason": why if why in UNMANAGED_REASONS else None,
+        "expiry_guard_on": _guard_on(cfg, c["now_et"]),
         "broker": broker,
         "signals": signals,
         "market": market,
@@ -1499,7 +1666,7 @@ def build_status(cfg, state, rows, runtime=None, now=None,
         "activity": activity_page(rows, limit=activity_limit, _checked=True),
         "results": {**_results(rows, now),
                     "signal_cost": _signal_cost(cfg, state, rows, now)},
-        "notices": _notices(rt),
+        "notices": _notices(rt, cfg, state, signals),
     }
 
 
