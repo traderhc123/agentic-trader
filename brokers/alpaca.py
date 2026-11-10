@@ -16,8 +16,15 @@ import time
 import requests
 
 import broker_events
+from platform_compat import safe_print
 
+from . import order_guard
 from .pricing import exit_qty, marketable_limit
+
+# Every status line in this module goes through safe_print: a console that
+# can't show a character ("→" on a Windows cp1252 stdout) must never stop an
+# order by making print() raise.
+print = safe_print
 
 _TIMEOUT = 15
 _OCC_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
@@ -120,8 +127,12 @@ def _quote_price(cfg, occ):
 
 
 def mark_price(cl, cfg, event, side="buy"):
-    """Per-share quote for the agent's P&L estimate (0.0 when unavailable)."""
+    """Per-share quote for the agent's P&L estimate (0.0 when unavailable):
+    the ask for a buy, the bid for a sell — a sale fills at the bid, so
+    marking it at the ask would understate a loss."""
     cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    if side == "sell":
+        return _bid(cfg, _occ_symbol(event)) or 0.0
     return _quote_price(cfg, _occ_symbol(event))
 
 
@@ -210,22 +221,226 @@ _CONFIRM_TRIES = 3
 _CONFIRM_WAIT_S = 5.0
 
 
-def _order(cfg, occ, side, qty, limit_price=None):
+class _Unconfirmed(Exception):
+    """The order request got no clear answer from Alpaca (a timeout, a
+    dropped connection, a server error): it may or may not have gone
+    through. Never answered by simply sending it again (order_guard)."""
+
+
+def _order(cfg, occ, side, qty, limit_price=None, client_order_id=None):
+    """Submit one order. Returns its id, or None when Alpaca refused it;
+    raises _Unconfirmed when there is no clear answer.
+
+    client_order_id: Alpaca accepts each one once per account, so a repeat
+    of the same order is refused instead of buying or selling twice (that
+    refusal is raised as _Unconfirmed too: the order is there already)."""
     body = {"symbol": occ, "qty": str(int(qty)), "side": side,
             "type": "market", "time_in_force": "day"}
     if limit_price is not None:
         body.update(type="limit", limit_price=f"{limit_price:.2f}")
-    resp = requests.post(f"{_base(cfg)}/v2/orders", headers=_headers(cfg),
-                         json=body, timeout=_TIMEOUT)
-    if resp.status_code not in (200, 201):
+    if client_order_id:
+        body["client_order_id"] = client_order_id
+    try:
+        resp = requests.post(f"{_base(cfg)}/v2/orders", headers=_headers(cfg),
+                             json=body, timeout=_TIMEOUT)
+        status = int(resp.status_code)
+    except Exception as exc:
+        raise _Unconfirmed(type(exc).__name__) from exc
+    if status >= 500:
+        raise _Unconfirmed(f"HTTP {status}")
+    if status not in (200, 201):
+        if client_order_id and "client_order_id" in str(resp.text):
+            # "client_order_id must be unique": an order under this id is
+            # already there — which one is for the caller to look up
+            raise _Unconfirmed("Alpaca already has an order under this id")
         print(f"  ORDER FAILED HTTP {resp.status_code}: {resp.text[:200]}")
         broker_events.report("order_failed" if side == "buy" else "exit_failed",
                              f"Alpaca rejected the {side} order (HTTP "
                              f"{resp.status_code}): {resp.text[:300]}")
         return None
-    oid = resp.json().get("id", "submitted")
+    try:
+        oid = resp.json().get("id", "submitted")
+    except Exception as exc:  # accepted, but the answer can't be read
+        raise _Unconfirmed(type(exc).__name__) from exc
     print(f"  alpaca order {side} x{qty} -> {oid}")
     return oid
+
+
+def _order_by_key(cfg, key):
+    """The order Alpaca holds under this client_order_id: its row, False
+    when Alpaca says there is none, None when it can't be read."""
+    try:
+        resp = requests.get(f"{_base(cfg)}/v2/orders:by_client_order_id",
+                            params={"client_order_id": key},
+                            headers=_headers(cfg), timeout=_TIMEOUT)
+        if resp.status_code == 404:
+            return False
+        row = resp.json() if resp.status_code == 200 else None
+    except Exception:
+        return None
+    if isinstance(row, dict) and row.get("id") and row.get("client_order_id") == key:
+        return row
+    return None
+
+
+def _account(cfg):
+    """Paper and live are separate accounts: their order ids never mix."""
+    return "alpaca:paper" if cfg.get("alpaca_paper", True) else "alpaca:live"
+
+
+def _send(cfg, state, pos_key, event, contract, occ, side, qty, limit=None):
+    """Place the order for this signal — once. Returns the order id, or
+    None when no order is known to be at Alpaca: it was refused (reported
+    by _order), or there was no clear answer and Alpaca doesn't show it
+    (remembered in state and reported; see order_guard)."""
+    pos = state["positions"].get(pos_key) if side == "sell" else None
+    seq = order_guard.sell_seq(pos)
+    key = order_guard.order_key(_account(cfg), event, side, seq)
+    kw = {"limit_price": limit} if limit is not None else {}
+    sent_at = time.time()
+    try:
+        oid = _order(cfg, occ, side, qty, client_order_id=key, **kw)
+    except _Unconfirmed as exc:
+        found = _order_by_key(cfg, key)
+        if not found:
+            order_guard.note(state, pos_key, side, key, qty, occ,
+                             event_id=event.get("event_id"), contract=contract)
+            lost = order_guard.lost_text("Alpaca", side, qty, contract)
+            print(f"  no answer from Alpaca to the {side} order ({exc}) and it "
+                  "isn't listed — NOT sending it again without knowing")
+            if side == "buy":
+                broker_events.report(
+                    "order_failed", lost + " It will NOT send this buy again. "
+                    "Check your Alpaca dashboard: if the order is there, the "
+                    "agent finds it on its own and manages the position; if it "
+                    "isn't, this trade was missed.", placed=True)
+            else:
+                broker_events.report("exit_failed", lost + _SELL_WAITS, placed=True)
+            return None
+        oid = str(found["id"])
+        if _ours_now(found, state, sent_at):
+            print(f"  no clear answer from Alpaca to the {side} order ({exc}), "
+                  f"but the order is there ({oid}) — using it")
+        else:
+            # an OLDER order holds this id: Alpaca refused this one as a
+            # repeat of it, so nothing new went in — and nothing is adopted
+            print(f"  ORDER NOT PLACED: Alpaca already has an earlier order for "
+                  f"this same signal ({oid})")
+            broker_events.report(
+                "order_failed" if side == "buy" else "exit_failed",
+                f"Alpaca already has an earlier order for this same signal "
+                f"({oid}), so it took no new {side} order for {contract} — "
+                "check your Alpaca dashboard", placed=True)
+            oid = None
+    if pos is not None:
+        # Alpaca answered: a later sell for this signal is a new order
+        pos["sell_seq"] = seq + 1
+    return oid
+
+
+def _ours_now(order, state, sent_at):
+    """True when the order Alpaca holds under an id can be the one a
+    request sent at sent_at left there (order_guard.from_this_attempt)."""
+    return order_guard.from_this_attempt(
+        order.get("id"), order.get("submitted_at") or order.get("created_at"),
+        sent_at, state.get("agent_order_ids"))
+
+
+_SELL_WAITS = (" It will not sell again until Alpaca can tell it (it asks every "
+               "loop): a second sell could open a short position. Check your "
+               "Alpaca dashboard and close the position there if it must be "
+               "closed right now.")
+
+
+def _settle_unconfirmed(cfg, state, pos_key):
+    """Look up an order whose request got no clear answer (order_guard).
+    "clear": nothing is waiting (any more) — it isn't at Alpaca;
+    "adopted": it is there, and the ledger now has what it filled;
+    "unknown": Alpaca can't say yet — never place another order on it."""
+    unc = order_guard.get(state, pos_key)
+    if not unc:
+        return "clear"
+    side, qty = unc.get("side"), int(unc.get("qty") or 0)
+    pos = state["positions"].get(pos_key)
+    contract = unc.get("contract") or pos_key.replace("|", " ")
+    if (side == "sell") != bool(pos) or (
+            side == "buy" and order_guard.age(unc) > order_guard.GIVE_UP_S):
+        order_guard.drop(state, pos_key)  # nothing left it could change
+        return "clear"
+    found = _order_by_key(cfg, unc.get("key"))
+    if found is None:
+        return "unknown"
+    if found is False:
+        if side == "buy" and order_guard.age(unc) < order_guard.BUY_KEEP_S:
+            return "unknown"  # not there now; it may still show up late
+        order_guard.drop(state, pos_key)
+        return "clear"
+    oid = str(found["id"])
+    order_guard.drop(state, pos_key)
+    if not _ours_now(found, state, unc.get("at")):
+        # an older order under the same id: the request was refused as a
+        # repeat of it. Nothing new is at Alpaca.
+        if side == "sell":
+            pos["sell_seq"] = order_guard.sell_seq(pos) + 1
+        return "clear"
+    _remember_order(state, oid)
+    print(f"  the {side} order for {contract} did reach Alpaca ({oid}) — using it")
+    filled = _confirm_fill(cfg, oid, qty, side=side)
+    if side == "sell":
+        pos["sell_seq"] = order_guard.sell_seq(pos) + 1
+        _book_sale(state, pos_key, pos, oid, filled, qty, contract)
+    elif filled < 1:
+        print(f"  it never filled — no position recorded ({contract})")
+        broker_events.report("entry_unfilled",
+                             f"the buy order for {contract} that the agent "
+                             "couldn't confirm did reach Alpaca, but never filled")
+    else:
+        state["positions"][pos_key] = {"option_id": unc.get("option_id"),
+                                       "qty": filled,
+                                       "opened_event": unc.get("event_id")}
+        _stamp_order(state["positions"][pos_key], oid)
+        broker_events.report(
+            "order_failed", f"the buy order for {contract} that the agent "
+            f"couldn't confirm did go through: {filled} contract(s) bought. The "
+            "agent tracks this position now and sells it on its exit signal.",
+            placed=True)
+    return "adopted"
+
+
+def reconcile(cl, cfg, state, save_state):
+    """Called by the agent once per loop, before new events: looks again
+    for buy orders whose request got no clear answer. One that is at Alpaca
+    after all becomes the position it bought. (An unconfirmed sell is
+    settled by its exit's own retry in execute, so the sale is logged as
+    that exit.) No network call unless such an order is waiting."""
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    changed = False
+    for pos_key in list(order_guard.unconfirmed(state)):
+        unc = order_guard.get(state, pos_key)
+        if (unc and unc.get("side") == "sell"
+                and pos_key in state.get("positions", {})):
+            continue
+        if _settle_unconfirmed(cfg, state, pos_key) != "unknown":
+            changed = True
+    if changed:
+        save_state(state)
+
+
+def _book_sale(state, pos_key, pos, oid, sold, qty, contract):
+    """Take what an exit order sold out of the ledger row."""
+    remaining = int(pos["qty"]) - sold
+    if remaining > 0:
+        pos["qty"] = remaining
+        _stamp_order(pos, oid)
+        # the agent re-sells the remainder (agent.exit_remainder_tick)
+        print(f"  ⚠️ exit only filled {sold}/{qty} — {remaining}x still "
+              f"held; re-selling the remaining {remaining}x next loop")
+        broker_events.report("exit_partial",
+                             f"exit filled {sold}/{qty} — {remaining}x "
+                             f"{contract} still held; the agent re-sells "
+                             f"the remaining {remaining}x next loop")
+    else:
+        del state["positions"][pos_key]
 
 
 def _order_state(cfg, oid):
@@ -305,6 +520,19 @@ def execute(cl, cfg, event, state):
     if event["event"] == "ENTERED":
         if pos_key in state["positions"]:
             return False
+        if _settle_unconfirmed(cfg, state, pos_key) == "unknown":
+            # an earlier buy of this contract got no clear answer and Alpaca
+            # still can't say whether it is there: never buy on top of it
+            print(f"SKIPPED {contract}: an earlier buy order for it is still "
+                  "unconfirmed — not buying again")
+            broker_events.report(
+                "order_failed", f"an earlier buy order for {contract} is still "
+                "unconfirmed (the agent can't tell whether it went through), so "
+                "it did not buy again — check your Alpaca dashboard",
+                placed=True)
+            return False
+        if pos_key in state["positions"]:
+            return False  # that earlier buy is the position now
         qty, note = _size(cfg, occ)
         if qty < 1:
             print(f"SKIPPED {contract}: {note}")
@@ -313,7 +541,7 @@ def execute(cl, cfg, event, state):
                 "skip_no_quote" if "no quote" in note else "skip_sizing", note)
             return False
         print(f"ENTERED event -> buying {qty}x {contract} ({note})")
-        oid = _order(cfg, occ, "buy", qty)
+        oid = _send(cfg, state, pos_key, event, contract, occ, "buy", qty)
         if oid:
             _remember_order(state, oid)
             filled = _confirm_fill(cfg, oid, qty)
@@ -329,6 +557,25 @@ def execute(cl, cfg, event, state):
             return True
     elif event["event"] == "EXITED":
         pos = state["positions"].get(pos_key)
+        if order_guard.get(state, pos_key):
+            # an order for this contract got no clear answer: find out first
+            settled = _settle_unconfirmed(cfg, state, pos_key)
+            if settled == "unknown" and not pos:
+                # the BUY may be there: keep the exit until that is known
+                raise RuntimeError(
+                    f"can't tell yet whether the buy order for {contract} went "
+                    "through — its exit signal waits until the agent knows")
+            if settled == "unknown":
+                print(f"  can't tell yet whether the earlier sell of {contract} "
+                      "went through — not selling again until Alpaca can say")
+                broker_events.report(
+                    "exit_failed", f"the agent still can't tell whether its sell "
+                    f"order for {contract} went through." + _SELL_WAITS,
+                    placed=True)
+                return False
+            if settled == "adopted" and pos:
+                return True  # that sell was there: the ledger has what it sold
+            pos = state["positions"].get(pos_key)
         if not pos:
             return False
         qty = exit_qty(pos, event)
@@ -340,24 +587,12 @@ def execute(cl, cfg, event, state):
             print(f"  marketable sell — limit @ ${limit:.2f}"
                   if limit is not None else
                   "  marketable sell: no usable bid — placing it as a market order")
-        oid = _order(cfg, pos.get("option_id", occ), "sell", qty,
-                     **({"limit_price": limit} if limit is not None else {}))
+        oid = _send(cfg, state, pos_key, event, contract,
+                    pos.get("option_id", occ), "sell", qty, limit)
         if oid:
             _remember_order(state, oid)
             sold = _confirm_fill(cfg, oid, qty, side="sell")
-            remaining = int(pos["qty"]) - sold
-            if remaining > 0:
-                pos["qty"] = remaining
-                _stamp_order(pos, oid)
-                # the agent re-sells the remainder (agent.exit_remainder_tick)
-                print(f"  ⚠️ exit only filled {sold}/{qty} — {remaining}x still "
-                      f"held; re-selling the remaining {remaining}x next loop")
-                broker_events.report("exit_partial",
-                                     f"exit filled {sold}/{qty} — {remaining}x "
-                                     f"{contract} still held; the agent re-sells "
-                                     f"the remaining {remaining}x next loop")
-            else:
-                del state["positions"][pos_key]
+            _book_sale(state, pos_key, pos, oid, sold, qty, contract)
             return True
     return False
 

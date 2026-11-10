@@ -75,6 +75,32 @@ def venv_pip(prefix="./.venv"):
     return prefix + "/bin/pip"
 
 
+def safe_print(*args, **kwargs):
+    """print() that can never raise.
+
+    Windows gives a redirected stdout the legacy code page (cp1252) unless
+    the supervisor started the process (it sets PYTHONIOENCODING=utf-8), and
+    print("→") raises UnicodeEncodeError there. A status line must never
+    stop the order that follows it: characters the console can't show are
+    printed as "?", and a stream that can't be written at all is skipped."""
+    try:
+        print(*args, **kwargs)
+        return
+    except UnicodeEncodeError:
+        pass
+    except Exception:
+        return
+    try:
+        stream = kwargs.get("file") or sys.stdout
+        enc = getattr(stream, "encoding", None) or "ascii"
+        sep = kwargs.get("sep")
+        text = (" " if sep is None else sep).join(str(a) for a in args)
+        rest = {k: v for k, v in kwargs.items() if k != "sep"}
+        print(text.encode(enc, "replace").decode(enc, "replace"), **rest)
+    except Exception:
+        pass
+
+
 def wait_port_free(port, timeout=20.0):
     """Wait until nothing is listening on 127.0.0.1:port. True if free."""
     import socket

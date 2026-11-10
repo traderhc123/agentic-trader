@@ -23,6 +23,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import requests
 
 import broker_events
+from platform_compat import safe_print
+
+# The connection notes below are printed inside the call that talks to
+# Robinhood: a console that can't show "⚠️" or "✓" must not make that call
+# raise and lose its answer.
+print = safe_print
 
 MCP_URL = "https://agent.robinhood.com/mcp/trading"
 REGISTER_URL = "https://agent.robinhood.com/oauth/trading/register"
