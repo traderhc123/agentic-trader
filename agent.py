@@ -358,9 +358,59 @@ def _state_hold():
     return hold if isinstance(hold, dict) and hold.get("why") else None
 
 
+# This run is on hold over a damaged state.json (_announce_state_hold): no
+# orders at all — no entries, no exits, no expiry-guard or re-sell orders —
+# and the feed is not read, until the owner's `resume`. This is NOT the
+# owner's Pause (config.json "paused", which only stops new entries): the
+# agent's memory is in doubt, so it must not sell from it either. Kept in
+# memory, so it holds for this run even when the record (state-hold.json)
+# could not be written or is briefly unreadable.
+_STATE_HELD = {"on": False}
+
+
+# Shown next to the dashboard's "Paused" line, whose own words describe the
+# owner's Pause (exits keep running) — not true on a memory hold.
+_STATE_HELD_NOTE = (
+    "IMPORTANT: this is not an ordinary pause. The agent's memory file was "
+    "damaged (see the warning on this page), so until you press Resume it "
+    "places NO orders at all, exits and the expiry guard included, and reads "
+    "no signals. Check your broker account and close positions there "
+    "yourself if needed.")
+
+
+# The same for a hand-off to a server (transfer.HANDOFF): Resume is refused.
+_HANDOFF_NOTE = (
+    "This setup is being moved, or was moved, to a server. The agent on this "
+    "computer places NO orders at all, exits and the expiry guard included, "
+    "and reads no signals, so the two can never both trade. Resume is "
+    "switched off; if the move fails, the agent carries on here by itself.")
+
+
+def _state_held():
+    return bool(_STATE_HELD["on"])
+
+
+def _handed_off():
+    """A move to a server is in progress or done (transfer.HANDOFF): the
+    heartbeat places no orders at all, and `resume` can't lift it."""
+    import transfer
+    return bool(transfer.HANDOFF["hold"])
+
+
+def _full_hold_note():
+    """Why the agent places no orders at all right now — no entries and no
+    exits, unlike the owner's Pause — in the owner's words; "" when it is
+    not on such a hold. (The few seconds before a restart are reported
+    separately: status "restarting".)"""
+    if _handed_off():
+        return _HANDOFF_NOTE
+    return _STATE_HELD_NOTE if _state_held() else ""
+
+
 def _end_state_hold():
     """The owner said resume: forget the hold. Returns the record it ended
     (None if there was none)."""
+    _STATE_HELD["on"] = False
     hold = _state_hold()
     if hold is None:
         return None
@@ -392,8 +442,11 @@ def _state_hold_text(hold, cfg=None):
     kept = (f" The damaged file was kept as {hold['kept']}."
             if hold.get("kept") else "")
     undated = cfg is not None and cfg.get("source", "agenthc") != "agenthc"
-    paused = ("While paused the agent places no orders and pays for no "
-              "signals. When you have checked, press Resume on the dashboard")
+    # unlike the owner's own Pause, which only stops new entries
+    paused = ("While paused this way the agent places no orders at all (it "
+              "does not sell on exit signals or at expiry either) and pays "
+              "for no signals. When you have checked, press Resume on the "
+              "dashboard")
     if hold.get("why") == "old_backup":
         when = _et_stamp(hold.get("backup_at")) or "an earlier time"
         return ("PAUSED: the agent's memory file (state.json) was damaged or "
@@ -427,6 +480,7 @@ def _state_startup(cfg, state, info):
     and pause when the agent can't be sure its memory is complete. Returns
     True when this run starts paused."""
     import webui
+    _STATE_HELD["on"] = False  # decided anew by every start
     how = info.get("how")
     if how == "unopened":
         # Its contents are unknown (it may be perfectly good): never set it
@@ -526,7 +580,7 @@ def _state_stuck_exit(cfg, unopened=None):
 
 
 def _announce_state_hold(cfg, hold, webui):
-    webui.CONTROLS["paused"] = True
+    _STATE_HELD["on"] = True
     text = _state_hold_text(hold, cfg)
     print("\n" + "!" * 72 + "\n" + text + "\n(No dashboard? Check your broker "
           f"account, then delete {_state_hold_path()} and start the agent "
@@ -558,6 +612,104 @@ def _durability_banner():
     except Exception:
         pass
     return out
+
+
+# ── config.json: one lock, always read-modify-write ──────────────────────────
+# The chat commands, the dashboard buttons and the settings pages all change
+# config.json, from different threads of the running agent. Every change has
+# to start from what is in the file NOW and hold this lock until it is saved:
+# a save made from a copy read earlier silently undoes somebody else's change
+# (it once put the agent back in LIVE mode after the owner chose dry-run).
+CONFIG_LOCK = __import__("threading").RLock()
+
+
+class ConfigUnreadable(OSError):
+    """config.json is there but can't be used as settings right now. The
+    text is what the owner is told. `damaged`: it is not valid JSON (a typo
+    from editing it by hand), as opposed to locked or busy."""
+    damaged = False
+
+
+class ConfigDamaged(ConfigUnreadable):
+    damaged = True
+
+
+def _config_damaged_text():
+    return ("Nothing was changed: your settings file has a typo, so I can't "
+            f"read it ({CONFIG_PATH}). This usually happens after editing it "
+            "by hand — look for a missing or extra comma or quote mark, fix "
+            "it and try again. Until then no setting can be changed; the "
+            "agent keeps running on the last settings it could read, but it "
+            "can't start again after a stop. To stop the agent right now, "
+            "type: stop")
+
+
+_CONFIG_BUSY_TEXT = ("I couldn't read your settings file just now, so nothing "
+                     "was changed. Try again in a moment. To stop the agent "
+                     "right now, type: stop")
+
+
+def _read_config():
+    """config.json as it is on disk right now; {} ONLY when there is no file
+    yet. Raises ConfigUnreadable (an OSError) when the file is there but
+    can't be read at this moment, and ConfigDamaged when it is there but is
+    not a JSON object — a caller about to save must never take "couldn't
+    read it" or "has a typo" for "empty" and replace the owner's settings
+    (wallet key, broker keys, limits, dry-run) with its own few keys."""
+    for attempt in (0, 1):
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                cfg = json.load(f)
+            if isinstance(cfg, dict):
+                return cfg
+            problem = ConfigDamaged(_config_damaged_text())
+        except FileNotFoundError:
+            return {}
+        except ValueError:
+            problem = ConfigDamaged(_config_damaged_text())
+        except OSError:
+            problem = ConfigUnreadable(_CONFIG_BUSY_TEXT)
+        if attempt:
+            raise problem
+        time.sleep(0.05)  # an editor or a sync program may be mid-save
+
+
+def _set_damaged_config_aside():
+    """Copy a config.json that can't be read next to itself before setup
+    writes a new one — it may hold the only copy of a wallet key. Returns
+    the copy's path, or "" when no copy could be made."""
+    import platform_compat
+    dst = f"{CONFIG_PATH}.damaged-{time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        with open(CONFIG_PATH, "rb") as src, open(dst, "wb") as out:
+            out.write(src.read())
+        if not platform_compat.IS_WINDOWS:
+            os.chmod(dst, 0o600)  # Windows: inherits the locked directory's ACL
+    except OSError:
+        return ""
+    print(f"Your settings file could not be read (a typo?). It was kept as "
+          f"{dst} and setup is writing a new one.")
+    return dst
+
+
+def update_config(change, if_damaged=None):
+    """Apply change(cfg) to the config that is on disk now and save it, all
+    under CONFIG_LOCK. `change` should touch only the keys it owns. Returns
+    the saved config. A file that can't be read is never written over
+    (ConfigUnreadable) — except by setup: `if_damaged` is a function that
+    returns the settings to start again from when the file is damaged (the
+    setup wizard, with no agent running), or None to refuse. The damaged
+    file is kept next to the new one."""
+    with CONFIG_LOCK:
+        try:
+            cfg = _read_config()
+        except ConfigDamaged:
+            cfg = if_damaged() if if_damaged else None
+            if not isinstance(cfg, dict) or not _set_damaged_config_aside():
+                raise
+        change(cfg)
+        _save(CONFIG_PATH, cfg, private=True)
+        return cfg
 
 
 # ── event safety rails (see SECURITY.md) ─────────────────────────────────────
@@ -1289,6 +1441,123 @@ def _resolve_percent(cfg, broker, client):
     return {**cfg, "sizing_mode": "budget", "budget_per_trade_usd": budget}, ""
 
 
+def _dry_run_keeps_selling_real_positions(cfg):
+    """OPERATOR DECISION — the one switch for it.
+
+    Dry-run stops NEW real trades. A position the agent already bought with
+    a real order stays real-managed after the owner switches to dry-run: its
+    exit signal, the expiry guard and the re-sell of an exit's remainder
+    still place real sell orders, logged as real exits. (Before, the exit
+    signal was booked as a dry-run exit and the real contracts were left at
+    the broker with nobody watching them.)
+
+    Return False to flip it: in dry-run the agent then places no orders at
+    all. It keeps the real position in its list, never books it as sold,
+    and tells the owner to sell it in the broker app."""
+    return True
+
+
+def _dry_run_holds_real_sells(cfg):
+    """True when the agent is in dry-run and dry-run stops it from selling
+    real positions too (only when the decision above is flipped)."""
+    return bool(cfg.get("dry_run")) and not _dry_run_keeps_selling_real_positions(cfg)
+
+
+def _opened_live(row):
+    """True when this ledger row is a position the agent bought with a REAL
+    order. New rows say so ("live": true). Older ledgers are read from what
+    they always carried: a dry-run row has "dry": true and the option id
+    "dry"; every other row was written by a broker adapter after a real
+    order. A row that says neither counts as real — the reading that can
+    never leave a real position unmanaged."""
+    if not isinstance(row, dict):
+        return False
+    if row.get("live") is True:
+        return True
+    return not row.get("dry") and row.get("option_id") != "dry"
+
+
+def _real_positions(state):
+    """Ledger keys of the real (not dry-run) positions the agent holds."""
+    rows = (state or {}).get("positions")
+    return [k for k, r in (rows.items() if isinstance(rows, dict) else ())
+            if _opened_live(r)]
+
+
+def _dry_run_note(cfg, state):
+    """What dry-run means for the real positions that are open now, in the
+    owner's words ("" when there are none)."""
+    n = len(_real_positions(state))
+    if n < 1:
+        return ""
+    one = n == 1
+    head = f"You have {n} real position{'' if one else 's'} open. "
+    if _dry_run_keeps_selling_real_positions(cfg):
+        guard_on = _et_hhmm(cfg, "expiry_guard_et", EXPIRY_GUARD_DEFAULT) is not None
+        return (head + f"I will still sell {'it' if one else 'those'} when "
+                f"{'its' if one else 'their'} exit signal arrives"
+                + (f", or on {'its' if one else 'their'} expiry day if still "
+                   "open then (expiry guard)" if guard_on else "")
+                + ". No new real trades will be placed.")
+    return (head + f"In dry-run I will NOT sell {'it' if one else 'them'} — "
+            f"sell {'it' if one else 'them'} in your broker app. No new real "
+            "trades will be placed.")
+
+
+# shown wherever a moved setup is described: it starts in dry-run, but that
+# does not stop it selling the real positions that came with it
+MOVED_POSITIONS_NOTE = ("Real positions you moved over are still sold on their "
+                        "exit signal, so make sure the old computer is off first.")
+
+
+def _mode_label(cfg, state):
+    """The mode as the startup line and notification show it. In dry-run
+    with real positions open, "no orders" would be untrue: those are still
+    sold (_dry_run_keeps_selling_real_positions)."""
+    if not cfg.get("dry_run"):
+        return "LIVE"
+    if _real_positions(state) and _dry_run_keeps_selling_real_positions(cfg):
+        return "DRY-RUN (no new trades; real positions still get sold)"
+    return "DRY-RUN (no orders)"
+
+
+def _paused(cfg):
+    """The owner pressed Pause (saved in config.json, so it survives a
+    restart): no NEW entries. Exits, the expiry guard and the broker checks
+    keep running."""
+    return bool((cfg or {}).get("paused"))
+
+
+def _feed_paid_per_day(cfg):
+    """The AgentHC feed without a Premium key: each day it is read uses a
+    prepaid signal day or buys a day-pass."""
+    return (cfg.get("source", "agenthc") == "agenthc"
+            and not cfg.get("agenthc_api_key"))
+
+
+def _pause_skips_feed(cfg, state):
+    """Paused with no REAL position open, on a feed that is paid per day:
+    don't read the feed. There is no exit order to wait for, and a read
+    could use up a prepaid signal day or buy a day-pass — a pause must not
+    spend money just to book the exit of a dry-run (paper) position. In
+    every other case the feed is read as usual while paused: exit signals
+    are acted on, entry signals are logged as skipped."""
+    return (_paused(cfg) and not _real_positions(state)
+            and _feed_paid_per_day(cfg))
+
+
+def _pause_note(cfg, state):
+    """What a pause means for the paid signal feed right now, in the owner's
+    words ("" when not paused, or the feed costs nothing per day)."""
+    if not _paused(cfg) or not _feed_paid_per_day(cfg):
+        return ""
+    if _real_positions(state):
+        return ("While a real position is open the agent still reads the "
+                "signal feed to get its exit signal, which uses a signal day.")
+    return ("No real position is open, so the agent is not reading the signal "
+            "feed: the pause uses no signal day.")
+
+
 def _execute_dry(cfg, event, state, broker=None, client=None, on_skip=None):
     """Dry-run bookkeeping: identical position tracking, zero orders.
 
@@ -1546,7 +1815,7 @@ def _refresh_cash(cfg, state, save_state, broker, client, cash):
 # Your own limits and rules: not problems, but still a reason a signal didn't
 # become a trade, so the dashboard lists them with the rest.
 _OWN_SKIPS = {"skip_daily_cap", "skip_position_cap", "skip_daily_loss",
-              "skip_rule", "policy_veto"}
+              "skip_rule", "policy_veto", "skip_paused"}
 
 
 def _ai_block_problem(cfg):
@@ -2463,6 +2732,13 @@ def handle_event(ev, cfg, state, broker, client, save_state):
               "had already left your account — no order placed")
         return None
 
+    if ev["event"] == "ENTERED" and _paused(cfg):
+        msg = (f"SKIPPED {contract}: the agent is paused — no new entries "
+               "until you press Resume")
+        print(msg)
+        _log_trade({"action": "skip_paused", "book": book, "event_id": ev["event_id"],
+                    "contract": contract})
+        return msg
     if ev["event"] == "ENTERED":
         # A contract that expires today, past the expiry guard time: the
         # guard would sell it again on the next loop at bid -5% (a sure
@@ -2554,9 +2830,21 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         policy_reason = (ev.get("exit_reason") or ev.get("guard_reason")
                          or "exits always close what was opened")
 
-    # Never place a real order against a dry-run position.
+    # Never place a real order against a dry-run position — and never book
+    # the exit of a REAL position as a dry-run exit: that drops it from the
+    # ledger while the contracts stay at the broker
+    # (_dry_run_keeps_selling_real_positions).
     existing = state["positions"].get(pos_key)
-    dry = bool(cfg.get("dry_run")) or bool(existing and existing.get("dry"))
+    real_exit = ev["event"] == "EXITED" and _opened_live(existing)
+    if real_exit and _dry_run_holds_real_sells(cfg):
+        _report_problem(cfg, state, save_state, "exit_failed", contract,
+                        "the exit signal arrived, but the agent is in dry-run "
+                        "and does not sell real positions — the agent did not "
+                        "sell it; sell it in your broker app",
+                        event_id=ev["event_id"], book=book)
+        return None
+    dry = not real_exit and (bool(cfg.get("dry_run"))
+                             or bool(existing and existing.get("dry")))
     if ev["event"] == "EXITED" and not existing and not dry:
         try:
             _warn_if_reheld(cfg, state, save_state, broker, client, pos_key,
@@ -2709,6 +2997,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             if mark > 0:
                 row["entry_mark"] = mark
             if not dry:  # holdings checks: grace period + which account
+                row["live"] = True  # bought with a real order (_opened_live)
                 row.setdefault("opened_at", _now())
                 row["last_order_at"] = max(_float0(row.get("last_order_at")), _now())
                 row.setdefault("acct", _account_tag(cfg, broker, client))
@@ -2755,8 +3044,10 @@ def handle_event(ev, cfg, state, broker, client, save_state):
 #
 # state["exits_to_retry"]: exit signals that weren't finished (the sell
 # wasn't placed, the broker couldn't be reached, a holdings read is
-# awaited). They are retried from here on every loop (not while paused:
-# no orders then) until done or nothing is left to sell — the feed lists
+# awaited). They are retried from here on every loop — also while paused
+# (a pause only stops new entries), not while the agent is on hold for a
+# restart or over a damaged state.json: no orders then — until done or
+# nothing is left to sell — the feed lists
 # only its latest events and may be unreachable, so it can't be relied on
 # to send them again.
 #
@@ -3146,9 +3437,9 @@ def _expiry_guard_sell(cfg, state, save_state, broker, client, key, day, guard):
     ev["guard_reason"] = (f"expiry guard: expires today and was still open at "
                           f"{_hm(guard)} ET")
     if not row.get("dry"):
-        if cfg.get("dry_run"):
-            # a real position while the agent is in dry-run: never pop it
-            # unsold (the dry path would) — the alert tells the owner
+        if _dry_run_holds_real_sells(cfg):
+            # a real position while dry-run places no orders at all: never
+            # pop it unsold — the alert tells the owner
             if _note_once(state, save_state, row, "expiry_guard_noted", day):
                 print(f"expiry guard: {contract} expires today, but the agent is "
                       "in dry-run — it won't sell this real position")
@@ -3197,7 +3488,7 @@ def _guard_hold_reason(cfg, row, paused, acct=None):
                 "agent uses now, so the agent won't sell it")
     if paused:
         return "the agent is paused, so the expiry guard isn't selling"
-    if cfg.get("dry_run"):
+    if _dry_run_holds_real_sells(cfg):
         return "the agent is in dry-run, so it doesn't sell real positions"
     return ""
 
@@ -3626,7 +3917,7 @@ def _rest_hold_reason(cfg, broker, client, row, tag):
     if row.get("acct") and tag and row["acct"] != tag:
         return ("it was opened in a different broker account or mode than the "
                 "agent uses now, so the agent won't sell it")
-    if cfg.get("dry_run"):
+    if _dry_run_holds_real_sells(cfg):
         return "the agent is in dry-run, so it doesn't sell real positions"
     if not _gate_on(cfg, broker, client):
         # never more than the account holds: without a holdings read, no re-sell
@@ -3721,7 +4012,7 @@ def _exit_remainders(cfg, state, save_state, broker, client, paused, now_et,
                         "gone today")
             print("EXIT REMAINDER ALERT: " + msg)
             notify(cfg, "⚠️ agentic-trader: " + msg, priority="high")
-        if why or paused or not trading or cfg.get("dry_run"):
+        if why or paused or not trading or _dry_run_holds_real_sells(cfg):
             continue
         if _past_expiry_guard(cfg, expiry, now_et) is not None:
             continue  # from the guard time on its expiry day, the guard sells it
@@ -3906,7 +4197,7 @@ def _rest_proven(cfg, state, broker, client, key, row, t, h, now):
 def _ledger_check(cfg, state, save_state, broker, client, now_et, now, tag):
     """Compare what the account holds with the ledger for contracts the agent
     bought; re-add (or alert about) what the ledger lost."""
-    if (not _gate_on(cfg, broker, client) or cfg.get("dry_run")
+    if (not _gate_on(cfg, broker, client) or _dry_run_holds_real_sells(cfg)
             or getattr(client, "last_error", None)):
         return
     day = now_et.date().isoformat()
@@ -4349,9 +4640,124 @@ def set_book_sizing(cfg, book, mode, value):
     return True, ""
 
 
-def _rule_command(t, cfg):
-    """Dashboard chat commands for the built-in rules. (handled, reply)."""
+# A chat command must match its whole grammar. A question, extra words, or
+# words that can't be tickers or numbers mean it is NOT a command: nothing
+# is changed, and the owner gets the usage line (or, for a question, an
+# answer). "tickers skipped today and why?" once set the ticker list to
+# SKIPPED, TODAY, AND — and every signal after it was skipped.
+_NOTHING_CHANGED = "Nothing was changed. "
+_CMD_TICKER_RE = re.compile(r"\$?[A-Za-z]{1,5}(?:\.[A-Za-z]{1,2})?")
+# Ordinary words are never read as tickers in lower case, even when a ticker
+# of that name is known. Typed in CAPITALS they are ("tickers ALL ON").
+_CMD_NOT_TICKERS = frozenset(
+    "a an and or the is are was were be been do does did why what which when "
+    "where who how my me i you it its to of in on at for with from not no yes "
+    "any all none off today yesterday tomorrow now please show list tell skip "
+    "skipped only just also but if then than that this these those can could "
+    "should would will there their them they we us our your about so too very "
+    "trade trades ticker tickers".split())
+# The only words read as tickers in lower case ("tickers spy qqq"), besides
+# the owner's own (rule lists, open positions, trade log): widely traded
+# names of three letters or more that are not ordinary words. Anything else
+# has to be typed in CAPITALS — "tickers look wrong" is a sentence, and a
+# sentence must never replace the ticker list.
+_CMD_COMMON_TICKERS = frozenset(
+    "SPY QQQ IWM DIA SPX NDX XSP TLT GLD SLV USO XLF XLE XLK XLV XLI XLP XLU "
+    "XLY XBI SMH SOXX SOXL SOXS TQQQ SQQQ UVXY VXX ARKK EEM EFA FXI HYG KRE GDX "
+    "AAPL MSFT NVDA AMZN GOOG GOOGL TSLA AMD INTC NFLX AVGO ORCL CRM ADBE CSCO "
+    "QCOM TXN IBM PYPL UBER LYFT ABNB PLTR SOFI RIVN LCID NIO BABA PDD BIDU "
+    "TSM ASML SMCI HPQ DDOG CRWD PANW OKTA MDB DOCU ROKU RBLX DKNG MSTR CLSK "
+    "GME AMC NOK JPM BAC WFC SCHW BLK AXP COF PNC BRK.B UNH JNJ PFE MRK LLY "
+    "ABBV BMY AMGN MRNA CVS XOM CVX SLB HON LMT RTX FDX UAL DAL AAL CCL RCL "
+    "NCLH CMCSA WMT TGT NKE SBUX MCD CMG TMUS CVNA CHWY ETSY EBAY AFRM UPST "
+    "ENPH FSLR NEE IONQ RKLB ASTS LULU ULTA WDAY INTU ISRG TMO DHR ABT MDT "
+    "BKNG EXPE WYNN LVS MGM".split())
+_CMD_MAX_TICKERS = 50
+
+
+def _known_tickers(cfg):
+    """Tickers the agent can recognise in lower case: the common ones plus
+    the owner's own — in the rule lists, open positions or the trade log."""
     import rules
+    known = set(_CMD_COMMON_TICKERS)
+    known.update(rules.parse_tickers(cfg.get("rule_tickers")))
+    known.update(rules.parse_tickers(cfg.get("rule_skip_tickers")))
+    rows = (_load(STATE_PATH, {}) or {}).get("positions")
+    known.update(str(k).split("|")[0].upper()
+                 for k in (rows if isinstance(rows, dict) else ()))
+    known.update(str(r.get("contract") or "").split(" ")[0].upper()
+                 for r in _recent_trades(500) if isinstance(r, dict))
+    return {k for k in known if _CMD_TICKER_RE.fullmatch(k)}
+
+
+def _command_tickers(raw, known=(), capitals_count=True):
+    """Reads the argument of a 'tickers …' command, as the owner typed it.
+    (tickers, None) when it is nothing but a list of tickers the agent can
+    be sure of: each word is in CAPITALS (when `capitals_count` — not when
+    the whole command was typed in capitals), starts with $, or is a
+    `known` ticker that isn't an ordinary word. Otherwise (None, guess):
+    nothing may be changed; `guess` is the list the owner may have meant,
+    to show them the exact command ([] when it reads as no list at all)."""
+    import rules
+    tokens = [x for x in re.split(r"[\s,;]+", str(raw).strip()) if x]
+    if not tokens or len(tokens) > _CMD_MAX_TICKERS:
+        return None, []
+    if not all(_CMD_TICKER_RE.fullmatch(tok) for tok in tokens):
+        return None, []
+    sure = True
+    for tok in tokens:
+        if tok.startswith("$") or (capitals_count and tok == tok.upper()):
+            continue  # typed as a ticker on purpose
+        if tok.lower() in _CMD_NOT_TICKERS or tok.upper() not in known:
+            sure = False
+    if sure:
+        return rules.parse_tickers(tokens), None
+    return None, rules.parse_tickers(
+        [tok for tok in tokens if tok.lower() not in _CMD_NOT_TICKERS])
+
+
+def _ticker_list_reply(guess, command, purpose, example, clear):
+    """The reply to a 'tickers …' line that was not a sure ticker list."""
+    if guess:
+        named = (guess[0] if len(guess) == 1
+                 else ", ".join(guess[:-1]) + " and " + guess[-1])
+        lead = (f"To {purpose} {named}, type: {command} {' '.join(guess)}   "
+                "(tickers in CAPITALS, so I know it is a list and not a "
+                "sentence). ")
+    else:
+        lead = ("I couldn't read that as a list of tickers. To "
+                f"{purpose} some tickers, type: {command} {example}   "
+                f"({clear}). A ticker that is also an ordinary word goes in "
+                f"CAPITALS: {command} NOW. ")
+    return (_NOTHING_CHANGED + lead + "To ask me a question, end it with a "
+            "question mark.")
+
+
+def _command_number(t, name, unit="$"):
+    """The number of a '<name> N' command when that is ALL it says ("set
+    budget 500", "set budget to $1,500", "set percent 2%"), else None.
+    `unit`: "$" allows a dollar sign in front, "%" a percent sign after,
+    "" neither — "set budget 500%" is not a dollar budget."""
+    m = re.fullmatch(re.escape(name) + r"(?:\s+to)?\s+(\$?)(\d[\d,]*(?:\.\d+)?)(\s?%)?", t)
+    if not m or (m.group(1) and unit != "$") or (m.group(3) and unit != "%"):
+        return None
+    try:
+        return float(m.group(2).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _command_whole(t, name):
+    """_command_number, for a count: whole numbers only, no $ or %."""
+    val = _command_number(t, name, unit="")
+    return int(val) if val is not None and val == int(val) else None
+
+
+def _rule_command(t, cfg, text=None):
+    """Dashboard chat commands for the built-in rules. (handled, reply).
+    `text`: the command as typed (capitals kept), for ticker lists."""
+    import rules
+    typed = str(text if text is not None else t).strip()
 
     def saved(reply):
         _save(CONFIG_PATH, cfg, private=True)
@@ -4361,17 +4767,31 @@ def _rule_command(t, cfg):
                       "with: tickers SPY QQQ / tickers any, skip tickers TSLA / "
                       "skip tickers none, calls only / puts only / calls and puts, "
                       "min strike 10, no 0dte on|off, loss stop 2 (0 = off).")
-    m = re.match(r"^(?:set |only )?tickers?\s+(.+)$", t)
+    m = re.match(r"^((?:set |only )?tickers?)(?:\s+(.+))?$", typed, re.I | re.S)
     if m:
-        val = m.group(1).strip()
-        cfg["rule_tickers"] = [] if val in ("any", "all", "none", "off") \
-            else rules.parse_tickers(val)
+        val = (m.group(2) or "").strip()
+        if val.lower() in ("any", "all", "none", "off"):
+            cfg["rule_tickers"] = []
+            return saved("Ticker list updated.")
+        tickers, guess = _command_tickers(val, _known_tickers(cfg),
+                                          m.group(1) != m.group(1).upper())
+        if not tickers:
+            return True, _ticker_list_reply(guess, "tickers", "trade only",
+                                            "SPY QQQ", "any ticker again: tickers any")
+        cfg["rule_tickers"] = tickers
         return saved("Ticker list updated.")
-    m = re.match(r"^skip tickers?\s+(.+)$", t)
+    m = re.match(r"^(skip tickers?)(?:\s+(.+))?$", typed, re.I | re.S)
     if m:
-        val = m.group(1).strip()
-        cfg["rule_skip_tickers"] = [] if val in ("none", "off") \
-            else rules.parse_tickers(val)
+        val = (m.group(2) or "").strip()
+        if val.lower() in ("none", "off"):
+            cfg["rule_skip_tickers"] = []
+            return saved("Skip list updated.")
+        tickers, guess = _command_tickers(val, _known_tickers(cfg),
+                                          m.group(1) != m.group(1).upper())
+        if not tickers:
+            return True, _ticker_list_reply(guess, "skip tickers", "never trade",
+                                            "TSLA", "clear the list: skip tickers none")
+        cfg["rule_skip_tickers"] = tickers
         return saved("Skip list updated.")
     if t in ("calls only", "puts only", "calls and puts", "both sides"):
         cfg["rule_sides"] = t.split()[0] if t.endswith("only") else "both"
@@ -4400,16 +4820,64 @@ def _apply_command(text):
     matched here falls through to answer-only LLM Q&A. The LLM can never
     reach these controls — it can only ANSWER.
     """
-    import webui
     t = text.lower().strip()
-    cfg = _load(CONFIG_PATH, {}) or {}
+    if text.lower().startswith("code:"):
+        import self_edit  # asks the AI (slow) and changes no setting: no lock
+        _ok, msg = self_edit.propose(_load(CONFIG_PATH, {}) or {}, text[5:].strip())
+        return True, msg
+    if "?" in t:
+        # A question is never a command — it gets an answer, and no setting
+        # changes. (Commands that only show something may end in one.)
+        if t.rstrip("? ") not in _SHOW_COMMANDS or "?" in t.rstrip("? "):
+            return False, ""
+        t = t.rstrip("? ")
+    if t == "stop":
+        # changes no setting, so it needs none: Stop must work even when
+        # config.json can't be read
+        import webui
+        webui.CONTROLS["stop"] = True
+        return True, ("Stopping after this cycle. Open positions remain in your "
+                      "brokerage account — close them there if needed.")
+    # One change at a time, each starting from the settings on disk NOW
+    # (the settings pages save under the same lock).
+    with CONFIG_LOCK:
+        try:
+            cfg = _read_config()
+        except ConfigUnreadable as exc:
+            return True, str(exc)  # says what is wrong; nothing was changed
+        except OSError:
+            return True, _CONFIG_BUSY_TEXT
+        return _command(t, cfg, text.strip())
+
+
+# commands that change nothing (a trailing "?" is fine: "status?")
+_SHOW_COMMANDS = ("status", "rules", "my rules", "show rules", "autostart",
+                  "start at login", "expiry guard", "expiry alert")
+
+
+def _command(t, cfg, text):
+    """_apply_command's allowlist, under CONFIG_LOCK. `t`: the command in
+    lower case; `text`: as typed."""
     if t == "pause":
-        webui.CONTROLS["paused"] = True
-        return True, "Paused — no new events processed until you say 'resume'."
+        cfg["paused"] = True
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, ("Paused — no new entries. Exit signals, the expiry "
+                      "guard and the broker checks keep running for positions "
+                      "you already have. The agent stays paused, also after a "
+                      "restart, until you say 'resume'."
+                      + (" While a real position is open the agent still "
+                         "reads the signal feed to get its exit signal, which "
+                         "uses a signal day (or buys a day-pass, if you turned "
+                         "that on). With no real position open it stops "
+                         "reading the feed, so the pause costs nothing; dry-run "
+                         "(paper) positions are then not updated until you "
+                         "resume."
+                         if _feed_paid_per_day(cfg) else ""))
     if t == "resume":
         import transfer
         if transfer.HANDOFF["hold"] or transfer.moved_away():
             # handed to a server / another computer: not a pause to undo
+            # (nothing is changed: not the saved pause, not a memory hold)
             return True, (
                 "Can't resume here: this setup is being moved, or was moved, "
                 "to a server or another computer, and two copies would place "
@@ -4417,8 +4885,10 @@ def _apply_command(text):
                 "here by itself.) To run it on this computer again after a "
                 "move: stop or destroy the other copy first, then run: "
                 "python agent.py resume-here")
-        webui.CONTROLS["paused"] = False
-        hold = _end_state_hold()  # paused at startup over a damaged state.json
+        cfg.pop("paused", None)
+        _save(CONFIG_PATH, cfg, private=True)
+        was_held = _state_held()
+        hold = _end_state_hold()  # on hold since startup over a damaged state.json
         if hold is not None:
             return True, ("Resumed. The agent is trading again from "
                           + ("the older backup of its memory"
@@ -4427,12 +4897,13 @@ def _apply_command(text):
                           + ": it will not sell positions that are missing "
                           "from the open positions list, so close those in "
                           "your broker account yourself.")
-        return True, "Resumed."
-    if t == "stop":
-        webui.CONTROLS["stop"] = True
-        return True, ("Stopping after this cycle. Open positions remain in your "
-                      "brokerage account — close them there if needed.")
-    handled, reply = _rule_command(t, cfg)
+        if was_held:  # the record itself could not be written at startup
+            return True, ("Resumed. The agent is trading again from the "
+                          "memory it started with: it will not sell positions "
+                          "that are missing from the open positions list, so "
+                          "close those in your broker account yourself.")
+        return True, "Resumed — the agent takes new entries again."
+    handled, reply = _rule_command(t, cfg, text)
     if handled:
         return True, reply
     handled, reply = _expiry_command(t, cfg)
@@ -4483,7 +4954,10 @@ def _apply_command(text):
     if t in ("dry on", "dry-run on"):
         cfg["dry_run"] = True
         _save(CONFIG_PATH, cfg, private=True)
-        return True, "Dry-run ON — actions logged, no real orders."
+        note = _dry_run_note(cfg, _load(STATE_PATH, {}) or {})
+        return True, ("Dry-run ON — " + note if note else
+                      "Dry-run ON — new signals are only logged; no real "
+                      "trades will be placed.")
     if t in ("dry off", "dry-run off", "go live"):
         if llm_policy.entries_blocked(cfg):
             return True, ("Not going live: " + llm_policy.BLOCKED_MSG
@@ -4492,32 +4966,30 @@ def _apply_command(text):
         _save(CONFIG_PATH, cfg, private=True)
         return True, "Dry-run OFF — the agent will place REAL orders from now on."
     if t.startswith("set budget"):
-        try:
-            val = float(t.split()[-1].lstrip("$").replace(",", ""))
-            assert val > 0
-        except (ValueError, AssertionError, IndexError):
-            return True, "Usage: set budget 500"
+        val = _command_number(t, "set budget")
+        if val is None or val <= 0:
+            return True, (_NOTHING_CHANGED + "Usage: set budget 500   (dollars "
+                          "per trade; for a percent of your account, type: set "
+                          "percent 2)")
         cfg["sizing_mode"] = "budget"
         cfg["budget_per_trade_usd"] = val
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Per-trade budget set to ${val:,.0f} (your decision — see DISCLAIMER.md)."
     if t.startswith("set other budget"):
-        try:
-            val = float(t.split()[-1].lstrip("$").replace(",", ""))
-            assert val > 0
-        except (ValueError, AssertionError, IndexError):
-            return True, "Usage: set other budget 100"
+        val = _command_number(t, "set other budget")
+        if val is None or val <= 0:
+            return True, (_NOTHING_CHANGED + "Usage: set other budget 100   "
+                          "(dollars per trade; for a percent of your account, "
+                          "type: set other percent 2)")
         cfg["other_sizing_mode"] = "budget"
         cfg["other_budget_per_trade_usd"] = val
         _save(CONFIG_PATH, cfg, private=True)
         return True, (f"'Other trades' budget set to ${val:,.0f}/trade — main "
                       "pick keeps its own sizing (your decision — see DISCLAIMER.md).")
     if t.startswith("set other contracts"):
-        try:
-            val = int(t.split()[-1])
-            assert val >= 1
-        except (ValueError, AssertionError, IndexError):
-            return True, "Usage: set other contracts 1"
+        val = _command_whole(t, "set other contracts")
+        if val is None or val < 1:
+            return True, _NOTHING_CHANGED + "Usage: set other contracts 1"
         cfg["other_sizing_mode"] = "contracts"
         cfg["other_contracts_per_trade"] = val
         _save(CONFIG_PATH, cfg, private=True)
@@ -4525,19 +4997,27 @@ def _apply_command(text):
                       "main pick keeps its own sizing.")
     if t.startswith("set percent") or t.startswith("set other percent"):
         book = "other" if t.startswith("set other") else "main"
-        ok, err = set_book_sizing(cfg, book, "percent", t.split()[-1])
+        usage = f"Usage: set {'other ' if book == 'other' else ''}percent 2"
+        val = _command_number(t, "set other percent" if book == "other"
+                              else "set percent", unit="%")
+        if val is None:
+            return True, _NOTHING_CHANGED + usage
+        ok, err = set_book_sizing(cfg, book, "percent", val)
         if not ok:
-            return True, (f"{err}. Usage: set {'other ' if book == 'other' else ''}"
-                          "percent 2")
+            return True, f"{_NOTHING_CHANGED}{err[0].upper()}{err[1:]}. {usage}"
         _save(CONFIG_PATH, cfg, private=True)
         who = "'Other trades'" if book == "other" else "Main pick"
         return True, (f"{who} sizing set to {_book_desc(cfg, 'other_' if book == 'other' else '')}"
                       " — sized from your account value at each entry "
                       "(your decision — see DISCLAIMER.md).")
     if t.startswith("set contracts"):
-        ok, err = set_book_sizing(cfg, "main", "contracts", t.split()[-1])
+        val = _command_number(t, "set contracts", unit="")
+        if val is None:
+            return True, _NOTHING_CHANGED + "Usage: set contracts 1"
+        ok, err = set_book_sizing(cfg, "main", "contracts", val)
         if not ok:
-            return True, f"{err}. Usage: set contracts 1"
+            return True, (f"{_NOTHING_CHANGED}{err[0].upper()}{err[1:]}. "
+                          "Usage: set contracts 1")
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Main pick sizing set to {_book_desc(cfg)}."
     if t in ("other trades on", "other trades off"):
@@ -4554,29 +5034,23 @@ def _apply_command(text):
         _save(CONFIG_PATH, cfg, private=True)
         return True, "'Other trades' now size the same as the main pick."
     if t.startswith("set cap"):
-        try:
-            val = int(t.split()[-1])
-            assert val >= 1
-        except (ValueError, AssertionError, IndexError):
-            return True, "Usage: set cap 3"
+        val = _command_whole(t, "set cap")
+        if val is None or val < 1:
+            return True, _NOTHING_CHANGED + "Usage: set cap 3"
         cfg["max_entries_per_day"] = val
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Daily entry cap set to {val}."
     if t.startswith("set positions"):
-        try:
-            val = int(t.split()[-1])
-            assert val >= 1
-        except (ValueError, AssertionError, IndexError):
-            return True, "Usage: set positions 5"
+        val = _command_whole(t, "set positions")
+        if val is None or val < 1:
+            return True, _NOTHING_CHANGED + "Usage: set positions 5"
         cfg["max_open_positions"] = val
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Max concurrent open positions set to {val}."
     if t.startswith("set max loss"):
-        try:
-            val = float(t.split()[-1].lstrip("$").replace(",", ""))
-            assert val >= 0
-        except (ValueError, AssertionError, IndexError):
-            return True, "Usage: set max loss 300   (0 = off)"
+        val = _command_number(t, "set max loss")
+        if val is None:
+            return True, _NOTHING_CHANGED + "Usage: set max loss 300   (0 = off)"
         cfg["max_daily_loss_usd"] = val
         _save(CONFIG_PATH, cfg, private=True)
         if val == 0:
@@ -4594,21 +5068,25 @@ def _apply_command(text):
         cfg["self_edit_enabled"] = False
         _save(CONFIG_PATH, cfg, private=True)
         return True, "Self-edit OFF."
-    if text.lower().startswith("code:"):
-        import self_edit
-        _ok, msg = self_edit.propose(cfg, text[5:].strip())
-        return True, msg
     if t == "status":
         st = _load(STATE_PATH, {"positions": {}})
+        note = _dry_run_note(cfg, st) if cfg.get("dry_run") else ""
         dry = bool(cfg.get("dry_run"))  # each mode counts its own trades
         return True, (f"{'DRY-RUN' if cfg.get('dry_run') else 'LIVE'} · "
+                      + ("ON HOLD (being moved to a server: no orders at "
+                         "all) · " if _handed_off() else
+                         "ON HOLD (memory file was damaged: no orders at "
+                         "all until you say 'resume') · " if _state_held() else
+                         "PAUSED (no new entries; exits still run) · "
+                         if _paused(cfg) else "") +
                       f"{_sizing_desc(cfg)} · entries today {_entries_today(dry)}/"
                       f"{cfg.get('max_entries_per_day', 5)} · "
                       f"est. P&L today ${_est_pnl_today(dry)[0]:,.0f}"
                       + (f" (max loss ${float(cfg['max_daily_loss_usd']):,.0f})"
                          if float(cfg.get('max_daily_loss_usd') or 0) > 0 else "")
                       + " · open: "
-                      f"{', '.join(st.get('positions', {})) or 'none'}")
+                      f"{', '.join(st.get('positions', {})) or 'none'}"
+                      + (f" · {note}" if note else ""))
     return False, ""
 
 
@@ -4677,6 +5155,12 @@ def cmd_run(app_window=False):
             sys.exit(1)
 
     def save_state(st):
+        import webui
+        if webui.setup_replaced():
+            # A move file was just imported: state.json on disk is the
+            # imported setup now, and `st` is the one from before. Never
+            # written over it — the agent is on hold until it restarts.
+            return
         # holds the day-pass L402 token; backup: see _load_state
         _save(STATE_PATH, st, private=True, backup=True)
 
@@ -4702,11 +5186,26 @@ def cmd_run(app_window=False):
             return None
 
     def get_status():
-        c = _load(CONFIG_PATH, {}) or {}
+        # config.json unreadable right now (a typo from a manual edit)?
+        # Show the settings the agent is really running on, not defaults.
+        c = _load(CONFIG_PATH, None)
+        c = c if c and isinstance(c, dict) else cfg
         st = _load(STATE_PATH, {"positions": {}})
         return {
             "mode": "DRY-RUN" if c.get("dry_run") else "LIVE",
-            "paused": webui.CONTROLS["paused"],
+            # also on a full hold: a damaged state.json (the dashboard then
+            # offers Resume, which is what ends it) or a hand-off to a
+            # server (Resume answers why not). "hold": the dashboard then
+            # shows pause_note instead of what the owner's Pause means.
+            "paused": _paused(c) or bool(_full_hold_note()),
+            "hold": bool(_full_hold_note()),
+            "pause_note": _full_hold_note() or _pause_note(c, st),
+            # an update or a move is about to restart the agent: until then
+            # it reads no signals and places no orders
+            "restarting": webui.orders_held(),
+            # real positions the agent holds, and what dry-run does with them
+            "real_positions": len(_real_positions(st)),
+            "dry_run_note": _dry_run_note(c, st),
             "fields": {
                 "source": c.get("source"),
                 **({"feed access": _feed_access(c, st)}
@@ -4731,8 +5230,9 @@ def cmd_run(app_window=False):
                    if _broker_conn_desc(client) else {}),
             },
             "cash_warning": cash.get("warning", ""),
+            # the owner's Pause doesn't stop the expiry guard; a full hold does
             "expiry_warnings": _durability_banner() + expiry_banner(
-                c, st, paused=webui.CONTROLS["paused"], acct=_status_acct(c)),
+                c, st, paused=bool(_full_hold_note()), acct=_status_acct(c)),
             "problems": _problems_with_ai_block(c),
             "budget_hints": _budget_hints(c),
             "would_have": dry_run_preview.summary(c),
@@ -4765,7 +5265,13 @@ def cmd_run(app_window=False):
         print("Updated the start-at-login entry.")
 
     _refresh_cash(cfg, state, save_state, broker, client, cash)
-    mode = "DRY-RUN (no orders)" if cfg.get("dry_run") else "LIVE"
+    mode = _mode_label(cfg, state)
+    if _state_held():  # damaged state.json: nothing is ordered at all
+        mode += ", ON HOLD — no orders at all until you press Resume"
+    elif _paused(cfg):  # saved in config.json: still paused after a restart
+        mode += ", PAUSED — no new entries until you press Resume"
+    if cfg.get("dry_run") and _dry_run_note(cfg, state):
+        print("Dry-run with real positions open. " + _dry_run_note(cfg, state))
     print(f"Heartbeat started [{mode}]: source={cfg['source']}, "
           f"{_sizing_desc(cfg)}, policy brain "
           f"{'ON' if llm_policy.enabled(cfg) else 'off'}. "
@@ -4850,9 +5356,23 @@ def cmd_run(app_window=False):
         # A move to a server copies this agent's memory between cycles:
         # mark "cycle in progress" FIRST, then read the hold (see transfer).
         transfer.CYCLE_IDLE.clear()
-        paused = webui.CONTROLS["paused"] or transfer.HANDOFF["hold"]
+        # Pause (the owner's, in config.json) only stops NEW entries — see
+        # handle_event. `held` is something else, a FULL stop: nothing is
+        # polled (so nothing is paid for) and nothing is ordered — no
+        # entries, no exits, no owed exits, no expiry-guard sells. Either
+        #  - an update or a move file is about to restart the agent (a few
+        #    seconds; webui.orders_held), or
+        #  - this run started from a damaged state.json (_state_held) and
+        #    waits for the owner's Resume: its memory is in doubt, so it
+        #    must not sell from it either, or
+        #  - this setup is being handed to a server (transfer.HANDOFF): the
+        #    server has, or is getting, a copy of this memory, and an order
+        #    placed here now — an exit included — would be one the server
+        #    doesn't know about, or one it places too.
+        held = (webui.orders_held() or _state_held()
+                or bool(transfer.HANDOFF["hold"]))
         try:
-            if not paused:
+            if not held:
                 try:
                     _prune_expired_positions(cfg, state, save_state)
                 except Exception as exc:
@@ -4886,22 +5406,40 @@ def cmd_run(app_window=False):
                         or bool(cfg.get("dry_run")) != cash.get("dry")):
                     _refresh_cash(cfg, state, save_state, broker, client, cash)
                 poll_error = None
-                try:
-                    events = source.poll(cfg, state, save_state)
-                except Exception as exc:
-                    if not _exits_to_retry(state):
-                        raise
-                    # the feed can't be read, but the exits the agent
-                    # still owes don't need it
-                    poll_error, events = exc, []
-                if poll_error is None:
-                    note_watching(cfg, access=_poll_had_access(source))
+                # paused, nothing real to sell, on the pay-per-day feed:
+                # the feed is deliberately not read
+                feed_read = not _pause_skips_feed(cfg, state)
+                if not feed_read:
+                    events = []
+                    # signals that fire meanwhile happened while the agent
+                    # wasn't watching: after Resume they are old news, not
+                    # a delay worth an alert
+                    _WATCH_SINCE.clear()
+                else:
+                    try:
+                        events = source.poll(cfg, state, save_state)
+                    except Exception as exc:
+                        if not _exits_to_retry(state):
+                            raise
+                        # the feed can't be read, but the exits the agent
+                        # still owes don't need it
+                        poll_error, events = exc, []
+                    if poll_error is None:
+                        note_watching(cfg, access=_poll_had_access(source))
+                    else:
+                        feed_read = False
+                # Also while paused and when the feed wasn't read: the exits
+                # the agent still owes are retried on every loop (a pause
+                # only stops new entries — handle_event). feed_read=False:
+                # there is no telling what the feed lists now, so nothing
+                # is forgotten from the handled list.
                 _handle_feed_events(events, cfg, state, broker, client,
-                                    save_state, feed_read=poll_error is None)
+                                    save_state, feed_read=feed_read)
                 if poll_error is not None:
                     raise poll_error
             else:
-                # paused: no orders, but the remainder alerts still go out
+                # restarting, on hold over a damaged state.json, or handed
+                # to a server: no orders, but the remainder alerts still go out
                 exit_remainder_tick(cfg, state, save_state, broker, client,
                                     paused=True)
         except KeyboardInterrupt:
@@ -4919,7 +5457,7 @@ def cmd_run(app_window=False):
         # unreachable: sell what expires today, alert on what's still open
         try:
             expiry_guard_tick(cfg, state, save_state, broker, client,
-                              paused=paused)
+                              paused=held)
         finally:
             transfer.CYCLE_IDLE.set()  # cycle over: state is saved
         try:
@@ -4930,8 +5468,10 @@ def cmd_run(app_window=False):
             # free closed-trades list → "would have taken" panel (never raises)
             dry_run_preview.refresh(cfg, _market_open_now())
         # Market-hours-aware cadence: fast while the market can move, slow
-        # overnight/weekends; snappy while paused so 'resume' feels instant.
-        if webui.CONTROLS["paused"]:
+        # overnight/weekends; short while a restart is pending, and while
+        # on hold (damaged state.json: Resume takes effect at once; a
+        # hand-off: a move that fails is picked up again at once).
+        if held:
             wait = 2
         else:
             wait = poll if _market_open_now() else max(poll, 300)
@@ -5057,7 +5597,10 @@ def cmd_status():
     print(f"broker           : {broker_name}{detail}"
           f"{'' if broker_ready(cfg) else ' — NOT CONFIGURED'}")
     print(f"contracts/trade  : {cfg.get('contracts_per_trade', 'unset')}")
-    print(f"mode             : {'DRY-RUN' if cfg.get('dry_run') else 'LIVE'}")
+    print(f"mode             : {'DRY-RUN' if cfg.get('dry_run') else 'LIVE'}"
+          + (" · ON HOLD (memory file was damaged: no orders at all until "
+             "you press Resume)" if _state_hold() is not None else
+             " · PAUSED (no new entries; exits still run)" if _paused(cfg) else ""))
     print(f"policy brain     : {'ON (' + llm_policy.policy_path() + ')' if llm_policy.enabled(cfg) else 'off'}")
     print(f"daily entry cap  : {cfg.get('max_entries_per_day', 5)}")
     print(f"entries today    : {_entries_today(bool(cfg.get('dry_run')))}")
@@ -5583,7 +6126,7 @@ def cmd_import(path):
             sys.exit(1)
     print(f"Imported your setup ({info['files']} files, from {info['from_os']}, "
           f"{info['created_at']}).")
-    print("It starts in DRY-RUN. Make sure the old computer is off, then say "
+    print("It starts in DRY-RUN: no new trades. " + MOVED_POSITIONS_NOTE + " Then say "
           "`dry off` in the dashboard" + (" to go live again." if info["was_live"]
                                          else " when you want to go live."))
     print("Start it: python agent.py start")

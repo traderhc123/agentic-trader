@@ -1,6 +1,7 @@
 import { ArrowRight, Copy, ExternalLink, Zap } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Button, LinkButton } from "../components/ui/button";
+import { ConfirmDialog } from "../components/ui/dialog";
 import { Disclosure } from "../components/ui/disclosure";
 import { Field, Input, Select } from "../components/ui/field";
 import { QR } from "../components/ui/qr";
@@ -90,7 +91,25 @@ export function SourceStep() {
     else if (r.status === "expired" || r.status === "used_up") setPassMsg(err("Your pass has run out. Buy more days above."));
   }
 
+  // One invoice per click: a double-click (or a second card while the first
+  // is still being made) must not ask for two invoices.
+  const buying = useRef(false);
+  const [buyBusy, setBuyBusy] = useState(false);
   const buyPass = async (days: number) => {
+    if (buying.current) return;
+    buying.current = true;
+    setBuyBusy(true);
+    try {
+      await requestPass(days);
+    } catch {
+      setPassMsg(err("Could not reach the agent on this computer. Check that it is still running, then pick a pass again."));
+    } finally {
+      buying.current = false;
+      setBuyBusy(false);
+    }
+  };
+
+  const requestPass = async (days: number) => {
     setSelDays(days);
     setPassMsg(info("Creating invoice…"));
     const r = await api("/api/pass/buy", { days });
@@ -207,9 +226,11 @@ export function SourceStep() {
                   type="button"
                   data-days={p.days}
                   onClick={() => buyPass(p.days)}
+                  disabled={buyBusy}
+                  aria-busy={buyBusy && selDays === p.days}
                   aria-pressed={selDays === p.days}
                   className={cn(
-                    "flex min-w-0 flex-col items-start rounded-md border px-3 pb-2.5 pt-3 text-left transition-colors",
+                    "flex min-w-0 flex-col items-start rounded-md border px-3 pb-2.5 pt-3 text-left transition-colors disabled:cursor-wait disabled:opacity-60",
                     selDays === p.days
                       ? "border-accent bg-accent/[0.08] shadow-[inset_0_0_0_1px_rgb(var(--accent))]"
                       : "border-line2 bg-panel2 hover:border-accent/50 hover:bg-raise",
@@ -343,6 +364,8 @@ function AgentWallet() {
   );
   const [mwMsg, setMwMsg] = useState<MsgT>(null);
   const [warn, setWarn] = useState("");
+  // after a replace: where the old wallet's details were saved, and that its sats were not moved
+  const [madeNote, setMadeNote] = useState("");
   const [sats, setSats] = useState("16000");
   const satsEdited = useRef(false);
   const [quote, setQuote] = useState("");
@@ -397,14 +420,57 @@ function AgentWallet() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [!!made]);
 
-  const create = async () => {
+  // The page can mount before /api/state arrives: pick up a wallet that is
+  // already connected, so "create" asks before replacing it.
+  useEffect(() => {
+    if (st?.wallet?.connected) setMade((m) => m || { label: "Wallet connected", page: st.wallet.page });
+  }, [st?.wallet?.connected, st?.wallet?.page]);
+
+  // A wallet is already connected: creating another one replaces it, which
+  // takes an explicit yes (the server refuses without { replace: true }).
+  const [confirmReplace, setConfirmReplace] = useState(false);
+  const creating = useRef(false);
+  const connectedWallet = async () => {
+    try {
+      const s = await api("/api/state");
+      if (!s.wallet?.connected) return false;
+      setMade((m) => m || { label: "Wallet connected", page: s.wallet.page });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const create = async (replace = false) => {
+    if (creating.current) return;
+    if (made && !replace) return setConfirmReplace(true);
+    creating.current = true;
     setMwMsg(info("Creating…"));
-    const r = await api("/api/wallet/create", {});
-    if (r.ok) {
-      setMwMsg(null);
-      setMade({ label: "Created", page: r.page });
-      if (r.warning) setWarn(r.warning);
-    } else setMwMsg(err(r.error));
+    try {
+      const r = await api("/api/wallet/create", replace ? { replace: true } : {});
+      if (r.ok) {
+        setMwMsg(null);
+        setMade({ label: replace ? "New wallet created" : "Created", page: r.page });
+        setWarn(r.warning || "");
+        setMadeNote(r.note || "");
+        if (replace) {
+          // the invoice and balance on screen belonged to the old wallet
+          setInv(null);
+          setBal(null);
+          api("/api/wallet/balance")
+            .then((b) => b && b.ok && setBal(b.sats))
+            .catch(() => {});
+        }
+      } else if (!replace && (r.needs_replace || (await connectedWallet()))) {
+        // the agent already has a wallet this page didn't know about, and
+        // the server refused to replace it without a yes: ask now
+        setMwMsg(null);
+        setConfirmReplace(true);
+      } else setMwMsg(err(r.error));
+    } catch {
+      setMwMsg(err("Could not reach the setup server. Reload this page to see whether a wallet was created before you try again."));
+    } finally {
+      creating.current = false;
+    }
   };
 
   const fund = async () => {
@@ -431,7 +497,7 @@ function AgentWallet() {
         The agent pays about $10 each market day from a wallet it holds the keys to. Only for people who want hands-off daily payments.
       </p>
       <div className="flex flex-wrap items-center gap-3">
-        <Button onClick={create}>Create my agent's wallet for me</Button>
+        <Button onClick={() => create()}>{made ? "Create a new wallet (replaces this one)" : "Create my agent's wallet for me"}</Button>
         {made && (
           <span className="text-xs text-up">
             {made.label}
@@ -444,7 +510,19 @@ function AgentWallet() {
         )}
         <Msg m={mwMsg} />
       </div>
+      {madeNote && <p className="m-0 text-sm text-fg2">{madeNote}</p>}
       {warn && <p className="m-0 text-sm text-down">⚠ {warn}</p>}
+      <ConfirmDialog
+        open={confirmReplace}
+        onOpenChange={setConfirmReplace}
+        title="Replace your agent's wallet?"
+        confirmLabel="Create a new wallet"
+        onConfirm={() => create(true)}
+      >
+        Your agent already has a wallet connected. If you create a new one, the agent switches to it and stops using the old
+        one. The old wallet is not deleted, but <b className="text-fg">any sats still in it stay there</b>: open the wallet
+        page and move them out first.
+      </ConfirmDialog>
 
       {made && (
         <div className="space-y-3 rounded border border-line bg-panel2 p-4">

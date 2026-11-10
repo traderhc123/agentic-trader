@@ -94,8 +94,9 @@ export function MovePanel({ onClose }: { onClose: () => void }) {
           <b className="text-fg">On the new computer</b>
           <p className="m-0">
             Run the same one-line installer. When the setup page opens, press <b className="text-fg">Open my move file</b> in the "Moving from another computer?" box at the top,
-            pick the file and type your passphrase. It starts in dry-run there; say <code className="font-mono">dry off</code> when
-            you're ready.
+            pick the file and type your passphrase. It starts in dry-run there (no new trades); say{" "}
+            <code className="font-mono">dry off</code> when you're ready. Real positions you move over are still sold there on
+            their exit signal, so stop the agent on this computer (step 3) before you start the new one.
           </p>
         </li>
         <li className="space-y-2">

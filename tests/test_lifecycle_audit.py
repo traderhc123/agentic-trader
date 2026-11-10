@@ -443,7 +443,8 @@ def test_update_that_cannot_restart_resumes_and_tells_the_owner(
     told = []
     monkeypatch.setattr(agent, "notify", lambda cfg, text, **k: told.append(text))
     monkeypatch.delenv("AGENT_UPDATE_RESTARTED", raising=False)
-    monkeypatch.setitem(webui.CONTROLS, "paused", True)   # update_pull did this
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    webui.hold_orders()                              # update_pull did this
     broker = _SlowBroker()
     order = _order_in_flight(broker, [])
     try:
@@ -452,17 +453,24 @@ def test_update_that_cannot_restart_resumes_and_tells_the_owner(
         broker.finish.set()
         order.join(30)
     assert execs == []
-    assert webui.CONTROLS["paused"] is False        # not left paused forever
+    assert webui.orders_held() is False             # not left on hold
     assert "AGENT_UPDATE_RESTARTED" not in os.environ
     assert len(told) == 1 and "did NOT restart" in told[0]
+    assert "keeps trading as before" in told[0]
     assert "python agent.py stop, then python agent.py start" in told[0]
     assert "Not restarting" in capsys.readouterr().out
 
 
 def test_update_restart_keeps_an_owner_pause(home, execs, monkeypatch):
+    """The owner's Pause is in config.json: the update's own hold comes and
+    goes without touching it, and the owner is told it is still paused."""
     import webui
-    monkeypatch.setattr(agent, "notify", lambda *a, **k: None)
-    monkeypatch.setitem(webui.CONTROLS, "paused", True)
+    told = []
+    monkeypatch.setattr(agent, "notify", lambda cfg, text, **k: told.append(text))
+    with open(agent.CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump({"paused": True}, f)
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    webui.hold_orders()                              # update_pull did this
     held, release = threading.Event(), threading.Event()
 
     def hold():
@@ -473,12 +481,15 @@ def test_update_restart_keeps_an_owner_pause(home, execs, monkeypatch):
     t.start()
     assert held.wait(30)
     try:
-        assert webui._restart_after_update(["agent.py", "run"],
-                                           was_paused=True) is False
+        assert webui._restart_after_update(["agent.py", "run"]) is False
     finally:
         release.set()
         t.join(30)
-    assert webui.CONTROLS["paused"] is True
+    assert webui.orders_held() is False
+    with open(agent.CONFIG_PATH, encoding="utf-8") as f:
+        assert json.load(f) == {"paused": True}
+    assert len(told) == 1 and "stays paused (no new entries" in told[0]
+    assert "keeps trading" not in told[0]
 
 
 # ── L4: a plan never makes a live agent bigger or more live ──────────────────
@@ -997,18 +1008,24 @@ def _stuck_order(monkeypatch):
     return told
 
 
-def test_import_that_cannot_restart_tells_the_owner_it_is_paused(
+def test_import_that_cannot_restart_tells_the_owner_it_is_on_hold(
         home, monkeypatch):
     import webui
     told = _stuck_order(monkeypatch)
     monkeypatch.delenv("AGENT_UPDATE_RESTARTED", raising=False)
-    monkeypatch.setitem(webui.CONTROLS, "paused", True)   # the import did this
+    # the import did this: a hold with no time limit, and "memory is stale"
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", float("inf"))
+    monkeypatch.setitem(webui.CONTROLS, "replaced", True)
     assert webui._restart_after_import(["agent.py", "run"]) is False
-    assert webui.CONTROLS["paused"] is True   # memory still holds the old setup
+    # memory still holds the old setup: it never trades on it again, and
+    # never saves it over the imported files
+    assert webui.orders_held() and webui.orders_held(now=4e9)
+    assert webui.setup_replaced()
     assert "AGENT_UPDATE_RESTARTED" not in os.environ
     (text, kw), = told
-    assert "did NOT restart" in text and "PAUSED" in text
+    assert "did NOT restart" in text and "ON HOLD" in text
     assert "does NOT act on exit signals" in text
+    assert "expiry guard does not sell" in text
     assert "python agent.py stop, then python agent.py start" in text
     assert kw.get("priority") == "high"
 
@@ -1138,24 +1155,33 @@ def test_refusal_warns_what_dry_run_does_to_open_positions(tmp_path):
         dict(_LIVE_REAL), True, str(tmp_path))
     err = " ".join(rep["errors"])
     assert "`dry on`" in err and "`dry off`" in err
-    assert "BEFORE they do" in err and "close every position" in err
-    assert "exit signal" in err and "will NOT sell it later" in err
+    assert "stops NEW trades only" in err
+    assert "still sold for real on its exit signal" in err
+    # the one case where the agent stops selling a position it holds
+    assert "changes the broker account" in err and "BEFORE the plan" in err
+    assert "closes every position" in err and "will NOT sell" in err
 
 
-def test_dry_run_really_drops_a_real_position_on_an_exit_signal(home, no_policy):
-    """What that warning says, checked against the agent itself.
+def test_dry_run_still_sells_a_real_position_on_an_exit_signal(home, no_policy):
+    """What that text says, checked against the agent itself (audit finding
+    W3: dry-run keeps selling the positions it bought with real orders).
 
-    If this fails because dry-run now keeps selling real positions (audit
-    finding W3, fixed on another branch), the warning is out of date: reword
-    the refusal in setup_plan.apply and the `dry on` paragraph in BOOT.md to
-    say what dry-run does then, and change this test and the one above."""
+    If this fails, the refusal in setup_plan.apply and the `dry on`
+    paragraph in BOOT.md are out of date: reword both to what dry-run does
+    then, and change this test and the one above."""
     ev = make_event()
     key = f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
     state = {"positions": {key: {"option_id": "real", "qty": 2}}}
     broker = StubBroker()
     agent.handle_event(make_event(event="EXITED", event_id="x-2"),
                        {"dry_run": True}, state, broker, object(), lambda s: None)
-    assert broker.calls == [] and key not in state["positions"]
+    assert [e["event"] for e in broker.calls] == ["EXITED"]   # a real sell
+    assert key not in state["positions"]
+    # ...and the exception it names: a row bought in another broker account
+    state = {"positions": {key: {"option_id": "real", "qty": 2,
+                                 "acct": "the-account-before-the-plan"}}}
+    assert agent._check_before_exit({"dry_run": True}, state, lambda s: None,
+                                    broker, object(), key, ev) == "blocked"
 
 
 def test_naming_the_default_broker_is_not_a_broker_switch(tmp_path):

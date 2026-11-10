@@ -379,8 +379,12 @@ def _wizard_fn(name):
 
 def test_classic_page_asks_before_it_replaces_a_wallet():
     js = _wizard_fn("makeWallet")
-    assert "r.exists" in js and "confirm(" in js and "{replace:true}" in js
-    assert js.index("api('/api/wallet/create',{})") < js.index("{replace:true}")
+    assert "r.exists" in js and "confirm(" in js
+    # {replace:true} is only ever sent once `replace` is true: after a yes
+    assert "api('/api/wallet/create',replace===true?{replace:true}:{})" in js
+    assert js.count("{replace:true}") == 1
+    assert "if(confirm(ASK))return makeWallet(true);" in js
+    assert "if(!confirm(ASK))return;replace=true;" in js
 
 
 @pytest.mark.parametrize("answer, posts, shown", [
@@ -393,6 +397,7 @@ def test_classic_page_replaces_a_wallet_only_on_a_yes(answer, posts, shown):
         pytest.skip("node not installed")
     js = """
 const posted = [], asked = [], mw = {textContent: '', innerHTML: ''};
+let walletBusy = false, walletMade = false;  // the page's own globals
 const document = {getElementById: () => mw};
 const esc = (s) => String(s);
 const confirm = (q) => { asked.push(q); return %s; };

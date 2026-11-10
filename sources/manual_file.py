@@ -13,7 +13,7 @@ Each line is executed once (tracked by a content hash). ``type`` is "C" or
 One exception: an ``enter`` that the agent first reads together with an
 ``exit`` for the same contract (both written before its next read of the
 file — every ``poll_seconds``, every 5 minutes outside market hours, not
-while paused or stopped) is NOT bought, whichever line comes first, and
+while stopped) is NOT bought, whichever line comes first, and
 you are told. The exit is still run. To open that contract afterwards,
 add a new ``enter`` line that differs from the old one (e.g. an extra
 ``"note"`` field): an identical line counts as already executed.

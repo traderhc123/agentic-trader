@@ -75,11 +75,13 @@ and apply them in one step. Order:
    or web address), turn on `include_other_trades`, remove or widen a rule,
    or replace an existing policy. For those, the human first says `dry on`
    in the dashboard, you apply the plan, and they say `dry off` once they
-   have checked the new settings. **Warn them before `dry on`:** while
-   dry-run is on the agent places no orders, and an exit signal that
-   arrives in that time is used up — the agent stops tracking that position
-   and will not sell it later. They should close the agent's open positions
-   first, or be ready to close them in their broker app.
+   have checked the new settings. **Tell them what `dry on` does:** it
+   stops new trades only — a position the agent already bought with a real
+   order is still sold for real on its exit signal, and by the expiry guard
+   on its expiry day. **Warn them if the plan changes the broker account:**
+   the agent never sells from an account it is no longer connected to, so
+   they should close the agent's open positions in the current account
+   before you apply the plan, or be ready to close them in their broker app.
 5. **Hand the `owner_steps` to the human.** Plans can never do these; the
    human does them in the wizard: log in to Robinhood (if chosen), buy and
    pay for AgentHC signal days from their own wallet (if the AgentHC feed),

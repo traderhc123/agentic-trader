@@ -217,7 +217,38 @@ def _asset_path(path):
     return full
 
 # Run-loop controls the dashboard can flip; agent.py polls these.
-CONTROLS = {"paused": False, "stop": False}
+# The owner's Pause is NOT here: it is saved in config.json ("paused") so it
+# survives a restart, and it only stops new entries (agent._paused).
+# hold_until: an update or a move is about to restart the agent — until that
+# time the heartbeat polls nothing and places no orders, so an in-flight
+# order can finish saving. It runs out by itself if the restart never comes.
+# replaced: a move file was imported while this agent runs (setup_replaced).
+CONTROLS = {"stop": False, "hold_until": 0.0, "replaced": False}
+_HOLD_S = 60
+
+
+def hold_orders(seconds=_HOLD_S, now=None):
+    import time
+    CONTROLS["hold_until"] = (time.time() if now is None else now) + seconds
+
+
+def release_orders():
+    CONTROLS["hold_until"] = 0.0
+
+
+def orders_held(now=None):
+    import time
+    return ((time.time() if now is None else now)
+            < float(CONTROLS.get("hold_until") or 0))
+
+
+def setup_replaced():
+    """A move file was imported while this agent runs: the files on disk are
+    the imported setup, and what this process has in memory is the setup
+    from before. The agent is on hold with no time limit (hold_orders) until
+    it restarts, and nothing it has in memory may be saved over those files
+    (agent.cmd_run's save_state) — however long the restart takes."""
+    return bool(CONTROLS.get("replaced"))
 
 _STYLE = """
 <style>
@@ -1256,8 +1287,13 @@ async function copyText(srcId,msgId){
   try{await navigator.clipboard.writeText(t);msg.textContent='copied ✓';}
   catch(e){msg.textContent='clipboard blocked — select the invoice text above and copy it';}
 }
-let passTimer=null,passHelpTimer=null;
+let passTimer=null,passHelpTimer=null,passBusy=false;
 async function buyPass(days){
+  // one invoice per click: a double-click must not ask for two
+  if(passBusy)return;passBusy=true;
+  try{await buyPassNow(days);}finally{passBusy=false;}
+}
+async function buyPassNow(days){
   document.querySelectorAll('button.pass').forEach(b=>b.classList.toggle('sel',b.dataset.days===String(days)));
   const st=document.getElementById('pass-status');st.textContent='creating invoice…';
   const r=await api('/api/pass/buy',{days:days});
@@ -1343,6 +1379,14 @@ async function boot(){
   if(st.sizing){done('s-sizing');restoredNote('s-sizing',notes.sizing||'Sizing saved');
     restoreSizing(st.sizing_detail);}
   if(st.safety){done('s-safety');restoredNote('s-safety',notes.safety||'Safety saved');}
+  // Safety shows the mode and limits as they are set now, never its own
+  // defaults: re-saving the step must not switch the mode or reset the cap.
+  SF={dry:(typeof st.dry_run==='boolean')?st.dry_run:null,
+      cap:st.max_entries_per_day==null?null:String(st.max_entries_per_day),
+      loss:st.max_daily_loss_usd>0?String(st.max_daily_loss_usd):''};
+  if(SF.dry!==null){document.getElementById('sf-dry').checked=SF.dry;sfDryChanged();}
+  if(SF.cap!==null)document.getElementById('sf-cap').value=SF.cap;
+  if(SF.loss)document.getElementById('sf-maxloss').value=SF.loss;
   cur=Math.min(maxUnlocked,STEPS.length-1);render();booted=true;
   loadBrokers();
 }
@@ -1357,7 +1401,7 @@ async function doConsent(){
   const r=await api('/api/consent',{phrase:ph.value});
   mark(ph,!r.ok);
   document.getElementById('c-msg').innerHTML=r.ok?'<span class="ok">accepted ✓</span>'
-    :'<span class="err">'+r.error+'</span>';
+    :'<span class="err">'+esc(r.error)+'</span>';
   if(!r.ok)ph.focus();
   if(r.ok)done('s-consent');
 }
@@ -1443,21 +1487,35 @@ function showWallet(page,label){
     }
   }).catch(function(){});
 }
-async function makeWallet(){
+let walletBusy=false;
+async function makeWallet(replace){
+  // The agent already has a wallet: replace it only on a clear yes.
+  const ASK='Your agent already has a wallet. Replace it with a new, empty one?'
+    +' Sats in the current wallet are NOT moved to the new one. The current'
+    +" wallet's details are saved to a file in the agent's folder first, so"
+    +' you can still open it and move them yourself. If you only want to add'
+    +' sats, press Cancel. OK = replace the wallet. Cancel = keep it.';
+  if(walletBusy)return;
   const mw=document.getElementById('mw-msg');
+  // this page already knows a wallet is connected: ask before anything is sent
+  if(walletMade&&replace!==true){if(!confirm(ASK))return;replace=true;}
+  walletBusy=true;
   mw.textContent=' creating…';
-  let r=await api('/api/wallet/create',{});
-  if(!r.ok&&r.exists){
-    // The agent already has a wallet: replace it only on a clear yes.
-    if(!confirm('Your agent already has a wallet. Replace it with a new, empty one?'
-        +' Sats in the current wallet are NOT moved to the new one. The current'
-        +" wallet's details are saved to a file in the agent's folder first, so"
-        +' you can still open it and move them yourself. If you only want to add'
-        +' sats, press Cancel. OK = replace the wallet. Cancel = keep it.')){
-      mw.textContent=' Kept your current wallet — nothing changed.';return;}
-    mw.textContent=' creating…';
-    r=await api('/api/wallet/create',{replace:true});
-  }
+  let r;
+  try{r=await api('/api/wallet/create',replace===true?{replace:true}:{});}
+  catch(e){r={ok:false,error:'could not reach the setup server'};}
+  walletBusy=false;
+  if(!r.ok&&replace!==true){
+    // refused because the agent already has a wallet (this page didn't
+    // know)? Then ask, and only replace it on a yes.
+    const refused=!!(r.exists||r.needs_replace);
+    let has=refused;
+    if(!has){try{const s=await api('/api/state');has=!!(s.wallet&&s.wallet.connected);
+      if(has)showWallet(s.wallet.page,'wallet connected ✓');}catch(e){}}
+    if(has){
+      if(confirm(ASK))return makeWallet(true);
+      if(refused)mw.textContent=' Kept your current wallet — nothing changed.';
+      return;}}
   if(r.ok){showWallet(r.page,'created ✓');
     if(r.note)mw.innerHTML+='<div class="muted" style="margin-top:.5rem">'+esc(r.note)+'</div>';
     if(r.warning)mw.innerHTML+=
@@ -1467,7 +1525,7 @@ async function makeWallet(){
 async function fundInvoice(){
   const sats=document.getElementById('fund-sats').value;
   const r=await api('/api/wallet/fund',{sats:sats});
-  if(!r.ok){document.getElementById('mw-msg').innerHTML=' <span class="err">'+r.error+'</span>';return;}
+  if(!r.ok){document.getElementById('mw-msg').innerHTML=' <span class="err">'+esc(r.error)+'</span>';return;}
   const pre=document.getElementById('bolt11');pre.style.display='';pre.textContent=r.bolt11;
   renderQr(r.qr);
   const fn=document.getElementById('fund-note');
@@ -1489,8 +1547,8 @@ async function doSource(){
     lnbits_key:document.getElementById('ln-key').value,
     agenthc_key:document.getElementById('hc-key').value,
     source_url:document.getElementById('src-url-input').value});
-  document.getElementById('src-msg').innerHTML=r.ok?'<span class="ok">'+r.note+'</span>'
-    :'<span class="err">'+r.error+'</span>';
+  document.getElementById('src-msg').innerHTML=r.ok?'<span class="ok">'+esc(r.note)+'</span>'
+    :'<span class="err">'+esc(r.error)+'</span>';
   if(r.ok)done('s-source');
 }
 llmLoadProviders();
@@ -1521,8 +1579,8 @@ async function brkConnect(){
   const vals={};b.fields.forEach(f=>{const el=document.getElementById('bf-'+f.id);
     vals[f.id]=(f.type==='checkbox')?el.checked:el.value;});
   const r=await api('/api/broker/connect',{broker:id,values:vals});
-  document.getElementById('brk-msg').innerHTML=r.ok?' <span class="ok">'+r.note+'</span>'
-    :' <span class="err">'+r.error+'</span>';
+  document.getElementById('brk-msg').innerHTML=r.ok?' <span class="ok">'+esc(r.note)+'</span>'
+    :' <span class="err">'+esc(r.error)+'</span>';
   if(r.ok){document.getElementById('brk-status').innerHTML='<span class="ok">Connected: '+
     esc(b.name||id)+' ✓</span>';done('s-broker');}
 }
@@ -1530,7 +1588,7 @@ async function rhStart(){
   const r=await api('/api/rh/start');
   if(r.url){document.getElementById('rh-msg').textContent='waiting for approval…';
     window.open(r.url,'_blank');poll();}
-  else document.getElementById('rh-msg').innerHTML='<span class="err">'+r.error+'</span>';
+  else document.getElementById('rh-msg').innerHTML='<span class="err">'+esc(r.error)+'</span>';
 }
 async function poll(){
   const st=await api('/api/state');
@@ -1539,7 +1597,7 @@ async function poll(){
     document.getElementById('brk-status').innerHTML='<span class="ok">Connected: Robinhood account ····'+
       esc(st.broker)+' ✓</span>';
     if(st.rh_warning)document.getElementById('rh-accounts').innerHTML=
-      '<p class="err">'+st.rh_warning+'</p>';
+      '<p class="err">'+esc(st.rh_warning)+'</p>';
     done('s-broker');}
   else setTimeout(poll,1500);
 }
@@ -1580,13 +1638,20 @@ async function doSizing(){
   const r=await api('/api/sizing',{main:{mode:sel.value,value:document.getElementById('sz-val').value},
     other:{mode:osel?osel.value:'same',value:document.getElementById('sz-other-val').value}});
   document.getElementById('sz-msg').innerHTML=r.ok?'<span class="ok">saved ✓</span>'
-    :'<span class="err">'+r.error+'</span>';
+    :'<span class="err">'+esc(r.error)+'</span>';
   if(r.ok)done('s-sizing');
 }
+let SF={dry:null,cap:null,loss:''};
 async function doSafety(){
-  const r=await api('/api/safety',{dry:document.getElementById('sf-dry').checked,
-    cap:document.getElementById('sf-cap').value,
-    max_loss:document.getElementById('sf-maxloss').value,
+  const dry=document.getElementById('sf-dry').checked,cap=document.getElementById('sf-cap').value;
+  let loss=document.getElementById('sf-maxloss').value;
+  if(!String(loss).trim()&&SF.loss)loss='0';  // you cleared a limit that was set: off
+  const body={};
+  // mode and cap are sent only when you changed them here (or never set them)
+  if(SF.dry===null||dry!==SF.dry)body.dry=dry;
+  if(SF.cap===null||String(cap)!==SF.cap)body.cap=cap;
+  const r=await api('/api/safety',{...body,seeded:booted,
+    max_loss:loss,
     discord:document.getElementById('nt-discord').value,
     ntfy:document.getElementById('nt-ntfy').value,
     tg_token:document.getElementById('nt-tg-token').value,
@@ -1594,11 +1659,12 @@ async function doSafety(){
     policy:document.getElementById('pol-text').value,
     anthropic_key:document.getElementById('pol-key').value});
   if(r.ok){done('s-safety');
+    SF={dry:dry,cap:String(cap),loss:(Number(loss)>0)?String(loss):''};
     document.getElementById('done-body').innerHTML=
      '<p class="ok">Setup complete — pick where your agent should live.</p>'+
      '<details><summary class="muted">…or start it from a terminal instead</summary>'+
      '<pre>'+esc(r.next)+'</pre></details>';}
-  else document.getElementById('sf-msg').innerHTML='<span class="err">'+r.error+'</span>';
+  else document.getElementById('sf-msg').innerHTML='<span class="err">'+esc(r.error)+'</span>';
 }
 async function startLocal(){
   const el=document.getElementById('start-msg');
@@ -1622,7 +1688,7 @@ async function deploy(){
   el.innerHTML='creating server… (takes 1–3 minutes)';
   const r=await api('/api/deploy',{token:document.getElementById('do-token').value,
     region:document.getElementById('do-region').value});
-  if(!r.ok){el.innerHTML='<span class="err">'+r.error+'</span>';return;}
+  if(!r.ok){el.innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}
   const here=r.here?'<br><b>'+esc(r.here)+'</b>':'';
   const poll2=async()=>{
     let s;
@@ -2037,7 +2103,7 @@ async function helpReport(){
 const SOURCES={agenthc:'AgentHC feed',url:'Your JSON feed',manual:'Manual commands'};
 const SKIPS={skip_stale:'signal was too old',skip_daily_cap:'daily entry cap reached',
   skip_position_cap:'max open positions reached',skip_daily_loss:'daily loss limit reached',
-  policy_veto:'your rules said no'};
+  policy_veto:'your rules said no',skip_paused:'the agent is paused'};
 const ICON=n=>'<svg class="i"><use href="#i-'+n+'"/></svg>';
 function cap1(s){s=String(s||'');return s.charAt(0).toUpperCase()+s.slice(1);}
 function shortDate(d){return d.toLocaleDateString([], {month:'short',day:'numeric'});}
@@ -2100,7 +2166,7 @@ function spark(points){
     '<path d="'+d+'" fill="none" stroke="'+col+'" stroke-width="1.75" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>';
   wrap.style.display='';
 }
-function setMode(kind,live,paused){
+function setMode(kind,live,paused,note,pauseNote,restarting,hold){
   // kind: 'ok' | 'off' | 'unreachable'
   // #modebar is a live region polled every 5s: only touch the DOM when the
   // text actually changes, or screen readers re-announce it on every poll.
@@ -2110,9 +2176,14 @@ function setMode(kind,live,paused){
   if(kind==='unreachable'){put('modebar off','<b>Can\\'t reach the agent on this computer</b> — is it still running?');return;}
   put('modebar '+(live?'live':'dry')+(paused?' paused':''),
     (live?'<b>LIVE.</b> Real orders with real money are sent to your broker.':
+    note?'<b>Dry-run.</b> '+esc(note):
     '<b>Dry-run.</b> The agent logs every decision but places no orders.')+
-    (paused?' <b class="pz">Paused</b> — no new entries until you press Resume.':''));
-  const st=live?'Switch to dry-run any time to stop sending orders — your decision, not advice.':
+    (hold?' <b class="pz">On hold</b> — '+esc(pauseNote||'the agent places no orders at all.'):
+     paused?' <b class="pz">Paused</b> — no new entries. Exit signals and the expiry guard keep'+
+      ' running for positions you already have. Stays paused, also after a restart, until you press Resume.'+
+      (pauseNote?' '+esc(pauseNote):''):'')+
+    (restarting?' <b class="pz">Restarting</b> — the agent reads no signals and places no orders until it is back (a few seconds).':''));
+  const st=live?'Switch to dry-run any time to stop new trades (positions already open are still sold on their exit signal) — your decision, not advice.':
     'Going live sends real orders with real money — your decision, not advice.';
   if(sub.textContent!==st)sub.textContent=st;
 }
@@ -2132,13 +2203,16 @@ async function refresh(){
     if(s.mode==='OFFLINE'){badMode('Agent not running','off');return;}
     const f=s.fields||{};const live=s.mode==='LIVE';
     const bm=$('b-mode');
-    bm.innerHTML=live?'<span class="dot"></span>LIVE · real orders':'<span class="dot"></span>Dry-run · no orders';
+    LAST=s;const note=live?'':(s.dry_run_note||'');
+    bm.innerHTML=live?'<span class="dot"></span>LIVE · real orders':
+      '<span class="dot"></span>Dry-run · '+(note?'no new trades':'no orders');
     bm.className='pill '+(live?'live':'dry');
     const mk=$('b-market'),open=(f['market']||'').startsWith('open');
     mk.innerHTML=open?'<span class="dot"></span>Market open':'Market closed';
     mk.className='pill'+(open?' open':'');mk.style.display='';
     $('b-paused').style.display=s.paused?'':'none';
-    setMode('ok',live,!!s.paused);
+    $('b-paused').textContent=s.hold?'On hold':'Paused';
+    setMode('ok',live,!!s.paused,note,s.pause_note||'',!!s.restarting,!!s.hold);
     const qp=$('q-pause');
     qp.innerHTML=s.paused?ICON('play')+'Resume':ICON('pause')+'Pause';
     qp.dataset.cmd=s.paused?'resume':'pause';qp.className=s.paused?'btn-primary':'';
@@ -2236,7 +2310,10 @@ function chatAdd(cls,text){
     '</div><div class="body">'+esc(text)+'</div></div>');
   log.scrollTop=log.scrollHeight;
 }
+let LAST=null;  // the latest /api/status
 async function quick(cmd){
+  // Real positions are open: say what dry-run does with them before switching.
+  if(cmd==='dry on'&&LAST&&LAST.dry_run_note&&!confirm('Switch to dry-run? '+LAST.dry_run_note))return;
   // Going LIVE is a real-money action: never on a single (mis-)tap.
   if(cmd==='dry off'&&!confirm('Go LIVE? The agent will send real orders with real money to your broker from now on. Your decision — not advice.'))return;
   chatAdd('me',cmd);
@@ -2840,7 +2917,9 @@ def _wallet_create(cfg, save, data):
     import lightning_wallet
     had = bool(cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"))
     if had and (data or {}).get("replace") is not True:
-        return {"ok": False, "exists": True, "error": _WALLET_EXISTS,
+        # "needs_replace": the React wizard's name for the same refusal
+        return {"ok": False, "exists": True, "needs_replace": True,
+                "error": _WALLET_EXISTS,
                 "page": cfg.get("lnbits_wallet_page", "")}
     old_page, old_file = cfg.get("lnbits_wallet_page", ""), ""
     try:
@@ -3032,12 +3111,171 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     from brokers.robinhood import RobinhoodMCP, _token_path, content_json
     from lightning_wallet import LNbitsWallet, WalletError
 
-    cfg = A._load(A.CONFIG_PATH, {}) or {}
     pending = {"oauth": None, "broker_last4": "", "rh_warning": "",
                "finished": threading.Event()}
 
+    # config.json is shared with the chat commands and the dashboard buttons,
+    # which write it too (agent._apply_command). `cfg` is only this server's
+    # working copy of it: brought up to date from the file when a request
+    # starts, and save() writes back ONLY the keys this server changed, onto
+    # the file as it is at that moment, under the lock the commands use.
+    # (Saving the whole copy undid the owner's commands: a settings save
+    # after "dry on" put the agent back in LIVE mode.)
+    # What a request changed in the copy and did not save is taken out again
+    # when that request ends, so a rejected form (a broker whose keys were
+    # refused, a feed address that was not accepted) can never ride along
+    # with the next save — not even one made by a request that was running
+    # at the same time.
+    import copy
+    touched = {}  # request thread -> the keys it has changed in the copy
+    _gone = object()
+
+    class _WorkingCopy(dict):
+        """A dict that notes which request changed which key."""
+
+        def _note(self, *keys):
+            mine = touched.get(threading.get_ident())
+            if mine is not None:
+                mine.update(keys)
+
+        def __setitem__(self, k, v):
+            self._note(k)
+            dict.__setitem__(self, k, v)
+
+        def __delitem__(self, k):
+            self._note(k)
+            dict.__delitem__(self, k)
+
+        def pop(self, k, *default):
+            self._note(k)
+            return dict.pop(self, k, *default)
+
+        def setdefault(self, k, default=None):
+            self._note(k)
+            return dict.setdefault(self, k, default)
+
+        def update(self, *a, **kw):
+            new = dict(*a, **kw)
+            self._note(*new)
+            dict.update(self, new)
+
+        def __ior__(self, other):
+            self.update(other)
+            return self
+
+        def clear(self):
+            self._note(*self)
+            dict.clear(self)
+
+    on_file = A._load(A.CONFIG_PATH, {})
+    cfg = _WorkingCopy(on_file if isinstance(on_file, dict) else {})
+    synced = {"cfg": copy.deepcopy(dict(cfg))}  # config.json as of the last sync
+
+    def _own_changes():
+        """What this server changed in its copy and hasn't saved yet:
+        ({key: value}, [removed keys])."""
+        base = synced["cfg"]
+        changed = {k: v for k, v in list(cfg.items())
+                   if k not in base or base[k] != v}
+        return changed, [k for k in list(base) if k not in cfg]
+
+    def _put(k, src):
+        """cfg[k] = what `src` has for it (no note: not a request's change)."""
+        if k in src:
+            dict.__setitem__(cfg, k, copy.deepcopy(src[k]))
+        else:
+            dict.pop(cfg, k, None)
+
+    def _pull(disk, keep_own=True):
+        """Bring `cfg` up to date with config.json (`disk`), one key at a
+        time so another request never sees it empty. keep_own: leave this
+        server's unsaved changes in place (a request is still working on
+        them); False drops them all (a whole new config was imported)."""
+        base = synced["cfg"]
+        if keep_own:
+            changed, removed = _own_changes()
+            keys = [k for k in set(base) | set(disk)
+                    if base.get(k, _gone) != disk.get(k, _gone)
+                    and k not in changed and k not in removed]
+        else:
+            keys = [k for k in set(cfg) | set(disk)
+                    if cfg.get(k, _gone) != disk.get(k, _gone)]
+        for k in keys:
+            _put(k, disk)
+        synced["cfg"] = copy.deepcopy(disk)
+
+    def _drop_unsaved(mine):
+        """A request is over: what it changed in the copy and did not save
+        goes back to what is on file. Keys another request is still working
+        on are left to that request; with no other request running, nothing
+        unsaved stays at all."""
+        base = synced["cfg"]
+        if touched:
+            busy = set().union(*touched.values())
+            keys = [k for k in mine if k not in busy]
+        else:
+            changed, removed = _own_changes()
+            keys = list(changed) + removed
+        for k in keys:
+            if cfg.get(k, _gone) != base.get(k, _gone):
+                _put(k, base)
+
+    def _setup_restart_from():
+        """Setup wizard only, with no agent running on this computer: the
+        settings to start again from when config.json can't be read (a
+        typo) — the ones this wizard last read. The damaged file is kept
+        next to the new one. A running agent never does this (None): its
+        settings pages refuse to save until the file is fixed."""
+        if get_status is not None:
+            return None
+        try:
+            import keep_running
+            if keep_running.is_running():
+                return None
+        except Exception:
+            return None
+        return copy.deepcopy(synced["cfg"])
+
     def save():
-        A._save(A.CONFIG_PATH, cfg, private=True)
+        """Write what THIS request changed in the copy onto config.json as
+        it is now. Another request's unfinished changes are not written."""
+        mine = touched.get(threading.get_ident())
+
+        def own_keys_only(disk):
+            changed, removed = _own_changes()
+            for k in removed:
+                if mine is None or k in mine:
+                    disk.pop(k, None)
+            disk.update(copy.deepcopy({k: v for k, v in changed.items()
+                                       if mine is None or k in mine}))
+        with A.CONFIG_LOCK:
+            _pull(A.update_config(own_keys_only, if_damaged=_setup_restart_from))
+
+    def _fresh(fn, plain_errors=True):
+        """A route that starts from the settings as they are on disk now,
+        and leaves nothing unsaved behind in the copy when it ends."""
+        def run(*args):
+            me = threading.get_ident()
+            if me in touched:  # already inside a request on this thread
+                return fn(*args)
+            with A.CONFIG_LOCK:
+                touched[me] = set()
+                try:
+                    _pull(A._read_config())
+                except OSError:
+                    pass  # unreadable right now (locked, or a typo): answer
+                    # from the copy; a save in this request is refused
+            try:
+                return fn(*args)
+            except A.ConfigUnreadable as exc:
+                if not plain_errors:
+                    raise
+                # a save was refused: say why, in full (nothing was changed)
+                return {"ok": False, "error": str(exc)}
+            finally:
+                with A.CONFIG_LOCK:
+                    _drop_unsaved(touched.pop(me, set()))
+        return run
 
     class W(_Handler):
         pages = {"/setup": _WIZARD_HTML, "/dash": _DASH_HTML}
@@ -3074,6 +3312,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             # the agent itself is serving this page (vs. the setup wizard)
             "running": get_status is not None,
             "keep_awake": cfg.get("keep_awake", True) is not False,
+            # the mode and limits as they are set now (None = never set), so
+            # the Safety form shows them instead of its own defaults
+            "dry_run": (bool(cfg["dry_run"]) if cfg.get("dry_run") is not None
+                        else None),
+            "max_entries_per_day": cfg.get("max_entries_per_day"),
+            "max_daily_loss_usd": cfg.get("max_daily_loss_usd"),
         }
 
     def consent(_h, data):
@@ -3265,13 +3509,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         # "resume" can't lift this — and wait until the cycle it is in right
         # now (maybe an order being placed) has finished and saved, so
         # nothing is traded here that the server wouldn't know about.
-        was_paused = CONTROLS.get("paused", False)
+        # A full stop: no entries, no exits, no expiry-guard sells (the
+        # owner's own Pause, in config.json, would still sell on exits).
+        # The dashboard shows it from the agent's status (agent._handed_off).
         transfer.HANDOFF["hold"] = True  # this is what stops the heartbeat
-        CONTROLS["paused"] = True  # what the dashboard shows
 
         def carry_on_here():
             transfer.HANDOFF["hold"] = False
-            CONTROLS["paused"] = was_paused
         if not transfer.CYCLE_IDLE.wait(provision.CYCLE_WAIT_S):
             carry_on_here()
             return {"ok": False, "error": (
@@ -3325,8 +3569,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     _time.sleep(0.2)
                 CONTROLS["stop"] = True
             threading.Thread(target=_stop_here, daemon=True).start()
-            retired += ("; the agent here is paused now (it places no more "
-                        "orders, and \"resume\" is switched off) and stops "
+            retired += ("; the agent here is on hold now (it places no more "
+                        "orders, exits included, and \"resume\" is switched "
+                        "off) and stops "
                         "by itself about a minute after this page shows the "
                         "server's address ("
                         f"{max(1, round(provision.LOCAL_STOP_CAP_S / 60))} "
@@ -3440,16 +3685,19 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         import time as _time
         # Stop new event polls so an in-flight order can finish its atomic
         # state save before the exec; all durable state (config, positions,
-        # seen-events, trade log, daily cap) already lives on disk. CONTROLS
-        # resets on restart, so polling resumes automatically.
-        was_paused = CONTROLS["paused"]
-        CONTROLS["paused"] = True
+        # seen-events, trade log, daily cap) already lives on disk. The hold
+        # is in memory only, so polling resumes automatically after the
+        # restart (and the owner's own Pause, in config.json, is untouched).
+        # Long enough for the restart to wait for an order that is still
+        # being placed; released at once if the restart gives up.
+        import platform_compat
+        hold_orders(_HOLD_S + platform_compat.ORDER_WAIT_SECONDS)
 
         def _restart():
             _time.sleep(3.0)  # response flush
             # waits for an order that is still being placed (never restarts
             # in the middle of one)
-            _restart_after_update(list(sys.argv), was_paused)
+            _restart_after_update(list(sys.argv))
         threading.Thread(target=_restart, daemon=True).start()
         return {"ok": True, "restarting": True,
                 "note": note + " — restarting with the new code; this page "
@@ -3607,8 +3855,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                     other.get("value"))
         if not ok:
             return {"ok": False, "error": f"shadow book: {err}"}
-        cfg.clear()
-        cfg.update(new)
+        for k in [k for k in list(cfg) if k not in new]:
+            cfg.pop(k, None)  # (never clear(): another request may be reading)
+        cfg.update({k: v for k, v in new.items()
+                    if k not in cfg or cfg[k] != v})  # only what sizing changed
         save()
         return {"ok": True}
 
@@ -3628,10 +3878,29 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                   data.get("anthropic_key", ""))
         if perr:
             return {"ok": False, "error": perr}
-        cfg["dry_run"] = bool(data.get("dry", True))
+        # Mode and cap change only when the form sends them (it sends what
+        # the owner changed). Left out, they stay as they are — saving a
+        # ticker rule must never switch the mode or reset the cap. Never
+        # set before (first setup): dry-run, 5 entries a day.
+        if isinstance(data.get("dry"), bool):
+            cfg["dry_run"] = data["dry"]
+        elif cfg.get("dry_run") is None:
+            cfg["dry_run"] = True
+        raw_cap = str(data.get("cap") or "").strip()
         try:
-            cfg["max_entries_per_day"] = max(1, int(data.get("cap") or 5))
-        except (TypeError, ValueError):
+            cap = max(1, int(float(raw_cap))) if raw_cap else None
+        except (TypeError, ValueError, OverflowError):
+            cap = None  # not a number: keep what is set
+        old_cap = cfg.get("max_entries_per_day")
+        if (cap is not None and data.get("seeded") is not True
+                and isinstance(old_cap, int) and cap > old_cap):
+            # A Safety page still open from before an update sends its own
+            # default (5), not your cap. Only a page that was filled in
+            # from the current settings ("seeded") may RAISE the cap.
+            cap = None
+        if cap is not None:
+            cfg["max_entries_per_day"] = cap
+        elif old_cap is None:
             cfg["max_entries_per_day"] = 5
         raw_loss = str(data.get("max_loss") or "").strip()
         if raw_loss:  # blank keeps any existing limit (re-running the wizard)
@@ -3748,18 +4017,24 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 # in-flight event finish its state save, so nothing in memory
                 # overwrites the imported files. A restart then loads them.
                 import time as _t
-                was_paused = CONTROLS["paused"]
-                CONTROLS["paused"] = True
+                # no time limit: once the files are replaced, the state in
+                # memory must never be saved over them (released on failure)
+                hold_orders(float("inf"))
                 _t.sleep(2.0)
             try:
                 info = transfer.import_bundle(blob, pw,
                                               replace=bool(data.get("replace")))
             except Exception:
                 if running_here:
-                    # nothing changed: carry on as before — still paused if
-                    # the owner (or a damaged-memory start) had paused it
-                    CONTROLS["paused"] = was_paused
+                    # nothing changed: carry on as before — the owner's
+                    # Pause (config.json) and a damaged-memory hold
+                    # (agent._state_held) were never touched
+                    release_orders()
                 raise
+            if running_here:
+                # the files are the imported setup now: what this process
+                # has in memory is never saved over them (see setup_replaced)
+                CONTROLS["replaced"] = True
         except transfer.TransferError as exc:
             if str(exc) == "NEEDS_REPLACE":
                 return {"ok": False, "needs_replace": True,
@@ -3767,9 +4042,15 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"ok": False, "error": str(exc)}
         except Exception as exc:
             return {"ok": False, "error": f"import failed: {str(exc)[:150]}"}
-        # the wizard keeps config in memory: reload it from the imported file
-        cfg.clear()
-        cfg.update(A._load(A.CONFIG_PATH, {}) or {})
+        # the wizard keeps a copy of the config: reload it from the imported file
+        try:
+            with A.CONFIG_LOCK:
+                _pull(A._read_config(), keep_own=False)
+        except OSError:
+            # The file is busy this instant (antivirus, a sync program).
+            # Never stop here: the import is done and the agent is on hold
+            # until it restarts. The copy is refreshed by the next request.
+            pass
         if running_here:
             import sys as _sys
 
@@ -3777,9 +4058,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 import time as _t
                 _t.sleep(1.5)  # let this response reach the browser
                 # waits for an order that is still being placed; tells the
-                # owner if it had to give up
+                # owner if it had to give up, and leaves if it failed
                 _restart_after_import(list(_sys.argv))
-            threading.Thread(target=_restart, daemon=True).start()
+            try:
+                threading.Thread(target=_restart, daemon=True).start()
+            except Exception:
+                _restart()  # no new thread to be had: restart from this one
             info["restarting"] = True
         return {"ok": True, **info}
 
@@ -3894,7 +4178,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/move/download": move_download}
     def ask(_h, data):
         q = str(data.get("question", "")).strip()
-        wiz_state = {k: v for k, v in state(None).items() if k != "disclaimer"}
+        wiz_state = _llm_safe_state(state(None))
         reply = _ask_llm(cfg, q, wiz_state, [], system=(
             "You are the setup assistant embedded in the user's own "
             "agentic-trader install wizard. Help them complete setup: explain "
@@ -3930,6 +4214,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/proposal/reject": proposal_reject,
                      "/api/command": d_command}
 
+    W.routes_get = {p: _fresh(fn) for p, fn in W.routes_get.items()}
+    W.routes_post = {p: _fresh(fn) for p, fn in W.routes_post.items()}
+
     class _Redirect(Exception):
         pass
 
@@ -3941,7 +4228,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             if not self._guard(check_origin=False):
                 return
             try:
-                rh_callback(self)
+                _fresh(rh_callback, plain_errors=False)(self)
             except _Redirect:
                 pass
             except Exception as exc:
@@ -4200,34 +4487,62 @@ def _restart_or_tell(argv, done, now_it, to_finish, after="", port=None,
     return False
 
 
-def _restart_after_update(argv, was_paused=False):
+def _as_before_text():
+    """How the agent goes on when a restart could not happen: as it was."""
+    try:
+        import agent as A
+        if A._full_hold_note():
+            return " and stays on hold (no orders at all), as it was before."
+        if A._paused(A._load(A.CONFIG_PATH, {}) or {}):
+            return (" and stays paused (no new entries; exits still run), "
+                    "as it was before.")
+    except Exception:
+        pass
+    return " and keeps trading as before."
+
+
+def _restart_after_update(argv):
     """Restart onto the freshly downloaded code. If the restart can't happen
-    (see _restart_or_tell) the agent carries on as before — the update
-    paused it for the restart — and the owner is told."""
+    (see _restart_or_tell) the agent carries on as before — the update put
+    it on hold for the restart (hold_orders), which is released here; the
+    owner's own Pause, in config.json, was never touched — and the owner is
+    told."""
     ok = _restart_or_tell(
         argv, "the update was downloaded",
-        "It keeps running the previous version"
-        + (" and stays paused, as it was before the update."
-           if was_paused else " and keeps trading as before."),
+        "It keeps running the previous version" + _as_before_text(),
         "To finish the update, restart it")
     if not ok:
-        CONTROLS["paused"] = was_paused
+        release_orders()
     return ok
 
 
 def _restart_after_import(argv):
-    """Restart onto the setup that was just imported from a move file. If
-    the restart can't happen the agent stays paused (it was paused for the
-    import, and what it has in memory is the setup from before), and the
-    owner is told that it is not acting on anything until restarted."""
-    return _restart_or_tell(
-        argv, "the setup from your other computer was saved on this computer",
-        "It is PAUSED now: it places no orders and does NOT act on exit "
-        "signals — watch your open positions in your broker app.",
-        "Restart it",
-        after="After the restart, check that the imported setup is there; "
-              "if it is not, import the move file again.",
-        urgent=True)
+    """Restart onto the setup that was just imported from a move file.
+
+    If an order is still being placed and the restart gives up, the agent
+    stays on hold — the import's hold has no time limit, and what this
+    process has in memory is the setup from before: it must never trade on
+    it again, and it is never saved over the imported files
+    (setup_replaced) — and the owner is told that nothing is acted on until
+    they restart it. If the restart itself fails, the agent leaves
+    (_leave_after_import): the supervisor, or the owner, starts it again on
+    the imported setup."""
+    try:
+        return _restart_or_tell(
+            argv, "the setup from your other computer was saved on this computer",
+            "It is ON HOLD now: it reads no signals and places no orders at "
+            "all — it does NOT act on exit signals and the expiry guard does "
+            "not sell — so watch your open positions in your broker app. "
+            "What it still has in memory is the setup from before the import; "
+            "that is not saved over the imported one, so the order that was "
+            "still being placed is not in the imported setup's memory: check "
+            "your broker account for it.",
+            "Restart it",
+            after="After the restart, check that the imported setup is there; "
+                  "if it is not, import the move file again.",
+            urgent=True)
+    except Exception as exc:
+        _leave_after_import(exc)
 
 
 def restart_after_self_edit(argv, port=None):
@@ -4237,8 +4552,7 @@ def restart_after_self_edit(argv, port=None):
     return _restart_or_tell(
         argv, "the code change you approved was written",
         "It keeps running the code it had before the change"
-        + (" and stays paused." if CONTROLS.get("paused")
-           else " and keeps trading as before."),
+        + _as_before_text(),
         "To load the change, restart it", port=port, quiet=False)
 
 
@@ -4282,11 +4596,58 @@ def pull_code_updates(expect=None):
         return False, str(exc)[:200]
 
 
+def _leave_after_import(exc):
+    """The moved setup is on disk but the restart onto it failed. This
+    process still has the OLD setup in memory and is on hold (no signals,
+    no orders, for good): it must neither carry on like that nor save its
+    memory over the imported files. Leaving is the only safe way out — the
+    background supervisor starts the agent again on the imported setup;
+    without one the owner starts it."""
+    import os
+    import platform_compat
+    try:
+        print("The move file was imported, but the agent could not restart "
+              f"by itself ({str(exc)[:120]}). It is stopping now so it can't "
+              "keep running on the old setup. If it does not come back by "
+              "itself within a minute, start it again: python agent.py start",
+              flush=True)
+    except Exception:
+        pass
+    os._exit(platform_compat.RESTART_EXIT)
+
+
 # ── the dashboard (served BY the running agent) ──────────────────────────────
 
+def _site_only(url):
+    """A link cut down to its site: no login, path or query (where feed
+    tokens and wallet logins live)."""
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(url)
+        return f"{u.scheme}://{u.hostname or ''}/…"
+    except ValueError:
+        return "[link]"
+
+
+def _llm_safe_state(st):
+    """The wizard's state as an AI provider may see it. The page itself
+    needs the wallet link (its usr= part IS the wallet's login) and the
+    feed address; the AI gets "connected: yes/no" and the site name."""
+    import re
+    link = re.compile(r"https?://[^\s\"'<>]+")
+    out = {k: v for k, v in st.items() if k != "disclaimer"}
+    out["wallet"] = {"connected": bool((st.get("wallet") or {}).get("connected"))}
+    out["notes"] = {k: link.sub(lambda m: _site_only(m.group(0)), str(v))
+                    for k, v in (st.get("notes") or {}).items()}
+    return out
+
+
 def _ask_llm(cfg, question, status_fields, trades, system=None):
-    """Free-text Q&A about the agent's own state. Answer-only, never trades."""
+    """Free-text Q&A about the agent's own state. Answer-only, never trades.
+    Everything the agent adds to the question (status, trade log) is
+    scrubbed of keys, tokens, invoices and login links first."""
     import llm_client
+    import support
     if not llm_client.configured(cfg):
         return ("Connect an AI model (Setup → Connect your AI) to enable Q&A — "
                 "Claude, OpenAI, Grok, Gemini, OpenRouter or a local model.")
@@ -4304,9 +4665,10 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "set cap N, stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
-            f"STATUS:\n{json.dumps(status_fields, indent=1)}\n\n"
-            f"RECENT TRADE LOG:\n{json.dumps(trades, indent=1)}\n\n"
-            f"QUESTION: {question}",
+            support.scrub(
+                f"STATUS:\n{json.dumps(status_fields, indent=1)}\n\n"
+                f"RECENT TRADE LOG:\n{json.dumps(trades, indent=1)}\n\n")
+            + f"QUESTION: {question}",
             max_tokens=1024, effort="low")
     except llm_client.LLMError as exc:
         if exc.reason == "refused":

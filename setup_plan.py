@@ -404,15 +404,18 @@ def apply(plan, cfg, consent_ok, home):
                 "this agent is LIVE (it places real orders), and this plan "
                 "would " + "; ".join(bigger) + ". A plan can never do that "
                 "to a live agent. The OWNER first switches it to dry-run "
-                "themselves (`dry on` in the dashboard). BEFORE they do, "
-                "they close every position the agent holds, or get ready to "
-                "close it themselves in their broker app: while dry-run is "
-                "on the agent places no orders at all, and an exit signal "
-                "that arrives in that time is used up — the agent stops "
-                "tracking that position and will NOT sell it later, not "
-                "even after `dry off`. Then the plan can be applied, and the "
-                "agent stays in dry-run until the owner has checked the new "
-                "settings and says `dry off`")
+                "themselves (`dry on` in the dashboard). Dry-run stops NEW "
+                "trades only: a position the agent already bought with a "
+                "real order is still sold for real on its exit signal, and "
+                "by the expiry guard on its expiry day. One thing to do "
+                "BEFORE the plan is applied: if it changes the broker "
+                "account, the owner first closes every position the agent "
+                "holds in the current account (or gets ready to close them "
+                "in their broker app) — the agent never sells from an "
+                "account it is no longer connected to, so it will NOT sell "
+                "those after the switch. Then the plan can be applied, and "
+                "the agent stays in dry-run until the owner has checked the "
+                "new settings and says `dry off`")
 
     if errors:
         report["applied"] = []

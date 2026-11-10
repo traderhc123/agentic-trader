@@ -149,14 +149,15 @@ def test_deploy_retires_this_computer(deploy_route, monkeypatch):
     # exactly what "move to another computer" does
     assert transfer.moved_away()
     assert not keep_running.autostart_enabled()
-    # paused at once (no orders), stopped once the page had time to show the
-    # server's address — the delay is 0 here
-    assert webui.CONTROLS["paused"] is True
+    # on hold at once (no orders), stopped once the page had time to show
+    # the server's address — the delay is 0 here
+    assert transfer.HANDOFF["hold"] is True
     deadline = time.time() + 10
     while not webui.CONTROLS["stop"] and time.time() < deadline:
         time.sleep(0.01)
     assert webui.CONTROLS["stop"] is True
-    assert "paused now" in r["note"] and "stops by itself" in r["note"]
+    assert "on hold now" in r["note"] and "stops by itself" in r["note"]
+    assert "exits included" in r["note"]
     # ...and the owner is told, with the way back
     assert "this computer" in r["note"].lower()
     assert "resume-here" in r["note"]
@@ -177,7 +178,7 @@ def test_failed_deploy_changes_nothing_here(deploy_route, monkeypatch):
 
     def boom(token, region):
         # no new signals may be handled while the snapshot is being sent
-        seen["paused"] = webui.CONTROLS["paused"]
+        seen["paused"] = transfer.HANDOFF["hold"]
         raise RuntimeError("DigitalOcean rejected the token (401)")
     monkeypatch.setattr(provision, "create_droplet", boom)
     r = deploy_route(running=True)(None, {"token": "bad"})
@@ -185,7 +186,7 @@ def test_failed_deploy_changes_nothing_here(deploy_route, monkeypatch):
     assert seen["paused"] is True
     assert transfer.moved_away() is None
     assert keep_running.autostart_enabled()
-    assert not webui.CONTROLS["paused"] and not webui.CONTROLS["stop"]
+    assert not transfer.HANDOFF["hold"] and not webui.CONTROLS["stop"]
 
 
 def test_second_deploy_is_refused_while_the_first_server_has_the_setup(
@@ -256,7 +257,7 @@ def test_deploy_is_refused_while_a_trade_will_not_finish(deploy_route, monkeypat
     assert "no server was created" in r["error"].lower()
     assert transfer.moved_away() is None and keep_running.autostart_enabled()
     assert transfer.HANDOFF["hold"] is False
-    assert not webui.CONTROLS["paused"] and not webui.CONTROLS["stop"]
+    assert not transfer.HANDOFF["hold"] and not webui.CONTROLS["stop"]
 
 
 def test_setup_page_refuses_while_the_agent_runs_in_another_window(
@@ -281,15 +282,19 @@ def test_resume_cannot_undo_the_handoff(deploy_route, monkeypatch):
     assert deploy_route(running=True)(None, {"token": "t"})["ok"]
     handled, reply = A._apply_command("resume")
     assert handled and "resume-here" in reply and "twice" in reply
-    assert webui.CONTROLS["paused"] is True and transfer.HANDOFF["hold"] is True
+    assert transfer.HANDOFF["hold"] is True
     webui.CONTROLS["stop"] = True   # let the waiting thread go
 
 
-def test_resume_still_works_when_nothing_was_moved(deploy_route):
+def test_resume_still_works_when_nothing_was_moved(deploy_route, home):
     deploy_route(running=True)
-    webui.CONTROLS["paused"] = True
-    assert A._apply_command("resume") == (True, "Resumed.")
-    assert webui.CONTROLS["paused"] is False
+    assert A._apply_command("pause")[0]
+    assert json.loads((home / "config.json").read_text(
+        encoding="utf-8")).get("paused") is True
+    assert A._apply_command("resume") == (
+        True, "Resumed — the agent takes new entries again.")
+    assert "paused" not in json.loads((home / "config.json").read_text(
+        encoding="utf-8"))
 
 
 # ── review: the page must get the server's address before this one stops ──
@@ -308,7 +313,7 @@ def test_agent_here_stops_only_after_the_page_has_the_address(
     assert status(None)["ip"] == ""
     time.sleep(0.3)
     assert webui.CONTROLS["stop"] is False     # still serving the page
-    assert webui.CONTROLS["paused"] is True    # ...but placing no orders
+    assert transfer.HANDOFF["hold"] is True            # ...but placing no orders
     ip["v"] = "203.0.113.9"
     assert "203.0.113.9" in status(None)["ssh"]
     assert _wait_for(lambda: webui.CONTROLS["stop"])
@@ -329,7 +334,7 @@ def test_reply_tells_the_page_what_happened_to_this_computer(
                         lambda token, region: (7, "droplet 7 creating in nyc3"))
     r = deploy_route(running=True)(None, {"token": "t"})
     here = r["here"]
-    assert "paused now" in here and "places no more orders" in here
+    assert "on hold now" in here and "places no more orders" in here
     assert "this page" in here                      # when it stops
     assert "nothing is watching your open positions" in here
     assert "resume-here" in here
@@ -339,7 +344,7 @@ def test_reply_tells_the_page_what_happened_to_this_computer(
     monkeypatch.setitem(webui.CONTROLS, "stop", False)
     r2 = deploy_route(running=False)(None, {"token": "t"})
     assert "won't run the agent again" in r2["here"]
-    assert "paused now" not in r2["here"]   # nothing was running here
+    assert "on hold now" not in r2["here"]   # nothing was running here
 
 
 # ── review: nothing after "the server exists" may leave both copies live ──
@@ -358,7 +363,7 @@ def test_server_created_but_login_entry_cannot_be_removed(
     assert r["ok"], r
     assert transfer.moved_away()                 # the agent refuses to start
     assert "could not be removed" in r["note"]   # and the owner is told
-    assert webui.CONTROLS["paused"] is True
+    assert transfer.HANDOFF["hold"] is True
     assert _wait_for(lambda: webui.CONTROLS["stop"])
     assert not deploy(None, {"token": "t"})["ok"] and made == [1]
 
@@ -374,7 +379,7 @@ def test_server_created_but_the_marker_cannot_be_written(
     r = deploy_route(running=True)(None, {"token": "t"})
     assert r["ok"], r
     assert "do not start the agent on this computer" in r["note"].lower()
-    assert webui.CONTROLS["paused"] is True and transfer.HANDOFF["hold"] is True
+    assert transfer.HANDOFF["hold"] is True
     assert _wait_for(lambda: webui.CONTROLS["stop"])
 
 
@@ -447,7 +452,7 @@ def test_unknown_outcome_reaches_the_owner_in_full(deploy_route, monkeypatch,
     r = deploy_route(running=True)(None, {"token": "t"})
     assert not r["ok"]
     assert r["error"].rstrip().endswith("second time.")   # not cut short
-    assert not webui.CONTROLS["paused"] and not webui.CONTROLS["stop"]
+    assert not transfer.HANDOFF["hold"] and not webui.CONTROLS["stop"]
     assert transfer.HANDOFF["hold"] is False
 
 

@@ -113,7 +113,9 @@ positions, history, rules) into one file locked with a passphrase you pick,
 then stops the agent on the old computer so two machines never trade the same
 account. On the new computer run the installer and choose **"Moving from
 another computer?"** on the first setup page. The setup starts there in
-dry-run; say `dry off` when you're ready. (Terminal: `agent.py export FILE` /
+dry-run (no new trades); say `dry off` when you're ready. Real positions you
+moved over are still sold on their exit signal, so make sure the old computer
+is off first. (Terminal: `agent.py export FILE` /
 `agent.py import FILE`.)
 
 Only one copy can run at a time — starting a second one (another window,
@@ -227,8 +229,27 @@ whatever `max_autopay_sats` is set to.
   open a new position in a contract that expires that day. Early-close days
   (1:00 PM: the day after Thanksgiving, and Dec 24 / Jul 3 when they fall
   Monday–Thursday) move both times 3 hours earlier, never before 09:30; add
-  any other with `"early_close_days": ["YYYY-MM-DD"]`. Not while paused, and
-  never a real position while in dry-run (the alert still fires).
+  any other with `"early_close_days": ["YYYY-MM-DD"]`. The guard keeps
+  running while the agent is paused, and in dry-run it still sells positions
+  the agent bought with real orders (dry-run positions stay on paper).
+- **Pause and dry-run, exactly**: **Pause** stops *new entries* only — exit
+  signals, the expiry guard and the broker checks keep running for positions
+  you already have, and the agent stays paused after a restart until you
+  press Resume. (On the pay-per-day AgentHC feed: while a real position is
+  open, a paused agent still reads the feed to get its exit signal, which
+  uses a signal day. With no real position open it stops reading the feed,
+  so the pause costs nothing; dry-run positions are not updated meanwhile.)
+  **Dry-run** stops *new real trades* only — a position the agent already
+  bought with a real order is still sold for real when its exit signal
+  arrives; the dashboard tells you how many such positions are open before
+  you switch.
+- **Editing config.json by hand**: if a typo (a stray comma or quote) makes
+  the file unreadable, the running agent keeps the settings it last read and
+  refuses every settings change — the dashboard and the chat tell you so —
+  until you fix the file. It never writes a new file over it, and `stop`
+  still works. Only the setup wizard, with no agent running, starts a new
+  file; it keeps the unreadable one next to it as
+  `config.json.damaged-<date>`.
 - **Exit remainders** (any day): when an exit sells only part of a position
   (a partial fill, or an order that died or was cancelled with contracts
   left), the agent re-sells the rest on the next loop — a marketable limit,

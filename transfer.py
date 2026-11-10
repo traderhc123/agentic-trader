@@ -57,8 +57,10 @@ class TransferError(Exception):
 # ── handing the setup over while the agent is running here ──────────────────
 # The copy that goes to the other machine must hold everything this one has
 # done, so it is taken only when the heartbeat is between cycles:
-#   HANDOFF["hold"]  the heartbeat treats this as "paused" and — unlike the
-#                    dashboard's pause — typing "resume" cannot undo it. Set
+#   HANDOFF["hold"]  the heartbeat stops completely: no feed read and no
+#                    orders at all — no entries, no exits, no expiry-guard
+#                    sells. Unlike the dashboard's Pause (which only stops
+#                    new entries) typing "resume" cannot undo it. Set
 #                    before the copy is taken; left on once the setup has
 #                    moved (this computer is retired).
 #   CYCLE_IDLE       set while the heartbeat is NOT in the middle of a cycle

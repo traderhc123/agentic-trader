@@ -55,7 +55,21 @@ export async function apiTimed(path: string, body: unknown, ms: number): Promise
 // ── shapes the server returns ────────────────────────────────────────────
 export interface StatusResp {
   mode: "LIVE" | "DRY-RUN" | "OFFLINE" | string;
+  /** the owner pressed Pause: no new entries (exits keep running); saved, survives a restart.
+   *  Also true on a full hold (see `hold`), so the Resume button is offered. */
   paused: boolean;
+  /** a full hold, not the owner's Pause: no orders at all, exits included (damaged memory file,
+   *  or the setup is being moved to a server). `pause_note` then says which and what to do. */
+  hold?: boolean;
+  /** real (not dry-run) positions the agent holds now */
+  real_positions?: number;
+  /** what dry-run does with those positions, in plain words ("" when there are none) */
+  dry_run_note?: string;
+  /** while paused on the pay-per-day feed: whether the agent still reads it ("" otherwise);
+   *  on a full hold (`hold`): why the agent places no orders at all */
+  pause_note?: string;
+  /** an update or a move is about to restart the agent: no signals read, no orders, until it is back */
+  restarting?: boolean;
   fields: Record<string, string>;
   cash_warning?: string;
   expiry_warnings?: ExpiryWarning[];
@@ -230,4 +244,8 @@ export interface WizardState {
   policy_on?: boolean;
   running?: boolean;
   keep_awake?: boolean;
+  /** mode and limits as saved now; null = never set (first setup) */
+  dry_run?: boolean | null;
+  max_entries_per_day?: number | null;
+  max_daily_loss_usd?: number | null;
 }

@@ -104,12 +104,11 @@ def test_unreadable_state_with_no_backup_pauses_and_keeps_the_file(home, monkeyp
     """REGRESSION: a state.json a power cut left unparseable was read as
     "no state", the agent traded on from an empty memory, and its next save
     made the loss permanent."""
-    import webui
     (home / "state.json").write_bytes(_TORN)
     calls, sent = _run_one_loop(home, monkeypatch, [make_event()])
     # paused: the feed isn't fetched (so nothing is paid) and nothing ordered
     assert calls == []
-    assert webui.CONTROLS["paused"] is True
+    assert agent._state_held() is True
     # the damaged file is still there, under a new name
     kept = _damaged(home)
     assert len(kept) == 1 and kept[0].read_bytes() == _TORN
@@ -123,26 +122,25 @@ def test_unreadable_state_with_no_backup_pauses_and_keeps_the_file(home, monkeyp
     # a restart (reboot, crash, start-at-login) must not quietly go on from
     # the empty memory either: still paused, and no second alert that day
     calls, sent = _run_one_loop(home, monkeypatch, [make_event()])
-    assert calls == [] and webui.CONTROLS["paused"] is True
+    assert calls == [] and agent._state_held() is True
     assert not [m for m in sent if "PAUSED" in m]
     assert len(_damaged(home)) == 1
 
     # only the owner's own "resume" ends it
     handled, reply = agent._apply_command("resume")
     assert handled and "empty memory" in reply
-    assert webui.CONTROLS["paused"] is False
+    assert agent._state_held() is False
     assert agent._durability_banner() == []
     calls, _sent = _run_one_loop(home, monkeypatch)
     assert calls == ["poll"]
 
 
 def test_unreadable_state_is_restored_from_the_backup(home, monkeypatch):
-    import webui
     agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
     _tear(home / "state.json")
     calls, sent = _run_one_loop(home, monkeypatch)
     # the backup written right after it: same save, so the agent carries on
-    assert calls == ["poll"] and webui.CONTROLS["paused"] is False
+    assert calls == ["poll"] and agent._state_held() is False
     state = _read(home / "state.json")
     assert state["positions"] == _GOOD["positions"]
     assert state["seen"] == ["old-1"] and state["l402"]["token"] == "L402 a:b"
@@ -154,14 +152,13 @@ def test_unreadable_state_is_restored_from_the_backup(home, monkeypatch):
 def test_restoring_from_an_old_backup_pauses(home, monkeypatch):
     """A backup much older than the damaged file may miss trades: the agent
     loads it (better than nothing) but waits for the owner."""
-    import webui
     agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
     bak = agent.STATE_PATH + ".bak"
     old = os.path.getmtime(bak) - 3 * 3600
     os.utime(bak, (old, old))
     (home / "state.json").write_bytes(_TORN)
     calls, sent = _run_one_loop(home, monkeypatch, [make_event()])
-    assert calls == [] and webui.CONTROLS["paused"] is True
+    assert calls == [] and agent._state_held() is True
     assert _read(home / "state.json")["positions"] == _GOOD["positions"]
     alert = next(m for m in sent if "PAUSED" in m)
     assert "older backup" in alert
@@ -170,9 +167,8 @@ def test_restoring_from_an_old_backup_pauses(home, monkeypatch):
 
 
 def test_missing_state_is_a_fresh_install_not_damage(home, monkeypatch):
-    import webui
     calls, sent = _run_one_loop(home, monkeypatch)
-    assert calls == ["poll"] and webui.CONTROLS["paused"] is False
+    assert calls == ["poll"] and agent._state_held() is False
     assert not _damaged(home) and agent._durability_banner() == []
     assert not [m for m in sent if "PAUSED" in m or "restored" in m]
     # the first save leaves a backup beside the state file
@@ -436,7 +432,6 @@ def test_log_row_after_a_torn_line_is_not_swallowed(home):
 def test_damaged_state_that_cannot_be_set_aside_is_never_overwritten(home, monkeypatch):
     """If the damaged file can be neither moved nor copied, an empty state
     must not be written over the only copy: the agent does not start."""
-    import webui
     (home / "state.json").write_bytes(_TORN)
     real_set_aside = agent._set_aside
     monkeypatch.setattr(agent, "_set_aside", lambda path: None)
@@ -452,7 +447,7 @@ def test_damaged_state_that_cannot_be_set_aside_is_never_overwritten(home, monke
     # its own alert is not swallowed by the one already sent today
     monkeypatch.setattr(agent, "_set_aside", real_set_aside)
     calls, sent = _run_one_loop(home, monkeypatch, [make_event()])
-    assert calls == [] and webui.CONTROLS["paused"] is True
+    assert calls == [] and agent._state_held() is True
     assert len([m for m in sent if "PAUSED" in m]) == 1
     assert [p.read_bytes() for p in _damaged(home)] == [_TORN]
 
@@ -544,7 +539,6 @@ def test_a_state_file_that_cannot_be_opened_is_not_called_lost(home, monkeypatch
     no backup yet) left a "memory lost" hold behind: the next start loaded
     the file normally, yet started paused and told the owner the agent no
     longer knew its positions."""
-    import webui
     agent._save(agent.STATE_PATH, _GOOD, private=True)  # no backup yet
     before = (home / "state.json").read_bytes()
     unlock = _lock(monkeypatch, "state.json")
@@ -564,10 +558,12 @@ def test_a_state_file_that_cannot_be_opened_is_not_called_lost(home, monkeypatch
     # the lock is gone: the agent starts normally, with its position
     sent = []
     calls, _ = _run_one_loop(home, monkeypatch, sent=sent)
-    assert calls == ["poll"] and webui.CONTROLS["paused"] is False
+    assert calls == ["poll"] and agent._state_held() is False
     assert not [m for m in sent if "PAUSED" in m or "did NOT start" in m]
     assert _read(home / "state.json")["positions"] == _GOOD["positions"]
-    assert agent._apply_command("resume") == (True, "Resumed.")
+    # no hold to end: the plain reply to the owner's own Resume
+    assert agent._apply_command("resume") == (
+        True, "Resumed — the agent takes new entries again.")
 
 
 def test_a_locked_state_file_is_never_replaced_by_its_backup(home, monkeypatch):
@@ -603,7 +599,6 @@ def test_a_backup_one_save_behind_is_not_the_same_save(home, monkeypatch):
     """REVIEW: saves come milliseconds apart, so "the backup is at most 5 s
     older" passed off a backup that missed the last save as the same save:
     the agent carried on, unpaused, without the position that save added."""
-    import webui
     told = []
     monkeypatch.setattr(agent, "notify", lambda cfg, msg, **k: told.append(msg))
     agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
@@ -627,7 +622,7 @@ def test_a_backup_one_save_behind_is_not_the_same_save(home, monkeypatch):
     _tear(home / "state.json")
     assert agent._load_state()[1]["how"] == "restored_old"
     calls, sent = _run_one_loop(home, monkeypatch, [make_event()])
-    assert calls == [] and webui.CONTROLS["paused"] is True
+    assert calls == [] and agent._state_held() is True
     alert = next(m for m in sent if "PAUSED" in m)
     assert "older backup" in alert and "will NOT sell" in alert
     # the startup save refreshed the backup: the warning is gone
@@ -743,11 +738,19 @@ def test_a_failed_move_file_import_does_not_lift_the_pause(home, monkeypatch):
                     apply_command=lambda t: (False, ""), cfg_getter=lambda: {})
     route = made["routes"]["/api/move/import"]
     data = {"data": base64.b64encode(b"x").decode("ascii"), "passphrase": "pw"}
+    (home / "config.json").write_text(json.dumps({"paused": True}),
+                                      encoding="utf-8")
     for was in (True, False):
-        monkeypatch.setitem(webui.CONTROLS, "paused", was)
+        # the damaged-memory hold is kept in memory (agent._STATE_HELD), the
+        # owner's own Pause in config.json: the import touches neither
+        monkeypatch.setitem(agent._STATE_HELD, "on", was)
         reply = route(None, dict(data))
         assert reply["ok"] is False and "damaged" in reply["error"]
-        assert webui.CONTROLS["paused"] is was
+        assert agent._state_held() is was
+        assert _read(home / "config.json") == {"paused": True}
+        # and its own hold (no polls, no orders while the files are replaced)
+        # is released: nothing changed, the agent carries on as before
+        assert webui.orders_held() is False
 
 
 def test_both_damaged_files_are_named_in_the_alert(home, monkeypatch):
