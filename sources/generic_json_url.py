@@ -18,8 +18,14 @@ agent last read the feed, so it counts as that old.
     bought (your caps and rules still apply).
   - New after the computer slept for an hour: up to an hour old — an entry
     is NOT bought (and the owner is told).
-  - Already listed the first time the agent reads the feed after it starts
-    (or after the URL changes): no telling how old — an entry is NOT bought.
+  - Already listed the first time the agent ever reads the feed (or the
+    first time after the URL changes): no telling how old — an entry is NOT
+    bought, and no alert is sent (a line in the log only).
+  - After a restart the agent carries on from its last read, kept in
+    state.json: an entry that is new since then is as old as that read —
+    it can be bought after a short restart; after a stop longer than
+    ``max_event_age_s`` it is NOT bought (no alert, a line in the log only —
+    like any signal from before the agent was running).
 Exits are never held back for their age. (Without ``occurred_at``, keep
 ``poll_seconds`` well under ``max_event_age_s``: an entry that is new after
 a gap that long is never bought. Outside market hours the agent reads the
@@ -30,6 +36,7 @@ API key for your feed. YOU are responsible for what your feed tells the agent
 to do; this template ships no judgment about third-party signals.
 """
 
+import hashlib
 from datetime import datetime, timezone
 
 import requests
@@ -39,12 +46,46 @@ DESCRIPTION = "Generic JSON feed at a URL you provide (bring your own signals)"
 
 # This run's memory, for events the feed gives no time for: when the feed
 # was last read, and for each such event still listed, the read before the
-# one that first showed it (None: listed on the first read).
+# one that first showed it (None: listed on the first read). A copy is kept
+# in state["url_feed"] so a restart (an update, a crash, the dashboard
+# stopped answering) carries on from the last read instead of treating
+# everything listed as "no telling how old". The agent saves state.json at
+# least every two minutes and whenever it stops; a copy that is a little
+# behind only makes an event look older, never newer.
 _SIGHT = {}
+_STATE_KEY = "url_feed"
 
 
 def _utcnow():
     return datetime.now(timezone.utc)
+
+
+def _url_mark(url):
+    """Stands for the URL in state.json (the URL itself can carry a key)."""
+    return hashlib.sha256(str(url).encode("utf-8")).hexdigest()[:16]
+
+
+def _saved_time(value, now):
+    t = datetime.fromisoformat(value)
+    if t.tzinfo is None or t > now:
+        raise ValueError("not a time this agent saved")
+    return t
+
+
+def _saved_sight(state, url, now):
+    """(last read, first-sight times) an earlier run saved for this URL, or
+    (None, {}) — nothing saved, another URL, damaged, or dated later than
+    now (the computer's clock was changed): then nothing is known."""
+    try:
+        saved = state[_STATE_KEY]
+        if saved["url"] != _url_mark(url):
+            return None, {}
+        read_at = _saved_time(saved["read_at"], now)
+        first = {str(eid): None if since is None else _saved_time(since, now)
+                 for eid, since in saved["first"].items()}
+        return read_at, first
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None, {}
 
 
 def _feed_time(value):
@@ -67,8 +108,12 @@ def poll(cfg, state, save_state=lambda s: None):
     resp = requests.get(url, headers=cfg.get("source_headers") or {}, timeout=15)
     resp.raise_for_status()
     if _SIGHT.get("url") != url:
+        fresh_start = not _SIGHT          # a new run, not a changed URL
         _SIGHT.clear()
         _SIGHT.update(url=url, read_at=None, first={})
+        if fresh_start:
+            read_at, seen_first = _saved_sight(state, url, started)
+            _SIGHT.update(read_at=read_at, first=seen_first)
     last_read, first = _SIGHT["read_at"], {}
     events = []
     for ev in resp.json().get("events", []):
@@ -101,6 +146,13 @@ def poll(cfg, state, save_state=lambda s: None):
         norm["occurred_at"] = when
         events.append(norm)
     _SIGHT.update(read_at=started, first=first)
+    try:
+        state[_STATE_KEY] = {
+            "url": _url_mark(url), "read_at": started.isoformat(),
+            "first": {eid: None if since is None else since.isoformat()
+                      for eid, since in first.items()}}
+    except TypeError:
+        pass  # no state to keep it in: this run's memory still works
     return events
 
 

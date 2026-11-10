@@ -85,11 +85,13 @@ def feed(event, occurred_at, ticker="SPY", track="main"):
 
 
 def run_loop(home, monkeypatch, state, polls, clock=None, steps=(), broker=None,
-             access=None, before_poll=None):
+             access=None, before_poll=None, source=None, config=None):
     """`agent.py run` for len(polls) loops. polls[i] is the list of events
     poll i returns, or an exception it raises. After loop i the clock moves
     steps[i] seconds (default 30). access[i]: whether poll i could read
-    signals (omit = the source has no say). Returns (broker, saved state)."""
+    signals (omit = the source has no say). source: a real source module to
+    poll instead (polls then only sets the number of loops); config: extra
+    config.json keys. Returns (broker, saved state)."""
     import brokers
     import keep_running
     import webui
@@ -125,7 +127,7 @@ def run_loop(home, monkeypatch, state, polls, clock=None, steps=(), broker=None,
     monkeypatch.setattr(agent, "require_consent_or_exit", lambda: None)
     monkeypatch.setattr(brokers, "broker_ready", lambda c: True)
     monkeypatch.setitem(agent.BROKERS, "stub", broker)
-    monkeypatch.setitem(agent.SOURCES, "stub", Source)
+    monkeypatch.setitem(agent.SOURCES, "stub", source or Source)
     monkeypatch.setattr(webui, "start_dashboard", no_dashboard)
     monkeypatch.setattr(keep_running, "refresh_autostart", lambda: False)
     monkeypatch.setattr(agent, "_refresh_cash", lambda *a, **k: None)
@@ -136,7 +138,8 @@ def run_loop(home, monkeypatch, state, polls, clock=None, steps=(), broker=None,
     monkeypatch.setitem(webui.CONTROLS, "stop", False)
     monkeypatch.setattr(agent, "_sleep_unless_stopped", sleep)
     (home / "config.json").write_text(
-        json.dumps({"source": "stub", "broker": "stub"}), encoding="utf-8")
+        json.dumps({"source": "stub", "broker": "stub", **(config or {})}),
+        encoding="utf-8")
     (home / "state.json").write_text(json.dumps(state), encoding="utf-8")
     agent.cmd_run()
     return broker, json.loads((home / "state.json").read_text(encoding="utf-8"))
@@ -220,6 +223,47 @@ def test_upgrade_does_not_buy_again_what_the_trade_log_says_it_bought(
     assert "my-feed-entry-17" in saved["seen"]
 
 
+def test_upgrade_reads_a_damaged_trade_log(home):
+    """One half-written line (power loss mid-save) or a hand edit in the
+    trade log must not hide the entries around it, or stop the agent."""
+    took = {"action": "entry", "event_id": "my-feed-entry-17", "dry": False}
+    (home / "trades.jsonl").write_text(
+        json.dumps(took) + "\n" + '{"action": "skip_stale", "event_id": "x", "re\n'
+        + "null\n7\n[]\n" + json.dumps({**took, "event_id": "my-feed-entry-18"}) + "\n",
+        encoding="utf-8")
+    state = {"seen": old_exit_ids(3), "positions": {}}
+    assert agent._seen_ids(state)[-2:] == ["my-feed-entry-17", "my-feed-entry-18"]
+    assert state["seen_order"] == "oldest_first"
+
+
+def test_upgrade_never_stops_the_agent_starting(home, monkeypatch):
+    def broken():
+        raise RuntimeError("trade log unreadable")
+    monkeypatch.setattr(agent, "_read_trade_log", broken)
+    state = {"seen": old_exit_ids(3), "positions": {}}
+    assert agent._seen_ids(state) == old_exit_ids(3)
+    assert state["seen_order"] == "oldest_first"
+
+
+def test_nothing_is_forgotten_while_the_feed_cannot_be_read(home, monkeypatch, sent, clock):
+    """The feed lists more than 500 events (a long commands.jsonl) and one
+    read of it fails while an owed exit is sold. Every id is still listed
+    by the feed — forgetting the oldest would run that command again."""
+    exited = feed("EXITED", clock.ago(5))
+    old = [f"manual-{i:04d}" for i in range(520)]
+    state = {"seen": list(old), "seen_order": "oldest_first",
+             "positions": {KEY: {"option_id": "stub", "qty": 1}},
+             "exits_to_retry": [exited]}
+    broker, saved = run_loop(home, monkeypatch, state,
+                             [OSError("commands.jsonl is in use")], clock=clock)
+    assert broker.calls == [("sell", exited["event_id"])]
+    assert saved["seen"] == old + [exited["event_id"]]
+    # the next read that works trims again, oldest first, never a listed id
+    agent._mark_seen(saved, "next", listed=old[:5] + ["next"])
+    assert len(saved["seen"]) == 500 and saved["seen"][:5] == old[:5]
+    assert saved["seen"][-2:] == [exited["event_id"], "next"]
+
+
 # ── E3: an entry and its exit in one batch; exits the agent still owes ──────
 
 @pytest.mark.parametrize("newest_first", [True, False])
@@ -240,9 +284,77 @@ def test_entry_whose_exit_already_arrived_is_not_bought(
     assert set(saved["seen"]) == {entered["event_id"], exited["event_id"]}
 
 
-def test_exit_seen_earlier_also_stops_a_late_entry(home, monkeypatch, sent, clock):
-    """The buy kept failing while the exit arrived and was handled (nothing
-    held, nothing to sell). When the buy finally works, the trade is over."""
+def manual_commands(home, *actions):
+    """The `manual` source's events for these commands.jsonl lines (the
+    owner's own commands: no times)."""
+    from sources import manual_file
+    (home / "commands.jsonl").write_text("".join(
+        json.dumps({"action": a, "ticker": "SPY", "expiry": EXPIRY, "strike": 752,
+                    "type": "C"}) + "\n" for a in actions), encoding="utf-8")
+    return manual_file.poll({}, {})
+
+
+@pytest.mark.parametrize("actions", [("enter", "exit"), ("exit", "enter")])
+def test_entry_and_exit_without_times_in_one_read_are_not_bought(
+        home, monkeypatch, sent, clock, actions):
+    """Events with no times (the owner's commands.jsonl: an enter and an
+    exit for the same contract written before the agent's next read). The
+    exit is handled first and can't be used again, so buying the entry
+    would leave a position that nothing ever sells."""
+    batch = manual_commands(home, *actions)
+    ids = {ev["event"]: ev["event_id"] for ev in batch}
+    broker, saved = run_loop(home, monkeypatch, {"seen": [], "positions": {}},
+                             [batch, batch], clock=clock)
+    assert broker.calls == [] and saved["positions"] == {}
+    (row,) = rows(home)
+    assert row["action"] == "skip_stale" and row["event_id"] == ids["ENTERED"]
+    assert len([m for m in sent if "SKIPPED" in m and "not bought" in m]) == 1
+    assert set(saved["seen"]) == set(ids.values())
+
+
+def test_exit_then_entry_without_times_in_one_read_sells_and_does_not_buy_back(
+        home, monkeypatch, sent, clock):
+    """The contract is held; an exit and an enter for it are read together.
+    The exit sells; the enter is not bought, and the owner is told."""
+    batch = manual_commands(home, "exit", "enter")
+    state = {"seen": [], "positions": {KEY: {"option_id": "stub", "qty": 1}}}
+    broker, saved = run_loop(home, monkeypatch, state, [batch, batch], clock=clock)
+    assert broker.calls == [("sell", batch[0]["event_id"])]
+    assert saved["positions"] == {}
+    assert len([m for m in sent if "SKIPPED" in m and "not bought" in m]) == 1
+
+
+def test_entry_without_times_is_bought_after_an_exit_handled_on_an_earlier_read(
+        home, monkeypatch, sent, clock):
+    """An exit command the agent already ran (nothing to sell) closed an
+    earlier trade: an enter written later is a new one."""
+    exited, entered = manual_commands(home, "exit", "enter")
+    broker, saved = run_loop(home, monkeypatch, {"seen": [], "positions": {}},
+                             [[exited], [exited, entered], [exited, entered]],
+                             clock=clock)
+    assert broker.calls == [("buy", entered["event_id"])]
+    assert list(saved["positions"]) == [KEY]
+
+
+def test_exit_handled_on_an_earlier_poll_also_stops_a_late_entry(
+        home, monkeypatch, sent, clock):
+    """The exit was handled a poll ago (nothing held, nothing to sell); the
+    feed only now lists the entry it closed. The trade is over."""
+    entered = feed("ENTERED", (START + timedelta(seconds=10)).isoformat())
+    exited = feed("EXITED", (START + timedelta(seconds=40)).isoformat())
+    broker, saved = run_loop(home, monkeypatch, {"seen": [], "positions": {}},
+                             [[], [exited], [exited, entered], [exited, entered]],
+                             clock=clock, steps=(60, 30, 30))
+    assert broker.calls == [] and saved["positions"] == {}
+    (row,) = rows(home)
+    assert row["action"] == "skip_stale" and row["event_id"] == entered["event_id"]
+    assert "exit" in row["reason"]
+
+
+def test_entry_whose_buy_kept_failing_is_not_bought_once_its_exit_arrived(
+        home, monkeypatch, sent, clock):
+    """The buy kept failing; then the exit arrived (nothing held, nothing
+    to sell). When the buy could finally work, the trade is over."""
     entered = feed("ENTERED", (START + timedelta(seconds=10)).isoformat())
     exited = feed("EXITED", (START + timedelta(seconds=40)).isoformat())
 
@@ -406,11 +518,11 @@ def test_agenthc_source_says_whether_the_poll_could_read_entries(monkeypatch):
 
 # ── E2: the `url` source and event times ────────────────────────────────────
 
-def url_poll(monkeypatch, events, now):
+def url_poll(monkeypatch, events, now, state=None, url="https://x.example/feed"):
     monkeypatch.setattr(generic_json_url.requests, "get",
                         lambda url, headers, timeout: Resp(200, {"events": events}))
     monkeypatch.setattr(generic_json_url, "_utcnow", lambda: now, raising=False)
-    return generic_json_url.poll({"source_url": "https://x.example/feed"}, {})
+    return generic_json_url.poll({"source_url": url}, {} if state is None else state)
 
 
 def url_event(event="ENTERED", **over):
@@ -458,6 +570,87 @@ def test_url_feed_without_times_is_dated_by_when_the_agent_last_read_it(
     # exits are never blocked for their age, known or not
     (out,) = url_poll(monkeypatch, [url_event("EXITED")], woke)
     assert not agent._stale(out, {})
+
+
+def restart(monkeypatch, state):
+    """A new process: the source's own memory is gone, state.json is not."""
+    monkeypatch.setattr(generic_json_url, "_SIGHT", {})
+    return json.loads(json.dumps(state))
+
+
+def test_url_feed_without_times_keeps_its_place_over_a_restart(monkeypatch, url_memory):
+    """The agent is restarted (an update, the dashboard stopped answering, a
+    crash) and the feed publishes an entry seconds later. The last read is
+    in state.json, so the entry is known to be new since then — it is
+    bought, not dropped as "already listed when the agent started"."""
+    now = datetime.now(timezone.utc)
+    t0 = now - timedelta(seconds=40)
+    monkeypatch.setattr(agent, "_WATCH_SINCE", {"main": now})
+    state = {}
+    (first,) = url_poll(monkeypatch, [url_event()], t0, state)
+    assert first.get("age_unknown")
+    state = restart(monkeypatch, state)
+    first, new = url_poll(monkeypatch, [url_event(), url_event(event_id="u-new")],
+                          now, state)
+    assert first.get("age_unknown") and agent._stale(first, {})   # still unknown
+    assert new["occurred_at"] == t0.isoformat() and "age_unknown" not in new
+    assert not agent._stale(new, {})                               # 40 s at most
+    # the same after a second restart: it keeps the date it was first given
+    state = restart(monkeypatch, state)
+    _f, new = url_poll(monkeypatch, [url_event(), url_event(event_id="u-new")],
+                       now + timedelta(seconds=30), state)
+    assert new["occurred_at"] == t0.isoformat()
+
+
+def test_url_feed_entry_published_just_after_a_restart_is_bought(
+        home, monkeypatch, sent, clock, url_memory):
+    """The whole loop: the agent stops (its last read goes into state.json),
+    starts again 30 s later, and the feed's new entry — no time given — is
+    bought. The one that was already there on the very first read is not."""
+    listing = [url_event(event_id="u-old")]
+    monkeypatch.setattr(generic_json_url.requests, "get",
+                        lambda url, headers, timeout: Resp(200, {"events": list(listing)}))
+    monkeypatch.setattr(generic_json_url, "_utcnow", lambda: clock.t)
+    config = {"source_url": "https://x.example/feed"}
+    broker, saved = run_loop(home, monkeypatch, {"seen": [], "positions": {}}, [None],
+                             clock=clock, source=generic_json_url, config=config)
+    assert broker.calls == [] and saved["url_feed"]["read_at"] == START.isoformat()
+    saved = restart(monkeypatch, saved)
+    clock.t += timedelta(seconds=30)
+    listing.append(url_event(event_id="u-new", ticker="QQQ"))
+    broker, saved = run_loop(home, monkeypatch, saved, [None, None], clock=clock,
+                             source=generic_json_url, config=config)
+    assert broker.calls == [("buy", "u-new")]
+    assert sent == [m for m in sent if "QQQ" in m]       # nothing about u-old
+
+
+def test_url_feed_restart_memory_is_only_used_when_it_can_be_trusted(
+        monkeypatch, url_memory):
+    now = datetime.now(timezone.utc)
+    batch = [url_event(), url_event(event_id="u-new")]
+
+    def saved_at(when, **over):
+        state = {}
+        url_poll(monkeypatch, [url_event()], when, state, **over)
+        return restart(monkeypatch, state)
+    # stopped for two hours: what is new now may be two hours old — not bought
+    _f, new = url_poll(monkeypatch, batch, now, saved_at(now - timedelta(hours=2)))
+    assert agent._stale(new, {})
+    # the last read is "later than now" (the clock was changed): not trusted
+    _f, new = url_poll(monkeypatch, batch, now, saved_at(now + timedelta(hours=1)))
+    assert new.get("age_unknown") and agent._stale(new, {})
+    # another feed URL: its events were never read before
+    state = saved_at(now - timedelta(seconds=30), url="https://x.example/other")
+    _f, new = url_poll(monkeypatch, batch, now, state)
+    assert new.get("age_unknown") and agent._stale(new, {})
+    # the URL itself (it can carry a key) is not copied into state.json
+    assert "x.example" not in json.dumps(state)
+    # a damaged or hand-edited memory is ignored, never an error
+    for bad in ("x", {"url": 1}, {"read_at": "soon", "first": []},
+                {**state["url_feed"], "first": {"u-new": "not a time"}}):
+        monkeypatch.setattr(generic_json_url, "_SIGHT", {})
+        _f, new = url_poll(monkeypatch, batch, now, {"url_feed": bad})
+        assert new.get("age_unknown") and agent._stale(new, {})
 
 
 def test_manual_commands_are_still_run_whenever_the_agent_next_reads_them(home):

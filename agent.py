@@ -2095,14 +2095,18 @@ def handle_event(ev, cfg, state, broker, client, save_state):
 #
 # state["exits_to_retry"]: exit signals that weren't finished (the sell
 # wasn't placed, the broker couldn't be reached, a holdings read is
-# awaited). They are retried from here on every loop until done or nothing
-# is left to sell — the feed lists only its latest events and may be
-# unreachable, so it can't be relied on to send them again.
+# awaited). They are retried from here on every loop (not while paused:
+# no orders then) until done or nothing is left to sell — the feed lists
+# only its latest events and may be unreachable, so it can't be relied on
+# to send them again.
 #
 # Order within one poll: exits the agent still owes, then the feed's new
 # exits, then its new entries — and an entry whose own exit is already
 # known is never bought. After a sleep or an outage both can arrive in one
 # poll: bought-then-sold at once, or bought with no exit ever coming.
+# "Known" is judged against what was handled BEFORE this poll: the exits
+# of this batch run first, and must still count for its entries (events
+# without times — the manual source — have nothing else to go by).
 
 _SEEN_KEPT = 500
 _SEEN_ORDER = "oldest_first"
@@ -2117,10 +2121,17 @@ def _seen_ids(state):
     ids = state.get("seen")
     ids = [i for i in ids if isinstance(i, (str, int))] if isinstance(ids, list) else []
     if state.get("seen_order") != _SEEN_ORDER:
+        try:
+            # the reader that skips damaged lines: one half-written row must
+            # not hide the entries around it, and nothing here may stop the
+            # agent starting
+            took = [t.get("event_id") for t in _read_trade_log()
+                    if t.get("action") == "entry"][-_SEEN_KEPT:]
+        except Exception:
+            took = []
         known = set(ids)
-        for t in _recent_trades(500):
-            eid = t.get("event_id")
-            if t.get("action") == "entry" and isinstance(eid, str) and eid not in known:
+        for eid in took:
+            if isinstance(eid, str) and eid not in known:
                 known.add(eid)
                 ids.append(eid)
         state["seen_order"] = _SEEN_ORDER
@@ -2130,9 +2141,11 @@ def _seen_ids(state):
 
 def _mark_seen(state, event_id, listed=()):
     """Remember a handled event. Past _SEEN_KEPT the oldest ids go first,
-    but never one the current poll still lists (`listed`)."""
+    but never one the current poll still lists (`listed`). listed=None: the
+    feed couldn't be read this time, so there's no telling what it still
+    lists — nothing is dropped until a read that works."""
     ids = [i for i in _seen_ids(state) if i != event_id]
-    over = len(ids) + 1 - _SEEN_KEPT
+    over = 0 if listed is None else len(ids) + 1 - _SEEN_KEPT
     if over > 0:
         keep, kept = set(listed), []
         for i in ids:
@@ -2189,7 +2202,9 @@ def _exit_already_known(ev, events, seen):
     """True when an exit for this entry's contract is already known (listed
     by the feed, or still owed) and isn't older than the entry — the trade
     is over. Without times on both, only an exit that is itself new counts
-    (one handled on an earlier poll closed an earlier position)."""
+    (one handled on an earlier poll closed an earlier position). `seen`:
+    the ids handled BEFORE this poll — an exit handled a moment ago, in the
+    same batch as the entry, is still new."""
     t_in = _occurred_at(ev)
     for other in events:
         if not _same_contract(ev, other) or other.get("event") != "EXITED":
@@ -2232,11 +2247,14 @@ def _poll_had_access(source):
         return True
 
 
-def _handle_feed_events(events, cfg, state, broker, client, save_state):
+def _handle_feed_events(events, cfg, state, broker, client, save_state,
+                        feed_read=True):
     """Run one poll's new events — and the exits still owed from earlier
-    polls — through handle_event."""
+    polls — through handle_event. feed_read=False: the feed couldn't be
+    read (events is empty; only the owed exits run)."""
     seen = set(_seen_ids(state))
-    listed = [ev.get("event_id") for ev in events]
+    seen_before = frozenset(seen)
+    listed = [ev.get("event_id") for ev in events] if feed_read else None
     owed = [_from_feed(ev) for ev in _exits_to_retry(state)]
     owed_ids = {ev["event_id"] for ev in owed}
     # only the agent's own exits may cap or reprice a sell
@@ -2256,7 +2274,8 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state):
         opens = not is_exit and key is not None and key not in state["positions"]
         error = None
         try:
-            if opens and not _stale(ev, cfg) and _exit_already_known(ev, known, seen):
+            if (opens and not _stale(ev, cfg)
+                    and _exit_already_known(ev, known, seen_before)):
                 outcome = _skip_exited_entry(ev, cfg, state, save_state)
             else:
                 outcome = handle_event(ev, cfg, state, broker, client, save_state)
@@ -4158,7 +4177,7 @@ def cmd_run(app_window=False):
                 if poll_error is None:
                     note_watching(cfg, access=_poll_had_access(source))
                 _handle_feed_events(events, cfg, state, broker, client,
-                                    save_state)
+                                    save_state, feed_read=poll_error is None)
                 if poll_error is not None:
                     raise poll_error
             else:
