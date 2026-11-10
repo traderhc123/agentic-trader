@@ -204,9 +204,10 @@ def test_start_dashboard_passes_the_view_through(monkeypatch):
     got = {}
     monkeypatch.setattr(webui, "start_app", lambda *a, **k: got.update(a=a, k=k))
     webui.start_dashboard(1, 2, 3, 4)
-    assert got == {"a": (1, 2, 3, 4), "k": {"get_view": None}}
-    webui.start_dashboard(1, 2, 3, 4, get_view=5)
-    assert got["k"] == {"get_view": 5}
+    assert got == {"a": (1, 2, 3, 4), "k": {"get_view": None,
+                                            "get_activity": None}}
+    webui.start_dashboard(1, 2, 3, 4, get_view=5, get_activity=6)
+    assert got["k"] == {"get_view": 5, "get_activity": 6}
 
 
 # ── reading the trade log for the view-model ────────────────────────────────
@@ -236,7 +237,7 @@ def test_view_rows_are_read_again_only_when_the_log_changes(home, monkeypatch):
     real = agent._read_trade_log
     monkeypatch.setattr(agent, "_read_trade_log",
                         lambda: reads.append(1) or real())
-    monkeypatch.setattr(agent, "_VIEW_LOG", {"key": None, "rows": []})
+    monkeypatch.setattr(agent, "_VIEW_LOG", {"snap": (None, [])})
     first = agent._view_rows()
     assert agent._view_rows() == first and len(reads) == 1
     first.append("mine")                      # a caller's list is its own
@@ -298,6 +299,9 @@ class Broker:
         return 1234.5
 
 
+HANDED = {}  # what the last cmd_run handed its dashboard
+
+
 def run_agent(home, monkeypatch, polls, config, during):
     """`agent.py run` for len(polls) loops; during(i, get_view, get_status)
     is called in the sleep after loop i."""
@@ -321,8 +325,9 @@ def run_agent(home, monkeypatch, polls, config, during):
         i["n"] += 1
 
     def dashboard(get_status, get_trades, apply_command, cfg_getter,
-                  get_view=None):
-        got.update(status=get_status, view=get_view)
+                  get_view=None, get_activity=None):
+        got.update(status=get_status, view=get_view, activity=get_activity)
+        HANDED.update(got)
         return "http://127.0.0.1:0/dash?k=test"
 
     class NoLock:
@@ -358,12 +363,16 @@ def event(kind="ENTERED", eid="ENTERED|1", **over):
 
 
 def test_running_loop_serves_a_live_view_model(home, monkeypatch, no_policy):
-    seen = []
+    seen, pages = [], []
+
+    def got_activity():
+        return HANDED["activity"](limit=1)
 
     def during(i, get_view, get_status):
         s = get_view()
         assert vm.validate(s) == [], vm.validate(s)
         seen.append((s, get_status()))
+        pages.append(got_activity())
 
     run_agent(home, monkeypatch,
               [[event()], OSError("feed down"),
@@ -408,6 +417,8 @@ def test_running_loop_serves_a_live_view_model(home, monkeypatch, no_policy):
     assert third["positions"] == [] and third["signals"]["last_poll_ok"] is True
     assert [r["action"] for r in third["activity"]["rows"]] == ["exit", "entry"]
     assert third["results"]["real"]["unmeasured"] == 1  # the stub has no quotes
+    assert [p["rows"][0]["action"] for p in pages] == ["entry", "entry", "exit"]
+    assert all(vm.validate(p, "ActivityPage") == [] for p in pages)
 
 
 def test_running_loop_reports_each_kind_of_pause(home, monkeypatch, no_policy):

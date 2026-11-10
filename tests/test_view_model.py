@@ -868,6 +868,27 @@ def test_results_days_are_market_days_not_utc_days():
     assert r["real"]["days"] == [{"day": "2026-11-06", "pnl": 10.0, "closed": 1}]
 
 
+def test_results_match_the_classic_pnl_totals(home):
+    """Same log, same estimate: each book's total, count and win / loss
+    split are what /api/pnl (agent.pnl_summary) reports."""
+    c = "SPY 2026-11-13 $700.0 C"
+    rows = [entry(c, at(10)), exit_(c, at(11), 64.0, qty=2, partial=True),
+            exit_(c, at(11, 1), -20.5, qty=2), entry(c, at(12), dry=True),
+            exit_(c, at(13), 7.25, dry=True),
+            {"action": "exit", "contract": c, "dry": False, "ts": at(14)},
+            exit_(c, at(14, 1), None, qty=2, counted_before=2)]
+    (home / "trades.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    old = agent.pnl_summary({}, {})
+    new = build(rows=rows)["results"]
+    for book, was in (("real", old["live"]), ("practice", old["dry"])):
+        assert (new[book]["total"], new[book]["closed"], new[book]["won"],
+                new[book]["lost"], new[book]["unmeasured"]) == (
+            was["total"], was["exits"], was["wins"], was["losses"],
+            was["unmeasured"]), book
+    assert new["real"]["total"] == 43.5 and new["real"]["unmeasured"] == 1
+
+
 def test_signal_cost_counts_recorded_days_and_never_invents_a_total():
     cfg = {**CFG, "agenthc_api_key": "", "feed_pass": {"token": "tok"}}
     st = {**state(), "paid_days": ["2026-11-05", "2026-11-06", TODAY],

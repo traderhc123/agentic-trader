@@ -3105,10 +3105,13 @@ def _broker_display(cfg, last4=""):
 
 
 def start_app(get_status=None, get_trades=None, apply_command=None,
-              cfg_getter=None, wait_finish=False, get_view=None):
+              cfg_getter=None, wait_finish=False, get_view=None,
+              get_activity=None):
     """One server, one port: /setup (wizard) + /dash (dashboard) + all APIs.
-    get_view: the running agent's view-model (agent.cmd_run), served at
-    /api/v2/status; without it that route describes a stopped agent."""
+    get_view / get_activity: the running agent's view-model and its pages of
+    older activity (agent.cmd_run), served at /api/v2/status and
+    /api/v2/activity; without them those routes answer from the files, as
+    for a stopped agent."""
     import agent as A
     from brokers.robinhood import RobinhoodMCP, _token_path, content_json
     from lightning_wallet import LNbitsWallet, WalletError
@@ -4156,8 +4159,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         `activity`: ?before=<n>&limit=<k>, like /api/trades."""
         from urllib.parse import parse_qs, urlparse
         qs = parse_qs(urlparse(h.path).query)
-        return A.view_activity(before=(qs.get("before") or [None])[0],
-                               limit=(qs.get("limit") or [None])[0])
+        page = get_activity if get_activity is not None else A.view_activity
+        return page(before=(qs.get("before") or [None])[0],
+                    limit=(qs.get("limit") or [None])[0])
 
     def d_pnl(_h):
         """All-time est. P&L from the whole trade log, incl. pass days."""
@@ -4701,7 +4705,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
 
 
 def start_dashboard(get_status, get_trades, apply_command, cfg_getter,
-                    get_view=None):
+                    get_view=None, get_activity=None):
     """Serve the combined app (dashboard + settings) from the running agent."""
     return start_app(get_status, get_trades, apply_command, cfg_getter,
-                     get_view=get_view)
+                     get_view=get_view, get_activity=get_activity)

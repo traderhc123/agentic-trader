@@ -27,6 +27,7 @@ compiles against (webui_app/src/lib/viewModel.ts) is generated from it —
 file is stale or when the builder's output and the declaration disagree.
 """
 
+import functools
 import math
 import re
 from datetime import datetime, timedelta, timezone
@@ -825,13 +826,13 @@ def _clean_rows(rows):
             and isinstance(r.get("n"), int) and not isinstance(r.get("n"), bool)]
 
 
-def activity_page(rows, before=None, limit=ACTIVITY_LIMIT):
+def activity_page(rows, before=None, limit=ACTIVITY_LIMIT, _checked=False):
     """One page of the trade log, newest first. `rows`: every row, oldest
     first, each with its line number `n` (agent._read_trade_log). `before`:
     only rows with a smaller `n`. Same paging contract as agent.trade_page."""
     limit = max(1, min(_int(limit, ACTIVITY_LIMIT) or ACTIVITY_LIMIT,
                        ACTIVITY_LIMIT_MAX))
-    rows = _clean_rows(rows)
+    rows = rows if _checked else _clean_rows(rows)
     oldest = rows[0]["n"] if rows else None
     cut = _int(before)
     if cut is not None:
@@ -850,26 +851,45 @@ def _et_day(d):
     return d.astimezone(A.MARKET_TZ).date().isoformat()
 
 
-def _book_results(rows, dry, now):
-    """One book's estimated closed-trade results. Real and practice are
-    never added together: `dry` picks the rows."""
+@functools.lru_cache(maxsize=65536)
+def _stamp_day(stamp):
+    """The market (ET) day of a timestamp string, '' when unreadable. Kept:
+    the dashboard asks every few seconds and a log's stamps don't change."""
+    d = _utc(stamp)
+    return _et_day(d) if d is not None else ""
+
+
+def _row_day(row):
+    """The market day a row's event happened on (as _row_time), or ''."""
+    for k in ("closed_at", "ts"):
+        v = row.get(k)
+        day = _stamp_day(v) if isinstance(v, str) else ""
+        if day:
+            return day
+    return ""
+
+
+def _results(rows, now):
+    """Each book's estimated closed-trade results, in one pass over the log.
+    Real and practice are never added together: a row belongs to the book
+    its "dry" says."""
     import agent as A
     today = _et_day(now)
     week_from = (now.astimezone(A.MARKET_TZ).date()
                  - timedelta(days=6)).isoformat()
-    b = {"today": 0.0, "last_7_days": 0.0, "total": 0.0, "closed": 0,
-         "won": 0, "lost": 0, "unmeasured": 0}
-    days = {}
+    books = {dry: {"today": 0.0, "last_7_days": 0.0, "total": 0.0,
+                   "closed": 0, "won": 0, "lost": 0, "unmeasured": 0,
+                   "days": {}} for dry in (False, True)}
     for t in rows:
-        if t.get("action") != "exit" or bool(t.get("dry")) != dry:
+        if t.get("action") != "exit":
             continue
+        b = books[bool(t.get("dry"))]
         v = _num(t.get("est_pnl_usd"))
         if v is None:
             if not A._counted_before(t):
                 b["unmeasured"] += 1
             continue
-        when = _row_time(t)
-        day = _et_day(when) if when is not None else ""
+        day = _row_day(t)
         b["total"] += v
         b["closed"] += 1
         b["won"] += v > 0
@@ -879,15 +899,17 @@ def _book_results(rows, dry, now):
         if week_from <= day <= today:
             b["last_7_days"] += v
         if day:
-            d = days.setdefault(day, {"day": day, "pnl": 0.0, "closed": 0})
+            d = b["days"].setdefault(day, {"day": day, "pnl": 0.0, "closed": 0})
             d["pnl"] += v
             d["closed"] += 1
-    for k in ("today", "last_7_days", "total"):
-        b[k] = round(b[k], 2)
-    b["days"] = sorted(days.values(), key=lambda d: d["day"], reverse=True)
-    for d in b["days"]:
-        d["pnl"] = round(d["pnl"], 2)
-    return b
+    for b in books.values():
+        for k in ("today", "last_7_days", "total"):
+            b[k] = round(b[k], 2)
+        b["days"] = sorted(b["days"].values(), key=lambda d: d["day"],
+                           reverse=True)
+        for d in b["days"]:
+            d["pnl"] = round(d["pnl"], 2)
+    return {"real": books[False], "practice": books[True]}
 
 
 def _signal_cost(cfg, state, rows, now):
@@ -899,8 +921,9 @@ def _signal_cost(cfg, state, rows, now):
         paid = A._paid_days(state)
         recorded = A._recorded_paid_days(state)
         tracked_from = min(recorded) if recorded else None
-        entry_days = {A._et_day(t.get("ts")) for t in rows
-                      if t.get("action") == "entry"} - {""}
+        entry_days = {_stamp_day(t["ts"]) for t in rows
+                      if t.get("action") == "entry"
+                      and isinstance(t.get("ts"), str)} - {""}
         used = len(paid)
         estimated = len({d for d in entry_days
                          if tracked_from is None or d < tracked_from} - paid)
@@ -1473,9 +1496,8 @@ def build_status(cfg, state, rows, runtime=None, now=None,
         "capabilities": _capabilities(c, limits, market, signals, pos),
         "entry_checks": list(check_ids()),
         "positions": pos,
-        "activity": activity_page(rows, limit=activity_limit),
-        "results": {"real": _book_results(rows, False, now),
-                    "practice": _book_results(rows, True, now),
+        "activity": activity_page(rows, limit=activity_limit, _checked=True),
+        "results": {**_results(rows, now),
                     "signal_cost": _signal_cost(cfg, state, rows, now)},
         "notices": _notices(rt),
     }

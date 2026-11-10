@@ -5300,7 +5300,7 @@ def _newest_signal_time(events):
     return newest
 
 
-_VIEW_LOG = {"key": None, "rows": []}
+_VIEW_LOG = {"snap": (None, [])}  # (the file's size and time, its rows)
 
 
 def _view_rows():
@@ -5313,10 +5313,11 @@ def _view_rows():
         key = (TRADES_PATH, st.st_size, st.st_mtime_ns)
     except OSError:
         key = None
-    if key is None or _VIEW_LOG["key"] != key:
-        _VIEW_LOG["rows"] = _read_trade_log()
-        _VIEW_LOG["key"] = key
-    rows = list(_VIEW_LOG["rows"])
+    kept_key, kept = _VIEW_LOG["snap"]
+    if key is None or kept_key != key:
+        kept = _read_trade_log()
+        _VIEW_LOG["snap"] = (key, kept)  # one assignment: other threads read it
+    rows = list(kept)
     n = rows[-1]["n"] + 1 if rows else 0
     for i, r in enumerate(_unwritten_rows()):
         rows.append({**r, "n": n + i})
@@ -5578,7 +5579,7 @@ def cmd_run(app_window=False):
             status_with_deploy_warning,
             lambda: _rows_without_facts(list(reversed(_recent_trades(25)))),
             _apply_command, lambda: _load(CONFIG_PATH, {}) or {},
-            get_view=get_view)
+            get_view=get_view, get_activity=view_activity)
 
     dash_url = None
     try:
