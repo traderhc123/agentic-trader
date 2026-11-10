@@ -2955,13 +2955,68 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         token = str(data.get("token", "")).strip()
         if not token:
             return {"ok": False, "error": "paste a DigitalOcean API token"}
+        import transfer
+        moved = transfer.moved_away()
+        if moved:  # e.g. a second click: two servers would double every order
+            return {"ok": False, "error": (
+                "this setup was already moved to a server or another "
+                f"computer ({moved.get('moved_at', '?')}). A second copy "
+                "would place every order twice, so no new server was "
+                "created. If that one is gone (destroyed or stopped), run: "
+                "python agent.py resume-here — then deploy again.")}
+        # The server gets a copy of this computer's memory (positions, signals
+        # already handled, today's counters). Hold new signals while that
+        # copy is made and sent, so nothing is traded here that the server
+        # wouldn't know about.
+        was_paused = CONTROLS["paused"]
+        CONTROLS["paused"] = True
         try:
             droplet_id, msg = provision.create_droplet(
                 token, str(data.get("region", "nyc3")))
-        except RuntimeError as exc:
+        except Exception as exc:
+            CONTROLS["paused"] = was_paused  # nothing was created: carry on here
+            if not isinstance(exc, RuntimeError):
+                raise
             return {"ok": False, "error": str(exc)[:250]}
         pending["deploy"] = (token, droplet_id)
-        return {"ok": True, "note": msg}
+        # The server now runs this setup. Retire THIS computer exactly like
+        # "move to another computer" does — two copies on one broker account
+        # would place every order twice.
+        import keep_running
+        retired = transfer.mark_moved_away()
+        if get_status is not None:  # the agent is running in this process
+            # It stays paused (no orders) and stops shortly — not instantly,
+            # because this same process serves the page that is about to
+            # show the owner the server's address and login command.
+            def _stop_here():
+                import time as _time
+                end = _time.time() + provision.LOCAL_STOP_DELAY_S
+                while _time.time() < end and not CONTROLS["stop"]:
+                    CONTROLS["paused"] = True  # even if "resume" is typed
+                    _time.sleep(1)
+                CONTROLS["stop"] = True
+            threading.Thread(target=_stop_here, daemon=True).start()
+            retired += ("; the agent here is paused now (it places no more "
+                        "orders) and stops in about "
+                        f"{max(1, round(provision.LOCAL_STOP_DELAY_S / 60))} "
+                        "minutes")
+        else:
+            CONTROLS["paused"] = was_paused
+            if keep_running.is_running():  # running in the background
+                keep_running.request_stop()
+                retired += "; the agent here is stopping"
+        note = (f"{msg}. This computer is now retired so the two can never "
+                f"both trade: {retired}. Until the server sends its "
+                "\"heartbeat started\" notification (about 5 minutes), nothing "
+                "is watching your open positions. To run the agent on this "
+                "computer again instead: destroy the server in DigitalOcean "
+                "first, then run: python agent.py resume-here")
+        print(note)
+        try:
+            A.notify(cfg, "agentic-trader: " + note)
+        except Exception:
+            pass
+        return {"ok": True, "note": note, "retired": True}
 
     def deploy_status(_h):
         import provision
@@ -3701,6 +3756,49 @@ def _snapshot_mode():
             or shutil.which("git") is None)
 
 
+def _install_write_problem():
+    """None if the updater can change files in the install folder, else why
+    not, in the owner's words. Asked BEFORE anything is downloaded: under the
+    systemd unit shipped before 2026-11 (ProtectSystem=strict with only the
+    state folder writable) git and pip hit a read-only filesystem, so every
+    server stayed on its deploy-day code with only a raw git error to show."""
+    import errno
+    import os
+    import sys
+    import tempfile
+    repo = _repo_dir()
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".update-write-test-", dir=repo)
+        os.close(fd)
+        os.unlink(probe)
+        return None
+    except OSError as exc:
+        why = exc
+    if os.getenv("INVOCATION_ID") and why.errno == errno.EROFS:
+        paths = [os.path.expanduser(os.getenv("AGENT_HOME", "~/.agentic-trader")),
+                 repo]
+        venv = os.path.abspath(sys.prefix)
+        if (sys.prefix != sys.base_prefix
+                and not venv.startswith(os.path.join(repo, ""))):
+            paths.append(venv)  # pip installs there
+        return (
+            "Can't update: the background service on this server is not "
+            "allowed to change the agent's own files (its service file is "
+            "from an older version). Nothing was changed. To fix it once, "
+            "log in to the server, run this one line, then press Update "
+            "again:\n"
+            f"  sudo sed -i 's|^ReadWritePaths=.*|ReadWritePaths="
+            f"{' '.join(paths)}|' /etc/systemd/system/agentic-trader.service"
+            " && sudo systemctl daemon-reload"
+            " && sudo systemctl restart agentic-trader\n"
+            "It restarts the agent; your settings, positions and trade "
+            "history are kept.")
+    return (f"Can't update: the agent can't write to its own folder ({repo}): "
+            f"{why.strerror or why}. Nothing was changed. Run the agent as "
+            "the user who owns that folder (in Docker, rebuild the image "
+            "instead of using this button).")
+
+
 def _github_unreachable(raw):
     """Error text for a failed update download: the diagnosed cause + fix
     when it looks like a network problem, else the raw error."""
@@ -3769,6 +3867,9 @@ def check_code_updates():
     """Fetch origin and report how far behind HEAD is. Never raises.
     Returns the exact commit (`target`) the user is shown, so the pull can
     install THAT commit and nothing pushed after they looked."""
+    problem = _install_write_problem()
+    if problem:
+        return {"ok": False, "error": problem}
     if _snapshot_mode():
         import snapshot_update
         try:
@@ -3808,6 +3909,9 @@ def pull_code_updates(expect=None):
     merged over silently — a diverged tree is reported, not resolved.
     `expect` (the `target` from check_code_updates) pins the exact commit the
     user reviewed: if the remote moved since, nothing is installed."""
+    problem = _install_write_problem()
+    if problem:
+        return False, problem
     if _snapshot_mode():
         import snapshot_update
         try:

@@ -148,6 +148,21 @@ the dashboard. No "heartbeat started" notification after 15 minutes? Log in
 with that command and run `sudo tail -50 /var/log/cloud-init-output.log`.
 DigitalOcean's browser **Web Console** also works.
 
+The server takes over the whole setup: your settings, broker login, open
+positions, the signals already handled, today's entry and loss counters and
+any paid day-pass go with it (a very long trade history is shortened to the
+most recent entries; the full file stays on this computer). **This computer
+is retired at the same moment** — start-at-login is turned off and the agent
+here stops and will not start again — because two copies on one broker
+account would place every order twice. For the few minutes until the
+server's "heartbeat started" notification, nothing is watching your open
+positions. To run it on this computer again instead: destroy the server in
+DigitalOcean first, then run `python agent.py resume-here`.
+
+**Update button on a server made before November 2026:** it will say it is
+not allowed to change the agent's own files and show one command. Log in to
+the server, run that command once, and the button works from then on.
+
 ### Option C — Docker (if you already use Docker)
 
 ```bash

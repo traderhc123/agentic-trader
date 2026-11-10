@@ -5,7 +5,16 @@ Same rules as the git path (webui.check_code_updates / pull_code_updates):
   - code only ever comes from the official repository on GitHub;
   - the user sees the commit list first, and the pull installs EXACTLY the
     commit they reviewed (the zip is fetched by that commit's SHA);
+  - that commit must be the one THIS agent's own last check found at the
+    head of the official branch. A commit id is never taken on the browser's
+    word: GitHub serves any commit of any fork under the official repo's
+    download address, so "whatever SHA the page sends" would be "any code";
   - nothing is installed automatically.
+
+The install is all-or-nothing. The whole snapshot is first written to
+`.update-staging/`; only then are files swapped in, and if any swap fails
+(disk full, a file locked by antivirus) the ones already swapped are put
+back, so the agent is never left on a half-old, half-new mix.
 
 Before a file is overwritten, a copy of it is kept under
 `.update-backup/<timestamp>/` if its content differs (self-edits or local
@@ -26,7 +35,12 @@ API = f"https://api.github.com/repos/{REPO}"
 ZIP_URL = "https://codeload.github.com/" + REPO + "/zip/{sha}"
 VERSION_FILE = ".installed_commit"
 BACKUP_DIR = ".update-backup"
-_SKIP = {".venv", ".git", "__pycache__", BACKUP_DIR}
+STAGING_DIR = ".update-staging"
+_SKIP = {".venv", ".git", "__pycache__", BACKUP_DIR, STAGING_DIR}
+# install folder -> the commit this process's last check() saw at the head of
+# the official branch. In memory on purpose: nothing on disk (or sent by the
+# page) can name a commit to install; after a restart, check again.
+_CHECKED = {}
 _MAX_ZIP_BYTES = 50 * 1024 * 1024
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 
@@ -38,6 +52,10 @@ def installed_commit(repo_dir):
         return sha if _SHA.match(sha) else ""
     except OSError:
         return ""
+
+
+def _key(repo_dir):
+    return os.path.normcase(os.path.abspath(repo_dir))
 
 
 def _get(url, **kw):
@@ -60,6 +78,7 @@ def check(repo_dir, branch="main"):
         return {"ok": False, "error": "GitHub returned no commits"}
     shas = [c["sha"] for c in commits]
     latest = shas[0]
+    _CHECKED[_key(repo_dir)] = str(latest).strip().lower()
     cur = installed_commit(repo_dir)
     if cur == latest:
         return {"ok": True, "behind": 0, "upstream": f"github/{branch}",
@@ -100,10 +119,16 @@ def _members(zf):
 
 
 def pull(repo_dir, expect):
-    """Install exactly commit `expect`. Returns (ok, message)."""
+    """Install exactly commit `expect`, which must be the commit this
+    agent's last check() reported. All-or-nothing. Returns (ok, message)."""
     expect = str(expect or "").strip().lower()
     if not _SHA.match(expect):
         return False, "check for updates first, review the commit list, then pull"
+    if _CHECKED.get(_key(repo_dir)) != expect:
+        return False, ("that isn't the version this agent last checked (the "
+                       "agent restarted, or a newer update came out since) — "
+                       "press 'Check for code updates' again, review the "
+                       "list, then install. Nothing was changed.")
     r = _get(ZIP_URL.format(sha=expect), timeout=120, stream=True)
     r.raise_for_status()
     buf = io.BytesIO()
@@ -121,29 +146,68 @@ def pull(repo_dir, expect):
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup = os.path.join(repo_dir, BACKUP_DIR, stamp)
-    changed = backed = 0
-    for m, rel in members:
-        data = zf.read(m)
-        dest = os.path.join(repo_dir, rel)
-        try:
-            with open(dest, "rb") as f:
-                old = f.read()
-        except OSError:
-            old = None
-        if old == data:
-            continue
-        if old is not None:
-            os.makedirs(os.path.dirname(os.path.join(backup, rel)), exist_ok=True)
-            shutil.copy2(dest, os.path.join(backup, rel))
-            backed += 1
-        os.makedirs(os.path.dirname(dest) or repo_dir, exist_ok=True)
-        tmp = dest + ".update-tmp"
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, dest)
-        changed += 1
-    with open(os.path.join(repo_dir, VERSION_FILE), "w", encoding="utf-8") as f:
-        f.write(expect + "\n")
+    staging = os.path.join(repo_dir, STAGING_DIR)
+    # 1) Stage every file that differs. Nothing the agent runs is touched yet.
+    shutil.rmtree(staging, ignore_errors=True)  # left by an interrupted run
+    todo = []  # (rel, staged copy, destination, had a previous version)
+    try:
+        for m, rel in members:
+            data = zf.read(m)
+            dest = os.path.join(repo_dir, rel)
+            try:
+                with open(dest, "rb") as f:
+                    old = f.read()
+            except OSError:
+                old = None
+            if old == data:
+                continue
+            staged = os.path.join(staging, rel)
+            os.makedirs(os.path.dirname(staged), exist_ok=True)
+            with open(staged, "wb") as f:
+                f.write(data)
+            todo.append((rel, staged, dest, old is not None))
+    except Exception as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        return False, (f"the update could not be prepared ({str(exc)[:150]}) "
+                       "— nothing was changed")
+    # 2) Swap them in; on any failure put back what was already swapped.
+    done = []
+    try:
+        for rel, staged, dest, had_old in todo:
+            if had_old:
+                os.makedirs(os.path.dirname(os.path.join(backup, rel)), exist_ok=True)
+                shutil.copy2(dest, os.path.join(backup, rel))
+            os.makedirs(os.path.dirname(dest) or repo_dir, exist_ok=True)
+            done.append((rel, dest, had_old))
+            os.replace(staged, dest)
+        version_tmp = os.path.join(staging, VERSION_FILE)
+        os.makedirs(staging, exist_ok=True)
+        with open(version_tmp, "w", encoding="utf-8") as f:
+            f.write(expect + "\n")
+        os.replace(version_tmp, os.path.join(repo_dir, VERSION_FILE))
+    except Exception as exc:
+        stuck = []
+        for rel, dest, had_old in reversed(done):
+            try:
+                if had_old:
+                    shutil.copy2(os.path.join(backup, rel), dest)
+                elif os.path.exists(dest):
+                    os.unlink(dest)
+            except OSError:
+                stuck.append(rel)
+        shutil.rmtree(staging, ignore_errors=True)
+        if stuck:
+            return False, (
+                f"the update failed part-way ({str(exc)[:150]}) and these "
+                f"files could not be put back: {', '.join(stuck[:10])}. Their "
+                f"previous versions are in {BACKUP_DIR}/{stamp} — copy them "
+                "back before restarting the agent.")
+        return False, (f"the update could not be installed ({str(exc)[:150]}) "
+                       "and was undone — the agent is still on the version "
+                       "it had")
+    shutil.rmtree(staging, ignore_errors=True)
+    changed = len(todo)
+    backed = sum(1 for _rel, _staged, _dest, had_old in todo if had_old)
     note = f"updated to {expect[:12]} ({changed} file(s) changed"
     if backed:
         note += f"; previous versions saved in {BACKUP_DIR}/{stamp}"

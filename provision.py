@@ -6,7 +6,15 @@ finished configuration there via cloud-init, and auto-start under systemd.
 The token is used for the creation calls and NOT stored.
 
 What gets copied to the droplet (the user's own files, to the user's own
-server): config.json, acceptance.json, robinhood_oauth.json, policy.md.
+server): config.json, acceptance.json, robinhood_oauth.json, policy.md, and
+the agent's memory — state.json (open positions, signals already handled,
+the paid day-pass) and trades.jsonl (today's rows ARE the daily entry cap and
+loss stop). Without the memory the server would start blind: it could pay for
+the day again and would not know which positions are its own to exit.
+
+Two computers must never run the same setup (every order would be placed
+twice), so once the server is created the dashboard retires THIS computer the
+same way "move to another computer" does (transfer.mark_moved_away).
 
 Secret-exposure note: cloud-init user-data carries these files (base64) and is,
 by default, (a) stored on disk under /var/lib/cloud and (b) served for the life
@@ -22,6 +30,7 @@ rotate the Robinhood session and any API keys it carried.
 """
 
 import base64
+import gzip
 import hashlib
 import json
 import os
@@ -47,6 +56,16 @@ METADATA_IP = "169.254.169.254"
 
 _HOME_FILES = ["config.json", "acceptance.json", "robinhood_oauth.json",
                "policy.md"]
+# The agent's memory. Sent gzip-compressed: DigitalOcean refuses user-data
+# over 64 KiB, and a few months of trade log is bigger than that as-is.
+_STATE_FILE = "state.json"
+_LEDGER_FILE = "trades.jsonl"
+USER_DATA_LIMIT = 60 * 1024   # DigitalOcean's cap is 64 KiB; leave headroom
+# After a deploy from a RUNNING agent's dashboard, the agent on this computer
+# is paused at once (no orders) but its process — which also serves the page —
+# lives this much longer, so the page can show the server's address and login
+# command before it goes away.
+LOCAL_STOP_DELAY_S = 120
 _SERVICE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "deploy", "agentic-trader.service")
 
@@ -82,6 +101,33 @@ def _b64_file(path, content, permissions, owner=None):
     if owner:
         f["owner"] = owner
     return f
+
+
+def _gz_file(path, content, permissions):
+    f = _b64_file(path, gzip.compress(content, mtime=0), permissions)
+    f["encoding"] = "gz+b64"   # cloud-init: base64, then gunzip
+    return f
+
+
+def _ledger_lines():
+    """The trade log's rows, oldest first, byte-for-byte."""
+    try:
+        with open(os.path.join(_agent_home(), _LEDGER_FILE), "rb") as f:
+            return f.read().splitlines(keepends=True)
+    except OSError:
+        return []
+
+
+def _is_todays_row(line, today):
+    """Same test agent.py's daily entry cap and loss stop use (UTC day)."""
+    if today.encode() not in line:
+        return False
+    try:
+        t = json.loads(line.decode("utf-8", errors="replace"))
+    except ValueError:
+        return False
+    return isinstance(t, dict) and (str(t.get("ts", "")).startswith(today)
+                                    or str(t.get("closed_at", "")).startswith(today))
 
 
 def ensure_ssh_key():
@@ -177,9 +223,15 @@ def pick_region_and_size(token, region):
     return region, SIZE, ""
 
 
-def build_cloud_init(authorized_keys=()):
+def build_cloud_init(authorized_keys=(), notes=None):
     """cloud-init that installs the agent, restores this machine's completed
-    config, and starts the systemd service.
+    config and memory (positions, handled signals, day-pass, trade log), and
+    starts the systemd service.
+
+    If the trade log is too long for DigitalOcean's user-data limit, the
+    OLDEST rows stay behind (they only feed the P&L history pages) and a
+    plain-language line saying so is appended to `notes`. Today's rows always
+    travel; if even those can't fit, raises RuntimeError — nothing is sent.
 
     Commands run as root via runuser, never sudo: with no SSH key DigitalOcean
     sets an expired root password, and sudo then refuses to run at all."""
@@ -191,6 +243,12 @@ def build_cloud_init(authorized_keys=()):
         with open(path, "rb") as f:
             write_files.append(_b64_file(f"/home/trader/.agentic-trader/{name}",
                                          f.read(), "0600"))
+    state_path = os.path.join(_agent_home(), _STATE_FILE)
+    if os.path.exists(state_path):
+        with open(state_path, "rb") as f:
+            write_files.append(_gz_file(
+                f"/home/trader/.agentic-trader/{_STATE_FILE}", f.read(), "0600"))
+    home_files = len(write_files)   # the trade log slots in right after these
     with open(_SERVICE_PATH, "rb") as f:
         write_files.append(_b64_file("/etc/systemd/system/agentic-trader.service",
                                      f.read(), "0644"))
@@ -202,9 +260,15 @@ def build_cloud_init(authorized_keys=()):
     keys = [k for k in authorized_keys if k]
     if keys:
         user["ssh_authorized_keys"] = keys
+    # Download to a file, THEN run it. `curl … | bash` reports bash's status,
+    # so a failed download looked like a successful install (nothing to run =
+    # exit 0) and the retry loop below never retried it.
     install = ("curl -fsSL https://raw.githubusercontent.com/traderhc123/"
-               "agentic-trader/main/install.sh | AGENTIC_TRADER_NO_LAUNCH=1 "
-               "AGENTIC_TRADER_DIR=/home/trader/agentic-trader bash")
+               "agentic-trader/main/install.sh "
+               "-o /home/trader/agentic-trader-install.sh && "
+               "AGENTIC_TRADER_NO_LAUNCH=1 "
+               "AGENTIC_TRADER_DIR=/home/trader/agentic-trader "
+               "bash /home/trader/agentic-trader-install.sh")
     doc = {
         "users": [user],
         # don't force a root password change at first login (it also breaks sudo)
@@ -219,6 +283,7 @@ def build_cloud_init(authorized_keys=()):
             "chown -R trader:trader /home/trader/.agentic-trader",
             "chmod 700 /home/trader/.agentic-trader",
             # retried: a network blip on first boot shouldn't strand the server
+            # (and a failed download must count as a failure — see `install`)
             "for i in 1 2 3; do runuser -u trader -- env HOME=/home/trader "
             f"USER=trader bash -c '{install}' && break; sleep 20; done",
             "systemctl daemon-reload",
@@ -232,7 +297,46 @@ def build_cloud_init(authorized_keys=()):
             "2>/dev/null || true",
         ],
     }
-    return "#cloud-config\n" + json.dumps(doc, indent=1)
+    lines = _ledger_lines()
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    first_today = next((i for i, row in enumerate(lines)
+                        if _is_todays_row(row, today)), len(lines))
+
+    def render(older):
+        """The document with today's rows plus the newest `older` rows."""
+        rows = lines[first_today - older:]
+        doc["write_files"] = list(write_files)
+        if rows:
+            doc["write_files"].insert(home_files, _gz_file(
+                f"/home/trader/.agentic-trader/{_LEDGER_FILE}",
+                b"".join(rows), "0600"))
+        raw = "#cloud-config\n" + json.dumps(doc, indent=1)
+        return raw if len(raw.encode("utf-8")) <= USER_DATA_LIMIT else None
+
+    raw = render(first_today)
+    if raw is not None:
+        return raw
+    best, lo, hi = render(0), 0, first_today
+    if best is None:
+        raise RuntimeError(
+            "this setup's saved state and today's activity log are too large "
+            "to send to a new server, so no server was created and nothing "
+            "changed on this computer. Try again tomorrow before the market "
+            "opens, when today's log is empty.")
+    while hi - lo > 1:   # most older rows that still fit
+        mid = (lo + hi) // 2
+        got = render(mid)
+        if got is None:
+            hi = mid
+        else:
+            best, lo = got, mid
+    if notes is not None:
+        notes.append(
+            "your trade history was too long to send in full, so the server "
+            f"starts with the most recent {len(lines) - first_today + lo} "
+            "entries (all of today's are there). The full history stays on "
+            f"this computer in {os.path.join(_agent_home(), _LEDGER_FILE)}")
+    return best
 
 
 def _not_available(resp):
@@ -257,8 +361,9 @@ def create_droplet(token, region="nyc3", name="agentic-trader"):
         kid = _upload_key(token, public_key)
         if kid and kid not in key_ids:
             key_ids.append(kid)
+    handoff_notes = []
     body = {"name": name, "region": region, "size": size, "image": IMAGE,
-            "user_data": build_cloud_init(trader_keys),
+            "user_data": build_cloud_init(trader_keys, notes=handoff_notes),
             "ssh_keys": [k for k in key_ids if k], "tags": ["agentic-trader"],
             "monitoring": True}
     tried = [region]
@@ -283,6 +388,8 @@ def create_droplet(token, region="nyc3", name="agentic-trader"):
     msg = f"droplet {droplet.get('id')} creating in {body['region']}"
     if note:
         msg += f" ({note})"
+    for extra in handoff_notes:
+        msg += f" — {extra}"
     if not public_key:
         msg += (" — no ssh-keygen on this computer, so no login key was made: "
                 "add your own SSH key in DigitalOcean to reach the dashboard")

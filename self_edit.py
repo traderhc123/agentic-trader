@@ -7,7 +7,8 @@ Flow (human merge gate, deliberately):
      + a unified diff.
   3. The dashboard shows the diff. The owner clicks Apply — the agent backs
      up the old files, writes the new ones, compile-checks every changed
-     .py (automatic rollback on failure), and restarts itself.
+     .py, makes sure the new code still imports in a throwaway process
+     (automatic rollback if either check fails), and restarts itself.
 
 Why the gate: an autonomous trading agent that applies its own code edits
 unattended is one prompt-injection away from deleting its own safety rails.
@@ -242,6 +243,10 @@ def propose(cfg, request):
                 or rel.split(os.sep)[0] in (".git", ".venv")
                 or any(part.startswith(".") for part in rel.split(os.sep))):
             return False, f"proposal rejected: illegal path {rel!r}"
+        # _repo_files() keys use forward slashes on every OS; normpath gives
+        # backslashes on Windows. Without this, every file in a folder was
+        # compared against "" there and shown to the owner as wholly new.
+        rel = rel.replace(os.sep, "/")
         old = files.get(rel, "")
         new = str(f.get("content", ""))
         if old == new:
@@ -298,6 +303,70 @@ def _same_as_foundation(dst_real, repo_real):
     return False
 
 
+_IMPORT_CHECK_TIMEOUT_S = 120
+_IMPORT_CHECK = (
+    "import importlib, os, sys\n"
+    "sys.path.insert(0, os.getcwd())\n"
+    "for name in sys.argv[1:]:\n"
+    "    try:\n"
+    "        importlib.import_module(name)\n"
+    "    except BaseException as exc:\n"
+    "        print('%s: %s: %s' % (name, type(exc).__name__, exc))\n"
+    "        raise SystemExit(1)\n")
+
+
+def _module_name(rel):
+    """Dotted module name for a changed file the agent could import, else
+    None (not Python, not a valid module path, or a test file — those need
+    pytest, which an owner's install doesn't have)."""
+    parts = rel.replace("\\", "/").split("/")
+    if not parts[-1].endswith(".py"):
+        return None
+    parts[-1] = parts[-1][:-3]
+    if (parts[0] == "tests" or parts[-1].startswith("test_")
+            or parts[-1] == "conftest"):
+        return None
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    if not parts or not all(p.isidentifier() for p in parts):
+        return None
+    return ".".join(parts)
+
+
+def _import_problem(paths):
+    """Import the changed modules, then the agent and its dashboard, in a
+    separate Python process. None if all of it loads; otherwise what failed.
+
+    A compile check only proves the syntax: a missing package or a renamed
+    function still compiles, and then the restarted agent dies on import —
+    over and over, with no dashboard left to undo the change from. If the
+    check itself cannot run, that counts as a failure too (the change is
+    rolled back rather than trusted)."""
+    names = [m for m in map(_module_name, paths) if m]
+    for top in ("agent", "webui"):
+        if top not in names and os.path.exists(os.path.join(_repo(), top + ".py")):
+            names.append(top)
+    if not names:
+        return None
+    try:
+        r = subprocess.run(
+            [sys.executable, "-B", "-c", _IMPORT_CHECK, *names], cwd=_repo(),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_IMPORT_CHECK_TIMEOUT_S,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                 "PYTHONIOENCODING": "utf-8"})
+    except subprocess.TimeoutExpired:
+        return ("the new code did not finish loading within "
+                f"{_IMPORT_CHECK_TIMEOUT_S}s")
+    except OSError as exc:
+        return f"could not check that the new code loads ({exc})"
+    if r.returncode == 0:
+        return None
+    lines = ((r.stdout or "").strip() or (r.stderr or "").strip()).splitlines()
+    return ("the new code does not load — "
+            + (lines[-1] if lines else f"exit code {r.returncode}"))
+
+
 def _app_port():
     try:
         import webui
@@ -308,7 +377,7 @@ def _app_port():
 
 def apply_and_restart(restart=True):
     """Apply the pending proposal: backup -> write -> compile-check ->
-    rollback on failure -> restart. Returns (ok, message)."""
+    import-check -> rollback on failure -> restart. Returns (ok, message)."""
     prop = current()
     if not prop:
         return False, "no pending proposal"
@@ -353,6 +422,10 @@ def apply_and_restart(restart=True):
             if ch["path"].endswith(".py"):
                 py_compile.compile(os.path.join(_repo(), ch["path"]),
                                    doraise=True)
+        # ...and prove the result still loads before restarting onto it
+        problem = _import_problem([ch["path"] for ch in prop["changes"]])
+        if problem:
+            raise RuntimeError(problem)
     except Exception as exc:
         # rollback
         for rel in written:

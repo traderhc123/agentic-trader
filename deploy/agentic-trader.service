@@ -1,7 +1,8 @@
 # systemd unit for always-on operation (Linux VPS / home server).
 #
 #   sudo cp deploy/agentic-trader.service /etc/systemd/system/
-#   # edit User= and the path below to match your install
+#   # edit User= and the paths below (WorkingDirectory, ExecStart and
+#   # ReadWritePaths) to match your install
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now agentic-trader
 #   journalctl -u agentic-trader -f
@@ -22,11 +23,14 @@ WorkingDirectory=/home/trader/agentic-trader
 ExecStart=/home/trader/agentic-trader/.venv/bin/python agent.py run
 Restart=on-failure
 RestartSec=30
-# hardening
+# hardening: the whole system is read-only to the agent, except its state
+# folder and its own install folder. The install folder (code + .venv) must
+# be writable or the dashboard's Update button (git + pip) and approved
+# self-edits fail with "Read-only file system".
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/home/trader/.agentic-trader
+ReadWritePaths=/home/trader/.agentic-trader /home/trader/agentic-trader
 
 [Install]
 WantedBy=multi-user.target
