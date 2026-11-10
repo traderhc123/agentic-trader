@@ -51,6 +51,7 @@ FOUNDATION = frozenset({
     "broker_events.py",  # how dropped trades reach the owner (can't be muted)
     "rules.py",          # the owner's built-in entry rules
     "dry_run_preview.py",  # what the dry-run preview claims the rules would do
+    "view_model.py",     # what the dashboard says the agent is doing and will do
     "transfer.py",       # exports the broker login + wallet keys (move file)
     "platform_compat.py",  # process launch/restart plumbing
     "llm_client.py",     # carries the AI key; the policy brain's only door
