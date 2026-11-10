@@ -40,6 +40,10 @@ _SCRYPT = {"n": 2 ** 15, "r": 8, "p": 1, "maxmem": 64 * 1024 * 1024, "dklen": 64
 _SKIP_NAMES = {
     "agent.lock", "agent.pid", "stop.request", "ui_token", ".acl-locked",
     "launchd.log", "MOVED_AWAY",
+    # what the background process on THIS computer is doing right now: its
+    # pid (never another computer's — `stop` may end that process), its note
+    # on the last failed start, a pending "try again", the agent's alive mark
+    "supervisor.pid", "supervisor.status", "retry.request", "agent.alive",
 }
 _SKIP_PREFIXES = ("agent-run.log",)
 _SKIP_SUFFIXES = (".tmp", ".lock")

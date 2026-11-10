@@ -57,7 +57,9 @@ def test_good_plan_applies_and_stays_dry_run(tmp_path):
 
 
 def test_existing_live_choice_is_kept(tmp_path):
-    new, rep = _apply({"source": {"type": "manual"}}, cfg={"dry_run": False},
+    # (same source as before: a plan may not CHANGE a live agent's source)
+    new, rep = _apply({"source": {"type": "manual"}},
+                      cfg={"dry_run": False, "source": "manual"},
                       home=str(tmp_path))
     assert rep["ok"] and new["dry_run"] is False  # the owner already chose live
 

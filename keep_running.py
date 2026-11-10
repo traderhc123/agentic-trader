@@ -11,7 +11,14 @@ How the pieces fit:
   the lock when the process dies, so a crash never leaves it stuck.
 - `agent.py supervise` runs `agent.py run` as a child, writes its output to
   HOME/agent-run.log, and starts it again if it crashes. A clean exit (stopped
-  from the dashboard or with `agent.py stop`) ends the supervisor too.
+  from the dashboard or with `agent.py stop`) ends the supervisor too. It
+  holds its own lock (HOME/supervisor.lock), so `stop` can find and end it
+  even while the agent is down between two tries, and it records why the
+  last try failed (HOME/supervisor.status) so `start` can say so.
+- "Running" means the agent is past its startup checks: it removes
+  HOME/agent.alive when it takes the lock and writes it at the top of its
+  first loop (is_ready). Holding the lock alone is not enough — a copy whose
+  broker login expired holds it for a moment and then exits.
 - `agent.py start` launches the supervisor detached from the terminal; the
   wizard's "Start my agent now" button does the same.
 - Autostart writes ONE file per OS that runs the supervisor at login: a
@@ -19,6 +26,7 @@ How the pieces fit:
   autostart entry (Linux desktops). Servers should use the systemd unit in
   deploy/ instead. Nothing here needs admin rights.
 """
+import json
 import os
 import subprocess
 import sys
@@ -125,7 +133,8 @@ class InstanceLock:
 
 
 def _pid_path(lock_path):
-    return os.path.join(os.path.dirname(lock_path), "agent.pid")
+    # agent.lock -> agent.pid, supervisor.lock -> supervisor.pid
+    return os.path.splitext(lock_path)[0] + ".pid"
 
 
 def is_running():
@@ -148,6 +157,86 @@ def running_pid():
         return None
 
 
+def is_ready():
+    """True once the running agent is past its startup checks (setup, broker
+    login, policy) and in its main loop. `agent.py run` calls clear_alive()
+    when it takes the lock and touch_alive() at the top of every loop, so
+    "lock held + alive file there" means it really started. A copy that dies
+    during startup never looks like it is running."""
+    return is_running() and os.path.exists(_alive_path())
+
+
+def _supervisor_lock_path():
+    return _path("supervisor.lock")
+
+
+def supervisor_running():
+    """True if a supervisor is alive — also while the agent itself is down
+    and the supervisor is waiting to start it again."""
+    probe = InstanceLock(_supervisor_lock_path())
+    if probe.acquire():
+        probe.release()
+        return False
+    return True
+
+
+def supervisor_pid():
+    if not supervisor_running():
+        return None
+    try:
+        with open(_pid_path(_supervisor_lock_path()), encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _status_path():
+    return _path("supervisor.status")
+
+
+def _set_status(**fields):
+    """What the supervisor is doing, for `start`, `stop` and `status`."""
+    fields.update(pid=os.getpid(), at=time.time())
+    try:
+        os.makedirs(home(), exist_ok=True)
+        tmp = _status_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(fields, f)
+        os.replace(tmp, _status_path())
+    except OSError:
+        pass
+
+
+def _clear_status():
+    try:
+        os.remove(_status_path())
+    except OSError:
+        pass
+
+
+def supervisor_status():
+    """The supervisor's last note ({} if none). state "running": it started
+    the agent; "waiting": the agent stopped with an error ("reason" = the
+    last lines it printed) and will be started again. Only meaningful while
+    supervisor_running() — a killed supervisor leaves its note behind."""
+    try:
+        with open(_status_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def start_failure(before=None):
+    """Why the agent's latest start did not work, in its own words — or None
+    if the supervisor has recorded no failed run. Pass the supervisor_status()
+    read before starting as `before` to ignore an older failure."""
+    st = supervisor_status()
+    if st.get("state") != "waiting" or st == (before or {}):
+        return None
+    return st.get("reason") or f"it stopped with error code {st.get('code')}"
+
+
 # ── stop requests (agent.py stop) ────────────────────────────────────────────
 
 def _stop_path():
@@ -161,7 +250,7 @@ def request_stop():
 
 
 def stop_requested():
-    return os.path.exists(_stop_path())
+    return _sigterm[0] or os.path.exists(_stop_path())
 
 
 def clear_stop():
@@ -171,35 +260,187 @@ def clear_stop():
         pass
 
 
+# ── SIGTERM = a deliberate stop (docker stop, systemctl stop, shutdown) ──────
+# Without this, SIGTERM ends Python on the spot — in the middle of an order,
+# if one is being placed — and with an exit code that reads as a crash, so
+# Docker's `--restart on-failure` would start the agent again after the next
+# reboot although the owner stopped it. (As the first process in a container
+# Python would not react at all, and `docker stop` would end it by force.)
+_sigterm = [False]
+# Docker ends a container by force 10 s after `docker stop`. If the agent's
+# loop has not stopped by itself this long after SIGTERM (it is stuck in a
+# network call), it ends itself — still as a deliberate stop.
+SIGTERM_GRACE_SECONDS = 8
+
+
+def _sigterm_deadline(sleep=time.sleep, leave=os._exit):
+    """Runs beside the agent after SIGTERM. The loop normally stops by
+    itself within a second or two and this never gets its turn. If it has
+    not, end the process — but not in the middle of an order: first wait
+    (up to ORDER_WAIT_SECONDS, like a restart does) until the order that is
+    being placed has been saved. Exit code 0: it was asked to stop, it did
+    not crash."""
+    sleep(SIGTERM_GRACE_SECONDS)
+    got = platform_compat.ORDER_LOCK.acquire(
+        timeout=platform_compat.ORDER_WAIT_SECONDS)
+    try:
+        print("Stopped (it was asked to end and did not stop by itself within "
+              f"{SIGTERM_GRACE_SECONDS} seconds). Open positions stay in your "
+              "broker account.", flush=True)
+    except Exception:
+        pass
+    try:
+        leave(0)
+    finally:
+        if got:   # only reached when `leave` is a stand-in (tests)
+            platform_compat.ORDER_LOCK.release()
+
+
+def stop_on_sigterm():
+    """Called by `agent.py run`: from now on SIGTERM is a stop request like
+    `agent.py stop` — the loop finishes what it is doing (an order being
+    placed is saved first), says it stopped and exits with code 0. Returns
+    False where that can't be set up (not the main thread)."""
+    import signal
+    import threading
+
+    def asked(_signum, _frame):
+        if _sigterm[0]:
+            return
+        _sigterm[0] = True
+        threading.Thread(target=_sigterm_deadline, daemon=True).start()
+    try:
+        signal.signal(signal.SIGTERM, asked)
+    except (ValueError, OSError, AttributeError):
+        return False
+    return True
+
+
+# ── "try again now" requests (a second `start` while one is waiting) ──────────
+
+def _retry_path():
+    return _path("retry.request")
+
+
+def request_retry():
+    os.makedirs(home(), exist_ok=True)
+    with open(_retry_path(), "w", encoding="utf-8") as f:
+        f.write(str(time.time()))
+
+
+def _take_retry(since=0.0):
+    """True (once) if someone asked the waiting supervisor to try again now.
+    The request is removed either way; one written before `since` (when the
+    agent's last run ended) is left over from earlier and does not count."""
+    try:
+        with open(_retry_path(), encoding="utf-8") as f:
+            asked = f.read().strip()
+    except OSError:
+        return False
+    try:
+        os.remove(_retry_path())
+    except OSError:
+        pass
+    try:
+        return float(asked) >= since
+    except ValueError:
+        return True   # caught while it was being written: it is new
+
+
+# A supervisor started by a version before the supervisor lock can't be seen,
+# but it does look for a stop request every second while it waits to restart
+# a crashed agent. `stop` leaves the request up this long so it notices.
+OLD_SUPERVISOR_WAIT = 2.5
+
+
 def stop(timeout=45.0, out=print):
-    """Ask the running agent to stop and wait for it. The heartbeat checks
-    the request every second, so this normally takes a second or two; if it
-    hangs (stuck network call) it is killed after `timeout`. Returns True if
-    nothing is running afterwards."""
-    if not is_running():
-        clear_stop()
-        out("The agent isn't running.")
-        return True
+    """Stop the agent AND the supervisor that would start it again, and wait
+    for both. The heartbeat checks the request every second, so this normally
+    takes a second or two; a supervisor that is waiting to restart a crashed
+    agent checks it every second too. Whatever hangs (stuck network call) is
+    killed after `timeout`. Returns True if nothing is running afterwards."""
+    agent_up, keeper_up = is_running(), supervisor_running()
+    if not agent_up and not keeper_up:
+        request_stop()
+        time.sleep(OLD_SUPERVISOR_WAIT)
+        # an older supervisor restarted it meanwhile — or a supervisor that
+        # was launched a moment ago has only now taken its lock, and its
+        # agent has not come up yet
+        agent_up, keeper_up = is_running(), supervisor_running()
+        if not agent_up and not keeper_up:
+            clear_stop()
+            out("The agent isn't running.")
+            return True
     request_stop()
-    out("Asking the agent to stop…")
+    # Agent down but its supervisor up: either the agent stopped with an
+    # error and the supervisor is waiting to try again, or the supervisor is
+    # starting the agent at this very moment (login, `start` a second ago).
+    failed = not agent_up and supervisor_status().get("state") == "waiting"
+    out("Asking the agent to stop…" if agent_up else
+        "The agent isn't running right now: it stopped with an error and was "
+        "going to be started again automatically. Cancelling that…" if failed
+        else "The agent was just being started — stopping it…")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if not is_running():
-            out("Stopped. Open positions stay in your broker account.")
+        if not is_running() and not supervisor_running():
+            clear_stop()
+            out("Stopped. Open positions stay in your broker account."
+                if not failed else
+                "Cancelled. The agent stays off until you start it again "
+                "(python agent.py start"
+                + (", or your next login — start at login is on" if
+                   autostart_enabled() else "")
+                + "). Open positions stay in your broker account.")
             return True
+        if not stop_requested():
+            # A copy that was only just starting removes the request (it is
+            # left over from last time, as far as it knows), and the copy
+            # that acted on it removes it on its way out. Keep it up until
+            # the supervisor is gone too, or it would start the agent again.
+            request_stop()
         time.sleep(0.5)
     pid = running_pid()
     if pid:
         out(f"It didn't stop within {int(timeout)}s — ending process {pid}.")
         _kill(pid)
+        # told to end, it gives itself SIGTERM_GRACE_SECONDS to stop first
+        for _ in range(2 * (SIGTERM_GRACE_SECONDS + 4)):
+            time.sleep(0.5)
+            if not is_running():
+                break
+        else:
+            # It did not even react to being told to end (frozen solid, or
+            # stuck in an order for a minute already): end it by force, as
+            # `stop` always has after its timeout.
+            _kill(pid, force=True)
+            time.sleep(1.0)
+    # with its agent gone the supervisor sees the request and ends by itself
+    for _ in range(10):
+        if not supervisor_running():
+            break
+        time.sleep(0.5)
+    keeper = supervisor_pid()
+    # Only ever end a process the supervisor itself vouches for: its note
+    # (supervisor.status) must name the same pid as its lock's pid file. A
+    # pid file that came from somewhere else (another computer's files, an
+    # old backup) could name any program on this computer.
+    if keeper and supervisor_status().get("pid") == keeper:
+        out(f"The background process that restarts the agent ({keeper}) "
+            "didn't stop either — ending it.")
+        _kill(keeper)
         time.sleep(1.0)
-    ok = not is_running()
+    ok = not is_running() and not supervisor_running()
+    if ok:
+        clear_stop()
     out("Stopped." if ok else "Could not stop it — end the python process "
         "in Task Manager / Activity Monitor.")
     return ok
 
 
-def _kill(pid):
+def _kill(pid, force=False):
+    """End a process. Windows: always by force (taskkill /F). Elsewhere:
+    SIGTERM, which `agent.py run` treats as a stop request (stop_on_sigterm);
+    `force` = SIGKILL, for a copy that did not react to that."""
     try:
         if IS_WINDOWS:
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -207,7 +448,7 @@ def _kill(pid):
                            timeout=15)
         else:
             import signal
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
     except Exception:
         pass
 
@@ -249,6 +490,10 @@ def _run_child(cmd):
     """Run one copy of the agent with output appended to the log; returns
     its exit code."""
     _rotate_log()
+    try:
+        _run_log_start[0] = os.path.getsize(log_path())
+    except OSError:
+        _run_log_start[0] = 0
     env = {**os.environ, SUPERVISED_ENV: "1", "PYTHONUNBUFFERED": "1",
            "PYTHONIOENCODING": "utf-8"}
     kwargs = {}
@@ -261,12 +506,25 @@ def _run_child(cmd):
                                 stdout=log, stderr=subprocess.STDOUT, env=env,
                                 **kwargs)
         started = time.time()
+        tick, awake_since = started, None
         try:
             while True:
                 code = proc.poll()
                 if code is not None:
                     return code
-                if child_hung(started):
+                now = time.time()
+                if now - tick > WAKE_GAP_SECONDS:
+                    # This loop runs every 2 s, so a gap means the computer
+                    # was asleep (or its clock jumped) and the agent was
+                    # asleep with it. Its last sign of life looks hours old
+                    # right now; count its silence from this moment instead
+                    # of ending a healthy agent before it has had a turn.
+                    awake_since = now
+                    _log(f"woke up after {int((now - tick) // 60)} min asleep "
+                         f"— giving the agent {HANG_SECONDS // 60} min to "
+                         "show it is still working")
+                tick = now
+                if child_hung(started, now, awake_since):
                     _log(f"agent stopped responding for {HANG_SECONDS // 60} min "
                          "(stuck network call?) — restarting it")
                     _end_child(proc)
@@ -275,6 +533,27 @@ def _run_child(cmd):
         except KeyboardInterrupt:
             proc.terminate()
             return 0
+
+
+# where the current/latest run's output starts in the log (bytes)
+_run_log_start = [0]
+
+
+def _child_said(max_lines=6, max_bytes=4000):
+    """The last few lines the agent printed in its latest run — its own
+    words for why it stopped ("Broker auth missing/expired — run: …")."""
+    try:
+        with open(log_path(), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            start = _run_log_start[0] if _run_log_start[0] <= end else 0
+            f.seek(max(start, end - max_bytes))
+            text = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = [ln.strip() for ln in text.splitlines()
+             if ln.strip() and "] supervisor: " not in ln]
+    return "\n".join(lines[-max_lines:])[:600]
 
 
 def _end_child(proc):
@@ -294,6 +573,9 @@ def _end_child(proc):
 # and starts a fresh one. Same code on Windows, macOS and Linux.
 HANG_SECONDS = 20 * 60   # longest normal gap is a 5-min overnight sleep
 HUNG_EXIT = 70           # treated as a crash: restarts with backoff
+# The watchdog loop runs every 2 s. A longer pause than this between two
+# turns means the whole computer was asleep, not that the agent froze.
+WAKE_GAP_SECONDS = 60
 _last_touch = [0.0]
 
 
@@ -314,62 +596,206 @@ def touch_alive(force=False):
         pass
 
 
-def child_hung(started, now=None):
+def clear_alive():
+    """Called by `agent.py run` the moment it holds the lock: this copy has
+    not shown it is up yet (see is_ready)."""
+    _last_touch[0] = 0.0
+    try:
+        os.remove(_alive_path())
+    except OSError:
+        pass
+
+
+def child_hung(started, now=None, awake_since=None):
     """True if the agent started after `started` has signalled it's alive at
     least once and then went quiet for HANG_SECONDS. Before the first signal
-    (still starting up, e.g. broker login) it is never judged hung."""
+    (still starting up, e.g. broker login) it is never judged hung.
+    `awake_since`: when the computer last woke from sleep — time spent asleep
+    is not silence, so the quiet period counts from there."""
     try:
         last = os.path.getmtime(_alive_path())
     except OSError:
         return False
     if last < started - 1:
         return False   # left over from a previous copy
+    if awake_since is not None:
+        last = max(last, awake_since)
     return (now or time.time()) - last > HANG_SECONDS
 
 
+# Tell the owner once the agent has stopped with an error this many times in
+# a row, then remind them this often for as long as it keeps happening.
+LOOP_NOTIFY_AFTER = 3
+LOOP_NOTIFY_EVERY = 6 * 3600
+
+
+def _no_links(text):
+    """Notifications go to third parties (Discord, ntfy, Telegram): cut every
+    web address down to its host, so a log line never carries the dashboard's
+    login token or a webhook address out with it."""
+    import re
+    text = re.sub(r"(https?://[^/\s]+)\S*", r"\1/…", text)
+    return re.sub(r"(with url: )\S+", r"\1…", text)  # requests' error text
+
+
+def _loop_message(failures, reason, backoff, freezes=0):
+    wait = (f"{backoff} seconds" if backoff < 120
+            else f"{backoff // 60} minutes")
+    if freezes >= LOOP_NOTIFY_AFTER:
+        return ("agentic-trader keeps freezing: it stopped responding "
+                f"{freezes} times in the last {LOOP_NOTIFY_EVERY // 3600} "
+                f"hours. Each time it was frozen for {HANG_SECONDS // 60} "
+                "minutes before it was started again; it will be started "
+                f"again in about {wait}. While it is frozen it places no "
+                "orders and does NOT act on exit signals for your open "
+                "positions — watch those in your broker app, and check this "
+                "computer's internet connection. To stop the agent: "
+                "python agent.py stop")
+    reason = _no_links(reason or "")
+    return ("agentic-trader is NOT running: it has stopped with an error "
+            f"{failures} times in a row."
+            + (" What it said: " + reason.replace("\n", " / ") + "."
+               if reason else "")
+            + f" It will try again by itself in about {wait} and keep "
+            "trying, waiting longer each time (up to 10 minutes between "
+            "tries). Until it is running again it "
+            "places no orders and does NOT act on exit signals for your open "
+            "positions — watch those in your broker app. To stop the "
+            "retries: python agent.py stop")
+
+
+def _tell(notify, text):
+    """Send in the background: a slow notification must not delay a stop."""
+    import threading
+
+    def send():
+        try:
+            notify(text)
+        except Exception:
+            pass
+    threading.Thread(target=send, daemon=True).start()
+
+
 def supervise(port=None, cmd=None, sleep=time.sleep, max_runs=None,
-              on_first_start=None):
+              on_first_start=None, notify=None):
     """Keep `agent.py run` alive. Exit 0 from the agent (stopped on purpose,
     or another copy is already running) ends supervision; RESTART_EXIT
     restarts at once; anything else is a crash and restarts with backoff
-    (15 s doubling to 10 min, reset after 10 healthy minutes)."""
+    (15 s doubling to 10 min, reset after 10 healthy minutes). One supervisor
+    per HOME: a second one leaves — after asking the first to try again
+    now, if the first is waiting to restart an agent that failed.
+    `notify(text)` is called when the agent keeps failing or keeps freezing
+    (restart loop): after LOOP_NOTIFY_AFTER failures in a row, again every
+    LOOP_NOTIFY_EVERY while it goes on, and afresh for every new loop that
+    starts after the agent had been working again."""
     cmd = cmd or [_python_for(windowless=False), agent_script(), "run"]
-    clear_stop()
-    backoff, runs = 15, 0
-    _log(f"started (pid {os.getpid()})")
-    if on_first_start is not None:
-        # e.g. open the dashboard once at login; runs beside the agent
-        import threading
-        threading.Thread(target=on_first_start, daemon=True).start()
-    while True:
-        if port:
-            platform_compat.wait_port_free(port)
-        started = time.time()
-        code = _run_child(cmd)
-        runs += 1
-        if code == 0:
-            _log("agent exited cleanly — supervisor done")
-            return 0
-        if stop_requested():
-            _log("stop requested — supervisor done")
-            return 0
-        if max_runs is not None and runs >= max_runs:
-            return code
-        if code == RESTART_EXIT:
-            _log("agent asked to restart")
-            backoff = 15
-            continue
-        if time.time() - started > 600:
-            backoff = 15
-        _log(f"agent exited with code {code} — restarting in {backoff}s")
-        waited = 0
-        while waited < backoff:
+    guard = InstanceLock(_supervisor_lock_path())
+    if not guard.acquire(wait=2):
+        if supervisor_status().get("state") == "waiting":
+            request_retry()
+            _log("a supervisor is already waiting to start the agent again "
+                 "— asked it to try again now instead of starting a second "
+                 "one")
+        else:
+            _log("a supervisor is already keeping the agent running — not "
+                 "starting a second one")
+        return 0
+    try:
+        clear_stop()
+        _take_retry()
+        # replaces the note of a supervisor that was killed (never cleared)
+        _set_status(state="starting")
+        backoff, runs = 15, 0
+        failures, told_at = 0, None
+        freezes, freeze_told_at = [], None   # when it was ended as frozen
+        _log(f"started (pid {os.getpid()})")
+        if on_first_start is not None:
+            # e.g. open the dashboard once at login; runs beside the agent
+            import threading
+            threading.Thread(target=on_first_start, daemon=True).start()
+        while True:
+            if port:
+                platform_compat.wait_port_free(port)
             if stop_requested():
                 _log("stop requested — supervisor done")
                 return 0
-            sleep(1)
-            waited += 1
-        backoff = min(backoff * 2, 600)
+            _take_retry()   # only a request made while waiting counts
+            _set_status(state="running", runs=runs)
+            started = time.time()
+            code = _run_child(cmd)
+            runs += 1
+            if code == 0:
+                _log("agent exited cleanly — supervisor done")
+                return 0
+            if stop_requested():
+                _log("stop requested — supervisor done")
+                return 0
+            if max_runs is not None and runs >= max_runs:
+                return code
+            if code == RESTART_EXIT:
+                _log("agent asked to restart")
+                # it was up and working: whatever comes next is a new loop
+                backoff, failures, told_at = 15, 0, None
+                continue
+            now = time.time()
+            ran = now - started
+            hung = code == HUNG_EXIT
+            if ran > 600:
+                backoff = 15
+            # A frozen run's last HANG_SECONDS were silence, not work: a
+            # copy that freezes right after every start never "worked".
+            if ran - (HANG_SECONDS if hung else 0) > 600:
+                # It worked for a while, so the earlier trouble is over. If
+                # it now fails again and again, that is a NEW loop and the
+                # owner is told again (not hours later because of an alert
+                # about the last one).
+                failures, told_at = 0, None
+            failures += 1
+            if hung:
+                # freezes are counted over time, not "in a row": every
+                # frozen run lasts over 20 minutes, working or not
+                freezes = [t for t in freezes
+                           if now - t < LOOP_NOTIFY_EVERY] + [now]
+            reason = (f"it stopped responding for {HANG_SECONDS // 60} minutes"
+                      if hung else _child_said())
+            _set_status(state="waiting", code=code, reason=reason, runs=runs,
+                        failures=failures, retry_in=backoff)
+            _log(f"agent exited with code {code} — restarting in {backoff}s")
+
+            def due(last):
+                return last is None or now - last >= LOOP_NOTIFY_EVERY
+            frozen = hung and len(freezes) >= LOOP_NOTIFY_AFTER
+            if notify is not None and (
+                    (failures >= LOOP_NOTIFY_AFTER and due(told_at))
+                    or (frozen and due(freeze_told_at))):
+                if failures >= LOOP_NOTIFY_AFTER:
+                    told_at = now
+                if frozen:
+                    freeze_told_at = now
+                _log((f"the agent froze {len(freezes)} times in the last "
+                      f"{LOOP_NOTIFY_EVERY // 3600} hours" if frozen else
+                      f"the agent has failed {failures} times in a row")
+                     + " — telling the owner")
+                _tell(notify, _loop_message(
+                    failures, reason, backoff,
+                    freezes=len(freezes) if frozen else 0))
+            waited = 0
+            while waited < backoff:
+                if stop_requested():
+                    _log("stop requested — supervisor done")
+                    return 0
+                # (`now` = when the run ended, just before the note above
+                # said "waiting": a request made because of that note counts)
+                if _take_retry(since=now):
+                    _log("asked to try again now")
+                    break
+                sleep(1)
+                waited += 1
+            else:
+                backoff = min(backoff * 2, 600)
+    finally:
+        _clear_status()
+        guard.release()
 
 
 def start_background(port=None):
@@ -388,17 +814,22 @@ def start_background(port=None):
                             stderr=subprocess.DEVNULL, **kwargs)
 
 
-def wait_until_running(timeout=30.0, proc=None):
-    """Poll until the agent holds its lock. Stops early if the supervisor
-    already exited (e.g. setup isn't finished)."""
+def wait_until_running(timeout=30.0, proc=None, before=None):
+    """Poll until the agent is past its startup checks and in its main loop
+    (is_ready). Returns False early if its start failed (start_failure says
+    why; `before` = the supervisor_status() read before starting) or if the
+    supervisor already exited (e.g. setup isn't finished)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if is_running():
+        if is_ready():
             return True
-        if proc is not None and proc.poll() is not None and not is_running():
+        if start_failure(before) is not None:
+            return False
+        if (proc is not None and proc.poll() is not None
+                and not is_running() and not supervisor_running()):
             return False
         time.sleep(0.5)
-    return is_running()
+    return is_ready()
 
 
 def last_log_lines(n=15):
