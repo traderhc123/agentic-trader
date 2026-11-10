@@ -134,14 +134,18 @@ def _stale(ev, cfg):
     """True for ENTERED events older than max_event_age_s (default 300s).
 
     A laptop waking from sleep must not buy into an hours-old entry. Events
-    without a timestamp (manual/url sources) are treated as fresh; EXITED
-    events are never stale-blocked (closing an open position is always right).
+    without a timestamp (the manual source: the owner's own commands) are
+    treated as fresh, unless the source says it can't tell how old the
+    entry is (age_unknown — the url source, for an entry that was already
+    listed the first time it read the feed): that one is never bought.
+    EXITED events are never stale-blocked (closing an open position is
+    always right).
     """
     if ev.get("event") != "ENTERED":
         return False
     ts = ev.get("occurred_at")
     if not ts:
-        return False
+        return bool(ev.get("age_unknown"))
     try:
         occurred = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
         age = (datetime.now(timezone.utc) - occurred).total_seconds()
@@ -157,8 +161,14 @@ def _stale(ev, cfg):
 _WATCH_SINCE = {}
 
 
-def note_watching(cfg, now=None):
-    """Call after each successful poll: records when each track started."""
+def note_watching(cfg, now=None, access=True):
+    """Call after each successful poll: records when each track started.
+    access=False: the poll couldn't read entry signals (no pass yet, or it
+    ran out) — nothing is being watched, and the clock starts again with
+    the next poll that can."""
+    if not access:
+        _WATCH_SINCE.clear()
+        return
     now = now or datetime.now(timezone.utc)
     _WATCH_SINCE.setdefault("main", now)
     if cfg.get("include_other_trades") or cfg.get("source", "agenthc") != "agenthc":
@@ -169,6 +179,8 @@ def note_watching(cfg, now=None):
 
 def _backlog(ev):
     """True when the signal happened before this run was watching its track."""
+    if ev.get("age_unknown") and not ev.get("occurred_at"):
+        return True  # already listed the first time the feed was read
     track = "main" if str(ev.get("track", "main")) == "main" else "other"
     since = _WATCH_SINCE.get(track)
     try:
@@ -1138,12 +1150,15 @@ def _grace_anchor(pos):
                _float0((pos.get("pending") or {}).get("placed_at")))
 
 
-def _past_expiry_close(key):
-    """From 4 PM ET on expiry day, expiry and exercise move holdings."""
+def _past_expiry_close(key, cfg=None):
+    """From the close on expiry day (4 PM ET; 1 PM on an early-close day —
+    brokers/market_hours.py, like the expiry guard), expiry and exercise
+    move holdings."""
     expiry = key.split("|")[1]
     now = _et_now()
     today = now.date().isoformat()
-    return expiry < today or (expiry == today and now.hour >= 16)
+    return expiry < today or (
+        expiry == today and now.hour * 60 + now.minute >= _close_min(cfg, today))
 
 
 def _tombstones(state):
@@ -1151,10 +1166,10 @@ def _tombstones(state):
     return t if isinstance(t, dict) else {}
 
 
-def _sync_candidates(state, tag, now):
+def _sync_candidates(state, tag, now, cfg=None):
     """({pos_key: option_id} to ask the broker about, changed). Only settled
     live rows of this account, past the grace period after the agent's own
-    orders and before 4 PM ET on expiry day. Rows sharing a contract are
+    orders and before the close on expiry day. Rows sharing a contract are
     left out (one holding can't be split between them)."""
     cand, owners, changed = {}, {}, False
     for key, pos in (state.get("positions") or {}).items():
@@ -1166,7 +1181,7 @@ def _sync_candidates(state, tag, now):
         owners.setdefault(oid, []).append(key)
         parts = key.split("|")
         if ("pending" in pos or _int0(pos.get("qty")) < 1 or len(parts) != 4
-                or not _EXPIRY_RE.match(parts[1]) or _past_expiry_close(key)
+                or not _EXPIRY_RE.match(parts[1]) or _past_expiry_close(key, cfg)
                 or pos.get("acct") not in (None, tag)):
             continue
         if now - _grace_anchor(pos) < POS_GRACE_S:
@@ -1219,7 +1234,7 @@ def _sync_read(cfg, state, save_state, broker, client, fn, keys, confirm_s,
                event_id, detected_by):
     now = _now()
     tag = _account_tag(cfg, broker, client)
-    cand, changed = _sync_candidates(state, tag, now)
+    cand, changed = _sync_candidates(state, tag, now, cfg)
     held = None
     if cand:
         try:
@@ -1580,10 +1595,10 @@ def _check_before_exit(cfg, state, save_state, broker, client, pos_key, ev):
     # there's no grace period — read first, and sell again only once a
     # read shows the contracts still held (unclear reads wait a while).
     unfilled_at = _float0(pos.get("exit_unfilled_at"))
-    if _past_expiry_close(pos_key):
+    if _past_expiry_close(pos_key, cfg):
         if not _resell_needs_read(pos, broker):
             return "go"
-        # Holdings aren't read from 4 PM ET on expiry day, so the read
+        # Holdings aren't read from the close on expiry day, so the read
         # this sell waits for can't come: hold it and tell the owner.
         _warn_exit_stuck(cfg, state, save_state, broker, pos_key, pos,
                          expiring=True)
@@ -1664,7 +1679,9 @@ def _warn_exit_stuck(cfg, state, save_state, broker, pos_key, row, expiring=Fals
         pass  # the alert matters more; the flag is saved with the next change
     name = _BROKER_NAMES.get(_broker_name(cfg, broker), "broker")
     if expiring:
-        why = (f"the agent doesn't check your {name} account for it after 4 PM "
+        close = _close_min(cfg, pos_key.split("|")[1])
+        at = f"{(close // 60 - 1) % 12 + 1}" + (f":{close % 60:02d}" if close % 60 else "")
+        why = (f"the agent doesn't check your {name} account for it after {at} PM "
                "ET on its expiry day, so it won't sell again")
     else:
         why = (f"your {name} account doesn't clearly show the contracts are "
@@ -2066,6 +2083,208 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         save_state(state)
         return f"{prefix}{action.upper()}: {contract}"
     return None
+
+
+# ── a poll's events: what's remembered, exits still owed, batch order ──────
+# state["seen"]: ids of the feed events already handled, in the order the
+# agent handled them (oldest first). The newest _SEEN_KEPT are kept, and
+# any older one the feed still lists. (The list used to be sorted by id and
+# cut alphabetically: every AgentHC "EXITED|…" id sorts after every
+# "ENTERED|…" one, so once it was full a new entry was forgotten at once
+# and handled again on every poll — bought again after its exit.)
+#
+# state["exits_to_retry"]: exit signals that weren't finished (the sell
+# wasn't placed, the broker couldn't be reached, a holdings read is
+# awaited). They are retried from here on every loop until done or nothing
+# is left to sell — the feed lists only its latest events and may be
+# unreachable, so it can't be relied on to send them again.
+#
+# Order within one poll: exits the agent still owes, then the feed's new
+# exits, then its new entries — and an entry whose own exit is already
+# known is never bought. After a sleep or an outage both can arrive in one
+# poll: bought-then-sold at once, or bought with no exit ever coming.
+
+_SEEN_KEPT = 500
+_SEEN_ORDER = "oldest_first"
+_EXITS_TO_RETRY_KEPT = 50
+
+
+def _seen_ids(state):
+    """state["seen"] as a list, oldest first. A list saved by an older
+    version (sorted by id, no "seen_order" mark) is kept whole — nothing it
+    lists is handled again — and every entry the trade log says the agent
+    took is added: that version could forget an entry it had just bought."""
+    ids = state.get("seen")
+    ids = [i for i in ids if isinstance(i, (str, int))] if isinstance(ids, list) else []
+    if state.get("seen_order") != _SEEN_ORDER:
+        known = set(ids)
+        for t in _recent_trades(500):
+            eid = t.get("event_id")
+            if t.get("action") == "entry" and isinstance(eid, str) and eid not in known:
+                known.add(eid)
+                ids.append(eid)
+        state["seen_order"] = _SEEN_ORDER
+    state["seen"] = ids
+    return ids
+
+
+def _mark_seen(state, event_id, listed=()):
+    """Remember a handled event. Past _SEEN_KEPT the oldest ids go first,
+    but never one the current poll still lists (`listed`)."""
+    ids = [i for i in _seen_ids(state) if i != event_id]
+    over = len(ids) + 1 - _SEEN_KEPT
+    if over > 0:
+        keep, kept = set(listed), []
+        for i in ids:
+            if over > 0 and i not in keep:
+                over -= 1
+            else:
+                kept.append(i)
+        ids = kept
+    state["seen"] = ids + [event_id]
+
+
+def _exits_to_retry(state):
+    owed = state.get("exits_to_retry")
+    if not isinstance(owed, list):
+        return []
+    return [e for e in owed if isinstance(e, dict) and e.get("event") == "EXITED"
+            and e.get("event_id")]
+
+
+def _owe_exit(state, ev):
+    """Keep an exit signal that isn't done yet. True when it was added."""
+    owed = _exits_to_retry(state)
+    if any(e["event_id"] == ev["event_id"] for e in owed):
+        return False
+    state["exits_to_retry"] = (owed + [dict(ev)])[-_EXITS_TO_RETRY_KEPT:]
+    return True
+
+
+def _exit_settled(state, event_id):
+    owed = _exits_to_retry(state)
+    left = [e for e in owed if e["event_id"] != event_id]
+    if len(left) != len(owed):
+        state["exits_to_retry"] = left
+
+
+def _same_contract(a, b):
+    try:
+        return (all(a.get(k) == b.get(k) for k in ("ticker", "expiry", "type"))
+                and float(a.get("strike")) == float(b.get("strike")))
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _occurred_at(ev):
+    """The event's occurred_at (no offset = UTC), or None."""
+    try:
+        t = datetime.fromisoformat(str(ev.get("occurred_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def _exit_already_known(ev, events, seen):
+    """True when an exit for this entry's contract is already known (listed
+    by the feed, or still owed) and isn't older than the entry — the trade
+    is over. Without times on both, only an exit that is itself new counts
+    (one handled on an earlier poll closed an earlier position)."""
+    t_in = _occurred_at(ev)
+    for other in events:
+        if not _same_contract(ev, other) or other.get("event") != "EXITED":
+            continue
+        t_out = _occurred_at(other)
+        if t_in is not None and t_out is not None:
+            if t_out >= t_in:
+                return True
+        elif other.get("event_id") not in seen:
+            return True
+    return False
+
+
+def _skip_exited_entry(ev, cfg, state, save_state):
+    """An entry that isn't bought because its exit is already known. Returns
+    the line to send, or None for one from before the agent was watching."""
+    contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
+    if _backlog(ev):
+        print(f"skipped earlier signal ({contract}) — it happened before "
+              "your agent was watching for it")
+        return None
+    msg = (f"SKIPPED {contract} — the exit for this trade had already "
+           "arrived, so it was not bought")
+    print(msg)
+    _report_problem(cfg, state, save_state, "skip_stale", contract,
+                    "the exit for this trade had already arrived when the "
+                    "agent first saw the entry, so it was not bought",
+                    event_id=ev["event_id"],
+                    book="main" if str(ev.get("track", "main")) == "main" else "shadow")
+    return msg
+
+
+def _poll_had_access(source):
+    """False when the source says its last poll couldn't read entry signals
+    (AgentHC: no pass or day-pass yet, or it ran out)."""
+    try:
+        fn = getattr(source, "had_access", None)
+        return True if fn is None else bool(fn())
+    except Exception:
+        return True
+
+
+def _handle_feed_events(events, cfg, state, broker, client, save_state):
+    """Run one poll's new events — and the exits still owed from earlier
+    polls — through handle_event."""
+    seen = set(_seen_ids(state))
+    listed = [ev.get("event_id") for ev in events]
+    owed = [_from_feed(ev) for ev in _exits_to_retry(state)]
+    owed_ids = {ev["event_id"] for ev in owed}
+    # only the agent's own exits may cap or reprice a sell
+    new = [_from_feed(ev) for ev in events
+           if ev.get("event_id") not in seen and ev.get("event_id") not in owed_ids]
+    known = list(events) + owed
+    batch = (owed + [ev for ev in new if ev.get("event") == "EXITED"]
+             + [ev for ev in new if ev.get("event") != "EXITED"])
+    for ev in batch:
+        eid = ev.get("event_id")
+        if eid in seen:
+            continue  # listed twice in one poll
+        is_exit = ev.get("event") == "EXITED"
+        key = (f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
+               if _valid_event(ev) else None)
+        # an entry for a contract the ledger doesn't hold
+        opens = not is_exit and key is not None and key not in state["positions"]
+        error = None
+        try:
+            if opens and not _stale(ev, cfg) and _exit_already_known(ev, known, seen):
+                outcome = _skip_exited_entry(ev, cfg, state, save_state)
+            else:
+                outcome = handle_event(ev, cfg, state, broker, client, save_state)
+        except Exception as exc:
+            error = exc
+        if opens and key in state["positions"]:
+            # A new position: an exit still owed for this contract is older
+            # than it (or the entry wouldn't have been bought) — it was for
+            # an earlier position and must never sell this one.
+            for old in _exits_to_retry(state):
+                if _same_contract(old, ev):
+                    _note_stale_exit(state, old["event_id"])
+        if error is not None:
+            # One malformed/erroring event must not block the rest of the
+            # batch. Not marked seen — transient broker/net errors get
+            # retried on the next poll (an exit: on every loop, from state).
+            print(f"event error (will retry next poll): {str(error)[:200]}")
+            if is_exit and key is not None and _owe_exit(state, ev):
+                save_state(state)
+            continue
+        if outcome:
+            notify(cfg, f"agentic-trader: {outcome}")
+        if not eid:
+            continue  # invalid (no id): nothing to remember it by
+        seen.add(eid)
+        _mark_seen(state, eid, listed)
+        _exit_settled(state, eid)
+        save_state(state)
 
 
 # ── expiry guard ─────────────────────────────────────────────────────────────
@@ -3731,7 +3950,7 @@ def cmd_run(app_window=False):
         print("Broker auth missing/expired — run: python agent.py setup")
         sys.exit(1)
     state = _load(STATE_PATH, {"seen": [], "positions": {}})
-    seen = set(state["seen"])
+    _seen_ids(state)  # brings an older version's list up to date
     if llm_policy.entries_blocked(cfg):
         if state.get("positions"):
             print("WARNING: " + llm_policy.BLOCKED_MSG + " Starting anyway so "
@@ -3927,29 +4146,21 @@ def cmd_run(app_window=False):
                 if (time.time() - cash["at"] > 600
                         or bool(cfg.get("dry_run")) != cash.get("dry")):
                     _refresh_cash(cfg, state, save_state, broker, client, cash)
-                events = source.poll(cfg, state, save_state)
-                note_watching(cfg)
-                for ev in events:
-                    if ev.get("event_id") in seen:
-                        continue
-                    # only the agent's own exits may cap or reprice a sell
-                    ev = _from_feed(ev)
-                    try:
-                        outcome = handle_event(ev, cfg, state, broker, client,
-                                               save_state)
-                    except Exception as exc:
-                        # One malformed/erroring event must not block the rest
-                        # of the batch. Not marked seen — transient broker/net
-                        # errors get retried on the next poll.
-                        print(f"event error (will retry next poll): "
-                              f"{str(exc)[:200]}")
-                        continue
-                    if outcome:
-                        notify(cfg, f"agentic-trader: {outcome}")
-                    seen.add(ev["event_id"])
-                    state["seen"] = sorted(seen)[-500:]
-                    seen = set(state["seen"])
-                    save_state(state)
+                poll_error = None
+                try:
+                    events = source.poll(cfg, state, save_state)
+                except Exception as exc:
+                    if not _exits_to_retry(state):
+                        raise
+                    # the feed can't be read, but the exits the agent
+                    # still owes don't need it
+                    poll_error, events = exc, []
+                if poll_error is None:
+                    note_watching(cfg, access=_poll_had_access(source))
+                _handle_feed_events(events, cfg, state, broker, client,
+                                    save_state)
+                if poll_error is not None:
+                    raise poll_error
             else:
                 # paused: no orders, but the remainder alerts still go out
                 exit_remainder_tick(cfg, state, save_state, broker, client,

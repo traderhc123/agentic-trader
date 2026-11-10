@@ -629,6 +629,18 @@ def _buy_day_pass(cfg, state, body, save_state):
     print("Day-pass active for ~23h.")
 
 
+_LAST_POLL = {"access": True}
+
+
+def had_access():
+    """Whether the last poll() could read ENTRY signals: False with no pass
+    or day-pass (not bought yet, run out, waiting for payment) and while a
+    used-up pass only gets exits. The agent starts its "was I watching when
+    this signal came?" clock on a poll that had access — an entry from
+    before then was never catchable, so it isn't reported as too old."""
+    return bool(_LAST_POLL["access"])
+
+
 def poll(cfg, state, save_state=lambda s: None, _retried=False):
     """Fetch recent journal events (normalized contract shape).
 
@@ -637,6 +649,7 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     shadow book — several entries a day; your daily entry cap and budget
     still apply per trade).
     """
+    _LAST_POLL["access"] = False  # until the feed is actually read (below)
     # Prepaid multi-day pass (bought in the dashboard, paid from any wallet):
     # takes precedence over the per-day wallet auto-pay. One charge per day:
     # a wallet day-pass that is already paid and still running is used up
@@ -713,6 +726,7 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
         if (now.weekday() < 5 and 9 * 60 + 30 <= minute < 16 * 60
                 and _record_paid_day(state, now.strftime("%Y-%m-%d"))):
             save_state(state)
+    _LAST_POLL["access"] = True
     return _parse_events(resp.json())
 
 
@@ -742,6 +756,7 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
             save_state(state)
     left = body.get("pass_days_left", body.get("pass_trading_days_left"))
     exits_only = bool(body.get("pass_exits_only"))
+    _LAST_POLL["access"] = not exits_only
     rec = state.setdefault("pass_status", {}).get(_token_id(token))
     if rec is not None:
         new_status = "exits_only" if exits_only else "active"
