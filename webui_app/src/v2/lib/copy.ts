@@ -919,7 +919,7 @@ export const UPDATE = {
   wont: [
     "Change your Pause setting, Practice or LIVE, or any rule or limit.",
     "Buy or sell anything because of the update.",
-    "Install anything newer. If a newer version came out since this check, nothing is installed.",
+    "Install any version other than the one shown here.",
   ],
   liveTitle: "Real money",
   live: (realPositions: number) =>

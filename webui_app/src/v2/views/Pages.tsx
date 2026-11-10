@@ -537,7 +537,7 @@ export function SettingsView({ page }: { page: Page }) {
         />
         <UpdateRow page={page} />
         <Row
-          label="Start at login, keep awake, updates, move to another computer"
+          label="Start at login, keep awake, move to another computer"
           exp="These live in the settings pages and the classic dashboard."
           act={
             <a className="btn btn-sm" href={SETUP}>
