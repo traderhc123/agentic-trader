@@ -250,7 +250,7 @@ def request_stop():
 
 
 def stop_requested():
-    return os.path.exists(_stop_path())
+    return _sigterm[0] or os.path.exists(_stop_path())
 
 
 def clear_stop():
@@ -258,6 +258,62 @@ def clear_stop():
         os.remove(_stop_path())
     except OSError:
         pass
+
+
+# ── SIGTERM = a deliberate stop (docker stop, systemctl stop, shutdown) ──────
+# Without this, SIGTERM ends Python on the spot — in the middle of an order,
+# if one is being placed — and with an exit code that reads as a crash, so
+# Docker's `--restart on-failure` would start the agent again after the next
+# reboot although the owner stopped it. (As the first process in a container
+# Python would not react at all, and `docker stop` would end it by force.)
+_sigterm = [False]
+# Docker ends a container by force 10 s after `docker stop`. If the agent's
+# loop has not stopped by itself this long after SIGTERM (it is stuck in a
+# network call), it ends itself — still as a deliberate stop.
+SIGTERM_GRACE_SECONDS = 8
+
+
+def _sigterm_deadline(sleep=time.sleep, leave=os._exit):
+    """Runs beside the agent after SIGTERM. The loop normally stops by
+    itself within a second or two and this never gets its turn. If it has
+    not, end the process — but not in the middle of an order: first wait
+    (up to ORDER_WAIT_SECONDS, like a restart does) until the order that is
+    being placed has been saved. Exit code 0: it was asked to stop, it did
+    not crash."""
+    sleep(SIGTERM_GRACE_SECONDS)
+    got = platform_compat.ORDER_LOCK.acquire(
+        timeout=platform_compat.ORDER_WAIT_SECONDS)
+    try:
+        print("Stopped (it was asked to end and did not stop by itself within "
+              f"{SIGTERM_GRACE_SECONDS} seconds). Open positions stay in your "
+              "broker account.", flush=True)
+    except Exception:
+        pass
+    try:
+        leave(0)
+    finally:
+        if got:   # only reached when `leave` is a stand-in (tests)
+            platform_compat.ORDER_LOCK.release()
+
+
+def stop_on_sigterm():
+    """Called by `agent.py run`: from now on SIGTERM is a stop request like
+    `agent.py stop` — the loop finishes what it is doing (an order being
+    placed is saved first), says it stopped and exits with code 0. Returns
+    False where that can't be set up (not the main thread)."""
+    import signal
+    import threading
+
+    def asked(_signum, _frame):
+        if _sigterm[0]:
+            return
+        _sigterm[0] = True
+        threading.Thread(target=_sigterm_deadline, daemon=True).start()
+    try:
+        signal.signal(signal.SIGTERM, asked)
+    except (ValueError, OSError, AttributeError):
+        return False
+    return True
 
 
 # ── "try again now" requests (a second `start` while one is waiting) ──────────
@@ -272,13 +328,23 @@ def request_retry():
         f.write(str(time.time()))
 
 
-def _take_retry():
-    """True (once) if someone asked the waiting supervisor to try again now."""
+def _take_retry(since=0.0):
+    """True (once) if someone asked the waiting supervisor to try again now.
+    The request is removed either way; one written before `since` (when the
+    agent's last run ended) is left over from earlier and does not count."""
     try:
-        os.remove(_retry_path())
-        return True
+        with open(_retry_path(), encoding="utf-8") as f:
+            asked = f.read().strip()
     except OSError:
         return False
+    try:
+        os.remove(_retry_path())
+    except OSError:
+        pass
+    try:
+        return float(asked) >= since
+    except ValueError:
+        return True   # caught while it was being written: it is new
 
 
 # A supervisor started by a version before the supervisor lock can't be seen,
@@ -297,21 +363,29 @@ def stop(timeout=45.0, out=print):
     if not agent_up and not keeper_up:
         request_stop()
         time.sleep(OLD_SUPERVISOR_WAIT)
-        agent_up = is_running()  # an older supervisor restarted it meanwhile
-        if not agent_up:
+        # an older supervisor restarted it meanwhile — or a supervisor that
+        # was launched a moment ago has only now taken its lock, and its
+        # agent has not come up yet
+        agent_up, keeper_up = is_running(), supervisor_running()
+        if not agent_up and not keeper_up:
             clear_stop()
             out("The agent isn't running.")
             return True
     request_stop()
+    # Agent down but its supervisor up: either the agent stopped with an
+    # error and the supervisor is waiting to try again, or the supervisor is
+    # starting the agent at this very moment (login, `start` a second ago).
+    failed = not agent_up and supervisor_status().get("state") == "waiting"
     out("Asking the agent to stop…" if agent_up else
         "The agent isn't running right now: it stopped with an error and was "
-        "going to be started again automatically. Cancelling that…")
+        "going to be started again automatically. Cancelling that…" if failed
+        else "The agent was just being started — stopping it…")
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not is_running() and not supervisor_running():
             clear_stop()
             out("Stopped. Open positions stay in your broker account."
-                if agent_up else
+                if not failed else
                 "Cancelled. The agent stays off until you start it again "
                 "(python agent.py start"
                 + (", or your next login — start at login is on" if
@@ -329,14 +403,28 @@ def stop(timeout=45.0, out=print):
     if pid:
         out(f"It didn't stop within {int(timeout)}s — ending process {pid}.")
         _kill(pid)
-        time.sleep(1.0)
+        # told to end, it gives itself SIGTERM_GRACE_SECONDS to stop first
+        for _ in range(2 * (SIGTERM_GRACE_SECONDS + 4)):
+            time.sleep(0.5)
+            if not is_running():
+                break
+        else:
+            # It did not even react to being told to end (frozen solid, or
+            # stuck in an order for a minute already): end it by force, as
+            # `stop` always has after its timeout.
+            _kill(pid, force=True)
+            time.sleep(1.0)
     # with its agent gone the supervisor sees the request and ends by itself
     for _ in range(10):
         if not supervisor_running():
             break
         time.sleep(0.5)
     keeper = supervisor_pid()
-    if keeper:
+    # Only ever end a process the supervisor itself vouches for: its note
+    # (supervisor.status) must name the same pid as its lock's pid file. A
+    # pid file that came from somewhere else (another computer's files, an
+    # old backup) could name any program on this computer.
+    if keeper and supervisor_status().get("pid") == keeper:
         out(f"The background process that restarts the agent ({keeper}) "
             "didn't stop either — ending it.")
         _kill(keeper)
@@ -349,7 +437,10 @@ def stop(timeout=45.0, out=print):
     return ok
 
 
-def _kill(pid):
+def _kill(pid, force=False):
+    """End a process. Windows: always by force (taskkill /F). Elsewhere:
+    SIGTERM, which `agent.py run` treats as a stop request (stop_on_sigterm);
+    `force` = SIGKILL, for a copy that did not react to that."""
     try:
         if IS_WINDOWS:
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -357,7 +448,7 @@ def _kill(pid):
                            timeout=15)
         else:
             import signal
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
     except Exception:
         pass
 
@@ -547,9 +638,19 @@ def _no_links(text):
     return re.sub(r"(with url: )\S+", r"\1…", text)  # requests' error text
 
 
-def _loop_message(failures, reason, backoff):
+def _loop_message(failures, reason, backoff, freezes=0):
     wait = (f"{backoff} seconds" if backoff < 120
             else f"{backoff // 60} minutes")
+    if freezes >= LOOP_NOTIFY_AFTER:
+        return ("agentic-trader keeps freezing: it stopped responding "
+                f"{freezes} times in the last {LOOP_NOTIFY_EVERY // 3600} "
+                f"hours. Each time it was frozen for {HANG_SECONDS // 60} "
+                "minutes before it was started again; it will be started "
+                f"again in about {wait}. While it is frozen it places no "
+                "orders and does NOT act on exit signals for your open "
+                "positions — watch those in your broker app, and check this "
+                "computer's internet connection. To stop the agent: "
+                "python agent.py stop")
     reason = _no_links(reason or "")
     return ("agentic-trader is NOT running: it has stopped with an error "
             f"{failures} times in a row."
@@ -581,21 +682,32 @@ def supervise(port=None, cmd=None, sleep=time.sleep, max_runs=None,
     or another copy is already running) ends supervision; RESTART_EXIT
     restarts at once; anything else is a crash and restarts with backoff
     (15 s doubling to 10 min, reset after 10 healthy minutes). One supervisor
-    per HOME: a second one asks the first to try again now and leaves.
-    `notify(text)` is called when the agent keeps failing (restart loop)."""
+    per HOME: a second one leaves — after asking the first to try again
+    now, if the first is waiting to restart an agent that failed.
+    `notify(text)` is called when the agent keeps failing or keeps freezing
+    (restart loop): after LOOP_NOTIFY_AFTER failures in a row, again every
+    LOOP_NOTIFY_EVERY while it goes on, and afresh for every new loop that
+    starts after the agent had been working again."""
     cmd = cmd or [_python_for(windowless=False), agent_script(), "run"]
     guard = InstanceLock(_supervisor_lock_path())
     if not guard.acquire(wait=2):
-        if not is_running():
+        if supervisor_status().get("state") == "waiting":
             request_retry()
-        _log("a supervisor is already keeping the agent running — asked it "
-             "to try again now instead of starting a second one")
+            _log("a supervisor is already waiting to start the agent again "
+                 "— asked it to try again now instead of starting a second "
+                 "one")
+        else:
+            _log("a supervisor is already keeping the agent running — not "
+                 "starting a second one")
         return 0
     try:
         clear_stop()
         _take_retry()
+        # replaces the note of a supervisor that was killed (never cleared)
+        _set_status(state="starting")
         backoff, runs = 15, 0
         failures, told_at = 0, None
+        freezes, freeze_told_at = [], None   # when it was ended as frozen
         _log(f"started (pid {os.getpid()})")
         if on_first_start is not None:
             # e.g. open the dashboard once at login; runs beside the agent
@@ -607,6 +719,7 @@ def supervise(port=None, cmd=None, sleep=time.sleep, max_runs=None,
             if stop_requested():
                 _log("stop requested — supervisor done")
                 return 0
+            _take_retry()   # only a request made while waiting counts
             _set_status(state="running", runs=runs)
             started = time.time()
             code = _run_child(cmd)
@@ -621,29 +734,59 @@ def supervise(port=None, cmd=None, sleep=time.sleep, max_runs=None,
                 return code
             if code == RESTART_EXIT:
                 _log("agent asked to restart")
-                backoff, failures = 15, 0
+                # it was up and working: whatever comes next is a new loop
+                backoff, failures, told_at = 15, 0, None
                 continue
-            if time.time() - started > 600:
-                backoff, failures = 15, 0
+            now = time.time()
+            ran = now - started
+            hung = code == HUNG_EXIT
+            if ran > 600:
+                backoff = 15
+            # A frozen run's last HANG_SECONDS were silence, not work: a
+            # copy that freezes right after every start never "worked".
+            if ran - (HANG_SECONDS if hung else 0) > 600:
+                # It worked for a while, so the earlier trouble is over. If
+                # it now fails again and again, that is a NEW loop and the
+                # owner is told again (not hours later because of an alert
+                # about the last one).
+                failures, told_at = 0, None
             failures += 1
+            if hung:
+                # freezes are counted over time, not "in a row": every
+                # frozen run lasts over 20 minutes, working or not
+                freezes = [t for t in freezes
+                           if now - t < LOOP_NOTIFY_EVERY] + [now]
             reason = (f"it stopped responding for {HANG_SECONDS // 60} minutes"
-                      if code == HUNG_EXIT else _child_said())
+                      if hung else _child_said())
             _set_status(state="waiting", code=code, reason=reason, runs=runs,
                         failures=failures, retry_in=backoff)
             _log(f"agent exited with code {code} — restarting in {backoff}s")
-            if (notify is not None and failures >= LOOP_NOTIFY_AFTER
-                    and (told_at is None
-                         or time.time() - told_at >= LOOP_NOTIFY_EVERY)):
-                told_at = time.time()
-                _log(f"the agent has failed {failures} times in a row — "
-                     "telling the owner")
-                _tell(notify, _loop_message(failures, reason, backoff))
+
+            def due(last):
+                return last is None or now - last >= LOOP_NOTIFY_EVERY
+            frozen = hung and len(freezes) >= LOOP_NOTIFY_AFTER
+            if notify is not None and (
+                    (failures >= LOOP_NOTIFY_AFTER and due(told_at))
+                    or (frozen and due(freeze_told_at))):
+                if failures >= LOOP_NOTIFY_AFTER:
+                    told_at = now
+                if frozen:
+                    freeze_told_at = now
+                _log((f"the agent froze {len(freezes)} times in the last "
+                      f"{LOOP_NOTIFY_EVERY // 3600} hours" if frozen else
+                      f"the agent has failed {failures} times in a row")
+                     + " — telling the owner")
+                _tell(notify, _loop_message(
+                    failures, reason, backoff,
+                    freezes=len(freezes) if frozen else 0))
             waited = 0
             while waited < backoff:
                 if stop_requested():
                     _log("stop requested — supervisor done")
                     return 0
-                if _take_retry():
+                # (`now` = when the run ended, just before the note above
+                # said "waiting": a request made because of that note counts)
+                if _take_retry(since=now):
                     _log("asked to try again now")
                     break
                 sleep(1)

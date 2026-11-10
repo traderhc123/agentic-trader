@@ -47,6 +47,26 @@ def no_policy(monkeypatch):
         lambda cfg, ev, log: {"act": True, "reason": "test: mechanical"})
 
 
+@pytest.fixture(autouse=True)
+def _no_leftover_sigterm_handler():
+    """`agent.cmd_run()` makes SIGTERM a stop request for its process — here
+    that is the test runner. Put back whatever was there after every test."""
+    import signal
+
+    import keep_running
+    try:
+        before = signal.getsignal(signal.SIGTERM)
+    except (ValueError, AttributeError):
+        before = None
+    yield
+    getattr(keep_running, "_sigterm", [False])[0] = False
+    if before is not None:
+        try:
+            signal.signal(signal.SIGTERM, before)
+        except (ValueError, OSError):
+            pass
+
+
 @pytest.fixture
 def frozen_now(monkeypatch):
     """agent's datetime.now() pinned to 2026-10-30 15:00 UTC (returned), so

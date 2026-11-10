@@ -1766,6 +1766,13 @@ def _order_in_flight(fn):
     return held
 
 
+def _order_lock():
+    """The same lock for a `with` block: the main loop's order reconcile
+    (cancel, re-place, save) is an order in flight too."""
+    import platform_compat
+    return platform_compat.ORDER_LOCK
+
+
 @_order_in_flight
 def handle_event(ev, cfg, state, broker, client, save_state):
     """Run one new event through the safety pipeline. Returns a log line or None."""
@@ -3725,6 +3732,9 @@ def cmd_run(app_window=False):
     # Not "running" yet: the checks below can still fail. The first loop's
     # touch_alive() is what tells `start`/`status` that it really started.
     keep_running.clear_alive()
+    # `docker stop`, `systemctl stop` and a shutdown end it like `agent.py
+    # stop`: the loop finishes what it is doing and exits with code 0
+    keep_running.stop_on_sigterm()
     import transfer
     moved = transfer.moved_away()
     if moved:
@@ -3928,7 +3938,10 @@ def cmd_run(app_window=False):
                     try:
                         # progress any unverified orders (fill verification,
                         # blackout-limit conversion) before new events
-                        broker.reconcile(client, cfg, state, save_state)
+                        # (it cancels and re-places orders and saves at
+                        # the end: no restart may cut in between)
+                        with _order_lock():
+                            broker.reconcile(client, cfg, state, save_state)
                     except Exception as exc:
                         print(f"order reconcile error (non-fatal): {str(exc)[:150]}")
                     for r in broker_events.drain():
@@ -4081,10 +4094,15 @@ def cmd_status():
         running = "starting — not trading yet (still in its startup checks)"
     elif keep_running.supervisor_running():
         why = keep_running.start_failure()
-        running = ("NO — it stopped with an error and will be started again "
-                   "automatically (cancel: python agent.py stop)"
-                   + (f"\n                   what it said: "
-                      + why.replace("\n", " / ") if why else ""))
+        if keep_running.supervisor_status().get("state") != "waiting":
+            # the background process is launching it at this moment (login,
+            # a `start` a second ago, a restart): nothing has failed
+            running = "starting — not trading yet"
+        else:
+            running = ("NO — it stopped with an error and will be started "
+                       "again automatically (cancel: python agent.py stop)"
+                       + (f"\n                   what it said: "
+                          + why.replace("\n", " / ") if why else ""))
     else:
         running = "no"
     print(f"agent running    : {running}")
@@ -4472,12 +4490,19 @@ def _dashboard_link():
     return f"http://127.0.0.1:{webui.APP_PORT}/dash?k={webui.ui_token()}"
 
 
-def _open_running_dashboard():
+def _open_running_dashboard(wait=0.0):
     """If the agent is already running, open its dashboard instead of
     starting anything (the wizard and a second agent can't share its port).
-    Returns True if it was running."""
+    Returns True if it was running. "Running" = past its startup checks
+    (keep_running.is_ready): a copy that is still in them may be about to
+    stop with an error (broker login expired), and its dashboard isn't up.
+    `wait`: seconds to give such a copy to either come up or give up."""
     import keep_running
-    if not keep_running.is_running():
+    end = time.time() + wait
+    while (keep_running.is_running() and not keep_running.is_ready()
+           and time.time() < end):
+        time.sleep(0.5)
+    if not keep_running.is_ready():
         return False
     link = _dashboard_link()
     print("Your agent is already running. Its dashboard (settings live there "
@@ -4524,11 +4549,15 @@ def cmd_start(open_dashboard=False, app_window=False):
         sys.exit(1)
     before = keep_running.supervisor_status()
     proc = None
-    if keep_running.is_running():
-        # holds the one-copy lock but isn't up yet: a copy is starting now
+    keeper_up = keep_running.supervisor_running()
+    waiting = keeper_up and before.get("state") == "waiting"
+    if keep_running.is_running() or (keeper_up and not waiting):
+        # A copy holds the one-copy lock but isn't up yet, or the background
+        # process is launching one at this moment (login, a `start` a second
+        # ago): it is starting now.
         print("The agent is already starting — waiting for it…")
     else:
-        if keep_running.supervisor_running():
+        if waiting:
             print("An earlier start failed and the agent was waiting to try "
                   "again — trying again now…")
         # a waiting supervisor is asked to retry now (never a second one)
@@ -4761,7 +4790,14 @@ def main():
     cmd = sys.argv[1]
     if cmd == "setup":
         if "--web" in sys.argv:
-            if _open_running_dashboard():
+            if _open_running_dashboard(wait=20):
+                return
+            import keep_running
+            if keep_running.is_running():
+                # the setup page and the agent's dashboard use the same port
+                print("Your agent is still starting (it is not trading yet), "
+                      "so the setup page can't be opened right now. Check on "
+                      "it in a minute: python agent.py status")
                 return
             import webui
             webui.run_wizard()

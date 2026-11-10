@@ -368,9 +368,17 @@ def apply_and_restart(restart=True):
     if restart:
         def _restart():
             time.sleep(1.5)  # let the HTTP response flush
-            import platform_compat
-            platform_compat.restart_self([os.path.join(_repo(), "agent.py"),
-                                          "run"], _app_port())
+            argv = [os.path.join(_repo(), "agent.py"), "run"]
+            try:
+                # never restarts in the middle of an order; tells the owner
+                # if it had to give up
+                import webui
+                tell = webui.restart_after_self_edit
+            except Exception:
+                import platform_compat
+                platform_compat.restart_self(argv, _app_port())
+                return
+            tell(argv, _app_port())
         threading.Thread(target=_restart, daemon=True).start()
         return True, (f"Applied {len(written)} file(s) (backup: {backup_dir}). "
                       "Restarting with the new code — this page will reconnect "

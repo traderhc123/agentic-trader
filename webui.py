@@ -3456,9 +3456,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             def _restart():
                 import time as _t
                 _t.sleep(1.5)  # let this response reach the browser
-                os.environ["AGENT_UPDATE_RESTARTED"] = "1"
-                import platform_compat
-                platform_compat.restart_self(list(_sys.argv), APP_PORT)
+                # waits for an order that is still being placed; tells the
+                # owner if it had to give up
+                _restart_after_import(list(_sys.argv))
             threading.Thread(target=_restart, daemon=True).start()
             info["restarting"] = True
         return {"ok": True, **info}
@@ -3801,31 +3801,79 @@ def check_code_updates():
         return {"ok": False, "error": str(exc)[:200]}
 
 
-def _restart_after_update(argv, was_paused=False):
-    """Restart onto the freshly downloaded code. restart_self waits for an
-    order that is still being placed; if that order is stuck and it gives up,
-    the agent carries on as before (the update paused it for the restart)
-    and the owner is told — it must not sit paused with nobody knowing."""
+def _restart_or_tell(argv, done, now_it, to_finish, after="", port=None,
+                     quiet=True, urgent=False):
+    """Restart the agent (update, move-file import, self-edit).
+    restart_self waits for an order that is still being placed; if that
+    order is stuck and it gives up, the owner is told what did and did not
+    happen — the page said "restarting", and nothing may be left waiting or
+    paused with nobody knowing. `done`: what already happened; `now_it`:
+    what the agent is doing instead; `to_finish`: how the instruction to
+    restart it by hand begins; `after`: what to do after that. `quiet`: the
+    restarted copy does not open a browser window."""
     import platform_compat
-    os.environ["AGENT_UPDATE_RESTARTED"] = "1"  # skip browser popup
-    if platform_compat.restart_self(argv, APP_PORT) is not False:
+    if quiet:
+        os.environ["AGENT_UPDATE_RESTARTED"] = "1"
+    if platform_compat.restart_self(
+            argv, APP_PORT if port is None else port) is not False:
         return True
-    os.environ.pop("AGENT_UPDATE_RESTARTED", None)
-    CONTROLS["paused"] = was_paused
-    msg = ("agentic-trader: the update was downloaded, but the agent did NOT "
+    if quiet:
+        os.environ.pop("AGENT_UPDATE_RESTARTED", None)
+    msg = (f"agentic-trader: {done}, but the agent did NOT "
            "restart, because an order was still being placed and restarting "
-           "in the middle of an order could lose track of it. It keeps "
-           "running the previous version"
-           + (" and stays paused, as it was before the update."
-              if was_paused else " and keeps trading as before.")
-           + " To finish the update, restart it once that order shows in the "
-           "dashboard: python agent.py stop, then python agent.py start")
+           f"in the middle of an order could lose track of it. {now_it} "
+           f"{to_finish} once that order shows in the "
+           "dashboard: python agent.py stop, then python agent.py start"
+           + (". " + after if after else ""))
     try:  # restart_self already printed why to the log
         import agent as A
-        A.notify(A._load(A.CONFIG_PATH, {}) or {}, msg)
+        A.notify(A._load(A.CONFIG_PATH, {}) or {}, msg,
+                 **({"priority": "high"} if urgent else {}))
     except Exception:
         pass
     return False
+
+
+def _restart_after_update(argv, was_paused=False):
+    """Restart onto the freshly downloaded code. If the restart can't happen
+    (see _restart_or_tell) the agent carries on as before — the update
+    paused it for the restart — and the owner is told."""
+    ok = _restart_or_tell(
+        argv, "the update was downloaded",
+        "It keeps running the previous version"
+        + (" and stays paused, as it was before the update."
+           if was_paused else " and keeps trading as before."),
+        "To finish the update, restart it")
+    if not ok:
+        CONTROLS["paused"] = was_paused
+    return ok
+
+
+def _restart_after_import(argv):
+    """Restart onto the setup that was just imported from a move file. If
+    the restart can't happen the agent stays paused (it was paused for the
+    import, and what it has in memory is the setup from before), and the
+    owner is told that it is not acting on anything until restarted."""
+    return _restart_or_tell(
+        argv, "the setup from your other computer was saved on this computer",
+        "It is PAUSED now: it places no orders and does NOT act on exit "
+        "signals — watch your open positions in your broker app.",
+        "Restart it",
+        after="After the restart, check that the imported setup is there; "
+              "if it is not, import the move file again.",
+        urgent=True)
+
+
+def restart_after_self_edit(argv, port=None):
+    """Restart onto code the owner just approved (self_edit). If the restart
+    can't happen the agent keeps running the code it had, and the owner is
+    told the change is not loaded yet."""
+    return _restart_or_tell(
+        argv, "the code change you approved was written",
+        "It keeps running the code it had before the change"
+        + (" and stays paused." if CONTROLS.get("paused")
+           else " and keeps trading as before."),
+        "To load the change, restart it", port=port, quiet=False)
 
 
 def pull_code_updates(expect=None):
