@@ -1387,6 +1387,62 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
                 "dashboard activity log.)")
 
 
+def _log_adopted_buys(cfg, state, save_state, broker, client):
+    """Log the buys an adapter found at the broker after all — orders whose
+    request got no clear answer, so their signal was recorded as handled
+    without an entry (brokers/order_guard.py). Each becomes the entry it
+    is: a trade-log row (the daily entry cap counts those), an entry price
+    for the P&L estimate, and the row fields a normal entry gets. The owner
+    is told every time. Returns how many were found; never raises."""
+    try:
+        from brokers import order_guard
+        found = order_guard.take_adopted(state)
+    except Exception:
+        return 0
+    for rec in found:
+        try:
+            key = rec["key"]
+            ticker, expiry, strike, kind = key.split("|")
+            contract = f"{ticker} {expiry} ${strike} {kind}"
+            ev = {"event": "ENTERED", "event_id": rec.get("event_id"),
+                  "ticker": ticker, "expiry": expiry, "strike": float(strike),
+                  "type": kind}
+            row = state["positions"].get(key)
+            if isinstance(row, dict) and not row.get("dry"):
+                now, tag = _now(), _account_tag(cfg, broker, client)
+                mark = _mark(broker, client, cfg, ev, "buy")
+                if mark > 0 and not row.get("entry_mark"):
+                    row["entry_mark"] = mark
+                sent = _float0(rec.get("at"))
+                row.setdefault("opened_at", sent if 0 < sent <= now else now)
+                row["last_order_at"] = max(_float0(row.get("last_order_at")), now)
+                row.setdefault("acct", tag)
+                ids = [str(rec["order_id"])] if rec.get("order_id") else []
+                _remember_agent_row(state, key, row, tag, now, new_ids=ids,
+                                    buy_ids=ids)
+                buried = _tombstones(state).pop(key, None)
+                for old in _ids((buried if isinstance(buried, dict) else {})
+                                .get("held_exits")):
+                    _note_stale_exit(state, old)
+            if not rec.get("logged"):  # (a re-placed order's entry already is)
+                _log_trade({"action": "entry", "event_id": rec.get("event_id"),
+                            "contract": contract, "dry": False,
+                            "reason": "found at your broker: the buy order the "
+                                      "agent couldn't confirm did go through"})
+            notify(cfg, f"agentic-trader: ENTRY: {contract} — the buy order "
+                        "the agent couldn't confirm earlier is at your broker "
+                        "after all. The agent tracks it now and sells what it "
+                        "bought on its exit signal.")
+        except Exception as exc:
+            print(f"found-order record error (non-fatal): {str(exc)[:150]}")
+    if found:
+        try:
+            save_state(state)
+        except Exception:
+            pass
+    return len(found)
+
+
 def _buying_power(broker, client, cfg):
     """Broker cash available for orders, or None if unknown/unsupported."""
     fn = getattr(broker, "buying_power", None)
@@ -2542,6 +2598,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         ids_before = set(_ids(state.get("agent_order_ids")))
         changed = broker.execute(client, ecfg, ev, state)
         reported = broker_events.drain()
+        # an earlier buy the adapter only now found at the broker: its entry
+        adopted = _log_adopted_buys(cfg, state, save_state, broker, client)
         action = ("entry" if ev["event"] == "ENTERED" else "exit") if changed else None
         prefix = ""
         try:  # the ledger check's record of contracts the agent bought
@@ -2580,7 +2638,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             _report_problem(cfg, state, save_state, r["kind"], contract, msg,
                             event_id=ev["event_id"], book=book,
                             placed=r.get("placed", False))
-        if not action and ev["event"] == "ENTERED" and not existing and not reported:
+        if (not action and ev["event"] == "ENTERED" and not existing
+                and not reported and not adopted):
             _report_problem(cfg, state, save_state, "broker_no_order", contract,
                             "the broker adapter didn't place the order and gave "
                             "no reason — see agent-run.log",
@@ -4513,6 +4572,8 @@ def cmd_run(app_window=False):
                         _report_problem(cfg, state, save_state, r["kind"],
                                         "", r["message"],
                                         placed=r.get("placed", False))
+                    # buys found at the broker after all: logged as entries
+                    _log_adopted_buys(cfg, state, save_state, broker, client)
                 # positions the owner closed in the broker app (throttled)
                 _position_upkeep(cfg, state, save_state, broker, client)
                 # contracts an exit left held (re-sold), and ones the agent

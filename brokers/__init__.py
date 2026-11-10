@@ -9,6 +9,8 @@ A broker module exposes:
     setup(cfg) -> cfg               interactive wizard (auth + account pick)
     client(cfg)                     authenticated client or None
     execute(client, cfg, event, state) -> bool   act on one normalized event
+    reconcile(client, cfg, state, save_state)    optional; once per loop,
+                                    before new events (orders still working)
 
 On an EXITED that sold, execute pops the row, lowers its qty, or (sale
 still working) sets row["pending"] = {"side": "sell", "requested": n, ...}.
@@ -64,6 +66,18 @@ account holds that the agent's own fills account for): sell min(row qty,
 max_qty) — pricing.exit_qty. The agent strips these keys from feed
 events. An exit that sells fewer than asked keeps the rest in row["qty"];
 the agent re-sells it.
+
+An order request that gets no clear answer (a timeout, a dropped
+connection, a gateway error) may have reached the broker. An adapter must
+never answer that by placing the order again, and must not let the error
+escape execute() either — the agent leaves an event whose handling raised
+unseen and hands it back on the next poll. Robinhood and Alpaca send every
+order under an id derived from its signal, look the order up, adopt it when
+it is there, and otherwise remember it in state["unconfirmed_orders"]: a buy
+is reported (broker_events.report(..., placed=True)) and not sent again; a
+sell is retried only once that is safe (order_guard.py). Their reconcile()
+hook, called once per loop, keeps looking for such a buy; one found later
+is queued (order_guard.adopted_buy) and the agent logs it as the entry it is.
 
     VERIFIES_FILLS = False          module constant for adapters that book an
                                     entry when the order is accepted, without

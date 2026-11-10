@@ -59,6 +59,16 @@ def begin():
     _events.clear()
 
 
+def discard(kind):
+    """Take back what was reported as `kind` since begin() — for an adapter
+    that learned better (e.g. "connection lost" while sending an order that
+    turned out to be there after all). Never raises."""
+    try:
+        _events[:] = [ev for ev in _events if ev.get("kind") != kind]
+    except Exception:
+        pass
+
+
 def drain():
     out = list(_events)
     _events.clear()
