@@ -107,19 +107,58 @@ def _replace(tmp, path):
             time.sleep(_REPLACE_WAIT_S * (i + 1))
 
 
+_IS_MAC = sys.platform == "darwin"
+
+
+def _fsync(fd):
+    """Have the system put this file's bytes on the disk. Returns quietly
+    when it did, or when this filesystem has no such call at all (some
+    network shares). Raises OSError when the system says it could NOT
+    write them (failing disk or card, full disk, quota): the caller must
+    then keep the old file. (Windows reports most such failures as "invalid
+    argument", which can't be told from "no such call" and is let through.)"""
+    import errno
+    unsupported = {getattr(errno, n) for n in (
+        "EINVAL", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "ENOTTY")
+        if hasattr(errno, n)}
+    if _IS_MAC:
+        # macOS: fsync alone leaves the bytes in the drive's own cache,
+        # where a power cut still loses them. F_FULLFSYNC empties it.
+        try:
+            import fcntl
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except (ImportError, AttributeError):
+            pass
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        if exc.errno not in unsupported:
+            raise
+
+
 def _write_json(path, payload, private):
     """Write `payload` to `path` so a power cut leaves the old file or the
     new one, never a half-written one: temp file, flush + fsync (the bytes
-    are on the disk), then swap it in."""
+    are on the disk), then swap it in. If the bytes can't be written, or
+    the system reports it could not put them on the disk, the temp file is
+    removed and `path` is left as it was (OSError)."""
     import platform_compat
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-        f.flush()
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            _fsync(f.fileno())
+    except OSError:
         try:
-            os.fsync(f.fileno())
+            os.remove(tmp)
         except OSError:
-            pass  # a filesystem without fsync (some network shares)
+            pass
+        raise
     if private and not platform_compat.IS_WINDOWS:
         os.chmod(tmp, 0o600)  # Windows: inherits the locked directory's ACL
     _replace(tmp, path)
@@ -157,11 +196,46 @@ def _save(path, payload, private=False, backup=False):
     if backup:
         try:
             _write_json(path + ".bak", payload, private)
+            _BAK_FAIL.pop("stale", None)
         except OSError as exc:
-            # the save itself worked; a backup left behind is noticed by its
-            # age if it is ever needed (_load_state)
-            print(f"could not refresh the backup of {os.path.basename(path)}: "
-                  f"{str(exc)[:120]}")
+            _backup_write_failed(path, exc)
+
+
+_BAK_FAIL = {}  # "stale": the backup is behind; "day": UTC day the owner was told
+_BAK_FAIL_TEXT = (
+    "The agent saved its memory file (state.json) but could not update the "
+    "backup copy beside it (state.json.bak): the disk may be full, or "
+    "another program may be using the file. The agent keeps running and "
+    "trading as before. If the memory file is damaged while this lasts, the "
+    "agent will load the older backup and pause until you press Resume. "
+    "Free some disk space or check the agent's folder.")
+
+
+def _backup_write_failed(path, exc):
+    """The save itself worked, but the backup beside it is now a save or
+    more behind. Never raises. _load_state tells a backup from the same
+    save by its date (written after the file): make sure this one can't
+    pass for that where file dates are coarse, and tell the owner (once a
+    day)."""
+    try:
+        print(f"could not refresh the backup of {os.path.basename(path)}: "
+              f"{str(exc)[:120]}")
+        _BAK_FAIL["stale"] = True
+        try:
+            at, bak_at = os.stat(path).st_mtime_ns, os.stat(path + ".bak").st_mtime_ns
+            if bak_at >= at:
+                old = at - 10 * 10 ** 9
+                os.utime(path + ".bak", ns=(old, old))
+        except OSError:
+            pass
+        today = datetime.now(timezone.utc).date().isoformat()
+        if _BAK_FAIL.get("day") == today:
+            return
+        _BAK_FAIL["day"] = today
+        notify(_load(CONFIG_PATH, {}) or {},
+               "⚠️ agentic-trader: " + _BAK_FAIL_TEXT, priority="high")
+    except Exception:
+        pass
 
 
 # ── state.json: the file the agent must never silently lose ──────────────────
@@ -170,32 +244,42 @@ def _save(path, payload, private=False, backup=False):
 # unreadable" (a power cut under an older version, a failing disk) is damage,
 # and must never be treated as an empty start.
 
-_STATE_BAK_FRESH_S = 5   # the backup is written right after the file: one
-                         # this close to it (clock granularity) is the same save
-
-
 def _state_hold_path():
     return os.path.join(os.path.dirname(STATE_PATH), "state-hold.json")
 
 
+def _state_stuck_path():
+    return os.path.join(os.path.dirname(STATE_PATH), "state-stuck.json")
+
+
 def _read_state_file(path):
-    """(state dict or None, exists). None with exists=True means the file
-    is there but unusable: bad JSON, bad bytes, not a JSON object, or it
-    can't be opened."""
-    for i in range(3):
+    """(state dict or None, what). what:
+
+      ok        read normally
+      missing   there is no such file
+      damaged   it was read and is not a state (bad JSON, bad bytes, not a
+                JSON object), or the disk itself reported a read error
+      unopened  it is there but could not be opened (in use by another
+                program, another user's file, anything else). What it holds
+                is unknown: it must not be treated as damaged."""
+    import errno
+    err = None
+    for i in range(_REPLACE_TRIES):
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            return (data if isinstance(data, dict) else None), True
+            return (data, "ok") if isinstance(data, dict) else (None, "damaged")
         except FileNotFoundError:
-            return None, False
+            return None, "missing"
         except ValueError:
-            return None, True
-        except OSError:
-            # Windows: briefly locked by another program — look again
-            if i < 2:
-                time.sleep(_REPLACE_WAIT_S * 4)
-    return None, True
+            return None, "damaged"
+        except OSError as exc:
+            # Windows: briefly locked by another program — look again, for
+            # as long as a save waits for the same thing (_replace)
+            err = exc.errno
+            if i < _REPLACE_TRIES - 1:
+                time.sleep(_REPLACE_WAIT_S * (i + 1))
+    return None, ("damaged" if err == errno.EIO else "unopened")
 
 
 def _set_aside(path):
@@ -224,27 +308,42 @@ def _load_state():
 
       ok            read normally
       fresh         no state.json and no backup: a new install
-      restored      state.json was unusable; the backup written with it
-                    (same save) was loaded instead
-      restored_old  loaded from a backup that is clearly older than the file
-                    it replaces, or state.json is gone: it may miss trades
-      lost          unusable and no usable backup: an EMPTY state
+      restored      state.json was damaged; the backup written right after
+                    it (same save) was loaded instead
+      restored_old  loaded from a backup written BEFORE the file it
+                    replaces, or state.json is gone: it may miss trades
+      lost          damaged and no usable backup: an EMPTY state
+      unopened      state.json (or, when it is needed, the backup) is there
+                    but could not be opened: info["file"]. The state returned
+                    is EMPTY and must not be used or saved — the caller must
+                    not start
 
     Nothing is written here. The caller (cmd_run) sets the damaged file
-    aside, alerts the owner and, for restored_old / lost, starts paused."""
+    aside, alerts the owner and, for restored_old / lost, starts paused.
+
+    Each save writes state.json first and the backup right after it, so a
+    backup of the same save is never dated before the file. A backup dated
+    even slightly before it is from an earlier save (saves come in bursts,
+    milliseconds apart) and may miss the agent's last action."""
     fresh = {"seen": [], "positions": {}}
     bak = STATE_PATH + ".bak"
-    state, exists = _read_state_file(STATE_PATH)
+    state, what = _read_state_file(STATE_PATH)
     if state is not None:
         return state, {"how": "ok"}
-    old, bak_exists = _read_state_file(bak)
-    if not exists and not bak_exists:
+    if what == "unopened":
+        return fresh, {"how": "unopened", "file": os.path.basename(STATE_PATH)}
+    old, bak_what = _read_state_file(bak)
+    if what == "missing" and bak_what == "missing":
         return fresh, {"how": "fresh"}
+    if bak_what == "unopened":
+        return fresh, {"how": "unopened", "file": os.path.basename(bak)}
     if old is None:
         return fresh, {"how": "lost"}
     try:
-        saved_at = os.path.getmtime(bak)
-        same_save = exists and saved_at >= os.path.getmtime(STATE_PATH) - _STATE_BAK_FRESH_S
+        st = os.stat(bak)
+        saved_at = st.st_mtime
+        same_save = (what != "missing"
+                     and st.st_mtime_ns >= os.stat(STATE_PATH).st_mtime_ns)
     except OSError:
         saved_at, same_save = None, False
     return old, {"how": "restored" if same_save else "restored_old",
@@ -305,7 +404,9 @@ def _state_hold_text(hold, cfg=None):
                 f"close what is missing yourself. {paused}."
                 + (" Your signal source does not date its signals, so after "
                    "Resume the agent will act again on any signal it handled "
-                   "after that backup: remove those first." if undated else "")
+                   "after that backup: remove those first." if undated else
+                   " After Resume the agent may pay for today's signals "
+                   "again, if it paid for them after that backup.")
                 + kept)
     return ("PAUSED: the agent's memory file (state.json) was damaged (for "
             "example by a power cut) and there was no backup to restore. The "
@@ -327,11 +428,20 @@ def _state_startup(cfg, state, info):
     True when this run starts paused."""
     import webui
     how = info.get("how")
+    if how == "unopened":
+        # Its contents are unknown (it may be perfectly good): never set it
+        # aside as damaged, never write a backup or an empty state over it.
+        _state_stuck_exit(cfg, info.get("file"))
     if how in ("restored", "restored_old", "lost"):
         kept = _set_aside(STATE_PATH) if os.path.exists(STATE_PATH) else None
-        stuck = kept is None and os.path.exists(STATE_PATH)
+        if how == "lost" and kept is None and os.path.exists(STATE_PATH):
+            # It could be neither moved nor copied, and an empty state must
+            # never be written over the only copy: don't run at all.
+            _state_stuck_exit(cfg, None)
         if how == "lost" and os.path.exists(STATE_PATH + ".bak"):
-            kept = _set_aside(STATE_PATH + ".bak") or kept
+            also = _set_aside(STATE_PATH + ".bak")
+            kept = (f"{kept} (and its damaged backup as {also})"
+                    if kept and also else kept or also)
         hold = None
         if how != "restored":
             prev = _state_hold() or {}  # a restart loop: one alert a day
@@ -344,14 +454,6 @@ def _state_startup(cfg, state, info):
                 _save(_state_hold_path(), hold, private=True)
             except OSError as exc:
                 print(f"could not write {_state_hold_path()}: {str(exc)[:150]}")
-        if how == "lost" and stuck:
-            # It could be neither moved nor copied, and an empty state must
-            # never be written over the only copy: don't run at all.
-            _announce_state_hold(cfg, hold, webui)
-            print("Not starting: state.json is damaged and could not be moved "
-                  "aside (is another program using it, or is the disk full?). "
-                  "Nothing was changed; the agent tries again at its next start.")
-            sys.exit(1)
         try:
             _save(STATE_PATH, state, private=True, backup=True)
         except OSError as exc:
@@ -359,20 +461,68 @@ def _state_startup(cfg, state, info):
         if how == "restored":
             when = _et_stamp(_iso_at(info["backup_at"])) or "the same moment"
             msg = ("the agent's memory file (state.json) was damaged (for "
-                   "example by a power cut) and was restored from its backup "
-                   f"copy, saved {when} with the same contents. The agent keeps "
-                   "running as before. To be safe, compare the dashboard's open "
-                   "positions with your broker account."
+                   "example by a power cut) and was restored from the backup "
+                   f"copy the agent wrote right after it ({when}). The agent "
+                   "keeps running as before. The backup should hold the same "
+                   "information, but the agent cannot check it against the "
+                   "damaged file: compare the dashboard's open positions with "
+                   "your broker account and close anything missing from the "
+                   "list yourself, because the agent will not sell a position "
+                   "that is not in its list."
                    + (f" The damaged file was kept as {kept}." if kept else ""))
             print(msg)
             notify(cfg, "⚠️ agentic-trader: " + msg)
         elif _state_hold() is None:
             # no record on disk: this run still starts paused
             return _announce_state_hold(cfg, hold, webui)
+    try:  # this start got past the file: forget an earlier "did not start"
+        os.remove(_state_stuck_path())
+    except OSError:
+        pass
     hold = _state_hold()
     if hold is None:
         return False
     return _announce_state_hold(cfg, hold, webui)
+
+
+def _state_stuck_text(unopened=None):
+    """Why the agent did not start, in plain words. `unopened`: the file
+    that could not be opened; None: state.json is damaged, has no backup
+    and could not be moved aside."""
+    bak = os.path.basename(STATE_PATH) + ".bak"
+    busy = ("another program may be using it, the file may belong to a "
+            "different user account, or the disk may be failing")
+    if unopened == bak:
+        why = ("its memory file (state.json) is damaged or missing, and it "
+               f"could not open the backup copy ({bak}): {busy}")
+    elif unopened:
+        why = f"it could not open its memory file ({unopened}): {busy}"
+    else:
+        why = ("its memory file (state.json) is damaged, there is no usable "
+               "backup to restore, and the damaged file could not be moved aside "
+               "(another program may be using it, or the disk may be full)")
+    return (f"agentic-trader did NOT start: {why}. Nothing was changed, and "
+            "the agent tries again every time it is started. While it is not "
+            "running it places no orders and does NOT sell your open "
+            "positions for you: check your broker account.")
+
+
+def _state_stuck_exit(cfg, unopened=None):
+    """The agent can't start without putting the owner's only copy of its
+    memory at risk: say so and stop (exit code 1). One alert a day — a
+    supervisor may start it again in a loop. No hold is written: nothing is
+    known to be lost, and the next start may read the file normally."""
+    text = _state_stuck_text(unopened)
+    print("\n" + "!" * 72 + "\n" + text + "\n" + "!" * 72 + "\n")
+    today = datetime.now(timezone.utc).date().isoformat()
+    last = _load(_state_stuck_path())
+    if not isinstance(last, dict) or last.get("notified") != today:
+        try:
+            _save(_state_stuck_path(), {"notified": today}, private=True)
+        except OSError:
+            pass
+        notify(cfg, "⚠️ " + text, priority="high")
+    sys.exit(1)
 
 
 def _announce_state_hold(cfg, hold, webui):
@@ -403,6 +553,8 @@ def _durability_banner():
                 hold, _load(CONFIG_PATH, {}) or {})})
         if _unwritten_rows():
             out.append({"level": "urgent", "text": _LOG_FAIL_TEXT})
+        if _BAK_FAIL.get("stale"):
+            out.append({"level": "warn", "text": _BAK_FAIL_TEXT})
     except Exception:
         pass
     return out

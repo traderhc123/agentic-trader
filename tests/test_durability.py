@@ -21,6 +21,7 @@ def _clean_memory(monkeypatch):
     """Rows a failed log write left in memory must not leak between tests."""
     monkeypatch.setattr(agent, "_UNWRITTEN", [], raising=False)
     monkeypatch.setattr(agent, "_LOG_FAIL", {}, raising=False)
+    monkeypatch.setattr(agent, "_BAK_FAIL", {}, raising=False)
     monkeypatch.setattr(agent, "_REPLACE_WAIT_S", 0, raising=False)
 
 
@@ -36,13 +37,14 @@ _GOOD = {"seen": ["old-1"], "positions": {"SPY|2030-01-18|700.0|C": {
 _TORN = b"\x00" * 64  # what a power cut mid-write leaves behind
 
 
-def _run_one_loop(home, monkeypatch, events=()):
+def _run_one_loop(home, monkeypatch, events=(), sent=None):
     """One pass of `agent.py run` with a stub broker and source. Returns
-    (calls, alerts): what the loop did, and what the owner was told."""
+    (calls, alerts): what the loop did, and what the owner was told (also
+    collected in `sent`, for a run that ends before it returns)."""
     import brokers
     import keep_running
     import webui
-    calls, sent = [], []
+    calls, sent = [], ([] if sent is None else sent)
 
     class Broker:
         @staticmethod
@@ -137,9 +139,9 @@ def test_unreadable_state_with_no_backup_pauses_and_keeps_the_file(home, monkeyp
 def test_unreadable_state_is_restored_from_the_backup(home, monkeypatch):
     import webui
     agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
-    (home / "state.json").write_bytes(_TORN)
+    _tear(home / "state.json")
     calls, sent = _run_one_loop(home, monkeypatch)
-    # same moment's backup: nothing was lost, so the agent carries on
+    # the backup written right after it: same save, so the agent carries on
     assert calls == ["poll"] and webui.CONTROLS["paused"] is False
     state = _read(home / "state.json")
     assert state["positions"] == _GOOD["positions"]
@@ -207,6 +209,7 @@ def test_save_reaches_the_disk_before_it_replaces_the_file(home, monkeypatch):
         return real_replace(src, dst)
     monkeypatch.setattr(os, "fsync", fsync)
     monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(agent, "_IS_MAC", False, raising=False)  # macOS: below
     agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
     assert order.index("fsync") < order.index("replace:state.json")
     assert order.index("replace:state.json") < order.index("replace:state.json.bak")
@@ -433,20 +436,25 @@ def test_log_row_after_a_torn_line_is_not_swallowed(home):
 def test_damaged_state_that_cannot_be_set_aside_is_never_overwritten(home, monkeypatch):
     """If the damaged file can be neither moved nor copied, an empty state
     must not be written over the only copy: the agent does not start."""
+    import webui
     (home / "state.json").write_bytes(_TORN)
+    real_set_aside = agent._set_aside
     monkeypatch.setattr(agent, "_set_aside", lambda path: None)
-    alerts = []
+    sent = []
     for _ in range(2):  # a supervisor restarts it: one alert, not one per try
-        try:
-            _run_one_loop(home, monkeypatch, [make_event()])
-        except SystemExit as exc:
-            assert exc.code == 1
-        else:
-            pytest.fail("the agent started")
-        finally:
-            alerts.append(agent._state_hold().get("notified"))
+        _not_started(home, monkeypatch, sent)
     assert (home / "state.json").read_bytes() == _TORN
-    assert alerts[0] and alerts[0] == alerts[1]
+    assert len(sent) == 1 and "did NOT start" in sent[0]
+    assert "could not be moved aside" in sent[0] and "PAUSED" not in sent[0]
+    # no "memory lost" record yet: nothing has been given up
+    assert agent._state_hold() is None
+    # once the file can be moved, the usual damaged-file start follows, and
+    # its own alert is not swallowed by the one already sent today
+    monkeypatch.setattr(agent, "_set_aside", real_set_aside)
+    calls, sent = _run_one_loop(home, monkeypatch, [make_event()])
+    assert calls == [] and webui.CONTROLS["paused"] is True
+    assert len([m for m in sent if "PAUSED" in m]) == 1
+    assert [p.read_bytes() for p in _damaged(home)] == [_TORN]
 
 
 def test_hold_text_warns_when_the_source_does_not_date_its_signals():
@@ -489,3 +497,314 @@ def test_half_written_log_rows_are_not_counted_twice(home, monkeypatch):
     with open(agent.TRADES_PATH, encoding="utf-8") as f:
         assert [json.loads(x)["action"] for x in f] == ["entry", "exit", "skip_rule"]
     assert agent._est_pnl_today() == (40.0, 0) and agent._entries_today() == 1
+
+
+# ── review fixes ─────────────────────────────────────────────────────────────
+
+def _tear(path):
+    """Damage a file the way a power cut or a bad disk does: its bytes are
+    gone, its date is still the one of its last save."""
+    st = os.stat(path)
+    path.write_bytes(_TORN)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+def _lock(monkeypatch, *names):
+    """These files can be neither opened nor renamed: what a Windows lock
+    (antivirus, a backup tool) or a file owned by another user looks like."""
+    real_open, real_replace = open, os.replace
+
+    def locked_open(path, *a, **k):
+        if os.path.basename(str(path)) in names:
+            raise PermissionError(13, "The process cannot access the file "
+                                      "because it is being used by another process")
+        return real_open(path, *a, **k)
+
+    def locked_replace(src, dst):
+        if os.path.basename(str(src)) in names:
+            raise PermissionError(13, "locked")
+        return real_replace(src, dst)
+    monkeypatch.setattr("builtins.open", locked_open)
+    monkeypatch.setattr(os, "replace", locked_replace)
+    return lambda: (monkeypatch.setattr("builtins.open", real_open),
+                    monkeypatch.setattr(os, "replace", real_replace))
+
+
+def _not_started(home, monkeypatch, sent):
+    try:
+        _run_one_loop(home, monkeypatch, [make_event()], sent=sent)
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:
+        pytest.fail("the agent started")
+
+
+def test_a_state_file_that_cannot_be_opened_is_not_called_lost(home, monkeypatch):
+    """REVIEW: a good state.json that was only locked for a moment (and had
+    no backup yet) left a "memory lost" hold behind: the next start loaded
+    the file normally, yet started paused and told the owner the agent no
+    longer knew its positions."""
+    import webui
+    agent._save(agent.STATE_PATH, _GOOD, private=True)  # no backup yet
+    before = (home / "state.json").read_bytes()
+    unlock = _lock(monkeypatch, "state.json")
+    sent = []
+    for _ in range(2):  # a supervisor restarts it: one alert, not one per try
+        _not_started(home, monkeypatch, sent)
+    unlock()
+    # nothing was changed, nothing is claimed lost, the owner is told why
+    assert (home / "state.json").read_bytes() == before
+    assert not _damaged(home) and agent._state_hold() is None
+    assert len(sent) == 1 and "did NOT start" in sent[0]
+    assert "could not open" in sent[0] and "Nothing was changed" in sent[0]
+    for wrong in ("PAUSED", "empty memory", "is damaged", "no backup"):
+        assert wrong not in sent[0]
+    assert agent._durability_banner() == []
+
+    # the lock is gone: the agent starts normally, with its position
+    sent = []
+    calls, _ = _run_one_loop(home, monkeypatch, sent=sent)
+    assert calls == ["poll"] and webui.CONTROLS["paused"] is False
+    assert not [m for m in sent if "PAUSED" in m or "did NOT start" in m]
+    assert _read(home / "state.json")["positions"] == _GOOD["positions"]
+    assert agent._apply_command("resume") == (True, "Resumed.")
+
+
+def test_a_locked_state_file_is_never_replaced_by_its_backup(home, monkeypatch):
+    """What a file holds is unknown while it can't be opened: it may be newer
+    than the backup, so the backup must not be written over it."""
+    agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
+    newer = dict(_GOOD, seen=["old-1", "new-2"])
+    agent._save(agent.STATE_PATH, newer, private=True)
+    unlock = _lock(monkeypatch, "state.json")
+    assert agent._load_state()[1]["how"] == "unopened"
+    _not_started(home, monkeypatch, [])
+    unlock()
+    assert _read(home / "state.json") == newer and not _damaged(home)
+
+
+def test_a_locked_backup_is_not_given_up_for_lost(home, monkeypatch):
+    agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
+    _tear(home / "state.json")
+    unlock = _lock(monkeypatch, "state.json.bak")
+    sent = []
+    _not_started(home, monkeypatch, sent)
+    unlock()
+    assert (home / "state.json").read_bytes() == _TORN
+    assert agent._state_hold() is None and not _damaged(home)
+    assert len(sent) == 1 and "state.json.bak" in sent[0]
+    # readable again: restored from it, nothing lost
+    calls, _ = _run_one_loop(home, monkeypatch)
+    assert calls == ["poll"]
+    assert _read(home / "state.json")["positions"] == _GOOD["positions"]
+
+
+def test_a_backup_one_save_behind_is_not_the_same_save(home, monkeypatch):
+    """REVIEW: saves come milliseconds apart, so "the backup is at most 5 s
+    older" passed off a backup that missed the last save as the same save:
+    the agent carried on, unpaused, without the position that save added."""
+    import webui
+    told = []
+    monkeypatch.setattr(agent, "notify", lambda cfg, msg, **k: told.append(msg))
+    agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
+    real_replace = os.replace
+
+    def replace(src, dst):
+        if str(dst).endswith(".bak"):
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+    monkeypatch.setattr(os, "replace", replace)
+    newer = json.loads(json.dumps(_GOOD))
+    newer["positions"]["QQQ|2030-01-18|500.0|C"] = {"option_id": "o2", "qty": 1}
+    agent._save(agent.STATE_PATH, newer, private=True, backup=True)
+    agent._save(agent.STATE_PATH, newer, private=True, backup=True)
+    monkeypatch.setattr(os, "replace", real_replace)
+    # the owner is told the backup is falling behind: once, not per save
+    assert len(told) == 1 and "state.json.bak" in told[0]
+    assert "keeps running" in told[0]
+    assert [b["level"] for b in agent._durability_banner()] == ["warn"]
+
+    _tear(home / "state.json")
+    assert agent._load_state()[1]["how"] == "restored_old"
+    calls, sent = _run_one_loop(home, monkeypatch, [make_event()])
+    assert calls == [] and webui.CONTROLS["paused"] is True
+    alert = next(m for m in sent if "PAUSED" in m)
+    assert "older backup" in alert and "will NOT sell" in alert
+    # the startup save refreshed the backup: the warning is gone
+    assert [b["level"] for b in agent._durability_banner()] == ["urgent"]
+
+
+def test_restored_alert_does_not_claim_the_backup_is_identical(home, monkeypatch):
+    agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
+    _tear(home / "state.json")
+    _calls, sent = _run_one_loop(home, monkeypatch)
+    told = next(m for m in sent if "restored" in m)
+    assert "same contents" not in told
+    assert "cannot check" in told and "broker account" in told
+    assert "will not sell" in told
+
+
+def test_a_backup_written_before_the_file_is_an_older_backup(home):
+    agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
+    bak = agent.STATE_PATH + ".bak"
+    st = os.stat(bak)
+    os.utime(bak, ns=(st.st_atime_ns, st.st_mtime_ns - 2_000_000_000))  # 2 s
+    _tear(home / "state.json")
+    assert agent._load_state()[1]["how"] == "restored_old"
+
+
+def test_a_save_the_disk_refused_keeps_the_old_file_and_its_backup(home, monkeypatch):
+    """REVIEW: every fsync error was ignored, so when the system said it
+    could not put the bytes on the disk (failing disk, quota) the save still
+    replaced state.json AND its only backup with them."""
+    import errno
+    agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
+
+    def fsync(fd):
+        raise OSError(errno.EIO, "Input/output error")
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(agent, "_IS_MAC", False, raising=False)
+    with pytest.raises(OSError):
+        agent._save(agent.STATE_PATH, {"seen": [], "positions": {}},
+                    private=True, backup=True)
+    assert _read(agent.STATE_PATH) == _GOOD == _read(agent.STATE_PATH + ".bak")
+    assert not os.path.exists(agent.STATE_PATH + ".tmp")
+    assert not os.path.exists(agent.STATE_PATH + ".bak.tmp")
+
+
+def test_a_filesystem_without_fsync_can_still_save(home, monkeypatch):
+    import errno
+
+    def fsync(fd):
+        raise OSError(errno.EINVAL, "Invalid argument")
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(agent, "_IS_MAC", False, raising=False)
+    agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
+    assert _read(agent.STATE_PATH) == _GOOD == _read(agent.STATE_PATH + ".bak")
+
+
+def test_macos_flushes_the_drive_cache(tmp_path, monkeypatch):
+    """On macOS fsync alone leaves the bytes in the drive's own cache."""
+    import errno
+    import sys
+    import types
+    done = []
+    fake = types.ModuleType("fcntl")
+    fake.F_FULLFSYNC = 51
+    fake.fcntl = lambda fd, op: done.append(("full", op)) or 0
+    monkeypatch.setitem(sys.modules, "fcntl", fake)
+    monkeypatch.setattr(agent, "_IS_MAC", True, raising=False)
+    monkeypatch.setattr(os, "fsync", lambda fd: done.append(("fsync", fd)))
+    with open(tmp_path / "f", "w", encoding="utf-8") as f:
+        agent._fsync(f.fileno())
+        assert done == [("full", 51)]
+
+        def unsupported(fd, op):  # a network share: fall back to fsync
+            raise OSError(errno.ENOTTY, "Inappropriate ioctl for device")
+        fake.fcntl = unsupported
+        del done[:]
+        agent._fsync(f.fileno())
+        assert done == [("fsync", f.fileno())]
+
+        def failing(fd, op):  # a real write error is never papered over
+            raise OSError(errno.EIO, "Input/output error")
+        fake.fcntl = failing
+        del done[:]
+        with pytest.raises(OSError):
+            agent._fsync(f.fileno())
+        assert done == []
+
+
+def test_a_failed_move_file_import_does_not_lift_the_pause(home, monkeypatch):
+    """REVIEW: a failed import from the dashboard set paused = False whatever
+    it was before, lifting the damaged-memory pause (or the owner's own)
+    without anyone pressing Resume."""
+    import base64
+    import time
+    import transfer
+    import webui
+    made = {}
+
+    class NoServer:
+        def __init__(self, addr, handler):
+            made["routes"] = handler.routes_post
+
+        def serve_forever(self):
+            pass
+    monkeypatch.setattr(webui, "_AppServer", NoServer)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(transfer, "decrypt", lambda blob, pw: b"")
+    monkeypatch.setattr(transfer, "existing_setup", lambda: False)
+
+    def broken(blob, pw, replace=False):
+        raise transfer.TransferError("the move file is damaged")
+    monkeypatch.setattr(transfer, "import_bundle", broken)
+    webui.start_app(get_status=lambda: {}, get_trades=lambda *a: [],
+                    apply_command=lambda t: (False, ""), cfg_getter=lambda: {})
+    route = made["routes"]["/api/move/import"]
+    data = {"data": base64.b64encode(b"x").decode("ascii"), "passphrase": "pw"}
+    for was in (True, False):
+        monkeypatch.setitem(webui.CONTROLS, "paused", was)
+        reply = route(None, dict(data))
+        assert reply["ok"] is False and "damaged" in reply["error"]
+        assert webui.CONTROLS["paused"] is was
+
+
+def test_both_damaged_files_are_named_in_the_alert(home, monkeypatch):
+    (home / "state.json").write_bytes(_TORN)
+    (home / "state.json.bak").write_bytes(_TORN)
+    _calls, sent = _run_one_loop(home, monkeypatch)
+    alert = next(m for m in sent if "PAUSED" in m)
+    names = [p.name for p in home.iterdir() if ".damaged-" in p.name]
+    assert len(names) == 2
+    for name in names:
+        assert name in alert
+
+
+def test_old_backup_text_warns_the_feed_may_be_paid_for_again():
+    hold = {"why": "old_backup", "backup_at": "2026-10-30T13:00:00+00:00"}
+    feed = agent._state_hold_text(hold, {"source": "agenthc"})
+    own = agent._state_hold_text(hold, {"source": "manual"})
+    assert "may pay for today's signals again" in feed
+    assert "may pay" not in own and "act again on any signal" in own
+
+
+def test_a_stale_backup_is_dated_before_the_file_it_no_longer_matches(home, monkeypatch):
+    """Where file dates are coarse (2 s on some disks) a backup one save
+    behind can carry the same date as the newer file: a failed backup
+    refresh dates it back, so it can't pass for the same save."""
+    monkeypatch.setattr(agent, "notify", lambda *a, **k: None)
+    agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
+    bak = agent.STATE_PATH + ".bak"
+    later = os.stat(bak).st_mtime_ns + 2_000_000_000
+    os.utime(bak, ns=(later, later))
+    real_replace = os.replace
+
+    def replace(src, dst):
+        if str(dst).endswith(".bak"):
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+    monkeypatch.setattr(os, "replace", replace)
+    agent._save(agent.STATE_PATH, dict(_GOOD, seen=["old-1", "new-2"]),
+                private=True, backup=True)
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert _read(bak) == _GOOD  # still the older save, and still there
+    _tear(home / "state.json")
+    state, info = agent._load_state()
+    assert info["how"] == "restored_old" and state == _GOOD
+
+
+def test_a_disk_read_error_is_damage_and_the_backup_is_used(home, monkeypatch):
+    """A file the disk can no longer read (bad sector, failing card) is
+    damaged, not merely busy: the backup takes over."""
+    import errno
+    agent._save(agent.STATE_PATH, _GOOD, private=True, backup=True)
+    real_open = open
+
+    def bad_sector(path, *a, **k):
+        if os.path.basename(str(path)) == "state.json":
+            raise OSError(errno.EIO, "Input/output error")
+        return real_open(path, *a, **k)
+    monkeypatch.setattr("builtins.open", bad_sector)
+    state, info = agent._load_state()
+    assert info["how"] == "restored" and state == _GOOD
