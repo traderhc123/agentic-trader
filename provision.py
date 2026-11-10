@@ -6,7 +6,15 @@ finished configuration there via cloud-init, and auto-start under systemd.
 The token is used for the creation calls and NOT stored.
 
 What gets copied to the droplet (the user's own files, to the user's own
-server): config.json, acceptance.json, robinhood_oauth.json, policy.md.
+server): config.json, acceptance.json, robinhood_oauth.json, policy.md, and
+the agent's memory — state.json (open positions, signals already handled,
+the paid day-pass) and trades.jsonl (today's rows ARE the daily entry cap and
+loss stop). Without the memory the server would start blind: it could pay for
+the day again and would not know which positions are its own to exit.
+
+Two computers must never run the same setup (every order would be placed
+twice), so once the server is created the dashboard retires THIS computer the
+same way "move to another computer" does (transfer.mark_moved_away).
 
 Secret-exposure note: cloud-init user-data carries these files (base64) and is,
 by default, (a) stored on disk under /var/lib/cloud and (b) served for the life
@@ -22,6 +30,8 @@ rotate the Robinhood session and any API keys it carried.
 """
 
 import base64
+import calendar
+import gzip
 import hashlib
 import json
 import os
@@ -47,6 +57,26 @@ METADATA_IP = "169.254.169.254"
 
 _HOME_FILES = ["config.json", "acceptance.json", "robinhood_oauth.json",
                "policy.md"]
+# The agent's memory. Sent gzip-compressed: DigitalOcean refuses user-data
+# over 64 KiB, and a few months of trade log is bigger than that as-is.
+_STATE_FILE = "state.json"
+_LEDGER_FILE = "trades.jsonl"
+USER_DATA_LIMIT = 60 * 1024   # DigitalOcean's cap is 64 KiB; leave headroom
+# A deploy from a RUNNING agent's dashboard first waits for the heartbeat to
+# finish the cycle it is in (an order being placed, its fill check, the state
+# save), so the copy sent to the server is complete. Longer than this and the
+# deploy is refused — nothing is created, nothing changes here.
+CYCLE_WAIT_S = 90
+# After the server is created, the agent on this computer is on hold at once
+# (no orders) but its process — which also serves the page — keeps running
+# until the page has been given the server's address and login command, plus
+# a moment to load them; or, if DigitalOcean never reports an address, until
+# the cap.
+LOCAL_STOP_AFTER_SHOWN_S = 60
+LOCAL_STOP_CAP_S = 15 * 60
+# Marks "this install's server deploy was already handled or checked", so the
+# one-time warning for deploys made by OLDER versions is not repeated.
+DEPLOY_CHECKED_FILE = "do_deploy_checked"
 _SERVICE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "deploy", "agentic-trader.service")
 
@@ -82,6 +112,71 @@ def _b64_file(path, content, permissions, owner=None):
     if owner:
         f["owner"] = owner
     return f
+
+
+def _gz_file(path, content, permissions):
+    f = _b64_file(path, gzip.compress(content, mtime=0), permissions)
+    f["encoding"] = "gz+b64"   # cloud-init: base64, then gunzip
+    return f
+
+
+def _ledger_lines():
+    """The trade log's rows, oldest first, byte-for-byte."""
+    try:
+        with open(os.path.join(_agent_home(), _LEDGER_FILE), "rb") as f:
+            return f.read().splitlines(keepends=True)
+    except OSError:
+        return []
+
+
+def _is_todays_row(line, today):
+    """Same test agent.py's daily entry cap and loss stop use (UTC day)."""
+    if today.encode() not in line:
+        return False
+    try:
+        t = json.loads(line.decode("utf-8", errors="replace"))
+    except ValueError:
+        return False
+    return isinstance(t, dict) and (str(t.get("ts", "")).startswith(today)
+                                    or str(t.get("closed_at", "")).startswith(today))
+
+
+def deployed_before():
+    """True if this computer ever asked DigitalOcean for a server: the login
+    key is made on the first attempt and never removed."""
+    return os.path.exists(os.path.join(_agent_home(), SSH_KEY_NAME))
+
+
+def mark_deploy_checked():
+    """No warning about an earlier deploy is needed (any more). Never raises."""
+    try:
+        os.makedirs(_agent_home(), exist_ok=True)
+        with open(os.path.join(_agent_home(), DEPLOY_CHECKED_FILE), "w",
+                  encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()) + "\n")
+    except OSError:
+        pass
+
+
+def earlier_deploy_warning():
+    """One-time warning text for an owner who created a server with a version
+    that did NOT retire this computer afterwards (before 2026-11): both
+    copies may be trading the same account. None when there is nothing to
+    say, or it was already said."""
+    if not deployed_before() or os.path.exists(
+            os.path.join(_agent_home(), DEPLOY_CHECKED_FILE)):
+        return None
+    mark_deploy_checked()
+    return (
+        "this computer was once used to create a cloud server for this agent "
+        "(DigitalOcean). Older versions left BOTH copies running, and two "
+        "copies on one broker account place every order twice. Please check "
+        "now: open cloud.digitalocean.com and look under Droplets. If a "
+        "server named agentic-trader is there, keep only one copy — either "
+        "destroy that server, or stop the agent on this computer with: "
+        "python agent.py stop   and then: python agent.py autostart off. "
+        "If there is no such server, nothing is wrong and you can ignore "
+        "this. This message is shown once.")
 
 
 def ensure_ssh_key():
@@ -177,9 +272,15 @@ def pick_region_and_size(token, region):
     return region, SIZE, ""
 
 
-def build_cloud_init(authorized_keys=()):
+def build_cloud_init(authorized_keys=(), notes=None):
     """cloud-init that installs the agent, restores this machine's completed
-    config, and starts the systemd service.
+    config and memory (positions, handled signals, day-pass, trade log), and
+    starts the systemd service.
+
+    If the trade log is too long for DigitalOcean's user-data limit, the
+    OLDEST rows stay behind (they only feed the P&L history pages) and a
+    plain-language line saying so is appended to `notes`. Today's rows always
+    travel; if even those can't fit, raises RuntimeError — nothing is sent.
 
     Commands run as root via runuser, never sudo: with no SSH key DigitalOcean
     sets an expired root password, and sudo then refuses to run at all."""
@@ -191,6 +292,12 @@ def build_cloud_init(authorized_keys=()):
         with open(path, "rb") as f:
             write_files.append(_b64_file(f"/home/trader/.agentic-trader/{name}",
                                          f.read(), "0600"))
+    state_path = os.path.join(_agent_home(), _STATE_FILE)
+    if os.path.exists(state_path):
+        with open(state_path, "rb") as f:
+            write_files.append(_gz_file(
+                f"/home/trader/.agentic-trader/{_STATE_FILE}", f.read(), "0600"))
+    home_files = len(write_files)   # the trade log slots in right after these
     with open(_SERVICE_PATH, "rb") as f:
         write_files.append(_b64_file("/etc/systemd/system/agentic-trader.service",
                                      f.read(), "0644"))
@@ -202,9 +309,15 @@ def build_cloud_init(authorized_keys=()):
     keys = [k for k in authorized_keys if k]
     if keys:
         user["ssh_authorized_keys"] = keys
+    # Download to a file, THEN run it. `curl … | bash` reports bash's status,
+    # so a failed download looked like a successful install (nothing to run =
+    # exit 0) and the retry loop below never retried it.
     install = ("curl -fsSL https://raw.githubusercontent.com/traderhc123/"
-               "agentic-trader/main/install.sh | AGENTIC_TRADER_NO_LAUNCH=1 "
-               "AGENTIC_TRADER_DIR=/home/trader/agentic-trader bash")
+               "agentic-trader/main/install.sh "
+               "-o /home/trader/agentic-trader-install.sh && "
+               "AGENTIC_TRADER_NO_LAUNCH=1 "
+               "AGENTIC_TRADER_DIR=/home/trader/agentic-trader "
+               "bash /home/trader/agentic-trader-install.sh")
     doc = {
         "users": [user],
         # don't force a root password change at first login (it also breaks sudo)
@@ -219,6 +332,7 @@ def build_cloud_init(authorized_keys=()):
             "chown -R trader:trader /home/trader/.agentic-trader",
             "chmod 700 /home/trader/.agentic-trader",
             # retried: a network blip on first boot shouldn't strand the server
+            # (and a failed download must count as a failure — see `install`)
             "for i in 1 2 3; do runuser -u trader -- env HOME=/home/trader "
             f"USER=trader bash -c '{install}' && break; sleep 20; done",
             "systemctl daemon-reload",
@@ -232,11 +346,83 @@ def build_cloud_init(authorized_keys=()):
             "2>/dev/null || true",
         ],
     }
-    return "#cloud-config\n" + json.dumps(doc, indent=1)
+    lines = _ledger_lines()
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    first_today = next((i for i, row in enumerate(lines)
+                        if _is_todays_row(row, today)), len(lines))
+
+    def render(older):
+        """The document with today's rows plus the newest `older` rows."""
+        rows = lines[first_today - older:]
+        doc["write_files"] = list(write_files)
+        if rows:
+            doc["write_files"].insert(home_files, _gz_file(
+                f"/home/trader/.agentic-trader/{_LEDGER_FILE}",
+                b"".join(rows), "0600"))
+        raw = "#cloud-config\n" + json.dumps(doc, indent=1)
+        return raw if len(raw.encode("utf-8")) <= USER_DATA_LIMIT else None
+
+    raw = render(first_today)
+    if raw is not None:
+        return raw
+    best, lo, hi = render(0), 0, first_today
+    if best is None:
+        raise RuntimeError(
+            "this setup's saved state and today's activity log are too large "
+            "to send to a new server, so no server was created and nothing "
+            "changed on this computer. Try again tomorrow before the market "
+            "opens, when today's log is empty.")
+    while hi - lo > 1:   # most older rows that still fit
+        mid = (lo + hi) // 2
+        got = render(mid)
+        if got is None:
+            hi = mid
+        else:
+            best, lo = got, mid
+    if notes is not None:
+        notes.append(
+            "your trade history was too long to send in full, so the server "
+            f"starts with the most recent {len(lines) - first_today + lo} "
+            "entries (all of today's are there). The full history stays on "
+            f"this computer in {os.path.join(_agent_home(), _LEDGER_FILE)}")
+    return best
 
 
 def _not_available(resp):
     return resp.status_code == 422 and "not available" in resp.text.lower()
+
+
+class OutcomeUnknown(RuntimeError):
+    """DigitalOcean did not answer and the account could not be read either:
+    a server may or may not exist. Nothing was changed on this computer."""
+
+
+def _recent_server(token, name):
+    """(known, droplet): a server by this name that DigitalOcean is creating
+    right now or made in the last few minutes. known=False when the account
+    could not be read (so "none found" would be a guess). Never raises."""
+    try:
+        resp = _do("GET", token, "/droplets?tag_name=agentic-trader&per_page=200")
+        if resp.status_code != 200:
+            return False, None
+        droplets = resp.json().get("droplets") or []
+    except Exception:
+        return False, None
+    now, found = time.time(), None
+    for d in droplets:
+        if not isinstance(d, dict) or d.get("name") != name:
+            continue
+        recent = d.get("status") == "new"
+        try:
+            made = calendar.timegm(time.strptime(
+                str(d.get("created_at", ""))[:19], "%Y-%m-%dT%H:%M:%S"))
+            recent = recent or abs(now - made) < 600
+        except ValueError:
+            pass
+        if recent and (found is None or str(d.get("created_at", ""))
+                       > str(found.get("created_at", ""))):
+            found = d
+    return True, found
 
 
 def create_droplet(token, region="nyc3", name="agentic-trader"):
@@ -257,13 +443,23 @@ def create_droplet(token, region="nyc3", name="agentic-trader"):
         kid = _upload_key(token, public_key)
         if kid and kid not in key_ids:
             key_ids.append(kid)
+    handoff_notes = []
     body = {"name": name, "region": region, "size": size, "image": IMAGE,
-            "user_data": build_cloud_init(trader_keys),
+            "user_data": build_cloud_init(trader_keys, notes=handoff_notes),
             "ssh_keys": [k for k in key_ids if k], "tags": ["agentic-trader"],
             "monitoring": True}
     tried = [region]
-    resp = _do("POST", token, "/droplets", json=body)
-    while _not_available(resp):  # catalog was stale: walk the nearby regions
+
+    def ask():
+        # No answer (timeout, dropped connection) is NOT "not created": the
+        # request may have arrived. Handled below — never as a plain failure.
+        try:
+            return _do("POST", token, "/droplets", json=body)
+        except requests.RequestException as exc:
+            return exc
+    resp = ask()
+    while not isinstance(resp, Exception) and _not_available(resp):
+        # catalog was stale: walk the nearby regions
         alt = next((r for r in NEARBY.get(tried[0], []) + REGIONS
                     if r not in tried), None)
         if alt is None:
@@ -271,18 +467,51 @@ def create_droplet(token, region="nyc3", name="agentic-trader"):
         tried.append(alt)
         body["region"] = alt
         note = f"{tried[0]} had no room for this server, so it's in {alt} instead"
-        resp = _do("POST", token, "/droplets", json=body)
-    if resp.status_code == 401:
-        raise RuntimeError("DigitalOcean rejected the token (401) — create a "
-                           "personal access token with write scope at "
-                           "cloud.digitalocean.com/account/api/tokens")
-    if resp.status_code not in (201, 202):
-        raise RuntimeError(f"droplet create failed HTTP {resp.status_code}: "
-                           f"{resp.text[:200]}")
-    droplet = resp.json().get("droplet", {})
-    msg = f"droplet {droplet.get('id')} creating in {body['region']}"
+        resp = ask()
+    if isinstance(resp, Exception):
+        known, droplet = _recent_server(token, name)
+        if droplet is None and known:
+            raise RuntimeError(
+                "DigitalOcean did not answer. Your account was checked and "
+                "no new server is there, so none was created. Nothing was "
+                "changed on this computer. Try again in a minute. (If a "
+                "server named agentic-trader shows up under Droplets at "
+                "cloud.digitalocean.com later anyway, destroy it.)")
+        if droplet is None:
+            raise OutcomeUnknown(
+                "DigitalOcean did not answer, so it is not known whether the "
+                "server was created. Nothing was changed on this computer. "
+                "Before you try again, open cloud.digitalocean.com and look "
+                "under Droplets: if a server named agentic-trader is there, "
+                "destroy it. Left running, it would place every order a "
+                "second time.")
+        if (droplet.get("region") or {}).get("slug"):
+            body["region"] = droplet["region"]["slug"]
+    else:
+        if resp.status_code == 401:
+            raise RuntimeError("DigitalOcean rejected the token (401) — create a "
+                               "personal access token with write scope at "
+                               "cloud.digitalocean.com/account/api/tokens")
+        if resp.status_code not in (201, 202):
+            raise RuntimeError(f"droplet create failed HTTP {resp.status_code}: "
+                               f"{resp.text[:200]}")
+        # From here the server EXISTS: nothing below may raise.
+        try:
+            droplet = resp.json().get("droplet") or {}
+        except (ValueError, AttributeError):
+            droplet = {}
+        if not droplet.get("id"):
+            droplet = _recent_server(token, name)[1] or {}
+    if droplet.get("id"):
+        msg = f"droplet {droplet.get('id')} creating in {body['region']}"
+    else:
+        msg = (f"the server was created in {body['region']}, but "
+               "DigitalOcean's reply could not be read — find its address "
+               "under Droplets at cloud.digitalocean.com")
     if note:
         msg += f" ({note})"
+    for extra in handoff_notes:
+        msg += f" — {extra}"
     if not public_key:
         msg += (" — no ssh-keygen on this computer, so no login key was made: "
                 "add your own SSH key in DigitalOcean to reach the dashboard")

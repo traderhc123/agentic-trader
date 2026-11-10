@@ -138,3 +138,17 @@ def test_download_route_returns_a_file():
     import webui
     r = webui.RawResponse(b"abc", headers={"Content-Disposition": "attachment"})
     assert r.body == b"abc" and r.ctype == "application/octet-stream"
+
+
+def test_marker_is_written_even_if_the_login_entry_cannot_be_removed(
+        home, monkeypatch):
+    """The marker is what keeps this computer from trading again; a locked
+    start-at-login file must not stop it being written."""
+    import keep_running
+
+    def locked():
+        raise PermissionError(13, "Access is denied")
+    monkeypatch.setattr(keep_running, "disable_autostart", locked)
+    note = transfer.mark_moved_away()
+    assert transfer.moved_away()
+    assert "could not be removed" in note and "Access is denied" in note

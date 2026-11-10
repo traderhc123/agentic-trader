@@ -1623,17 +1623,21 @@ async function deploy(){
   const r=await api('/api/deploy',{token:document.getElementById('do-token').value,
     region:document.getElementById('do-region').value});
   if(!r.ok){el.innerHTML='<span class="err">'+r.error+'</span>';return;}
+  const here=r.here?'<br><b>'+esc(r.here)+'</b>':'';
   const poll2=async()=>{
-    const s=await api('/api/deploy/status');
+    let s;
+    try{s=await api('/api/deploy/status');}
+    catch(e){el.innerHTML='Server created. The agent on this computer has stopped, '
+      +'so find the server address under Droplets at cloud.digitalocean.com.'+here;return;}
     if(s.ip){el.innerHTML='<span class="ok">Server created at '+esc(s.ip)
       +' ✓</span><br><span class="muted">It is installing the agent now (about 5 '
       +'minutes); you get the "heartbeat started" notification when it is running. '
       +'No notification after 15 minutes? Log in with the command below and run: '
       +'sudo tail -50 /var/log/cloud-init-output.log. Dashboard from here: '
       +esc(s.ssh||('ssh -L 8721:127.0.0.1:8721 trader@'+s.ip))
-      +' then open http://127.0.0.1:8721/dash</span>';
+      +' then open http://127.0.0.1:8721/dash</span>'+here;
       api('/api/finish',{});}
-    else{el.textContent='server status: '+s.status+' — waiting…';setTimeout(poll2,5000);}
+    else{el.innerHTML='server status: '+esc(s.status)+' — waiting…'+here;setTimeout(poll2,5000);}
   };
   poll2();
 }
@@ -3211,7 +3215,22 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         save()
         return {"ok": True, "describe": llm_client.describe(cfg)}
 
+    deploy_lock = threading.Lock()
+
     def deploy(_h, data):
+        # One at a time. A second click while the first is still talking to
+        # DigitalOcean (nothing is marked as moved yet) would create a second
+        # server, and two servers place every order twice.
+        if not deploy_lock.acquire(blocking=False):
+            return {"ok": False, "error": (
+                "a server is already being created from the first click — "
+                "wait for it to finish. No second server was created.")}
+        try:
+            return deploy_once(data)
+        finally:
+            deploy_lock.release()
+
+    def deploy_once(data):
         import provision
         import llm_policy
         if llm_policy.entries_blocked(cfg):
@@ -3219,22 +3238,130 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         token = str(data.get("token", "")).strip()
         if not token:
             return {"ok": False, "error": "paste a DigitalOcean API token"}
+        import transfer
+        moved = transfer.moved_away()
+        if not moved and pending.get("deploy_unmarked"):
+            moved = {"moved_at": "a moment ago"}  # marker couldn't be saved
+        if moved:  # e.g. a second click: two servers would double every order
+            return {"ok": False, "error": (
+                "this setup was already moved to a server or another "
+                f"computer ({moved.get('moved_at', '?')}). A second copy "
+                "would place every order twice, so no new server was "
+                "created. If that one is gone (destroyed or stopped), run: "
+                "python agent.py resume-here — then deploy again.")}
+        import keep_running
+        running_here = get_status is not None
+        if not running_here and keep_running.is_running():
+            # This page can't hold an agent that runs in another process, so
+            # it could trade while its memory is being copied to the server.
+            return {"ok": False, "error": (
+                "the agent is running on this computer right now, in the "
+                "background or another window. Stop it first with: "
+                "python agent.py stop — then press the button again. That "
+                "way nothing can be traded here while its positions are "
+                "being copied to the server. No server was created.")}
+        # The server gets a copy of this computer's memory (positions, signals
+        # already handled, today's counters). Put the heartbeat on hold —
+        # "resume" can't lift this — and wait until the cycle it is in right
+        # now (maybe an order being placed) has finished and saved, so
+        # nothing is traded here that the server wouldn't know about.
+        was_paused = CONTROLS.get("paused", False)
+        transfer.HANDOFF["hold"] = True  # this is what stops the heartbeat
+        CONTROLS["paused"] = True  # what the dashboard shows
+
+        def carry_on_here():
+            transfer.HANDOFF["hold"] = False
+            CONTROLS["paused"] = was_paused
+        if not transfer.CYCLE_IDLE.wait(provision.CYCLE_WAIT_S):
+            carry_on_here()
+            return {"ok": False, "error": (
+                "the agent is in the middle of handling a trade signal, so "
+                "its positions can't be copied safely right now. No server "
+                "was created and nothing changed. Wait a minute, then press "
+                "the button again.")}
+        first_try = not provision.deployed_before()
         try:
             droplet_id, msg = provision.create_droplet(
                 token, str(data.get("region", "nyc3")))
-        except RuntimeError as exc:
-            return {"ok": False, "error": str(exc)[:250]}
+        except Exception as exc:
+            carry_on_here()  # nothing was created (or: not known)
+            if first_try and not isinstance(exc, provision.OutcomeUnknown):
+                provision.mark_deploy_checked()  # no earlier server to warn of
+            if not isinstance(exc, RuntimeError):
+                raise
+            return {"ok": False, "error": str(exc)[:500]}
+        # ── The server now runs this setup. From here on NOTHING may leave
+        # this computer trading as well (two copies on one broker account
+        # place every order twice), whatever else goes wrong. ──
         pending["deploy"] = (token, droplet_id)
-        return {"ok": True, "note": msg}
+        pending.pop("deploy_shown", None)
+        provision.mark_deploy_checked()
+        # Retire THIS computer exactly like "move to another computer" does.
+        try:
+            retired = transfer.mark_moved_away()
+        except Exception as exc:
+            retired = (
+                "IMPORTANT: this computer could not save its \"moved\" note "
+                f"({str(exc)[:120]}), so do NOT start the agent on this "
+                "computer again while the server exists, and turn off "
+                "start-at-login with: python agent.py autostart off")
+            pending["deploy_unmarked"] = True  # still refuse a second server
+            try:
+                keep_running.disable_autostart()
+            except Exception:
+                pass
+        if running_here:
+            # It stays on hold (no orders) and stops by itself — not at once,
+            # because this same process serves the page that is about to
+            # show the owner the server's address and login command.
+            def _stop_here():
+                import time as _time
+                end = _time.time() + provision.LOCAL_STOP_CAP_S
+                while _time.time() < end and not CONTROLS["stop"]:
+                    shown = pending.get("deploy_shown")
+                    if (shown and _time.time() - shown
+                            >= provision.LOCAL_STOP_AFTER_SHOWN_S):
+                        break
+                    _time.sleep(0.2)
+                CONTROLS["stop"] = True
+            threading.Thread(target=_stop_here, daemon=True).start()
+            retired += ("; the agent here is paused now (it places no more "
+                        "orders, and \"resume\" is switched off) and stops "
+                        "by itself about a minute after this page shows the "
+                        "server's address ("
+                        f"{max(1, round(provision.LOCAL_STOP_CAP_S / 60))} "
+                        "minutes from now at the latest) — this dashboard "
+                        "stops answering then")
+        else:
+            carry_on_here()  # nothing runs in this process
+        here = (f"This computer is now retired so the two can never both "
+                f"trade: {retired}. Until the server sends its \"heartbeat "
+                "started\" notification (about 5 minutes), nothing is "
+                "watching your open positions. To run the agent on this "
+                "computer again instead: destroy the server in DigitalOcean "
+                "first, then run: python agent.py resume-here")
+        note = f"{msg}. {here}"
+        try:
+            print(note)
+            A.notify(cfg, "agentic-trader: " + note)
+        except Exception:
+            pass
+        return {"ok": True, "note": note, "retired": True, "here": here}
 
     def deploy_status(_h):
         import provision
         if not pending.get("deploy"):
             return {"status": "no deploy in progress", "ip": ""}
         token, droplet_id = pending["deploy"]
+        if not droplet_id:  # created, but DigitalOcean's reply was unreadable
+            return {"status": "created — find its address under Droplets at "
+                              "cloud.digitalocean.com", "ip": ""}
         st = provision.droplet_status(token, droplet_id)
         if st.get("ip"):
             st["ssh"] = provision.ssh_command(st["ip"])
+            # the agent on this computer may stop once the page has this
+            import time as _time
+            pending.setdefault("deploy_shown", _time.time())
         return st
 
     def brokers_list(_h):
@@ -3894,6 +4021,49 @@ def _snapshot_mode():
             or shutil.which("git") is None)
 
 
+def _install_write_problem():
+    """None if the updater can change files in the install folder, else why
+    not, in the owner's words. Asked BEFORE anything is downloaded: under the
+    systemd unit shipped before 2026-11 (ProtectSystem=strict with only the
+    state folder writable) git and pip hit a read-only filesystem, so every
+    server stayed on its deploy-day code with only a raw git error to show."""
+    import errno
+    import os
+    import sys
+    import tempfile
+    repo = _repo_dir()
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".update-write-test-", dir=repo)
+        os.close(fd)
+        os.unlink(probe)
+        return None
+    except OSError as exc:
+        why = exc
+    if os.getenv("INVOCATION_ID") and why.errno == errno.EROFS:
+        paths = [os.path.expanduser(os.getenv("AGENT_HOME", "~/.agentic-trader")),
+                 repo]
+        venv = os.path.abspath(sys.prefix)
+        if (sys.prefix != sys.base_prefix
+                and not venv.startswith(os.path.join(repo, ""))):
+            paths.append(venv)  # pip installs there
+        return (
+            "Can't update: the background service on this server is not "
+            "allowed to change the agent's own files (its service file is "
+            "from an older version). Nothing was changed. To fix it once, "
+            "log in to the server, run this one line, then press Update "
+            "again:\n"
+            f"  sudo sed -i 's|^ReadWritePaths=.*|ReadWritePaths="
+            f"{' '.join(paths)}|' /etc/systemd/system/agentic-trader.service"
+            " && sudo systemctl daemon-reload"
+            " && sudo systemctl restart agentic-trader\n"
+            "It restarts the agent; your settings, positions and trade "
+            "history are kept.")
+    return (f"Can't update: the agent can't write to its own folder ({repo}): "
+            f"{why.strerror or why}. Nothing was changed. Run the agent as "
+            "the user who owns that folder (in Docker, rebuild the image "
+            "instead of using this button).")
+
+
 def _github_unreachable(raw):
     """Error text for a failed update download: the diagnosed cause + fix
     when it looks like a network problem, else the raw error."""
@@ -3962,6 +4132,9 @@ def check_code_updates():
     """Fetch origin and report how far behind HEAD is. Never raises.
     Returns the exact commit (`target`) the user is shown, so the pull can
     install THAT commit and nothing pushed after they looked."""
+    problem = _install_write_problem()
+    if problem:
+        return {"ok": False, "error": problem}
     if _snapshot_mode():
         import snapshot_update
         try:
@@ -4001,6 +4174,9 @@ def pull_code_updates(expect=None):
     merged over silently — a diverged tree is reported, not resolved.
     `expect` (the `target` from check_code_updates) pins the exact commit the
     user reviewed: if the remote moved since, nothing is installed."""
+    problem = _install_write_problem()
+    if problem:
+        return False, problem
     if _snapshot_mode():
         import snapshot_update
         try:

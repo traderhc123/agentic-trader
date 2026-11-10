@@ -148,6 +148,41 @@ the dashboard. No "heartbeat started" notification after 15 minutes? Log in
 with that command and run `sudo tail -50 /var/log/cloud-init-output.log`.
 DigitalOcean's browser **Web Console** also works.
 
+The server takes over the whole setup: your settings, broker login, open
+positions, the signals already handled, today's entry and loss counters and
+any paid day-pass go with it (a very long trade history is shortened to the
+most recent entries; the full file stays on this computer). **This computer
+is retired at the same moment** — start-at-login is turned off, the agent
+here places no more orders ("resume" is switched off) and it will not start
+again — because two copies on one broker account would place every order
+twice. If you deploy from the running agent's dashboard, that dashboard keeps
+answering until about a minute after it has shown you the server's address
+(15 minutes at the latest), then stops. If the agent is running in the
+background while you use the setup page, the page asks you to stop it first
+(`python agent.py stop`). If the agent is in the middle of a trade when you
+press the button, the page waits for it to finish, so the server knows about
+that trade; if it has not finished after a minute and a half, no server is
+created and you are asked to try again. For the few minutes until the
+server's "heartbeat started" notification, nothing is watching your open
+positions. To run it on this computer again instead: destroy the server in
+DigitalOcean first, then run `python agent.py resume-here`.
+
+**Update button on a server made before November 2026:** on these servers
+the button fails with an error that mentions `Read-only file system`, because
+the background service was not allowed to change the agent's own files. Fix
+it once: log in to the server (the `ssh` command above, or DigitalOcean's
+Web Console) and paste this one line:
+
+```bash
+sudo sed -i 's|^ReadWritePaths=.*|ReadWritePaths=/home/trader/.agentic-trader /home/trader/agentic-trader|' /etc/systemd/system/agentic-trader.service && sudo systemctl daemon-reload && sudo systemctl restart agentic-trader
+```
+
+It restarts the agent; your settings, positions and trade history are kept.
+Then press Update again. (This line is for a server the wizard created. If
+you set up the service by hand with other folders, put your state folder and
+your install folder after `ReadWritePaths=` instead.) Once a server has
+updated, the button itself shows this line if it is ever needed again.
+
 ### Option C — Docker (if you already use Docker)
 
 ```bash

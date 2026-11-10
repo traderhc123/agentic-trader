@@ -54,8 +54,11 @@ def test_create_wallet_no_adminkey_raises():
             lw.create_wallet("https://demo.lnbits.com")
 
 
-def test_qr_matrix_shape_and_failsoft():
+def test_qr_matrix_shape_and_failsoft(monkeypatch):
     import webui
+    # The missing-qrcode path below would otherwise run a REAL
+    # `pip install -r requirements.txt` into the interpreter running the tests.
+    monkeypatch.setattr(webui, "_install_requirements", lambda: "")
     m = webui._qr_matrix("LNBC500N1TESTINVOICE")
     if m is not None:  # qrcode installed
         assert len(m) >= 21 and len(m) == len(m[0])
