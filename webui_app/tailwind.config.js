@@ -1,7 +1,9 @@
 /** @type {import('tailwindcss').Config} */
 const v = (n) => `rgb(var(--${n}) / <alpha-value>)`;
 export default {
-  content: ["./index.html", "./src/**/*.{ts,tsx}"],
+  // src/v2 is the /v2 dashboard: plain CSS, not Tailwind (and it must not
+  // add classes to the classic stylesheet)
+  content: ["./index.html", "./src/**/*.{ts,tsx}", "!./src/v2/**"],
   theme: {
     extend: {
       colors: {
