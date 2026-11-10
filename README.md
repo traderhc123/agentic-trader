@@ -225,8 +225,18 @@ whatever `max_autopay_sats` is set to.
   open a new position in a contract that expires that day. Early-close days
   (1:00 PM: the day after Thanksgiving, and Dec 24 / Jul 3 when they fall
   Monday–Thursday) move both times 3 hours earlier, never before 09:30; add
-  any other with `"early_close_days": ["YYYY-MM-DD"]`. Not while paused, and
-  never a real position while in dry-run (the alert still fires).
+  any other with `"early_close_days": ["YYYY-MM-DD"]`. The guard keeps
+  running while the agent is paused, and in dry-run it still sells positions
+  the agent bought with real orders (dry-run positions stay on paper).
+- **Pause and dry-run, exactly**: **Pause** stops *new entries* only — exit
+  signals, the expiry guard and the broker checks keep running for positions
+  you already have, and the agent stays paused after a restart until you
+  press Resume. (Paused with nothing open on the pay-per-day AgentHC feed,
+  it stops reading the feed, so a pause doesn't use up a signal day.)
+  **Dry-run** stops *new real trades* only — a position the agent already
+  bought with a real order is still sold for real when its exit signal
+  arrives; the dashboard tells you how many such positions are open before
+  you switch.
 - **Exit remainders** (any day): when an exit sells only part of a position
   (a partial fill, or an order that died or was cancelled with contracts
   left), the agent re-sells the rest on the next loop — a marketable limit,

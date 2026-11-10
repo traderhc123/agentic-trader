@@ -261,7 +261,25 @@ def test_dry_rows_are_simulated_and_never_alerted(quiet):
     assert not [m for m, _ in quiet if "sell it now" in m]
 
 
-def test_real_row_in_dry_run_mode_is_not_dropped_unsold(quiet):
+def test_real_row_in_dry_run_mode_is_still_sold_for_real(quiet):
+    """Dry-run stops new real trades; a position the agent already bought
+    with a real order is still sold by the guard, as a real exit."""
+    state = _state(KEY)
+    b = GuardBroker()
+    _tick(state, b, et(15, 50), cfg={"dry_run": True})
+    assert [e["event"] for e in b.calls] == ["EXITED"]
+    assert KEY not in state["positions"]
+    rows = [r for r in _log() if r.get("action") == "exit"]
+    assert rows and rows[0]["dry"] is False and rows[0]["cause"] == "expiry_guard"
+    assert not [m for m, _ in quiet if "sell it now" in m]
+
+
+def test_real_row_in_dry_run_mode_is_not_dropped_unsold_when_dry_run_sells_nothing(
+        quiet, monkeypatch):
+    """The operator's decision flipped (dry-run places no orders at all):
+    the real row is kept and the owner is told — never popped unsold."""
+    monkeypatch.setattr(agent, "_dry_run_keeps_selling_real_positions",
+                        lambda cfg: False)
     state = _state(KEY)
     b = GuardBroker()
     _tick(state, b, et(15, 50), cfg={"dry_run": True})
@@ -777,13 +795,18 @@ def test_startup_notice_silent_when_both_are_off():
     assert _wake(state, None, et(10, 0), cfg=cfg) == []
 
 
-def test_banner_says_who_is_not_selling():
+def test_banner_says_who_is_not_selling(monkeypatch):
     state = _state(KEY)
     paused = agent.expiry_banner({}, state, et(15, 46), paused=True)[0]
     assert paused["level"] == "urgent" and "paused" in paused["text"]
     assert "guard is selling" not in paused["text"]
+    # dry-run still sells the agent's real positions, so the guard is at work
     dry = agent.expiry_banner({"dry_run": True}, state, et(15, 46))[0]
-    assert dry["level"] == "urgent" and "dry-run" in dry["text"]
+    assert dry["level"] == "warn" and "guard is selling" in dry["text"]
+    with monkeypatch.context() as m:  # ...unless that decision is flipped
+        m.setattr(agent, "_dry_run_keeps_selling_real_positions", lambda cfg: False)
+        dry = agent.expiry_banner({"dry_run": True}, state, et(15, 46))[0]
+        assert dry["level"] == "urgent" and "dry-run" in dry["text"]
     other = agent.expiry_banner({}, _state(KEY, acct="alpaca:live"), et(15, 46),
                                 acct="robinhood:abc")[0]
     assert other["level"] == "urgent" and "different broker account" in other["text"]

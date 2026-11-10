@@ -34,6 +34,7 @@ const SKIPS: Record<string, string> = {
   skip_daily_cap: "daily entry cap reached",
   skip_position_cap: "max open positions reached",
   skip_daily_loss: "daily loss limit reached",
+  skip_paused: "the agent is paused",
   policy_veto: "your plain-English rules said no",
   skip_ai_needed: "entries skipped — your rules need an AI and none is working",
   skip_rule: "your rules",
@@ -78,6 +79,7 @@ export function Dashboard() {
   const [moveOpen, setMoveOpen] = useState(false);
   const [tipOpen, setTipOpen] = useState(false);
   const [confirmLive, setConfirmLive] = useState(false);
+  const [confirmDry, setConfirmDry] = useState(false);
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
 
   const refresh = async () => {
@@ -208,6 +210,8 @@ export function Dashboard() {
 
   const live = status?.mode === "LIVE";
   const paused = !!status?.paused;
+  // what dry-run does with the real positions that are open now ("" = none open)
+  const dryNote = status?.dry_run_note || "";
   const f = status?.fields || {};
   const rail = conn === "ok" ? (paused ? "paused" : live ? "live" : "dry") : conn === "loading" ? "none" : "off";
 
@@ -218,7 +222,7 @@ export function Dashboard() {
         {conn === "ok" ? (
           <>
             <Pill tone={live ? "live" : "dry"} dot>
-              {live ? "LIVE · real orders" : "Dry-run · no orders"}
+              {live ? "LIVE · real orders" : dryNote ? "Dry-run · no new trades" : "Dry-run · no orders"}
             </Pill>
             {(f["market"] || "").startsWith("open") ? (
               <Pill tone="up" dot className="max-sm:hidden">
@@ -275,7 +279,7 @@ export function Dashboard() {
               {paused ? "Resume" : "Pause"}
             </Button>
             {live ? (
-              <Button onClick={() => send("dry on")}>
+              <Button onClick={() => (dryNote ? setConfirmDry(true) : send("dry on"))}>
                 <ShieldCheck className="h-3.5 w-3.5" />
                 Switch to dry-run
               </Button>
@@ -299,9 +303,19 @@ export function Dashboard() {
         From now on the agent sends <b className="text-fg">real orders with real money</b> to your broker. You can switch
         back to dry-run at any time. Your decision, not advice.
       </ConfirmDialog>
+      <ConfirmDialog
+        open={confirmDry}
+        onOpenChange={setConfirmDry}
+        title="Switch to dry-run?"
+        confirmLabel="Switch to dry-run"
+        tone="primary"
+        onConfirm={() => send("dry on")}
+      >
+        {dryNote}
+      </ConfirmDialog>
 
       <main className="mx-auto max-w-[1440px] px-6 pb-10 pt-5 max-sm:px-4 max-sm:pt-4">
-        <ModeBanner conn={conn} live={live} paused={paused} />
+        <ModeBanner conn={conn} live={live} paused={paused} dryNote={dryNote} />
         {conn === "ok" && <ExpiryBanner items={status?.expiry_warnings || []} />}
         <StatusStrip conn={conn} f={f} />
         {conn === "ok" && <WhyNoTrades warning={status?.cash_warning || ""} problems={status?.problems || []} hints={status?.budget_hints || []} live={live} onCommand={send} />}
@@ -510,7 +524,7 @@ function ExpiryBanner({ items }: { items: ExpiryWarning[] }) {
 }
 
 // ── mode banner ─────────────────────────────────────────────────────────────
-function ModeBanner({ conn, live, paused }: { conn: Conn; live: boolean; paused: boolean }) {
+function ModeBanner({ conn, live, paused, dryNote }: { conn: Conn; live: boolean; paused: boolean; dryNote: string }) {
   if (conn === "loading") return <div className="h-10" />;
   const off = conn !== "ok";
   const tone = off ? "border-down/45 bg-down/[0.07]" : live ? "border-live/50 bg-live/[0.07]" : paused ? "border-warn/45 bg-warn/[0.07]" : "border-accent/40 bg-accent/[0.06]";
@@ -537,19 +551,21 @@ function ModeBanner({ conn, live, paused }: { conn: Conn; live: boolean; paused:
                 </>
               ) : (
                 <>
-                  <b className="text-accent">Dry-run.</b> The agent logs every decision but places no orders.
+                  <b className="text-accent">Dry-run.</b>{" "}
+                  {dryNote || "The agent logs every decision but places no orders."}
                 </>
               )}
               {paused && (
                 <>
                   {" "}
-                  <b className="text-warn">Paused:</b> no new entries until you press Resume.
+                  <b className="text-warn">Paused:</b> no new entries. Exit signals and the expiry guard keep running for
+                  positions you already have. Stays paused, also after a restart, until you press Resume.
                 </>
               )}
             </span>
             <span className="text-muted">
               {live
-                ? "Switch to dry-run any time to stop sending orders. Your decision, not advice."
+                ? "Switch to dry-run any time to stop new trades. Positions already open are still sold on their exit signal. Your decision, not advice."
                 : "Going live sends real orders with real money. Your decision, not advice."}
             </span>
           </>

@@ -217,7 +217,28 @@ def _asset_path(path):
     return full
 
 # Run-loop controls the dashboard can flip; agent.py polls these.
-CONTROLS = {"paused": False, "stop": False}
+# The owner's Pause is NOT here: it is saved in config.json ("paused") so it
+# survives a restart, and it only stops new entries (agent._paused).
+# hold_until: an update or a move is about to restart the agent — until that
+# time the heartbeat polls nothing and places no orders, so an in-flight
+# order can finish saving. It runs out by itself if the restart never comes.
+CONTROLS = {"stop": False, "hold_until": 0.0}
+_HOLD_S = 60
+
+
+def hold_orders(seconds=_HOLD_S, now=None):
+    import time
+    CONTROLS["hold_until"] = (time.time() if now is None else now) + seconds
+
+
+def release_orders():
+    CONTROLS["hold_until"] = 0.0
+
+
+def orders_held(now=None):
+    import time
+    return ((time.time() if now is None else now)
+            < float(CONTROLS.get("hold_until") or 0))
 
 _STYLE = """
 <style>
@@ -1256,8 +1277,13 @@ async function copyText(srcId,msgId){
   try{await navigator.clipboard.writeText(t);msg.textContent='copied ✓';}
   catch(e){msg.textContent='clipboard blocked — select the invoice text above and copy it';}
 }
-let passTimer=null,passHelpTimer=null;
+let passTimer=null,passHelpTimer=null,passBusy=false;
 async function buyPass(days){
+  // one invoice per click: a double-click must not ask for two
+  if(passBusy)return;passBusy=true;
+  try{await buyPassNow(days);}finally{passBusy=false;}
+}
+async function buyPassNow(days){
   document.querySelectorAll('button.pass').forEach(b=>b.classList.toggle('sel',b.dataset.days===String(days)));
   const st=document.getElementById('pass-status');st.textContent='creating invoice…';
   const r=await api('/api/pass/buy',{days:days});
@@ -1343,6 +1369,14 @@ async function boot(){
   if(st.sizing){done('s-sizing');restoredNote('s-sizing',notes.sizing||'Sizing saved');
     restoreSizing(st.sizing_detail);}
   if(st.safety){done('s-safety');restoredNote('s-safety',notes.safety||'Safety saved');}
+  // Safety shows the mode and limits as they are set now, never its own
+  // defaults: re-saving the step must not switch the mode or reset the cap.
+  SF={dry:(typeof st.dry_run==='boolean')?st.dry_run:null,
+      cap:st.max_entries_per_day==null?null:String(st.max_entries_per_day),
+      loss:st.max_daily_loss_usd>0?String(st.max_daily_loss_usd):''};
+  if(SF.dry!==null){document.getElementById('sf-dry').checked=SF.dry;sfDryChanged();}
+  if(SF.cap!==null)document.getElementById('sf-cap').value=SF.cap;
+  if(SF.loss)document.getElementById('sf-maxloss').value=SF.loss;
   cur=Math.min(maxUnlocked,STEPS.length-1);render();booted=true;
   loadBrokers();
 }
@@ -1357,7 +1391,7 @@ async function doConsent(){
   const r=await api('/api/consent',{phrase:ph.value});
   mark(ph,!r.ok);
   document.getElementById('c-msg').innerHTML=r.ok?'<span class="ok">accepted ✓</span>'
-    :'<span class="err">'+r.error+'</span>';
+    :'<span class="err">'+esc(r.error)+'</span>';
   if(!r.ok)ph.focus();
   if(r.ok)done('s-consent');
 }
@@ -1443,18 +1477,39 @@ function showWallet(page,label){
     }
   }).catch(function(){});
 }
-async function makeWallet(){
+const WALLET_REPLACE='Your agent already has a wallet connected. Create a NEW one and switch to it?'+
+  ' The old wallet is not deleted, but the agent stops using it. Sats still in it stay there —'+
+  ' move them out first (open wallet page).';
+let walletBusy=false;
+async function makeWallet(replace){
+  // a wallet is already connected: replacing it takes a clear yes
+  if(walletBusy)return;
+  if(walletMade&&!replace){if(!confirm(WALLET_REPLACE))return;replace=true;}
+  walletBusy=true;
+  const prev=document.getElementById('mw-msg').innerHTML;
   document.getElementById('mw-msg').textContent=' creating…';
-  const r=await api('/api/wallet/create',{});
+  let r;
+  try{r=await api('/api/wallet/create',replace?{replace:true}:{});}
+  catch(e){r={ok:false,error:'could not reach the setup server'};}
+  walletBusy=false;
+  if(!r.ok&&!replace){
+    // refused because a wallet is already connected (this page didn't
+    // know)? Then ask, and only replace it on a yes.
+    let has=!!r.needs_replace;
+    if(!has){try{const s=await api('/api/state');has=!!(s.wallet&&s.wallet.connected);
+      if(has)showWallet(s.wallet.page,'wallet connected ✓');}catch(e){}}
+    if(has){if(r.needs_replace)document.getElementById('mw-msg').innerHTML=prev;
+      if(confirm(WALLET_REPLACE))return makeWallet(true);
+      return;}}
   if(r.ok){showWallet(r.page,'created ✓');
     if(r.warning)document.getElementById('mw-msg').innerHTML+=
       '<div class="err" style="margin-top:.5rem">⚠️ '+esc(r.warning)+'</div>';}
-  else document.getElementById('mw-msg').innerHTML=' <span class="err">'+r.error+'</span>';
+  else document.getElementById('mw-msg').innerHTML=' <span class="err">'+esc(r.error)+'</span>';
 }
 async function fundInvoice(){
   const sats=document.getElementById('fund-sats').value;
   const r=await api('/api/wallet/fund',{sats:sats});
-  if(!r.ok){document.getElementById('mw-msg').innerHTML=' <span class="err">'+r.error+'</span>';return;}
+  if(!r.ok){document.getElementById('mw-msg').innerHTML=' <span class="err">'+esc(r.error)+'</span>';return;}
   const pre=document.getElementById('bolt11');pre.style.display='';pre.textContent=r.bolt11;
   renderQr(r.qr);
   const fn=document.getElementById('fund-note');
@@ -1476,8 +1531,8 @@ async function doSource(){
     lnbits_key:document.getElementById('ln-key').value,
     agenthc_key:document.getElementById('hc-key').value,
     source_url:document.getElementById('src-url-input').value});
-  document.getElementById('src-msg').innerHTML=r.ok?'<span class="ok">'+r.note+'</span>'
-    :'<span class="err">'+r.error+'</span>';
+  document.getElementById('src-msg').innerHTML=r.ok?'<span class="ok">'+esc(r.note)+'</span>'
+    :'<span class="err">'+esc(r.error)+'</span>';
   if(r.ok)done('s-source');
 }
 llmLoadProviders();
@@ -1508,8 +1563,8 @@ async function brkConnect(){
   const vals={};b.fields.forEach(f=>{const el=document.getElementById('bf-'+f.id);
     vals[f.id]=(f.type==='checkbox')?el.checked:el.value;});
   const r=await api('/api/broker/connect',{broker:id,values:vals});
-  document.getElementById('brk-msg').innerHTML=r.ok?' <span class="ok">'+r.note+'</span>'
-    :' <span class="err">'+r.error+'</span>';
+  document.getElementById('brk-msg').innerHTML=r.ok?' <span class="ok">'+esc(r.note)+'</span>'
+    :' <span class="err">'+esc(r.error)+'</span>';
   if(r.ok){document.getElementById('brk-status').innerHTML='<span class="ok">Connected: '+
     esc(b.name||id)+' ✓</span>';done('s-broker');}
 }
@@ -1517,7 +1572,7 @@ async function rhStart(){
   const r=await api('/api/rh/start');
   if(r.url){document.getElementById('rh-msg').textContent='waiting for approval…';
     window.open(r.url,'_blank');poll();}
-  else document.getElementById('rh-msg').innerHTML='<span class="err">'+r.error+'</span>';
+  else document.getElementById('rh-msg').innerHTML='<span class="err">'+esc(r.error)+'</span>';
 }
 async function poll(){
   const st=await api('/api/state');
@@ -1526,7 +1581,7 @@ async function poll(){
     document.getElementById('brk-status').innerHTML='<span class="ok">Connected: Robinhood account ····'+
       esc(st.broker)+' ✓</span>';
     if(st.rh_warning)document.getElementById('rh-accounts').innerHTML=
-      '<p class="err">'+st.rh_warning+'</p>';
+      '<p class="err">'+esc(st.rh_warning)+'</p>';
     done('s-broker');}
   else setTimeout(poll,1500);
 }
@@ -1567,13 +1622,20 @@ async function doSizing(){
   const r=await api('/api/sizing',{main:{mode:sel.value,value:document.getElementById('sz-val').value},
     other:{mode:osel?osel.value:'same',value:document.getElementById('sz-other-val').value}});
   document.getElementById('sz-msg').innerHTML=r.ok?'<span class="ok">saved ✓</span>'
-    :'<span class="err">'+r.error+'</span>';
+    :'<span class="err">'+esc(r.error)+'</span>';
   if(r.ok)done('s-sizing');
 }
+let SF={dry:null,cap:null,loss:''};
 async function doSafety(){
-  const r=await api('/api/safety',{dry:document.getElementById('sf-dry').checked,
-    cap:document.getElementById('sf-cap').value,
-    max_loss:document.getElementById('sf-maxloss').value,
+  const dry=document.getElementById('sf-dry').checked,cap=document.getElementById('sf-cap').value;
+  let loss=document.getElementById('sf-maxloss').value;
+  if(!String(loss).trim()&&SF.loss)loss='0';  // you cleared a limit that was set: off
+  const body={};
+  // mode and cap are sent only when you changed them here (or never set them)
+  if(SF.dry===null||dry!==SF.dry)body.dry=dry;
+  if(SF.cap===null||String(cap)!==SF.cap)body.cap=cap;
+  const r=await api('/api/safety',{...body,seeded:booted,
+    max_loss:loss,
     discord:document.getElementById('nt-discord').value,
     ntfy:document.getElementById('nt-ntfy').value,
     tg_token:document.getElementById('nt-tg-token').value,
@@ -1581,11 +1643,12 @@ async function doSafety(){
     policy:document.getElementById('pol-text').value,
     anthropic_key:document.getElementById('pol-key').value});
   if(r.ok){done('s-safety');
+    SF={dry:dry,cap:String(cap),loss:(Number(loss)>0)?String(loss):''};
     document.getElementById('done-body').innerHTML=
      '<p class="ok">Setup complete — pick where your agent should live.</p>'+
      '<details><summary class="muted">…or start it from a terminal instead</summary>'+
      '<pre>'+esc(r.next)+'</pre></details>';}
-  else document.getElementById('sf-msg').innerHTML='<span class="err">'+r.error+'</span>';
+  else document.getElementById('sf-msg').innerHTML='<span class="err">'+esc(r.error)+'</span>';
 }
 async function startLocal(){
   const el=document.getElementById('start-msg');
@@ -1609,7 +1672,7 @@ async function deploy(){
   el.innerHTML='creating server… (takes 1–3 minutes)';
   const r=await api('/api/deploy',{token:document.getElementById('do-token').value,
     region:document.getElementById('do-region').value});
-  if(!r.ok){el.innerHTML='<span class="err">'+r.error+'</span>';return;}
+  if(!r.ok){el.innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}
   const poll2=async()=>{
     const s=await api('/api/deploy/status');
     if(s.ip){el.innerHTML='<span class="ok">Server created at '+esc(s.ip)
@@ -2020,7 +2083,7 @@ async function helpReport(){
 const SOURCES={agenthc:'AgentHC feed',url:'Your JSON feed',manual:'Manual commands'};
 const SKIPS={skip_stale:'signal was too old',skip_daily_cap:'daily entry cap reached',
   skip_position_cap:'max open positions reached',skip_daily_loss:'daily loss limit reached',
-  policy_veto:'your rules said no'};
+  policy_veto:'your rules said no',skip_paused:'the agent is paused'};
 const ICON=n=>'<svg class="i"><use href="#i-'+n+'"/></svg>';
 function cap1(s){s=String(s||'');return s.charAt(0).toUpperCase()+s.slice(1);}
 function shortDate(d){return d.toLocaleDateString([], {month:'short',day:'numeric'});}
@@ -2083,7 +2146,7 @@ function spark(points){
     '<path d="'+d+'" fill="none" stroke="'+col+'" stroke-width="1.75" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>';
   wrap.style.display='';
 }
-function setMode(kind,live,paused){
+function setMode(kind,live,paused,note){
   // kind: 'ok' | 'off' | 'unreachable'
   // #modebar is a live region polled every 5s: only touch the DOM when the
   // text actually changes, or screen readers re-announce it on every poll.
@@ -2093,9 +2156,11 @@ function setMode(kind,live,paused){
   if(kind==='unreachable'){put('modebar off','<b>Can\\'t reach the agent on this computer</b> — is it still running?');return;}
   put('modebar '+(live?'live':'dry')+(paused?' paused':''),
     (live?'<b>LIVE.</b> Real orders with real money are sent to your broker.':
+    note?'<b>Dry-run.</b> '+esc(note):
     '<b>Dry-run.</b> The agent logs every decision but places no orders.')+
-    (paused?' <b class="pz">Paused</b> — no new entries until you press Resume.':''));
-  const st=live?'Switch to dry-run any time to stop sending orders — your decision, not advice.':
+    (paused?' <b class="pz">Paused</b> — no new entries. Exit signals and the expiry guard keep'+
+      ' running for positions you already have. Stays paused, also after a restart, until you press Resume.':''));
+  const st=live?'Switch to dry-run any time to stop new trades (positions already open are still sold on their exit signal) — your decision, not advice.':
     'Going live sends real orders with real money — your decision, not advice.';
   if(sub.textContent!==st)sub.textContent=st;
 }
@@ -2115,13 +2180,15 @@ async function refresh(){
     if(s.mode==='OFFLINE'){badMode('Agent not running','off');return;}
     const f=s.fields||{};const live=s.mode==='LIVE';
     const bm=$('b-mode');
-    bm.innerHTML=live?'<span class="dot"></span>LIVE · real orders':'<span class="dot"></span>Dry-run · no orders';
+    LAST=s;const note=live?'':(s.dry_run_note||'');
+    bm.innerHTML=live?'<span class="dot"></span>LIVE · real orders':
+      '<span class="dot"></span>Dry-run · '+(note?'no new trades':'no orders');
     bm.className='pill '+(live?'live':'dry');
     const mk=$('b-market'),open=(f['market']||'').startsWith('open');
     mk.innerHTML=open?'<span class="dot"></span>Market open':'Market closed';
     mk.className='pill'+(open?' open':'');mk.style.display='';
     $('b-paused').style.display=s.paused?'':'none';
-    setMode('ok',live,!!s.paused);
+    setMode('ok',live,!!s.paused,note);
     const qp=$('q-pause');
     qp.innerHTML=s.paused?ICON('play')+'Resume':ICON('pause')+'Pause';
     qp.dataset.cmd=s.paused?'resume':'pause';qp.className=s.paused?'btn-primary':'';
@@ -2219,7 +2286,10 @@ function chatAdd(cls,text){
     '</div><div class="body">'+esc(text)+'</div></div>');
   log.scrollTop=log.scrollHeight;
 }
+let LAST=null;  // the latest /api/status
 async function quick(cmd){
+  // Real positions are open: say what dry-run does with them before switching.
+  if(cmd==='dry on'&&LAST&&LAST.dry_run_note&&!confirm('Switch to dry-run? '+LAST.dry_run_note))return;
   // Going LIVE is a real-money action: never on a single (mis-)tap.
   if(cmd==='dry off'&&!confirm('Go LIVE? The agent will send real orders with real money to your broker from now on. Your decision — not advice.'))return;
   chatAdd('me',cmd);
@@ -2771,8 +2841,75 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     pending = {"oauth": None, "broker_last4": "", "rh_warning": "",
                "finished": threading.Event()}
 
+    # config.json is shared with the chat commands and the dashboard buttons,
+    # which write it too (agent._apply_command). `cfg` is only this server's
+    # working copy of it: brought up to date from the file when a request
+    # starts, and save() writes back ONLY the keys this server changed, onto
+    # the file as it is at that moment, under the lock the commands use.
+    # (Saving the whole copy undid the owner's commands: a settings save
+    # after "dry on" put the agent back in LIVE mode.)
+    import copy
+    synced = {"cfg": copy.deepcopy(cfg)}  # config.json as of the last sync
+    flight = {"n": 0}                     # requests being handled right now
+    flight_lock = threading.Lock()
+    _gone = object()
+
+    def _own_changes():
+        """What this server changed in its copy and hasn't saved yet:
+        ({key: value}, [removed keys])."""
+        base = synced["cfg"]
+        changed = {k: v for k, v in list(cfg.items())
+                   if k not in base or base[k] != v}
+        return changed, [k for k in list(base) if k not in cfg]
+
+    def _pull(disk, keep_own=True):
+        """Bring `cfg` up to date with config.json (`disk`), one key at a
+        time so another request never sees it empty. keep_own: leave this
+        server's unsaved changes in place (a request is still working on
+        them); False drops them (leftovers of a request that failed)."""
+        base = synced["cfg"]
+        if keep_own:
+            changed, removed = _own_changes()
+            keys = [k for k in set(base) | set(disk)
+                    if base.get(k, _gone) != disk.get(k, _gone)
+                    and k not in changed and k not in removed]
+        else:
+            keys = [k for k in set(cfg) | set(disk)
+                    if cfg.get(k, _gone) != disk.get(k, _gone)]
+        for k in keys:
+            if k in disk:
+                cfg[k] = copy.deepcopy(disk[k])
+            else:
+                cfg.pop(k, None)
+        synced["cfg"] = copy.deepcopy(disk)
+
     def save():
-        A._save(A.CONFIG_PATH, cfg, private=True)
+        def own_keys_only(disk):
+            changed, removed = _own_changes()
+            for k in removed:
+                disk.pop(k, None)
+            disk.update(copy.deepcopy(changed))
+        with A.CONFIG_LOCK:
+            _pull(A.update_config(own_keys_only))
+
+    def _fresh(fn):
+        """A route that starts from the settings as they are on disk now."""
+        def run(*args):
+            with flight_lock:
+                alone = flight["n"] == 0
+                flight["n"] += 1
+            try:
+                try:
+                    with A.CONFIG_LOCK:
+                        _pull(A._read_config(), keep_own=not alone)
+                except OSError:
+                    pass  # unreadable right now: answer from the copy; a
+                    # save in this request fails rather than guess
+                return fn(*args)
+            finally:
+                with flight_lock:
+                    flight["n"] -= 1
+        return run
 
     class W(_Handler):
         pages = {"/setup": _WIZARD_HTML, "/dash": _DASH_HTML}
@@ -2809,6 +2946,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             # the agent itself is serving this page (vs. the setup wizard)
             "running": get_status is not None,
             "keep_awake": cfg.get("keep_awake", True) is not False,
+            # the mode and limits as they are set now (None = never set), so
+            # the Safety form shows them instead of its own defaults
+            "dry_run": (bool(cfg["dry_run"]) if cfg.get("dry_run") is not None
+                        else None),
+            "max_entries_per_day": cfg.get("max_entries_per_day"),
+            "max_daily_loss_usd": cfg.get("max_daily_loss_usd"),
         }
 
     def consent(_h, data):
@@ -3049,9 +3192,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         import time as _time
         # Stop new event polls so an in-flight order can finish its atomic
         # state save before the exec; all durable state (config, positions,
-        # seen-events, trade log, daily cap) already lives on disk. CONTROLS
-        # resets on restart, so polling resumes automatically.
-        CONTROLS["paused"] = True
+        # seen-events, trade log, daily cap) already lives on disk. The hold
+        # is in memory only, so polling resumes automatically after the
+        # restart (and the owner's own Pause, in config.json, is untouched).
+        hold_orders()
 
         def _restart():
             _time.sleep(3.0)  # response flush + in-flight event grace
@@ -3289,7 +3433,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                     other.get("value"))
         if not ok:
             return {"ok": False, "error": f"shadow book: {err}"}
-        cfg.clear()
+        for k in [k for k in list(cfg) if k not in new]:
+            cfg.pop(k, None)  # (never clear(): another request may be reading)
         cfg.update(new)
         save()
         return {"ok": True}
@@ -3310,10 +3455,29 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                   data.get("anthropic_key", ""))
         if perr:
             return {"ok": False, "error": perr}
-        cfg["dry_run"] = bool(data.get("dry", True))
+        # Mode and cap change only when the form sends them (it sends what
+        # the owner changed). Left out, they stay as they are — saving a
+        # ticker rule must never switch the mode or reset the cap. Never
+        # set before (first setup): dry-run, 5 entries a day.
+        if isinstance(data.get("dry"), bool):
+            cfg["dry_run"] = data["dry"]
+        elif cfg.get("dry_run") is None:
+            cfg["dry_run"] = True
+        raw_cap = str(data.get("cap") or "").strip()
         try:
-            cfg["max_entries_per_day"] = max(1, int(data.get("cap") or 5))
-        except (TypeError, ValueError):
+            cap = max(1, int(float(raw_cap))) if raw_cap else None
+        except (TypeError, ValueError, OverflowError):
+            cap = None  # not a number: keep what is set
+        old_cap = cfg.get("max_entries_per_day")
+        if (cap is not None and data.get("seeded") is not True
+                and isinstance(old_cap, int) and cap > old_cap):
+            # A Safety page still open from before an update sends its own
+            # default (5), not your cap. Only a page that was filled in
+            # from the current settings ("seeded") may RAISE the cap.
+            cap = None
+        if cap is not None:
+            cfg["max_entries_per_day"] = cap
+        elif old_cap is None:
             cfg["max_entries_per_day"] = 5
         raw_loss = str(data.get("max_loss") or "").strip()
         if raw_loss:  # blank keeps any existing limit (re-running the wizard)
@@ -3430,14 +3594,16 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 # in-flight event finish its state save, so nothing in memory
                 # overwrites the imported files. A restart then loads them.
                 import time as _t
-                CONTROLS["paused"] = True
+                # no time limit: once the files are replaced, the state in
+                # memory must never be saved over them (released on failure)
+                hold_orders(float("inf"))
                 _t.sleep(2.0)
             try:
                 info = transfer.import_bundle(blob, pw,
                                               replace=bool(data.get("replace")))
             except Exception:
                 if running_here:
-                    CONTROLS["paused"] = False  # nothing changed: carry on
+                    release_orders()  # nothing changed: carry on
                 raise
         except transfer.TransferError as exc:
             if str(exc) == "NEEDS_REPLACE":
@@ -3446,9 +3612,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"ok": False, "error": str(exc)}
         except Exception as exc:
             return {"ok": False, "error": f"import failed: {str(exc)[:150]}"}
-        # the wizard keeps config in memory: reload it from the imported file
-        cfg.clear()
-        cfg.update(A._load(A.CONFIG_PATH, {}) or {})
+        # the wizard keeps a copy of the config: reload it from the imported file
+        with A.CONFIG_LOCK:
+            _pull(A._read_config(), keep_own=False)
         if running_here:
             import sys as _sys
 
@@ -3573,7 +3739,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/move/download": move_download}
     def ask(_h, data):
         q = str(data.get("question", "")).strip()
-        wiz_state = {k: v for k, v in state(None).items() if k != "disclaimer"}
+        wiz_state = _llm_safe_state(state(None))
         reply = _ask_llm(cfg, q, wiz_state, [], system=(
             "You are the setup assistant embedded in the user's own "
             "agentic-trader install wizard. Help them complete setup: explain "
@@ -3608,6 +3774,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/proposal/apply": proposal_apply,
                      "/api/proposal/reject": proposal_reject,
                      "/api/command": d_command}
+
+    W.routes_get = {p: _fresh(fn) for p, fn in W.routes_get.items()}
+    W.routes_post = {p: _fresh(fn) for p, fn in W.routes_post.items()}
 
     class _Redirect(Exception):
         pass
@@ -3839,9 +4008,36 @@ def pull_code_updates(expect=None):
 
 # ── the dashboard (served BY the running agent) ──────────────────────────────
 
+def _site_only(url):
+    """A link cut down to its site: no login, path or query (where feed
+    tokens and wallet logins live)."""
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(url)
+        return f"{u.scheme}://{u.hostname or ''}/…"
+    except ValueError:
+        return "[link]"
+
+
+def _llm_safe_state(st):
+    """The wizard's state as an AI provider may see it. The page itself
+    needs the wallet link (its usr= part IS the wallet's login) and the
+    feed address; the AI gets "connected: yes/no" and the site name."""
+    import re
+    link = re.compile(r"https?://[^\s\"'<>]+")
+    out = {k: v for k, v in st.items() if k != "disclaimer"}
+    out["wallet"] = {"connected": bool((st.get("wallet") or {}).get("connected"))}
+    out["notes"] = {k: link.sub(lambda m: _site_only(m.group(0)), str(v))
+                    for k, v in (st.get("notes") or {}).items()}
+    return out
+
+
 def _ask_llm(cfg, question, status_fields, trades, system=None):
-    """Free-text Q&A about the agent's own state. Answer-only, never trades."""
+    """Free-text Q&A about the agent's own state. Answer-only, never trades.
+    Everything the agent adds to the question (status, trade log) is
+    scrubbed of keys, tokens, invoices and login links first."""
     import llm_client
+    import support
     if not llm_client.configured(cfg):
         return ("Connect an AI model (Setup → Connect your AI) to enable Q&A — "
                 "Claude, OpenAI, Grok, Gemini, OpenRouter or a local model.")
@@ -3859,9 +4055,10 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "set cap N, stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
-            f"STATUS:\n{json.dumps(status_fields, indent=1)}\n\n"
-            f"RECENT TRADE LOG:\n{json.dumps(trades, indent=1)}\n\n"
-            f"QUESTION: {question}",
+            support.scrub(
+                f"STATUS:\n{json.dumps(status_fields, indent=1)}\n\n"
+                f"RECENT TRADE LOG:\n{json.dumps(trades, indent=1)}\n\n")
+            + f"QUESTION: {question}",
             max_tokens=1024, effort="low")
     except llm_client.LLMError as exc:
         if exc.reason == "refused":

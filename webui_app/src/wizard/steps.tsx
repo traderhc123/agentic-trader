@@ -4,7 +4,7 @@ import { Button } from "../components/ui/button";
 import { Disclosure } from "../components/ui/disclosure";
 import { ChoiceRow, Field, Input, Select, Textarea } from "../components/ui/field";
 import { Msg, err, info, ok, type MsgT } from "../components/ui/tag";
-import { api } from "../lib/api";
+import { api, type WizardState } from "../lib/api";
 import { mdLite } from "../lib/md";
 import { Block, Notice, StepCard, useWiz } from "./Wizard";
 
@@ -611,49 +611,75 @@ export function SizingStep() {
 }
 
 // ── 6. safety ───────────────────────────────────────────────────────────────
+// What the Safety form shows for the settings saved now (first setup:
+// dry-run, 5 entries a day, no rules).
+function safetyShown(st: WizardState | null | undefined) {
+  const r = st?.rules || {};
+  return {
+    dry: typeof st?.dry_run === "boolean" ? st.dry_run : true,
+    cap: st?.max_entries_per_day != null ? String(st.max_entries_per_day) : "5",
+    max_loss: st?.max_daily_loss_usd && st.max_daily_loss_usd > 0 ? String(st.max_daily_loss_usd) : "",
+    rule_tickers: (r.rule_tickers || []).join(", "),
+    rule_skip_tickers: (r.rule_skip_tickers || []).join(", "),
+    rule_sides: r.rule_sides || "both",
+    rule_min_strike: r.rule_min_strike ? String(r.rule_min_strike) : "",
+    rule_skip_0dte: !!r.rule_skip_0dte,
+    rule_loss_streak: r.rule_loss_streak ? String(r.rule_loss_streak) : "",
+    keep_awake: st?.keep_awake !== false,
+  };
+}
+
 export function SafetyStep() {
   const { st, done, isDone, setNext } = useWiz();
-  const [dry, setDry] = useState(true);
-  const [cap, setCap] = useState("5");
-  const [maxLoss, setMaxLoss] = useState("");
+  // Every field starts from what is saved now, never from this form's own
+  // defaults: an owner who is LIVE with a cap of 2 and comes here to change
+  // a ticker rule must leave LIVE with a cap of 2.
+  const s0 = safetyShown(st);
+  const [dry, setDry] = useState(s0.dry);
+  const [cap, setCap] = useState(s0.cap);
+  const [maxLoss, setMaxLoss] = useState(s0.max_loss);
   const [discord, setDiscord] = useState("");
   const [ntfy, setNtfy] = useState("");
   const [tgToken, setTgToken] = useState("");
   const [tgChat, setTgChat] = useState("");
-  const r0 = st?.rules || {};
-  const [tickers, setTickers] = useState((r0.rule_tickers || []).join(", "));
-  const [skipTickers, setSkipTickers] = useState((r0.rule_skip_tickers || []).join(", "));
-  const [sides, setSides] = useState(r0.rule_sides || "both");
-  const [minStrike, setMinStrike] = useState(r0.rule_min_strike ? String(r0.rule_min_strike) : "");
-  const [skip0dte, setSkip0dte] = useState(!!r0.rule_skip_0dte);
-  const [lossStreak, setLossStreak] = useState(r0.rule_loss_streak ? String(r0.rule_loss_streak) : "");
-  const [keepAwake, setKeepAwake] = useState(st?.keep_awake !== false);
-  // Steps mount before /api/state arrives: seed the fields once it does, so
-  // re-saving Safety never blanks rules the owner already set.
-  const seeded = useRef(!!st?.rules);
+  const [tickers, setTickers] = useState(s0.rule_tickers);
+  const [skipTickers, setSkipTickers] = useState(s0.rule_skip_tickers);
+  const [sides, setSides] = useState(s0.rule_sides);
+  const [minStrike, setMinStrike] = useState(s0.rule_min_strike);
+  const [skip0dte, setSkip0dte] = useState(s0.rule_skip_0dte);
+  const [lossStreak, setLossStreak] = useState(s0.rule_loss_streak);
+  const [keepAwake, setKeepAwake] = useState(s0.keep_awake);
+  // What the form was filled in with (null until /api/state has arrived).
+  // Saving sends only the fields the owner changed from it; everything else
+  // stays as the agent has it now, even if it changed elsewhere meanwhile
+  // (a chat command, another tab).
+  const shown = useRef<ReturnType<typeof safetyShown> | null>(st?.rules ? s0 : null);
+  // Steps mount before /api/state arrives: fill the fields once it does.
   useEffect(() => {
-    const r = st?.rules;
-    if (!r || seeded.current) return;
-    seeded.current = true;
-    setTickers((r.rule_tickers || []).join(", "));
-    setSkipTickers((r.rule_skip_tickers || []).join(", "));
-    setSides(r.rule_sides || "both");
-    setMinStrike(r.rule_min_strike ? String(r.rule_min_strike) : "");
-    setSkip0dte(!!r.rule_skip_0dte);
-    setLossStreak(r.rule_loss_streak ? String(r.rule_loss_streak) : "");
-    setKeepAwake(st?.keep_awake !== false);
+    if (!st?.rules || shown.current) return;
+    const s = safetyShown(st);
+    shown.current = s;
+    setDry(s.dry);
+    setCap(s.cap);
+    setMaxLoss(s.max_loss);
+    setTickers(s.rule_tickers);
+    setSkipTickers(s.rule_skip_tickers);
+    setSides(s.rule_sides);
+    setMinStrike(s.rule_min_strike);
+    setSkip0dte(s.rule_skip_0dte);
+    setLossStreak(s.rule_loss_streak);
+    setKeepAwake(s.keep_awake);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [st?.rules]);
   const [msg, setMsg] = useState<MsgT>(null);
 
   const save = async () => {
-    const r = await api("/api/safety", {
+    const was = shown.current;
+    if (!was) return setMsg(err("Still loading your current settings. Try again in a moment."));
+    const now: ReturnType<typeof safetyShown> = {
       dry,
       cap,
       max_loss: maxLoss,
-      discord,
-      ntfy,
-      tg_token: tgToken,
-      tg_chat: tgChat,
       rule_tickers: tickers,
       rule_skip_tickers: skipTickers,
       rule_sides: sides,
@@ -661,8 +687,21 @@ export function SafetyStep() {
       rule_skip_0dte: skip0dte,
       rule_loss_streak: lossStreak,
       keep_awake: keepAwake,
+    };
+    const changed: Record<string, string | boolean> = {};
+    for (const [k, v] of Object.entries(now)) if (v !== was[k as keyof typeof was]) changed[k] = v;
+    // a saved loss limit that the owner emptied means "off"
+    if (typeof changed.max_loss === "string" && changed.max_loss.trim() === "") changed.max_loss = "0";
+    const r = await api("/api/safety", {
+      ...changed,
+      seeded: true, // filled in from the current settings (see above)
+      discord,
+      ntfy,
+      tg_token: tgToken,
+      tg_chat: tgChat,
     });
     if (r.ok) {
+      shown.current = now;
       setNext(r.next || "");
       done("safety");
     } else setMsg(err(r.error));

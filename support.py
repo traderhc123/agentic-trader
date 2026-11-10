@@ -24,7 +24,9 @@ _SECRET_PATTERNS = [
     (re.compile(r"\b(aghc|xai|gsk|pk|rk)_[A-Za-z0-9_\-]{8,}", re.I), "[api key]"),
     (re.compile(r"\b[0-9a-fA-F]{32,}\b"), "[hex secret]"),
     (re.compile(r"\b[A-Za-z0-9+/=_\-]{40,}\b"), "[token]"),
-    (re.compile(r"([?&](k|key|token|api_key|usr)=)[^&\s]+", re.I), r"\1[redacted]"),
+    (re.compile(r"([?&](k|key|token|api_?key|access_token|auth|secret|password|"
+                r"sig|signature|usr|wal|account_number)=)[^&\s\"'<>]+", re.I),
+     r"\1[redacted]"),
     (re.compile(r"(https?://)[^/\s:@]+:[^/\s@]+@"), r"\1[user:pass]@"),
 ]
 

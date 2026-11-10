@@ -113,6 +113,47 @@ def _save(path, payload, private=False):
     os.replace(tmp, path)
 
 
+# ── config.json: one lock, always read-modify-write ──────────────────────────
+# The chat commands, the dashboard buttons and the settings pages all change
+# config.json, from different threads of the running agent. Every change has
+# to start from what is in the file NOW and hold this lock until it is saved:
+# a save made from a copy read earlier silently undoes somebody else's change
+# (it once put the agent back in LIVE mode after the owner chose dry-run).
+CONFIG_LOCK = __import__("threading").RLock()
+
+
+def _read_config():
+    """config.json as it is on disk right now; {} when there is none yet (or
+    it isn't valid JSON, so setup can write a good one). Raises OSError when
+    the file is there but can't be read at this moment — a caller about to
+    save must never take "couldn't read it" for "empty" and wipe the
+    owner's settings."""
+    for attempt in (0, 1):
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                cfg = json.load(f)
+            return cfg if isinstance(cfg, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except ValueError:
+            return {}
+        except OSError:
+            if attempt:
+                raise
+            time.sleep(0.05)
+
+
+def update_config(change):
+    """Apply change(cfg) to the config that is on disk now and save it, all
+    under CONFIG_LOCK. `change` should touch only the keys it owns. Returns
+    the saved config."""
+    with CONFIG_LOCK:
+        cfg = _read_config()
+        change(cfg)
+        _save(CONFIG_PATH, cfg, private=True)
+        return cfg
+
+
 # ── event safety rails (see SECURITY.md) ─────────────────────────────────────
 
 def _valid_event(ev):
@@ -720,6 +761,87 @@ def _resolve_percent(cfg, broker, client):
     return {**cfg, "sizing_mode": "budget", "budget_per_trade_usd": budget}, ""
 
 
+def _dry_run_keeps_selling_real_positions(cfg):
+    """OPERATOR DECISION — the one switch for it.
+
+    Dry-run stops NEW real trades. A position the agent already bought with
+    a real order stays real-managed after the owner switches to dry-run: its
+    exit signal, the expiry guard and the re-sell of an exit's remainder
+    still place real sell orders, logged as real exits. (Before, the exit
+    signal was booked as a dry-run exit and the real contracts were left at
+    the broker with nobody watching them.)
+
+    Return False to flip it: in dry-run the agent then places no orders at
+    all. It keeps the real position in its list, never books it as sold,
+    and tells the owner to sell it in the broker app."""
+    return True
+
+
+def _dry_run_holds_real_sells(cfg):
+    """True when the agent is in dry-run and dry-run stops it from selling
+    real positions too (only when the decision above is flipped)."""
+    return bool(cfg.get("dry_run")) and not _dry_run_keeps_selling_real_positions(cfg)
+
+
+def _opened_live(row):
+    """True when this ledger row is a position the agent bought with a REAL
+    order. New rows say so ("live": true). Older ledgers are read from what
+    they always carried: a dry-run row has "dry": true and the option id
+    "dry"; every other row was written by a broker adapter after a real
+    order. A row that says neither counts as real — the reading that can
+    never leave a real position unmanaged."""
+    if not isinstance(row, dict):
+        return False
+    if row.get("live") is True:
+        return True
+    return not row.get("dry") and row.get("option_id") != "dry"
+
+
+def _real_positions(state):
+    """Ledger keys of the real (not dry-run) positions the agent holds."""
+    rows = (state or {}).get("positions")
+    return [k for k, r in (rows.items() if isinstance(rows, dict) else ())
+            if _opened_live(r)]
+
+
+def _dry_run_note(cfg, state):
+    """What dry-run means for the real positions that are open now, in the
+    owner's words ("" when there are none)."""
+    n = len(_real_positions(state))
+    if n < 1:
+        return ""
+    one = n == 1
+    head = f"You have {n} real position{'' if one else 's'} open. "
+    if _dry_run_keeps_selling_real_positions(cfg):
+        guard_on = _et_hhmm(cfg, "expiry_guard_et", EXPIRY_GUARD_DEFAULT) is not None
+        return (head + f"I will still sell {'it' if one else 'those'} when "
+                f"{'its' if one else 'their'} exit signal arrives"
+                + (f", or on {'its' if one else 'their'} expiry day if still "
+                   "open then (expiry guard)" if guard_on else "")
+                + ". No new real trades will be placed.")
+    return (head + f"In dry-run I will NOT sell {'it' if one else 'them'} — "
+            f"sell {'it' if one else 'them'} in your broker app. No new real "
+            "trades will be placed.")
+
+
+def _paused(cfg):
+    """The owner pressed Pause (saved in config.json, so it survives a
+    restart): no NEW entries. Exits, the expiry guard and the broker checks
+    keep running."""
+    return bool((cfg or {}).get("paused"))
+
+
+def _pause_skips_feed(cfg, state):
+    """Paused with nothing open, on a feed that is paid per day (AgentHC
+    without a Premium key): don't read the feed. There is no exit to wait
+    for, and a read could use up a prepaid signal day or buy a day-pass.
+    In every other case the feed is read as usual while paused: exit
+    signals are acted on, entry signals are logged as skipped."""
+    return (_paused(cfg) and not state.get("positions")
+            and cfg.get("source", "agenthc") == "agenthc"
+            and not cfg.get("agenthc_api_key"))
+
+
 def _execute_dry(cfg, event, state, broker=None, client=None, on_skip=None):
     """Dry-run bookkeeping: identical position tracking, zero orders.
 
@@ -921,7 +1043,7 @@ def _refresh_cash(cfg, state, save_state, broker, client, cash):
 # Your own limits and rules: not problems, but still a reason a signal didn't
 # become a trade, so the dashboard lists them with the rest.
 _OWN_SKIPS = {"skip_daily_cap", "skip_position_cap", "skip_daily_loss",
-              "skip_rule", "policy_veto"}
+              "skip_rule", "policy_veto", "skip_paused"}
 
 
 def _ai_block_problem(cfg):
@@ -1793,6 +1915,13 @@ def handle_event(ev, cfg, state, broker, client, save_state):
               "had already left your account — no order placed")
         return None
 
+    if ev["event"] == "ENTERED" and _paused(cfg):
+        msg = (f"SKIPPED {contract}: the agent is paused — no new entries "
+               "until you press Resume")
+        print(msg)
+        _log_trade({"action": "skip_paused", "book": book, "event_id": ev["event_id"],
+                    "contract": contract})
+        return msg
     if ev["event"] == "ENTERED":
         # A contract that expires today, past the expiry guard time: the
         # guard would sell it again on the next loop at bid -5% (a sure
@@ -1880,9 +2009,21 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         policy_reason = (ev.get("exit_reason") or ev.get("guard_reason")
                          or "exits always close what was opened")
 
-    # Never place a real order against a dry-run position.
+    # Never place a real order against a dry-run position — and never book
+    # the exit of a REAL position as a dry-run exit: that drops it from the
+    # ledger while the contracts stay at the broker
+    # (_dry_run_keeps_selling_real_positions).
     existing = state["positions"].get(pos_key)
-    dry = bool(cfg.get("dry_run")) or bool(existing and existing.get("dry"))
+    real_exit = ev["event"] == "EXITED" and _opened_live(existing)
+    if real_exit and _dry_run_holds_real_sells(cfg):
+        _report_problem(cfg, state, save_state, "exit_failed", contract,
+                        "the exit signal arrived, but the agent is in dry-run "
+                        "and does not sell real positions — the agent did not "
+                        "sell it; sell it in your broker app",
+                        event_id=ev["event_id"], book=book)
+        return None
+    dry = not real_exit and (bool(cfg.get("dry_run"))
+                             or bool(existing and existing.get("dry")))
     if ev["event"] == "EXITED" and not existing and not dry:
         try:
             _warn_if_reheld(cfg, state, save_state, broker, client, pos_key,
@@ -2032,6 +2173,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             if mark > 0:
                 row["entry_mark"] = mark
             if not dry:  # holdings checks: grace period + which account
+                row["live"] = True  # bought with a real order (_opened_live)
                 row.setdefault("opened_at", _now())
                 row["last_order_at"] = max(_float0(row.get("last_order_at")), _now())
                 row.setdefault("acct", _account_tag(cfg, broker, client))
@@ -2248,9 +2390,9 @@ def _expiry_guard_sell(cfg, state, save_state, broker, client, key, day, guard):
     ev["guard_reason"] = (f"expiry guard: expires today and was still open at "
                           f"{_hm(guard)} ET")
     if not row.get("dry"):
-        if cfg.get("dry_run"):
-            # a real position while the agent is in dry-run: never pop it
-            # unsold (the dry path would) — the alert tells the owner
+        if _dry_run_holds_real_sells(cfg):
+            # a real position while dry-run places no orders at all: never
+            # pop it unsold — the alert tells the owner
             if _note_once(state, save_state, row, "expiry_guard_noted", day):
                 print(f"expiry guard: {contract} expires today, but the agent is "
                       "in dry-run — it won't sell this real position")
@@ -2299,7 +2441,7 @@ def _guard_hold_reason(cfg, row, paused, acct=None):
                 "agent uses now, so the agent won't sell it")
     if paused:
         return "the agent is paused, so the expiry guard isn't selling"
-    if cfg.get("dry_run"):
+    if _dry_run_holds_real_sells(cfg):
         return "the agent is in dry-run, so it doesn't sell real positions"
     return ""
 
@@ -2728,7 +2870,7 @@ def _rest_hold_reason(cfg, broker, client, row, tag):
     if row.get("acct") and tag and row["acct"] != tag:
         return ("it was opened in a different broker account or mode than the "
                 "agent uses now, so the agent won't sell it")
-    if cfg.get("dry_run"):
+    if _dry_run_holds_real_sells(cfg):
         return "the agent is in dry-run, so it doesn't sell real positions"
     if not _gate_on(cfg, broker, client):
         # never more than the account holds: without a holdings read, no re-sell
@@ -2823,7 +2965,7 @@ def _exit_remainders(cfg, state, save_state, broker, client, paused, now_et,
                         "gone today")
             print("EXIT REMAINDER ALERT: " + msg)
             notify(cfg, "⚠️ agentic-trader: " + msg, priority="high")
-        if why or paused or not trading or cfg.get("dry_run"):
+        if why or paused or not trading or _dry_run_holds_real_sells(cfg):
             continue
         if _past_expiry_guard(cfg, expiry, now_et) is not None:
             continue  # from the guard time on its expiry day, the guard sells it
@@ -3008,7 +3150,7 @@ def _rest_proven(cfg, state, broker, client, key, row, t, h, now):
 def _ledger_check(cfg, state, save_state, broker, client, now_et, now, tag):
     """Compare what the account holds with the ledger for contracts the agent
     bought; re-add (or alert about) what the ledger lost."""
-    if (not _gate_on(cfg, broker, client) or cfg.get("dry_run")
+    if (not _gate_on(cfg, broker, client) or _dry_run_holds_real_sells(cfg)
             or getattr(client, "last_error", None)):
         return
     day = now_et.date().isoformat()
@@ -3451,9 +3593,64 @@ def set_book_sizing(cfg, book, mode, value):
     return True, ""
 
 
-def _rule_command(t, cfg):
-    """Dashboard chat commands for the built-in rules. (handled, reply)."""
+# A chat command must match its whole grammar. A question, extra words, or
+# words that can't be tickers or numbers mean it is NOT a command: nothing
+# is changed, and the owner gets the usage line (or, for a question, an
+# answer). "tickers skipped today and why?" once set the ticker list to
+# SKIPPED, TODAY, AND — and every signal after it was skipped.
+_NOTHING_CHANGED = "Nothing was changed. "
+_CMD_TICKER_RE = re.compile(r"\$?[A-Za-z]{1,5}(?:\.[A-Za-z]{1,2})?")
+# Ordinary words: in lower case they show a sentence, not a ticker list.
+# Typed in CAPITALS they are taken as tickers ("tickers ALL ON").
+_CMD_NOT_TICKERS = frozenset(
+    "a an and or the is are was were be been do does did why what which when "
+    "where who how my me i you it its to of in on at for with from not no yes "
+    "any all none off today yesterday tomorrow now please show list tell skip "
+    "skipped only just also but if then than that this these those can could "
+    "should would will there their them they we us our your about so too very "
+    "trade trades ticker tickers".split())
+_CMD_MAX_TICKERS = 50
+
+
+def _command_tickers(raw):
+    """The tickers of a 'tickers …' command when its argument is nothing but
+    a list of plausible tickers (spaces or commas between them), else None.
+    `raw` is the argument as the owner typed it (capitals matter)."""
     import rules
+    tokens = [x for x in re.split(r"[\s,;]+", str(raw).strip()) if x]
+    if not tokens or len(tokens) > _CMD_MAX_TICKERS:
+        return None
+    for tok in tokens:
+        if not _CMD_TICKER_RE.fullmatch(tok):
+            return None
+        if tok.lstrip("$").lower() in _CMD_NOT_TICKERS and tok != tok.upper():
+            return None
+    return rules.parse_tickers(tokens)
+
+
+def _command_number(t, name):
+    """The number of a '<name> N' command when that is ALL it says ("set
+    budget 500", "set budget to $1,500", "set percent 2%"), else None."""
+    m = re.fullmatch(re.escape(name) + r"(?:\s+to)?\s+\$?(\d[\d,]*(?:\.\d+)?)\s?%?", t)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _command_whole(t, name):
+    """_command_number, for a count: whole numbers only."""
+    val = _command_number(t, name)
+    return int(val) if val is not None and val == int(val) else None
+
+
+def _rule_command(t, cfg, text=None):
+    """Dashboard chat commands for the built-in rules. (handled, reply).
+    `text`: the command as typed (capitals kept), for ticker lists."""
+    import rules
+    typed = str(text if text is not None else t).strip()
 
     def saved(reply):
         _save(CONFIG_PATH, cfg, private=True)
@@ -3463,17 +3660,37 @@ def _rule_command(t, cfg):
                       "with: tickers SPY QQQ / tickers any, skip tickers TSLA / "
                       "skip tickers none, calls only / puts only / calls and puts, "
                       "min strike 10, no 0dte on|off, loss stop 2 (0 = off).")
-    m = re.match(r"^(?:set |only )?tickers?\s+(.+)$", t)
+    m = re.match(r"^(?:set |only )?tickers?(?:\s+(.+))?$", typed, re.I | re.S)
     if m:
-        val = m.group(1).strip()
-        cfg["rule_tickers"] = [] if val in ("any", "all", "none", "off") \
-            else rules.parse_tickers(val)
+        val = (m.group(1) or "").strip()
+        if val.lower() in ("any", "all", "none", "off"):
+            cfg["rule_tickers"] = []
+            return saved("Ticker list updated.")
+        tickers = _command_tickers(val)
+        if not tickers:
+            return True, (_NOTHING_CHANGED + "I couldn't read that as a list of "
+                          "tickers. To trade only some tickers, type: tickers SPY "
+                          "QQQ   (any ticker again: tickers any). A ticker "
+                          "that is also an ordinary word goes in CAPITALS: "
+                          "tickers NOW. To ask me a question, end it with a "
+                          "question mark.")
+        cfg["rule_tickers"] = tickers
         return saved("Ticker list updated.")
-    m = re.match(r"^skip tickers?\s+(.+)$", t)
+    m = re.match(r"^skip tickers?(?:\s+(.+))?$", typed, re.I | re.S)
     if m:
-        val = m.group(1).strip()
-        cfg["rule_skip_tickers"] = [] if val in ("none", "off") \
-            else rules.parse_tickers(val)
+        val = (m.group(1) or "").strip()
+        if val.lower() in ("none", "off"):
+            cfg["rule_skip_tickers"] = []
+            return saved("Skip list updated.")
+        tickers = _command_tickers(val)
+        if not tickers:
+            return True, (_NOTHING_CHANGED + "I couldn't read that as a list of "
+                          "tickers. To never trade some tickers, type: skip "
+                          "tickers TSLA   (clear the list: skip tickers none). "
+                          "A ticker that is also an ordinary word goes in "
+                          "CAPITALS: skip tickers NOW. To ask me a question, "
+                          "end it with a question mark.")
+        cfg["rule_skip_tickers"] = tickers
         return saved("Skip list updated.")
     if t in ("calls only", "puts only", "calls and puts", "both sides"):
         cfg["rule_sides"] = t.split()[0] if t.endswith("only") else "both"
@@ -3502,20 +3719,57 @@ def _apply_command(text):
     matched here falls through to answer-only LLM Q&A. The LLM can never
     reach these controls — it can only ANSWER.
     """
-    import webui
     t = text.lower().strip()
-    cfg = _load(CONFIG_PATH, {}) or {}
+    if text.lower().startswith("code:"):
+        import self_edit  # asks the AI (slow) and changes no setting: no lock
+        _ok, msg = self_edit.propose(_load(CONFIG_PATH, {}) or {}, text[5:].strip())
+        return True, msg
+    if "?" in t:
+        # A question is never a command — it gets an answer, and no setting
+        # changes. (Commands that only show something may end in one.)
+        if t.rstrip("? ") not in _SHOW_COMMANDS or "?" in t.rstrip("? "):
+            return False, ""
+        t = t.rstrip("? ")
+    # One change at a time, each starting from the settings on disk NOW
+    # (the settings pages save under the same lock).
+    with CONFIG_LOCK:
+        try:
+            cfg = _read_config()
+        except OSError:
+            return True, ("I couldn't read your settings file just now, so "
+                          "nothing was changed. Try again in a moment.")
+        return _command(t, cfg, text.strip())
+
+
+# commands that change nothing (a trailing "?" is fine: "status?")
+_SHOW_COMMANDS = ("status", "rules", "my rules", "show rules", "autostart",
+                  "start at login", "expiry guard", "expiry alert")
+
+
+def _command(t, cfg, text):
+    """_apply_command's allowlist, under CONFIG_LOCK. `t`: the command in
+    lower case; `text`: as typed."""
+    import webui
     if t == "pause":
-        webui.CONTROLS["paused"] = True
-        return True, "Paused — no new events processed until you say 'resume'."
+        cfg["paused"] = True
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, ("Paused — no new entries. Exit signals, the expiry "
+                      "guard and the broker checks keep running for positions "
+                      "you already have. The agent stays paused, also after a "
+                      "restart, until you say 'resume'."
+                      + (" With nothing open it also stops reading the signal "
+                         "feed, so the pause doesn't use up a paid signal day."
+                         if cfg.get("source", "agenthc") == "agenthc"
+                         and not cfg.get("agenthc_api_key") else ""))
     if t == "resume":
-        webui.CONTROLS["paused"] = False
-        return True, "Resumed."
+        cfg.pop("paused", None)
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, "Resumed — the agent takes new entries again."
     if t == "stop":
         webui.CONTROLS["stop"] = True
         return True, ("Stopping after this cycle. Open positions remain in your "
                       "brokerage account — close them there if needed.")
-    handled, reply = _rule_command(t, cfg)
+    handled, reply = _rule_command(t, cfg, text)
     if handled:
         return True, reply
     handled, reply = _expiry_command(t, cfg)
@@ -3566,7 +3820,10 @@ def _apply_command(text):
     if t in ("dry on", "dry-run on"):
         cfg["dry_run"] = True
         _save(CONFIG_PATH, cfg, private=True)
-        return True, "Dry-run ON — actions logged, no real orders."
+        note = _dry_run_note(cfg, _load(STATE_PATH, {}) or {})
+        return True, ("Dry-run ON — " + note if note else
+                      "Dry-run ON — new signals are only logged; no real "
+                      "trades will be placed.")
     if t in ("dry off", "dry-run off", "go live"):
         if llm_policy.entries_blocked(cfg):
             return True, ("Not going live: " + llm_policy.BLOCKED_MSG
@@ -3575,32 +3832,26 @@ def _apply_command(text):
         _save(CONFIG_PATH, cfg, private=True)
         return True, "Dry-run OFF — the agent will place REAL orders from now on."
     if t.startswith("set budget"):
-        try:
-            val = float(t.split()[-1].lstrip("$").replace(",", ""))
-            assert val > 0
-        except (ValueError, AssertionError, IndexError):
-            return True, "Usage: set budget 500"
+        val = _command_number(t, "set budget")
+        if val is None or val <= 0:
+            return True, _NOTHING_CHANGED + "Usage: set budget 500"
         cfg["sizing_mode"] = "budget"
         cfg["budget_per_trade_usd"] = val
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Per-trade budget set to ${val:,.0f} (your decision — see DISCLAIMER.md)."
     if t.startswith("set other budget"):
-        try:
-            val = float(t.split()[-1].lstrip("$").replace(",", ""))
-            assert val > 0
-        except (ValueError, AssertionError, IndexError):
-            return True, "Usage: set other budget 100"
+        val = _command_number(t, "set other budget")
+        if val is None or val <= 0:
+            return True, _NOTHING_CHANGED + "Usage: set other budget 100"
         cfg["other_sizing_mode"] = "budget"
         cfg["other_budget_per_trade_usd"] = val
         _save(CONFIG_PATH, cfg, private=True)
         return True, (f"'Other trades' budget set to ${val:,.0f}/trade — main "
                       "pick keeps its own sizing (your decision — see DISCLAIMER.md).")
     if t.startswith("set other contracts"):
-        try:
-            val = int(t.split()[-1])
-            assert val >= 1
-        except (ValueError, AssertionError, IndexError):
-            return True, "Usage: set other contracts 1"
+        val = _command_whole(t, "set other contracts")
+        if val is None or val < 1:
+            return True, _NOTHING_CHANGED + "Usage: set other contracts 1"
         cfg["other_sizing_mode"] = "contracts"
         cfg["other_contracts_per_trade"] = val
         _save(CONFIG_PATH, cfg, private=True)
@@ -3608,19 +3859,27 @@ def _apply_command(text):
                       "main pick keeps its own sizing.")
     if t.startswith("set percent") or t.startswith("set other percent"):
         book = "other" if t.startswith("set other") else "main"
-        ok, err = set_book_sizing(cfg, book, "percent", t.split()[-1])
+        usage = f"Usage: set {'other ' if book == 'other' else ''}percent 2"
+        val = _command_number(t, "set other percent" if book == "other"
+                              else "set percent")
+        if val is None:
+            return True, _NOTHING_CHANGED + usage
+        ok, err = set_book_sizing(cfg, book, "percent", val)
         if not ok:
-            return True, (f"{err}. Usage: set {'other ' if book == 'other' else ''}"
-                          "percent 2")
+            return True, f"{_NOTHING_CHANGED}{err[0].upper()}{err[1:]}. {usage}"
         _save(CONFIG_PATH, cfg, private=True)
         who = "'Other trades'" if book == "other" else "Main pick"
         return True, (f"{who} sizing set to {_book_desc(cfg, 'other_' if book == 'other' else '')}"
                       " — sized from your account value at each entry "
                       "(your decision — see DISCLAIMER.md).")
     if t.startswith("set contracts"):
-        ok, err = set_book_sizing(cfg, "main", "contracts", t.split()[-1])
+        val = _command_number(t, "set contracts")
+        if val is None:
+            return True, _NOTHING_CHANGED + "Usage: set contracts 1"
+        ok, err = set_book_sizing(cfg, "main", "contracts", val)
         if not ok:
-            return True, f"{err}. Usage: set contracts 1"
+            return True, (f"{_NOTHING_CHANGED}{err[0].upper()}{err[1:]}. "
+                          "Usage: set contracts 1")
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Main pick sizing set to {_book_desc(cfg)}."
     if t in ("other trades on", "other trades off"):
@@ -3637,29 +3896,23 @@ def _apply_command(text):
         _save(CONFIG_PATH, cfg, private=True)
         return True, "'Other trades' now size the same as the main pick."
     if t.startswith("set cap"):
-        try:
-            val = int(t.split()[-1])
-            assert val >= 1
-        except (ValueError, AssertionError, IndexError):
-            return True, "Usage: set cap 3"
+        val = _command_whole(t, "set cap")
+        if val is None or val < 1:
+            return True, _NOTHING_CHANGED + "Usage: set cap 3"
         cfg["max_entries_per_day"] = val
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Daily entry cap set to {val}."
     if t.startswith("set positions"):
-        try:
-            val = int(t.split()[-1])
-            assert val >= 1
-        except (ValueError, AssertionError, IndexError):
-            return True, "Usage: set positions 5"
+        val = _command_whole(t, "set positions")
+        if val is None or val < 1:
+            return True, _NOTHING_CHANGED + "Usage: set positions 5"
         cfg["max_open_positions"] = val
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Max concurrent open positions set to {val}."
     if t.startswith("set max loss"):
-        try:
-            val = float(t.split()[-1].lstrip("$").replace(",", ""))
-            assert val >= 0
-        except (ValueError, AssertionError, IndexError):
-            return True, "Usage: set max loss 300   (0 = off)"
+        val = _command_number(t, "set max loss")
+        if val is None:
+            return True, _NOTHING_CHANGED + "Usage: set max loss 300   (0 = off)"
         cfg["max_daily_loss_usd"] = val
         _save(CONFIG_PATH, cfg, private=True)
         if val == 0:
@@ -3677,20 +3930,20 @@ def _apply_command(text):
         cfg["self_edit_enabled"] = False
         _save(CONFIG_PATH, cfg, private=True)
         return True, "Self-edit OFF."
-    if text.lower().startswith("code:"):
-        import self_edit
-        _ok, msg = self_edit.propose(cfg, text[5:].strip())
-        return True, msg
     if t == "status":
         st = _load(STATE_PATH, {"positions": {}})
+        note = _dry_run_note(cfg, st) if cfg.get("dry_run") else ""
         return True, (f"{'DRY-RUN' if cfg.get('dry_run') else 'LIVE'} · "
+                      + ("PAUSED (no new entries; exits still run) · "
+                         if _paused(cfg) else "") +
                       f"{_sizing_desc(cfg)} · entries today {_entries_today()}/"
                       f"{cfg.get('max_entries_per_day', 5)} · "
                       f"est. P&L today ${_est_pnl_today()[0]:,.0f}"
                       + (f" (max loss ${float(cfg['max_daily_loss_usd']):,.0f})"
                          if float(cfg.get('max_daily_loss_usd') or 0) > 0 else "")
                       + " · open: "
-                      f"{', '.join(st.get('positions', {})) or 'none'}")
+                      f"{', '.join(st.get('positions', {})) or 'none'}"
+                      + (f" · {note}" if note else ""))
     return False, ""
 
 
@@ -3771,7 +4024,10 @@ def cmd_run(app_window=False):
         st = _load(STATE_PATH, {"positions": {}})
         return {
             "mode": "DRY-RUN" if c.get("dry_run") else "LIVE",
-            "paused": webui.CONTROLS["paused"],
+            "paused": _paused(c),
+            # real positions the agent holds, and what dry-run does with them
+            "real_positions": len(_real_positions(st)),
+            "dry_run_note": _dry_run_note(c, st),
             "fields": {
                 "source": c.get("source"),
                 **({"feed access": _feed_access(c, st)}
@@ -3795,8 +4051,7 @@ def cmd_run(app_window=False):
                    if _broker_conn_desc(client) else {}),
             },
             "cash_warning": cash.get("warning", ""),
-            "expiry_warnings": expiry_banner(c, st, paused=webui.CONTROLS["paused"],
-                                             acct=_status_acct(c)),
+            "expiry_warnings": expiry_banner(c, st, acct=_status_acct(c)),
             "problems": _problems_with_ai_block(c),
             "budget_hints": _budget_hints(c),
             "would_have": dry_run_preview.summary(c),
@@ -3821,6 +4076,10 @@ def cmd_run(app_window=False):
 
     _refresh_cash(cfg, state, save_state, broker, client, cash)
     mode = "DRY-RUN (no orders)" if cfg.get("dry_run") else "LIVE"
+    if _paused(cfg):  # saved in config.json: still paused after a restart
+        mode += ", PAUSED — no new entries until you press Resume"
+    if cfg.get("dry_run") and _dry_run_note(cfg, state):
+        print("Dry-run with real positions open. " + _dry_run_note(cfg, state))
     print(f"Heartbeat started [{mode}]: source={cfg['source']}, "
           f"{_sizing_desc(cfg)}, policy brain "
           f"{'ON' if llm_policy.enabled(cfg) else 'off'}. "
@@ -3898,8 +4157,13 @@ def cmd_run(app_window=False):
                   list(state["positions"]) or "none")
             notify(cfg, "agentic-trader stopped via dashboard")
             return
+        # Pause (the owner's, in config.json) only stops NEW entries — see
+        # handle_event. `held` is something else: an update or a move is
+        # about to restart the agent, so nothing is polled or ordered for
+        # those few seconds.
+        held = webui.orders_held()
         try:
-            if not webui.CONTROLS["paused"]:
+            if not held:
                 try:
                     _prune_expired_positions(cfg, state, save_state)
                 except Exception as exc:
@@ -3927,8 +4191,15 @@ def cmd_run(app_window=False):
                 if (time.time() - cash["at"] > 600
                         or bool(cfg.get("dry_run")) != cash.get("dry")):
                     _refresh_cash(cfg, state, save_state, broker, client, cash)
-                events = source.poll(cfg, state, save_state)
-                note_watching(cfg)
+                if _pause_skips_feed(cfg, state):
+                    events = []
+                    # signals that fire meanwhile happened while the agent
+                    # wasn't watching: after Resume they are old news, not
+                    # a delay worth an alert
+                    _WATCH_SINCE.clear()
+                else:
+                    events = source.poll(cfg, state, save_state)
+                    note_watching(cfg)
                 for ev in events:
                     if ev.get("event_id") in seen:
                         continue
@@ -3951,7 +4222,7 @@ def cmd_run(app_window=False):
                     seen = set(state["seen"])
                     save_state(state)
             else:
-                # paused: no orders, but the remainder alerts still go out
+                # restarting: no orders, but the remainder alerts still go out
                 exit_remainder_tick(cfg, state, save_state, broker, client,
                                     paused=True)
         except KeyboardInterrupt:
@@ -3968,7 +4239,7 @@ def cmd_run(app_window=False):
         # after the feed's own exit signals, and even when the feed is
         # unreachable: sell what expires today, alert on what's still open
         expiry_guard_tick(cfg, state, save_state, broker, client,
-                          paused=webui.CONTROLS["paused"])
+                          paused=held)
         try:
             _maybe_daily_digest(cfg, state, save_state)
         except Exception:
@@ -3977,8 +4248,8 @@ def cmd_run(app_window=False):
             # free closed-trades list → "would have taken" panel (never raises)
             dry_run_preview.refresh(cfg, _market_open_now())
         # Market-hours-aware cadence: fast while the market can move, slow
-        # overnight/weekends; snappy while paused so 'resume' feels instant.
-        if webui.CONTROLS["paused"]:
+        # overnight/weekends; short while a restart is pending.
+        if held:
             wait = 2
         else:
             wait = poll if _market_open_now() else max(poll, 300)
@@ -4088,7 +4359,8 @@ def cmd_status():
     print(f"broker           : {broker_name}{detail}"
           f"{'' if broker_ready(cfg) else ' — NOT CONFIGURED'}")
     print(f"contracts/trade  : {cfg.get('contracts_per_trade', 'unset')}")
-    print(f"mode             : {'DRY-RUN' if cfg.get('dry_run') else 'LIVE'}")
+    print(f"mode             : {'DRY-RUN' if cfg.get('dry_run') else 'LIVE'}"
+          + (" · PAUSED (no new entries; exits still run)" if _paused(cfg) else ""))
     print(f"policy brain     : {'ON (' + llm_policy.policy_path() + ')' if llm_policy.enabled(cfg) else 'off'}")
     print(f"daily entry cap  : {cfg.get('max_entries_per_day', 5)}")
     print(f"entries today    : {_entries_today()}")

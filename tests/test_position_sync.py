@@ -779,9 +779,10 @@ def test_upkeep_throttle(monkeypatch, clock):
     assert len(b.asked) == n + 1
 
 
-def _run_one_loop(home, monkeypatch, paused):
+def _run_one_loop(home, monkeypatch, paused, held=False):
     """One pass of `agent.py run` with stub broker/source; returns the order
-    of the calls that matter here."""
+    of the calls that matter here. paused: the owner's Pause (config.json);
+    held: an update/move is restarting the agent."""
     import brokers
     import keep_running
     import webui
@@ -820,10 +821,13 @@ def _run_one_loop(home, monkeypatch, paused):
     monkeypatch.setattr(agent, "_refresh_cash", lambda *a, **k: calls.append("cash"))
     monkeypatch.setattr(agent, "_position_upkeep",
                         lambda *a, **k: calls.append("upkeep"))
-    monkeypatch.setitem(webui.CONTROLS, "paused", paused)
+    monkeypatch.setitem(webui.CONTROLS, "hold_until",
+                        float("inf") if held else 0.0)
     monkeypatch.setitem(webui.CONTROLS, "stop", False)
     monkeypatch.setattr(agent, "_sleep_unless_stopped", stop)
-    (home / "config.json").write_text(json.dumps({"source": "stub", "broker": "stub"}))
+    monkeypatch.setattr(agent, "_WATCH_SINCE", {})
+    (home / "config.json").write_text(json.dumps(
+        {"source": "stub", "broker": "stub", "paused": paused}))
     agent.cmd_run()
     return calls
 
@@ -835,9 +839,18 @@ def test_run_loop_checks_holdings_after_reconcile_before_events(home, monkeypatc
     assert calls.index("upkeep") < len(calls) - 1 - calls[::-1].index("cash")
 
 
-def test_run_loop_paused_skips_holdings_check(home, monkeypatch):
+def test_run_loop_paused_still_checks_holdings(home, monkeypatch):
+    # Pause only stops new entries: reconcile, the holdings check and the
+    # feed's exit signals keep running.
     calls = _run_one_loop(home, monkeypatch, paused=True)
+    assert calls.count("upkeep") == 1
+    assert calls.index("reconcile") < calls.index("upkeep") < calls.index("poll")
+
+
+def test_run_loop_held_for_a_restart_skips_holdings_check(home, monkeypatch):
+    calls = _run_one_loop(home, monkeypatch, paused=False, held=True)
     assert "upkeep" not in calls and "reconcile" not in calls
+    assert "poll" not in calls
 
 
 def test_open_rush_window(monkeypatch):
@@ -1331,10 +1344,15 @@ def test_exit_while_agent_sell_pending_is_noop(home):
 
 
 def test_dry_paths_untouched(home):
+    # a REAL position while the agent is in dry-run is still sold for real,
+    # through the same checks as in live mode (it is never booked as a
+    # dry-run exit: that left the contracts at the broker, untracked)
     st = _state()
-    b = FillsBroker({U1: 0})
+    b = FillsBroker({U1: 2})
     out = handle(st, b, cfg={**CFG, "dry_run": True})
-    assert out.startswith("[DRY-RUN] EXIT") and b.asked == [] and b.executed == []
+    assert out.startswith("EXIT") and b.executed == [("EXITED", 2)]
+    assert _log(home)[-1]["dry"] is False
+    # a dry-run position never reaches the broker
     st = {"positions": {KEY: {"option_id": "dry", "qty": 1, "dry": True}}}
     b = FillsBroker({U1: 0})
     assert handle(st, b).startswith("[DRY-RUN]")
