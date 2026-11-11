@@ -1,5 +1,5 @@
 // Rules & limits: the home of every limit, trade size, the expiry-day sell
-// time and every rule. Each row shows the saved value (GET /api/v2/settings)
+// time, the no-signal sell time and every rule. Each row shows the saved value (GET /api/v2/settings)
 // and, for a limit, today's use (the status): said here once, as Today's
 // meters say it on Today. A budget hint sits in its trade-size row.
 // A limit or a trade size is changed in place, then confirmed in a dialog
@@ -17,6 +17,7 @@ import {
   SIZING_DISCLAIMER,
   etClockWords,
   expiryTimePayload,
+  noSignalPayload,
   hintSize,
   hintWords,
   limitMeans,
@@ -497,6 +498,146 @@ function ExpiryRow({ page }: { page: Page }) {
   );
 }
 
+// ── the no-signal sell time (two-step, on the limits route) ────────────────
+// The chat's "no-signal sell on|off|HH:MM". Off, or a later time, raises the
+// risk: a position no exit signal can reach stays open longer.
+
+function NoSignalRow({ page }: { page: Page }) {
+  const s = page.s;
+  const v = page.settings.view;
+  const ns = v?.no_signal ?? null;
+  // "HH:MM" or null (off); undefined: not read yet
+  const saved: string | null | undefined = ns ? ns.sell_et : undefined;
+  const [open, setOpen] = useState(false);
+  const [off, setOff] = useState(false);
+  const [text, setText] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const id = useId();
+  const label = "No-signal sell time";
+  const parsed = noSignalPayload(saved ?? null, off, text);
+  const next = off ? null : parsed.ok ? (parsed.value ?? saved ?? null) : undefined;
+  const shown = saved !== undefined ? etClockWords(saved) : UNKNOWN;
+  const open0 = () => {
+    setOff(saved === null);
+    setText(saved ?? ns?.default ?? "15:30");
+    setErr("");
+    setOpen(true);
+    requestAnimationFrame(() => document.getElementById(id)?.focus());
+  };
+  const review = async () => {
+    if (!parsed.ok) return setErr(parsed.error);
+    if (parsed.value === undefined) return setErr("That is the time saved now.");
+    setBusy(true);
+    setErr("");
+    const payload = { no_signal_sell_et: parsed.value };
+    const a = await askPreview(API.limits, payload);
+    setBusy(false);
+    if (a.kind === "review") setDraft({ payload, preview: a.preview });
+    else setErr(a.kind === "error" ? a.error : a.note);
+  };
+  return (
+    <div className="setrow" data-row="no_signal_sell">
+      <span className="lbl">{label}</span>
+      <span className="exp">
+        When no exit signal has been able to reach the agent for a while (the signal pass ran out, the feed can't be read), it sells the real
+        positions it holds at this time (Eastern), at least 15 minutes after warning you, so they are not carried past the close with nobody
+        watching. It is not a price stop. Off: it only warns you.
+      </span>
+      <span className="val">
+        {shown}
+        <small>{ns && ns.today_et && ns.today_et !== ns.sell_et ? `Today (early close): ${etClockWords(ns.today_et)}.` : ""}</small>
+      </span>
+      <span className="act">{!open && <ChangeButton act="limits" label={label} page={page} onClick={open0} />}</span>
+      {open && (
+        <Editor
+          error={err}
+          errId={`${id}-e`}
+          busy={busy}
+          primary="Review change"
+          onPrimary={review}
+          onCancel={() => setOpen(false)}
+          risk={
+            next !== undefined && saved !== undefined ? (
+              <RiskLine
+                direction={riskOf("no_signal_sell_et", saved, next)}
+                same={next === saved}
+                means={
+                  next == null
+                    ? "With no exit signals the agent only warns you: nothing sells your positions before the close."
+                    : `With no exit signals, real positions still open at ${etClockWords(next)} are sold then.`
+                }
+              />
+            ) : null
+          }
+        >
+          <div className="editor-row">
+            <label className="check">
+              <input type="checkbox" checked={off} onChange={(x) => (setOff(x.target.checked), setErr(""))} />
+              <span>Off: never sell for lack of exit signals</span>
+            </label>
+            {!off && (
+              <div className="field">
+                <label htmlFor={id}>Sell at (HH:MM, Eastern, 09:30 to 15:59)</label>
+                <input
+                  id={id}
+                  className="input input-num"
+                  autoComplete="off"
+                  inputMode="numeric"
+                  value={text}
+                  aria-invalid={!!err}
+                  aria-describedby={err ? `${id}-e` : undefined}
+                  onChange={(x) => {
+                    setText(x.target.value);
+                    setErr("");
+                  }}
+                />
+              </div>
+            )}
+          </div>
+          <span className="muted small">
+            Saved now: <b>{shown}</b>
+          </span>
+        </Editor>
+      )}
+      {draft && (
+        <ReviewDialog
+          path={API.limits}
+          payload={draft.payload}
+          first={draft.preview}
+          title={draft.payload.no_signal_sell_et === "off" ? "Turn off the no-signal sell?" : "Change the no-signal sell time?"}
+          cancel={`Keep ${shown}`}
+          live={s.mode === "live"}
+          onClose={() => setDraft(null)}
+          onDone={async () => {
+            setDraft(null);
+            setOpen(false);
+            const nv = await page.settings.reload();
+            page.refresh();
+            page.say(true, nv?.no_signal ? `Saved. ${label}: ${etClockWords(nv.no_signal.sell_et)}.` : "Saved. This page could not read your settings back yet; it shows them once it can.");
+          }}
+        >
+          {(p) => {
+            const c = p.changes.find((x) => x.key === "no_signal_sell_et");
+            if (!c) return null;
+            if (c.new == null)
+              return (
+                <p className="small">
+                  With no exit signals the agent then only warns you: a real position it holds stays open past the close until you sell it
+                  yourself.
+                </p>
+              );
+            if (c.direction === "raises_risk")
+              return <p className="small">A real position no exit signal reaches then stays open later into the session.</p>;
+            return null;
+          }}
+        </ReviewDialog>
+      )}
+    </div>
+  );
+}
+
 // ── which signals to take (not money-affecting: saved straight away) ───────
 
 type RuleKey = "rule_tickers" | "rule_skip_tickers" | "rule_sides" | "rule_min_strike" | "rule_loss_streak";
@@ -819,6 +960,12 @@ export function RulesView({ page }: { page: Page }) {
         </div>
         <ExpiryRow page={page} />
       </section>
+      <section className={`panel ${page.stale ? "stale" : ""}`}>
+        <div className="ph">
+          <h2>When no exit signals arrive</h2>
+        </div>
+        <NoSignalRow page={page} />
+      </section>
       <div className="two">
         <section className={`panel ${page.stale ? "stale" : ""}`}>
           <div className="ph">
@@ -847,7 +994,7 @@ export function RulesView({ page }: { page: Page }) {
             <p className="small muted" style={{ marginTop: 8 }}>
               {perTrade == null ? "Your trade size is not a dollar amount, so there is no fixed dollar ceiling to show. " : ""}
               The most put in is also the most those trades can lose: an option can lose everything paid for it. The agent has no stop-loss
-              and no profit target. It sells on the exit signal or on expiry day.
+              and no profit target. It sells on the exit signal, on expiry day, or before the close when no exit signals reach it.
             </p>
           </div>
         </section>

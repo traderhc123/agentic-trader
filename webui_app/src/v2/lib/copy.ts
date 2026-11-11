@@ -10,7 +10,7 @@
 //   - a code this version does not know gets the fallback, which says so;
 //   - no imports that exist at run time except ./format (the Node tests load
 //     these two files as they are).
-import type { Activity, Answer, CheckId, NextAction, Position, ReasonCode, Status } from "../../lib/viewModel";
+import type { Activity, Answer, CheckId, ExitLoss, NextAction, Position, ReasonCode, Status } from "../../lib/viewModel";
 import { clip, contractName, etTime, etWhen, plural, usd } from "./format.ts";
 
 export type Cat = "trade" | "limit" | "problem" | "other";
@@ -36,6 +36,8 @@ export const CHECK_LABELS: Record<CheckId, string> = {
   signal_fresh: "The signal is fresh, not one that arrived late",
   not_paused: "New trades are not paused",
   before_expiry_guard: "It does not expire today after the expiry sell time",
+  exits_reachable: "The agent has not sold today for lack of exit signals",
+  pass_covers_close: "The signal pass runs until today's close",
   daily_cap: "Daily limit of new trades",
   position_cap: "Limit on open positions",
   daily_loss: "Daily loss limit",
@@ -167,6 +169,26 @@ export const REASONS: Record<ReasonCode, Entry> = {
       "It expired that day and was still open at the expiry sell time. The agent sells expiring positions then, so they cannot be exercised or expire worthless after the close.",
     can: nothing,
   },
+  signal_loss: {
+    cat: "trade",
+    icon: "out",
+    title: (c) =>
+      c.real === false
+        ? `Practice sale, no exit signals: ${c.name}`
+        : sellSent(c)
+          ? `Sell order sent, no exit signals: ${c.name}`
+          : `Sold ${c.name}: no exit signals`,
+    sub: () => "No exit signals reached the agent",
+    what: (c) =>
+      sellSent(c) ? sentSale(c, c.name) : sold(c, c.real === false ? "The agent recorded a pretend sale of" : "The agent sold"),
+    why: (c) =>
+      withNote(
+        c,
+        "No exit signal could reach the agent for most of the session, so it sold what it held before the close rather than carry it overnight with nobody watching. It is not a price stop.",
+      ),
+    can: () => "Nothing needed. It opens nothing new for the rest of that day. The no-signal sell time is in Rules & limits.",
+    go: "rules",
+  },
   exit_remainder: {
     cat: "trade",
     icon: "out",
@@ -284,6 +306,28 @@ export const REASONS: Record<ReasonCode, Entry> = {
     why: () =>
       "Buying a contract that expires today, after the time the agent sells expiring positions, would be sold again straight away.",
     can: nothing,
+  },
+  after_signal_loss_sell: {
+    cat: "limit",
+    icon: "skip",
+    title: (c) => `Skipped ${c.name}`,
+    sub: () => "The agent had sold what it held for lack of exit signals that day",
+    what: skipped,
+    why: () =>
+      "No exit signals had reached the agent that day, so it sold what it held before the close and opened nothing new until the next day: a new position would have had no exit signal either.",
+    can: () => "Nothing needed. New trades start again the next day.",
+  },
+  pass_wont_cover: {
+    cat: "limit",
+    icon: "skip",
+    title: (c) => `Skipped ${c.name}`,
+    sub: (c) =>
+      c.str("pass_ends_et") ? `The day-pass ended at ${c.str("pass_ends_et")} ET, before the close` : "The day-pass ended before the close",
+    what: skipped,
+    why: () =>
+      "The wallet's day-pass ran out before that day's close and a new one was not paid, so a position opened then would have lost its exit signals before the close.",
+    can: () => "Add sats to the agent's wallet on Signals & pass, or buy signal days there.",
+    go: "signals",
   },
   written_rules_veto: {
     cat: "limit",
@@ -507,6 +551,8 @@ export const TALLY_LABELS: Partial<Record<ReasonCode, string>> = {
   rule_not_in_list: "Not on your list of stocks to trade",
   rule_min_strike: "Strike under your minimum",
   past_expiry_guard: "Expiring today, after the expiry sell time",
+  after_signal_loss_sell: "Sold for lack of exit signals earlier",
+  pass_wont_cover: "The day-pass ends before the close",
 };
 
 export interface Described {
@@ -529,9 +575,9 @@ export interface Described {
   exitPath: boolean;
 }
 
-const TRADE_CODES = ["entered", "exit_signal", "expiry_guard", "exit_remainder", "closed_outside"];
+const TRADE_CODES = ["entered", "exit_signal", "expiry_guard", "signal_loss", "exit_remainder", "closed_outside"];
 const EXIT_CODES = [
-  "exit_signal", "expiry_guard", "exit_remainder", "closed_outside", "exit_failed", "exit_partial", "sell_unconfirmed",
+  "exit_signal", "expiry_guard", "signal_loss", "exit_remainder", "closed_outside", "exit_failed", "exit_partial", "sell_unconfirmed",
 ];
 /** an order that went in and may have filled: "filled" is not known */
 const UNCONFIRMED = ["buy_unconfirmed", "sell_unconfirmed"];
@@ -671,6 +717,10 @@ export function answerWhy(which: Which, a: Answer, s: Status): string {
   const real = s.limits.open_positions.real;
   const prac = s.limits.open_positions.practice;
   const days = s.signals.pass.days_left;
+  // no exit signals, and the agent sells what it holds itself before the close
+  const sells = sellsFor(s);
+  if (which === "closing" && sells && NO_EXITS.includes(a.reason_code))
+    return `No exit signals reach the agent. It sells your real positions itself at ${sells} today unless they are back.`;
   switch (a.reason_code) {
     case "ok":
       if (which === "opening")
@@ -779,6 +829,33 @@ const NEXT_UNMANAGED: Record<string, (p: Position, b: string) => string> = {
 function guardStill(p: Position): string {
   return p.next.expiry_guard_at ? ` The expiry sell still sells it on ${etWhen(p.next.expiry_guard_at)} if it is open then.` : "";
 }
+/** "3:30 PM ET" while the agent will sell what it holds itself for lack of
+ *  exit signals (signals.exit_loss armed), else null. */
+export function sellsFor(s: Status): string | null {
+  const x = s.signals?.exit_loss;
+  return x && x.armed && x.sell_at ? etTime(x.sell_at) : null;
+}
+/** The capability reasons that mean no exit signal reaches the agent. */
+const NO_EXITS = ["no_signal_access", "feed_unreachable", "pass_unchecked"];
+
+/** Why no exit signal reaches the agent, in the agent's own words
+ *  (agent._SIGNAL_LOSS_WHY; a test keeps the two the same). */
+export const EXIT_LOSS_WHY: Record<ExitLoss["cause"], string> = {
+  pass_ended: "your signal pass has run out",
+  pass_unpaid: "your signal pass is not paid yet",
+  pass_unchecked: "the agent could not check your signal pass with AgentHC",
+  no_day_pass: "the agent has no day-pass for today",
+  day_pass_off: "Recurring day-pass is off, so the agent has no day-pass for today",
+  day_pass_short: "the agent's wallet does not hold enough sats for today's day-pass",
+  day_pass_failed: "the agent's wallet could not pay for today's day-pass",
+  day_pass_undecided: "the agent's wallet has not said whether today's day-pass payment went through",
+  day_pass_refused: "AgentHC refused today's day-pass",
+  feed_error: "the signal feed can't be read",
+  feed_not_live: "the signal feed can't be read",
+  feed_refused: "the signal feed is refusing the agent",
+};
+export const exitLossWhy = (x: ExitLoss) => own(EXIT_LOSS_WHY, x.cause) ?? EXIT_LOSS_WHY.feed_error;
+
 /** Reasons whose own sentence already says what happens on expiry day. */
 const SAYS_EXPIRY = ["expired", "no_bid"];
 export const GUARD_STILL = ["no_exit_signals", "feed_unreachable", "pass_unchecked"];
@@ -815,6 +892,15 @@ export function nextSay(p: Position, s: Status): NextSay {
         : { text: "Closes on paper at its exit signal.", look: "ok", icon: "check" };
     case "unmanaged":
     case "unknown": {
+      const sells = sellsFor(s);
+      if (real && sells && GUARD_STILL.includes(n.reason_code)) {
+        const guardFirst = n.expiry_guard_at != null && s.signals.exit_loss?.sell_at != null && n.expiry_guard_at < s.signals.exit_loss.sell_at;
+        return {
+          text: `No exit signals reach the agent. It sells this at ${sells} today unless they are back.${guardFirst ? guardStill(p) : ""}`,
+          look: "bad",
+          icon: "clock",
+        };
+      }
       const say = own(NEXT_UNMANAGED, n.reason_code);
       let text = say ? say(p, b) : real ? "Not being looked after. The reason is not described in this version." : "Not updated right now.";
       const guarded = GUARD_STILL.includes(n.reason_code) && n.expiry_guard_at != null;

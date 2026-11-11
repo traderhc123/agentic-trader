@@ -415,6 +415,53 @@ STATES.update({
 })
 
 
+# ── the no-signal sell and the pass's last days ─────────────────────────────
+
+_RUN_OUT = ("Your signal pass has run out: no new trades until you buy more "
+            "signal days (dashboard → Settings → Signal source).")
+
+
+def _signal_loss():
+    """The prepaid pass ran out at 1:00 PM ET with real positions open: no
+    exit signal can reach the agent, it warned the owner at 1:05 PM, and it
+    sells what it holds at 3:30 PM unless signals are back. The running
+    agent hands over its own line about it (agent.signal_loss_banner)."""
+    import agent as A
+    cfg = LIVE
+    st = {**_state(True), **_pass_state(0, "used_up"), "pass_notice": _RUN_OUT,
+          "signal_loss": {"since": _T - 6060, "cause": "pass_ended",
+                          "warned_at": _T - 5760, "warned_day": TODAY}}
+    banner = A.signal_loss_banner(cfg, st, NOW.astimezone(A.MARKET_TZ))
+    return (cfg, st, _history(True), runtime(feed_access=False, notices=[
+        {**w, "code": "signal_loss", "condition": "positions_unmanaged"}
+        for w in banner]))
+
+
+STATES.update({
+    "signal-loss-sell": _signal_loss(),
+    # one signal day left on the prepaid pass; then its last day
+    "pass-one-day-left": (LIVE, {**_state(True), **_pass_state(1, "active")},
+                          _history(True), runtime()),
+    "pass-last-day": (LIVE, {**_state(True), **_pass_state(0, "active"),
+                             "pass_charged_day": TODAY},
+                      _history(True), runtime()),
+    # the 08:30 renewal of the wallet day-pass failed; the running one still
+    # reads entries until 3:00 PM ET (review F5: the alert is on /v2 too)
+    "daypass-renewal-failed": (
+        {**LIVE, "feed_pass": None, "lnbits_url": "https://wallet.example",
+         "day_pass_recurring": True},
+        {**_state(True), "l402": {"token": "t", "expires_at": _T + 1133},
+         "daypass_alert": "daypass_failed_notified",
+         "pass_notice": ("Your agent's wallet could not pay for today's "
+                         "day-pass (10,000 sats): the wallet does not hold "
+                         "enough sats — add sats in the dashboard (Settings → "
+                         "Signal source). Nothing was paid. The pass it has "
+                         "runs until 3:00 PM ET; it opens no new trades today "
+                         "because that is before the close.")},
+        _history(True), runtime(feed_access=True)),
+})
+
+
 def _stress():
     """Hostile and oversized data: long names, huge numbers, unknown kinds,
     rows from before the facts were recorded."""

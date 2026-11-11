@@ -207,7 +207,7 @@ export function valueWords(key: string, v: unknown): string {
   }
   if (key === "wallet_fund") return isNum(v) ? `${count(v)} sats` : "not set";
   if (key === "code" && typeof v === "string" && v) return v.charAt(0).toUpperCase() + v.slice(1);
-  if (key === "expiry_sell_et") return v == null || typeof v === "string" ? etClockWords(v) : "not known";
+  if (key === "expiry_sell_et" || key === "no_signal_sell_et") return v == null || typeof v === "string" ? etClockWords(v) : "not known";
   if (typeof v === "boolean") return v ? "On" : "Off";
   if (isNum(v)) return count(v);
   if (v == null || v === "") return "not set";
@@ -232,6 +232,7 @@ export function confirmLabel(changes: Change[]): string {
   }
   if (c.key === "trade_size.other" && c.new == null) return "Use the main-pick size";
   if (c.key === "expiry_sell_et") return c.new == null ? "Turn off the expiry-day sell" : `Sell at ${to}`;
+  if (c.key === "no_signal_sell_et") return c.new == null ? "Turn off the no-signal sell" : `Sell at ${to}`;
   const short = to.replace(/ a (trade|day)$| at once$/, "");
   return c.direction === "raises_risk" ? `Raise to ${short}` : c.direction === "lowers_risk" ? `Lower to ${short}` : `Change to ${short}`;
 }
@@ -240,9 +241,10 @@ export function confirmLabel(changes: Change[]): string {
  *  types ("This raises your risk"). Same rules as webui._risk_direction:
  *  bigger is riskier, and no daily loss limit is the riskiest. */
 export function riskOf(key: string, old: unknown, next: unknown): Direction {
-  if (key === "expiry_sell_et") {
+  if (key === "expiry_sell_et" || key === "no_signal_sell_et") {
     // "HH:MM" or null (off): off raises the risk, a later time holds the
-    // contract longer into its last day (webui._expiry_direction)
+    // contract longer into its last day, or a position nobody can get an
+    // exit signal for longer into the session (webui._expiry_direction)
     const a = old as string | null;
     const b = next as string | null;
     if (a === b) return "neutral";
@@ -443,6 +445,8 @@ export function expiryTimePayload(saved: string | null | undefined, off: boolean
 }
 
 export const expiryAlertPayload = expiryTimePayload;
+/** The no-signal sell time for a save on the limits route: the same rules. */
+export const noSignalPayload = expiryTimePayload;
 
 // ── trade size: the wizard's words, and the budget hint ─────────────────────
 
