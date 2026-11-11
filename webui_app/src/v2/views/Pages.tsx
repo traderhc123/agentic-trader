@@ -170,7 +170,7 @@ export function RulesView({ page }: { page: Page }) {
             L.max_daily_loss != null ? (
               <>
                 {usd(L.max_daily_loss, 0)}
-                <small>{usd(lost, 0)} lost today</small>
+                <small><span className={lost > 0 ? "loss" : ""}>{usd(lost, 0)}</span> lost today</small>
               </>
             ) : (
               <>

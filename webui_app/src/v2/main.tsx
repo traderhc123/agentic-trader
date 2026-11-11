@@ -9,7 +9,7 @@ try {
   const t = localStorage.getItem("at-theme");
   if (t === "dark" || t === "light") document.documentElement.dataset.theme = t;
 } catch {
-  /* private mode: follow the computer's setting */
+  /* private mode: the navy default */
 }
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

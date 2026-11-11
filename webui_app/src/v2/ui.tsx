@@ -148,7 +148,7 @@ export function useModal(open: boolean, box: RefObject<HTMLElement>, onClose: ()
   }, [open, box]);
 }
 
-/** A confirm dialog in the design's shape: strip (orange for LIVE, hatched
+/** A confirm dialog in the design's shape: strip (blue for LIVE, hatched
  *  for practice), title, lead, body, then the safe button first in focus. */
 export function Dialog({
   tone,

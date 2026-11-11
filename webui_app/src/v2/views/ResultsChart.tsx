@@ -1,184 +1,199 @@
-// Running totals of closed trades, one line per book (TradingView
-// Lightweight Charts, bundled; nothing is loaded at run time).
-// Real money = solid orange with round marks, practice = dashed periwinkle
-// with square marks: told apart by shape as well as colour. Left/right arrow
-// keys read each day; the same numbers are in the table under the chart.
-import { ColorType, CrosshairMode, LineStyle, createChart, type IChartApi, type ISeriesApi, type Time } from "lightweight-charts";
-import { useEffect, useRef, useState } from "react";
-import { dayLong, signed } from "../lib/format";
+// The Results chart: each book's running total of closed trades over the
+// chosen period, one point per market day (ET). Plain SVG drawn from the
+// numbers in lib/chart.ts; nothing is loaded at run time.
+//
+// Real money = solid blue line with round marks, practice = dashed violet
+// line with diamonds: told apart by line style and shape as well as colour.
+// Each day's mark is filled green for a winning day and red for a losing one
+// (the edge keeps the book colour). The end of each line carries its book's
+// name and signed total, green or red. Left/right arrow keys (and Home/End)
+// read each day; the by-day table under the chart has the same numbers.
+import { useLayoutEffect, useRef, useState } from "react";
+import { type BookKey, type ChartModel, type DayPoint, axisMoney, niceTicks } from "../lib/chart";
+import { dayLong, dayShort, signed, tone } from "../lib/format";
 
-export interface DayPoint {
-  day: string;
-  /** that day's result, null when nothing closed in this book that day */
-  pnl: number | null;
-  closed: number;
-  /** running total up to and including the day; null before the book's first trade */
-  cum: number | null;
-}
-export interface ChartModel {
-  days: string[];
-  real: DayPoint[];
-  practice: DayPoint[];
-}
+const NAME: Record<BookKey, [string, string]> = { real: ["Real money", "Real"], practice: ["Practice", "Practice"] };
+// marks are drawn while the days are far enough apart to read them
+const MAX_MARKED_DAYS = 66;
 
-const css = (n: string) => getComputedStyle(document.documentElement).getPropertyValue(`--${n}`).trim();
+/** Rough text width in px (the axis and end labels are short and tabular). */
+const textW = (s: string, px: number) => Math.ceil(s.length * px * 0.6);
 
-function safeLocale(): string {
-  for (const l of [navigator.language, "en-US"]) {
-    try {
-      new Intl.DateTimeFormat(l);
-      return l;
-    } catch {
-      /* some systems report a tag Intl rejects: try the next one */
-    }
-  }
-  return "en-US";
+function Mark({ k, x, y, cls }: { k: BookKey; x: number; y: number; cls: string }) {
+  return k === "real" ? (
+    <circle className={`mk mk-real ${cls}`} cx={x} cy={y} r={4.5} />
+  ) : (
+    <rect className={`mk mk-practice ${cls}`} x={x - 4} y={y - 4} width={8} height={8} transform={`rotate(45 ${x} ${y})`} />
+  );
 }
 
-const axis = (v: number) => {
-  const a = Math.abs(v);
-  return (v < 0 ? "−" : "") + "$" + (a >= 10000 ? (a / 1000).toLocaleString("en-US", { maximumFractionDigits: 1 }) + "k" : a.toLocaleString("en-US", { maximumFractionDigits: 0 }));
-};
-
-function line(label: string, p: DayPoint) {
-  if (p.cum == null) return `${label}: no trades yet`;
-  if (p.pnl == null) return `${label}: nothing closed, total ${signed(p.cum)}`;
-  return `${label}: ${signed(p.pnl)} that day, total ${signed(p.cum)}`;
+function TipLine({ k, p }: { k: BookKey; p: DayPoint }) {
+  const name = NAME[k][0];
+  if (p.cum == null) return <span>{name}: no closed trades yet</span>;
+  return (
+    <span>
+      {name}:{" "}
+      {p.pnl == null ? (
+        "nothing closed"
+      ) : (
+        <>
+          <b className={tone(p.pnl)}>{signed(p.pnl)}</b> that day
+        </>
+      )}
+      , running total <b className={tone(p.cum)}>{signed(p.cum)}</b>
+    </span>
+  );
 }
 
-export default function ResultsChart({ model, label }: { model: ChartModel; label: string }) {
+export default function ResultsChart({ model, label, emptyText }: { model: ChartModel; label: string; emptyText?: string }) {
   const wrap = useRef<HTMLDivElement>(null);
-  const el = useRef<HTMLDivElement>(null);
-  const chart = useRef<IChartApi | null>(null);
-  const series = useRef<{ real: ISeriesApi<"Line">; practice: ISeriesApi<"Line"> } | null>(null);
-  const [cur, setCur] = useState(-1);
-  const [left, setLeft] = useState(0);
   const tip = useRef<HTMLDivElement>(null);
-  const modelRef = useRef(model);
-  const repaint = useRef<() => void>(() => {});
-  modelRef.current = model;
+  const [W, setW] = useState(0);
+  const [cur, setCur] = useState(-1);
 
-  useEffect(() => {
-    if (!el.current) return;
-    const c = createChart(el.current, {
-      autoSize: true,
-      handleScroll: false,
-      handleScale: false,
-      localization: { locale: safeLocale(), priceFormatter: axis },
-      crosshair: { mode: CrosshairMode.Magnet, horzLine: { visible: false, labelVisible: false } },
-      rightPriceScale: { scaleMargins: { top: 0.14, bottom: 0.12 }, borderVisible: false },
-      timeScale: { fixLeftEdge: true, fixRightEdge: true, borderVisible: false },
-    });
-    const practice = c.addLineSeries({ lineStyle: LineStyle.Dashed, lineWidth: 2, title: "Practice", priceLineVisible: false, crosshairMarkerRadius: 4 });
-    const real = c.addLineSeries({ lineStyle: LineStyle.Solid, lineWidth: 3, title: "Real money", priceLineVisible: false, crosshairMarkerRadius: 4 });
-    real.createPriceLine({ price: 0, color: css("line2"), lineWidth: 1, lineStyle: LineStyle.Solid, axisLabelVisible: false, title: "" });
-    chart.current = c;
-    series.current = { real, practice };
-
-    const paint = () => {
-      const font = getComputedStyle(document.body).fontFamily;
-      c.applyOptions({
-        layout: { background: { type: ColorType.Solid, color: "transparent" }, textColor: css("ink2"), fontFamily: font, fontSize: 13 },
-        grid: { vertLines: { visible: false }, horzLines: { color: css("line") } },
-        crosshair: { vertLine: { color: css("line2"), labelBackgroundColor: css("ink") } },
-      });
-      // on a narrow chart the end labels would cover the lines: the legend
-      // above the chart carries the same two totals
-      const small = (el.current?.clientWidth ?? 0) < 560;
-      real.applyOptions({ color: css("real"), title: small ? "" : "Real money" });
-      practice.applyOptions({ color: css("prac"), title: small ? "" : "Practice" });
-      setMarks();
-    };
-    const setMarks = () => {
-      const m = modelRef.current;
-      if (m.days.length > 31) {
-        real.setMarkers([]);
-        practice.setMarkers([]);
-        return;
-      }
-      real.setMarkers(m.real.filter((p) => p.pnl != null).map((p) => ({ time: p.day as Time, position: "inBar" as const, shape: "circle" as const, color: css("real"), size: 0.8 })));
-      practice.setMarkers(m.practice.filter((p) => p.pnl != null).map((p) => ({ time: p.day as Time, position: "inBar" as const, shape: "square" as const, color: css("prac"), size: 0.8 })));
-    };
-    repaint.current = paint;
-    paint();
-    // follow the theme: the OS setting and the page's own switch
-    const mq = matchMedia("(prefers-color-scheme: dark)");
-    mq.addEventListener("change", paint);
-    const mo = new MutationObserver(paint);
-    mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-    addEventListener("resize", paint);
-    c.subscribeCrosshairMove((p) => {
-      const i = typeof p.time === "string" ? modelRef.current.days.indexOf(p.time) : -1;
-      setCur(i);
-      if (i >= 0 && p.point) setLeft(p.point.x);
-    });
-    return () => {
-      mq.removeEventListener("change", paint);
-      mo.disconnect();
-      removeEventListener("resize", paint);
-      c.remove();
-      chart.current = null;
-      series.current = null;
-    };
+  useLayoutEffect(() => {
+    const el = wrap.current;
+    if (!el) return;
+    const read = () => setW(Math.max(260, Math.floor(el.clientWidth)));
+    read();
+    const ro = new ResizeObserver(read);
+    ro.observe(el);
+    return () => ro.disconnect();
   }, []);
 
-  useEffect(() => {
-    const s = series.current;
-    const c = chart.current;
-    if (!s || !c) return;
-    const pts = (k: "real" | "practice") => model[k].filter((p) => p.cum != null).map((p) => ({ time: p.day as Time, value: p.cum as number }));
-    s.real.setData(pts("real"));
-    s.practice.setData(pts("practice"));
-    repaint.current();
-    c.timeScale().fitContent();
-  }, [model]);
-
-  const show = (i: number) => {
-    const c = chart.current;
-    const s = series.current;
-    if (!c || !s || i < 0 || i >= model.days.length) return;
-    const day = model.days[i];
-    const r = model.real[i];
-    const p = model.practice[i];
-    const on = r.cum != null ? s.real : s.practice;
-    const v = r.cum ?? p.cum ?? 0;
-    c.setCrosshairPosition(v, day as Time, on);
-    const x = c.timeScale().timeToCoordinate(day as Time);
-    if (x != null) setLeft(x);
-    setCur(i);
-  };
-  const hide = () => {
-    chart.current?.clearCrosshairPosition();
-    setCur(-1);
-  };
-
   const N = model.days.length;
-  const w = wrap.current?.clientWidth ?? 0;
-  const tw = tip.current?.offsetWidth ?? 0;
-  const tipLeft = Math.max(0, Math.min(left - tw / 2, Math.max(0, w - tw)));
+  const i = cur >= 0 && cur < N ? cur : -1;
+  const small = W > 0 && W < 560;
+  const H = small ? 220 : 260;
+
+  // the money axis: every value on the chart, and always $0
+  const vals = [...model.real, ...model.practice].map((p) => p.cum).filter((v): v is number => v != null);
+  const T = niceTicks(Math.min(0, ...vals), Math.max(0, ...vals));
+  const lo = T[0];
+  const hi = T[T.length - 1];
+
+  // end labels sit in a gutter right of the plot
+  const lines = (["real", "practice"] as BookKey[]).filter((k) => model.end[k] != null);
+  const name = (k: BookKey) => NAME[k][small ? 1 : 0];
+  const gutter = lines.length
+    ? Math.min(150, Math.max(56, ...lines.map((k) => Math.max(textW(name(k), 13) + 16, textW(signed(model.end[k], 0), 14)))) + 14)
+    : 12;
+  const m = { l: Math.max(...T.map((t) => textW(axisMoney(t), 13))) + 14, t: 16, r: gutter, b: 30 };
+  const plotW = Math.max(40, W - m.l - m.r);
+  const bw = plotW / Math.max(1, N);
+  const x = (j: number) => m.l + bw * (j + 0.5);
+  const y = (v: number) => m.t + ((hi - v) / (hi - lo)) * (H - m.t - m.b);
+
+  const step = Math.max(1, Math.ceil(N / Math.max(1, Math.floor(plotW / 64))));
+  const labelled: number[] = [];
+  for (let j = N - 1; j >= 0; j -= step) labelled.push(j);
+
+  const marked = N <= MAX_MARKED_DAYS;
+  const path = (k: BookKey) => {
+    const pts = model[k].map((p, j) => (p.cum == null ? null : `${x(j).toFixed(1)},${y(p.cum).toFixed(1)}`)).filter(Boolean);
+    return pts.length > 1 ? <path className={`ln ln-${k}`} d={`M${pts.join("L")}`} /> : null;
+  };
+  const marks = (k: BookKey) =>
+    model[k].map((p, j) => {
+      if (p.cum == null) return null;
+      const last = j === N - 1 || model[k][j + 1]?.cum == null;
+      if (marked && p.pnl != null) return <Mark key={j} k={k} x={x(j)} y={y(p.cum)} cls={tone(p.pnl) || "flat"} />;
+      // without daily marks, the line still ends on its book's mark
+      if (!marked && last) return <Mark key={j} k={k} x={x(j)} y={y(p.cum)} cls="book" />;
+      return null;
+    });
+
+  // direct labels at the end of each line, pushed apart when they would touch
+  const ends = lines
+    .map((k) => ({ k, v: model.end[k] as number, y: y(model.end[k] as number) }))
+    .sort((a, b) => a.y - b.y);
+  if (ends.length === 2 && ends[1].y - ends[0].y < 36) {
+    const mid = (ends[0].y + ends[1].y) / 2;
+    ends[0].y = mid - 18;
+    ends[1].y = mid + 18;
+  }
+  for (const e of ends) e.y = Math.min(H - m.b - 8, Math.max(m.t + 10, e.y));
+
+  useLayoutEffect(() => {
+    const t = tip.current;
+    if (!t || i < 0) return;
+    const left = Math.max(0, Math.min(x(i) - t.offsetWidth / 2, W - t.offsetWidth));
+    t.style.left = `${left}px`;
+  });
+
+  const move = (j: number) => setCur(Math.max(0, Math.min(N - 1, j)));
   return (
     <div
       className="chart-wrap"
       ref={wrap}
       tabIndex={0}
-      role="img"
+      role="group"
+      aria-roledescription="chart"
       aria-label={label}
-      onBlur={hide}
-      onMouseLeave={hide}
+      onBlur={() => setCur(-1)}
+      onMouseLeave={() => setCur(-1)}
       onKeyDown={(e) => {
-        if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+        const go: Record<string, number> = { ArrowRight: i < 0 ? N - 1 : i + 1, ArrowLeft: i < 0 ? N - 1 : i - 1, Home: 0, End: N - 1 };
+        if (e.key in go) {
           e.preventDefault();
-          show(Math.max(0, Math.min(N - 1, cur < 0 ? N - 1 : cur + (e.key === "ArrowRight" ? 1 : -1))));
-        }
+          move(go[e.key]);
+        } else if (e.key === "Escape") setCur(-1);
       }}
     >
-      <div ref={el} className="chart-canvas" />
-      <div className="tip" ref={tip} role="status" style={{ display: cur >= 0 ? "block" : "none", left: tipLeft }}>
-        {cur >= 0 && (
+      {W > 0 ? (
+        <svg className="chart" viewBox={`0 0 ${W} ${H}`} width={W} height={H} aria-hidden="true">
+          {T.map((t) => (
+            <g key={t}>
+              <line className={t === 0 ? "zero" : "grid"} x1={m.l} x2={W - m.r} y1={y(t)} y2={y(t)} />
+              <text x={m.l - 8} y={y(t) + 4} textAnchor="end">
+                {axisMoney(t)}
+              </text>
+            </g>
+          ))}
+          {labelled.map((j) => (
+            <text key={j} x={x(j)} y={H - 8} textAnchor={j === N - 1 && N > 1 ? "end" : "middle"} dx={j === N - 1 && N > 1 ? bw / 2 : 0}>
+              {dayShort(model.days[j])}
+            </text>
+          ))}
+          {i >= 0 && <line className="cross" x1={x(i)} x2={x(i)} y1={m.t} y2={H - m.b} />}
+          {path("practice")}
+          {path("real")}
+          {marks("practice")}
+          {marks("real")}
+          {i >= 0 &&
+            (["practice", "real"] as BookKey[]).map((k) => {
+              const p = model[k][i];
+              return p.cum == null ? null : <Mark key={k} k={k} x={x(i)} y={y(p.cum)} cls="hot" />;
+            })}
+          {ends.map((e) => (
+            <g key={e.k} className="endlab">
+              <Mark k={e.k} x={W - m.r + 12} y={e.y - 6} cls="book" />
+              <text className="end" x={W - m.r + 22} y={e.y - 2}>
+                {name(e.k)}
+              </text>
+              <text className={`endv ${tone(e.v)}`} x={W - m.r + 8} y={e.y + 15}>
+                {signed(e.v, 0)}
+              </text>
+            </g>
+          ))}
+          {model.days.map((d, j) => (
+            <rect key={d} className="hit" x={m.l + bw * j} y={m.t} width={bw} height={H - m.t - m.b} onMouseEnter={() => setCur(j)} onClick={() => setCur(j)} />
+          ))}
+        </svg>
+      ) : (
+        <div style={{ height: H }} />
+      )}
+      {emptyText && (
+        <p className="chart-empty" style={{ top: m.t, bottom: m.b, left: m.l, right: m.r }}>
+          <span>{emptyText}</span>
+        </p>
+      )}
+      <div className="tip" ref={tip} role="status" aria-live="polite" style={{ display: i >= 0 ? "block" : "none" }}>
+        {i >= 0 && (
           <>
-            <b>{dayLong(model.days[cur])}</b>
-            <span>{line("Real money", model.real[cur])}</span>
-            <span>{line("Practice", model.practice[cur])}</span>
+            <b>{dayLong(model.days[i])}</b>
+            <TipLine k="real" p={model.real[i]} />
+            <TipLine k="practice" p={model.practice[i]} />
           </>
         )}
       </div>
