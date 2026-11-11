@@ -7,7 +7,7 @@
 import { useEffect, useId, useState, type ReactNode } from "react";
 import type { Preview, SettingsView, SizeMode, SizeSpec } from "../../lib/settingsApi";
 import type { TradeSize } from "../../lib/viewModel";
-import { ReviewDialog, RiskLine, FieldError, Switch, askPreview } from "../Forms";
+import { ReviewDialog, RiskLine, FieldError, SettingsDoubt, Switch, askPreview } from "../Forms";
 import { API, send } from "../lib/http";
 import {
   SIZE_MODE_WORDS,
@@ -622,6 +622,7 @@ export function RulesView({ page }: { page: Page }) {
         </div>
         {page.stale && <Stamp at={page.asOf} />}
       </div>
+      <SettingsDoubt settings={page.settings} />
       {live && page.link === "ok" && (
         <div className="note note-info">
           <Icon name="info" />

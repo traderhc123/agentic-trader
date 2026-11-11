@@ -6,7 +6,7 @@
 // reads the settings again and shows those.
 import { useEffect, useId, useRef, useState } from "react";
 import type { AiModels, AiProviders, BrokerForm, Preview, Secret, SettingsView, SignInDone } from "../../lib/settingsApi";
-import { FieldError, ReviewDialog, Switch, askPreview } from "../Forms";
+import { FieldError, ReviewDialog, SettingsDoubt, Switch, askPreview } from "../Forms";
 import { brokerLabel } from "../lib/derive";
 import { API, getJson, send } from "../lib/http";
 import { MOVE_TOOL, RH_OPTIONS_URL, brokerName, signInOutcome } from "../lib/settings";
@@ -500,6 +500,7 @@ export function SettingsView({ page }: { page: Page }) {
         </div>
         {page.stale && <Stamp at={page.asOf} />}
       </div>
+      <SettingsDoubt settings={page.settings} />
       {why && page.link !== "lost" && !v && (
         <p className="small muted" role="status">
           {why}

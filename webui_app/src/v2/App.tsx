@@ -17,7 +17,7 @@ import { RulesView } from "./views/Rules";
 import { SettingsView } from "./views/Settings";
 import { SignalsView } from "./views/Signals";
 import { useSettings, type SettingsFeed } from "./useSettings";
-import { API, send } from "./lib/http";
+import { API, onUnknownWrite, send } from "./lib/http";
 import { VIEWS, type View } from "./lib/screens";
 import { ResultsView } from "./views/Results";
 import { Today } from "./views/Today";
@@ -230,6 +230,20 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
     toastTimer.current = setTimeout(() => setToast(null), 15000);
   }, []);
   const settings = useSettings();
+  // a write whose outcome is not known may have been saved: read the
+  // settings and the status again now, and say they are not confirmed
+  // until a read succeeds (no page keeps showing the old value as saved)
+  const { markUnsure, reload: reloadSettings } = settings;
+  const refreshStatus = feed.refresh;
+  useEffect(
+    () =>
+      onUnknownWrite(() => {
+        markUnsure();
+        reloadSettings();
+        refreshStatus();
+      }),
+    [markUnsure, reloadSettings, refreshStatus],
+  );
   // one typed command; the toast carries the agent's own reply, and the band
   // changes only when the next status says so
   const run = useCallback(

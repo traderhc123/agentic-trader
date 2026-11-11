@@ -63,6 +63,30 @@ export async function getJson<T>(path: string, f: Fetch = browserFetch): Promise
 /** A /v2 write's answer, or why there is none (`why`, with the words to show). */
 export type Sent<Done = object> = Reply<Done> | { ok: false; error: string; why: Failure };
 
+// Who to tell when a write's outcome is not known (no answer, or one this
+// page can't read): the change may have been saved, so the page must read
+// the settings again rather than keep showing what it read before.
+const unknownWrites = new Set<() => void>();
+
+/** Called after every write whose outcome is not known; returns the unsubscribe. */
+export function onUnknownWrite(fn: () => void): () => void {
+  unknownWrites.add(fn);
+  return () => {
+    unknownWrites.delete(fn);
+  };
+}
+
+function unknown<T>(r: T): T {
+  for (const fn of Array.from(unknownWrites)) {
+    try {
+      fn();
+    } catch {
+      /* a listener's failure never changes the answer */
+    }
+  }
+  return r;
+}
+
 /** POST to a /v2 route. The server answers every outcome with HTTP 200 and
  *  {ok, ...}; anything else is a failure this page reports as unknown. */
 export async function send<Done = object>(path: string, body: unknown, f: Fetch = browserFetch): Promise<Sent<Done>> {
@@ -70,7 +94,7 @@ export async function send<Done = object>(path: string, body: unknown, f: Fetch 
   try {
     r = await postJson(path, body, undefined, f);
   } catch {
-    return { ok: false, why: "network", error: FAILED.network.write };
+    return unknown({ ok: false, why: "network", error: FAILED.network.write });
   }
   if (r.status === 401 || r.status === 403) return { ok: false, why: "locked", error: FAILED.locked.write };
   let j: unknown = null;
@@ -81,7 +105,7 @@ export async function send<Done = object>(path: string, body: unknown, f: Fetch 
   }
   const o = j as { ok?: unknown; error?: unknown } | null;
   if (r.status !== 200 || !o || typeof o !== "object" || typeof o.ok !== "boolean")
-    return { ok: false, why: "server", error: FAILED.server.write };
+    return unknown({ ok: false, why: "server", error: FAILED.server.write });
   if (o.ok === false && typeof o.error !== "string") return { ...(o as object), ok: false, error: "The agent refused the change without saying why. Nothing was changed." } as Sent<Done>;
   return o as Sent<Done>;
 }

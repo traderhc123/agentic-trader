@@ -53,7 +53,7 @@ import {
 } from "../src/v2/lib/derive.ts";
 import { UNKNOWN, ago, contractName, dayLong, etDayKey, etTime, etWhen, plural, signed, span, tone, usd } from "../src/v2/lib/format.ts";
 import { UPDATE } from "../src/v2/lib/copy.ts";
-import { API, FAILED, confirmBody, getJson, postJson, send } from "../src/v2/lib/http.ts";
+import { API, FAILED, confirmBody, getJson, onUnknownWrite, postJson, send } from "../src/v2/lib/http.ts";
 import {
   MOVE_TOOL,
   ackGiven,
@@ -68,6 +68,7 @@ import {
   readTickers,
   riskOf,
   savedTickers,
+  settingsDoubt,
   signInOutcome,
   sizeMeans,
   sizeWords,
@@ -914,6 +915,35 @@ test("settings: a limits save sends only what changed, and never the mode", () =
   assert.deepEqual(limitsPayload(saved, { other: null }), { trade_size: { other: { mode: "same" } } });
   for (const p of [limitsPayload(saved, { max_open_positions: 9 }), limitsPayload(saved, {})])
     for (const k of Object.keys(p)) assert.ok(!/dry|mode|paused/.test(k), k);
+});
+
+test("http: a write with no answer, or one it can't read, makes the page read the settings again", async () => {
+  let told = 0;
+  const off = onUnknownWrite(() => told++);
+  const answer = (status, body) => async () => new Response(body, { status });
+  try {
+    // no answer, and an answer this page can't read: the change may have been saved
+    assert.equal((await send("/api/v2/settings/limits", {}, async () => { throw new TypeError("offline"); })).why, "network");
+    assert.equal(told, 1);
+    assert.equal((await send("/api/v2/settings/limits", {}, answer(502, "<html>bad gateway</html>"))).why, "server");
+    assert.equal(told, 2);
+    // a clear answer, either way, or a login that expired (nothing changed): no re-read needed
+    await send("/api/v2/settings/limits", {}, answer(200, JSON.stringify({ ok: true, saved: true })));
+    await send("/api/v2/settings/limits", {}, answer(200, JSON.stringify({ ok: false, error: "no" })));
+    await send("/api/v2/settings/limits", {}, answer(401, "{}"));
+    assert.equal(told, 2);
+  } finally {
+    off();
+  }
+  await send("/api/v2/settings/limits", {}, async () => { throw new TypeError("offline"); });
+  assert.equal(told, 2, "unsubscribed");
+  // what the page says beside values it can't vouch for, until a read succeeds
+  assert.equal(settingsDoubt(true, "", false), "");
+  assert.equal(settingsDoubt(false, "Could not reach the agent. Try again.", true), "", "no values shown: the page already says why");
+  assert.match(settingsDoubt(true, "", true), /^Not known: .*may not be what is saved now/);
+  assert.match(settingsDoubt(true, "Could not reach the agent. Try again.", true), /Could not reach the agent/);
+  assert.match(settingsDoubt(true, "Could not reach the agent. Try again.", false), /may be out of date.*Could not reach/);
+  for (const t of [settingsDoubt(true, "", true), settingsDoubt(true, "x.", false)]) clean(t, "doubt");
 });
 
 test("signal days: 'Paid' only for the purchase this dialog made", () => {

@@ -10,14 +10,19 @@ export interface SettingsFeed {
   view: SettingsView | null;
   /** why the last read failed ("" when it did not) */
   error: string;
+  /** a write's outcome is not known (see http.onUnknownWrite): `view` may
+   *  not be what is saved, until a read succeeds */
+  unsure: boolean;
   loading: boolean;
   /** read again; resolves to the new view (null when the read failed) */
   reload: () => Promise<SettingsView | null>;
+  markUnsure: () => void;
 }
 
 export function useSettings(): SettingsFeed {
   const [view, setView] = useState<SettingsView | null>(null);
   const [error, setError] = useState("");
+  const [unsure, setUnsure] = useState(false);
   const [loading, setLoading] = useState(false);
   const seq = useRef(0);
   const reload = useCallback(async () => {
@@ -31,8 +36,10 @@ export function useSettings(): SettingsFeed {
       return null;
     }
     setError("");
+    setUnsure(false);
     setView(r.body);
     return r.body;
   }, []);
-  return { view, error, loading, reload };
+  const markUnsure = useCallback(() => setUnsure(true), []);
+  return { view, error, unsure, loading, reload, markUnsure };
 }

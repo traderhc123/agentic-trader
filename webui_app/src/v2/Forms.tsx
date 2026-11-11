@@ -7,7 +7,8 @@
 // server said so, and the page then reads the settings again and shows them.
 import { useId, useState, type ReactNode } from "react";
 import type { Change, Direction, Preview } from "../lib/settingsApi";
-import { DIRECTION_WORDS, ackGiven, confirmLabel, valueWords } from "./lib/settings";
+import { DIRECTION_WORDS, ackGiven, confirmLabel, settingsDoubt, valueWords } from "./lib/settings";
+import type { SettingsFeed } from "./useSettings";
 import { confirmBody, send, type Sent } from "./lib/http";
 import { Dialog, Icon } from "./ui";
 
@@ -192,6 +193,25 @@ export function ReviewDialog<Done>({
         </div>
       )}
     </Dialog>
+  );
+}
+
+/** Said once at the top of a settings page while its values can't be
+ *  vouched for (settingsDoubt), with a way to read them again. */
+export function SettingsDoubt({ settings }: { settings: SettingsFeed }) {
+  const text = settingsDoubt(!!settings.view, settings.error, settings.unsure);
+  if (!text) return null;
+  return (
+    <div className="note note-warn" role="status">
+      <Icon name="alert" />
+      <h3>Settings not confirmed</h3>
+      <p>{text}</p>
+      <div className="note-act">
+        <button className="btn btn-sm" onClick={() => settings.reload()} disabled={settings.loading}>
+          {settings.loading ? "Reading…" : "Read again"}
+        </button>
+      </div>
+    </div>
   );
 }
 

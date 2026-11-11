@@ -238,6 +238,20 @@ export function v2Words(text: string): string {
     .replace(new RegExp(String.raw`\s*\(dashboard${to}[^)]*\)`, "gi"), " (Settings)");
 }
 
+// ── settings this page can't vouch for ───────────────────────────────────────
+
+/** What to say beside settings values this page read earlier but can't
+ *  vouch for now: a write's outcome is not known (it may have been saved),
+ *  or the last read failed. "" when the values are as last read. Pages with
+ *  no view at all already say why. */
+export function settingsDoubt(hasView: boolean, error: string, unsure: boolean): string {
+  if (!hasView) return "";
+  if (unsure)
+    return `Not known: this page could not confirm your last change, so the values below may not be what is saved now. ${error || "Reading them again…"}`;
+  if (error) return `The values below may be out of date: this page could not read them again. ${error}`;
+  return "";
+}
+
 // ── the going-LIVE tick box ──────────────────────────────────────────────────
 
 /** The tick box beside "Go LIVE" confirms ONE preview: it is remembered as

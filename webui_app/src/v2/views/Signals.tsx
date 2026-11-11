@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Invoice, PassCheck, PassOptions, Preview, WalletBalance } from "../../lib/settingsApi";
 import type { Status } from "../../lib/viewModel";
-import { FieldError, ReviewDialog, askPreview } from "../Forms";
+import { FieldError, ReviewDialog, SettingsDoubt, askPreview } from "../Forms";
 import { API, getJson } from "../lib/http";
 import { purchaseFate } from "../lib/settings";
 import { UNKNOWN, count, etDayKey, etWhen, plural, usd } from "../lib/format";
@@ -349,6 +349,7 @@ export function SignalsView({ page }: { page: Page }) {
         </div>
         {page.stale && <Stamp at={page.asOf} />}
       </div>
+      <SettingsDoubt settings={page.settings} />
       <div className="two">
         <section className={`panel ${page.stale ? "stale" : ""}`}>
           <div className="ph">
