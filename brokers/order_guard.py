@@ -27,9 +27,136 @@ happen:
 """
 
 import hashlib
+import math
 import time
 import uuid
 from datetime import datetime, timezone
+
+# ── the one rule every order obeys ──────────────────────────────────────────
+# The agent only ever BUYS options to open a long position and SELLS to close
+# a long position it holds. It never sells to open (writes) an option: a long
+# option can lose at most what was paid for it, a short one has no such
+# limit. check_order() is called by every adapter INSIDE the function that
+# sends the order to the broker (robinhood.place, alpaca._order,
+# moomoo._order), so no caller can go around it. tests/test_never_sell_to_open
+# fails if an order is sent from anywhere else.
+
+ALLOWED = {"buy": "open", "sell": "close"}  # side -> the only effect it may have
+
+
+class RefusedOrder(Exception):
+    """check_order() turned the order down; nothing was sent. `code`:
+    "invalid"          not a buy-to-open or a sell-to-close of a whole
+                       number of contracts above zero;
+    "nothing_held"     the broker shows none of the contract available to
+                       sell right now (none held, or every contract held is
+                       being sold already — possibly only for a moment);
+    "holdings_unknown" what the account holds can't be read, and this broker
+                       isn't known to refuse an opening sell itself."""
+
+    def __init__(self, reason, code="invalid"):
+        super().__init__(reason)
+        self.reason = reason
+        self.code = code
+
+
+def contracts(n):
+    """n as a whole number of contracts (an int, never a bool), or None."""
+    if isinstance(n, bool):
+        return None
+    if isinstance(n, int):
+        return n
+    if isinstance(n, float) and math.isfinite(n) and n.is_integer():
+        return int(n)
+    return None
+
+
+def check_order(side, effect, qty, held_long, broker_refuses_open=False):
+    """The quantity this order may send, or RefusedOrder.
+
+    side "buy" needs effect "open"; side "sell" needs effect "close"; qty is
+    a whole number of contracts above zero. A sell is capped at held_long:
+    the LONG contracts the broker itself says the account holds of this
+    exact contract, minus those its working sell orders are already selling
+    (the agent's ledger is only an upper bound). held_long None means that
+    couldn't be read: the sell goes out only where the broker itself refuses
+    a sell that would open a position (broker_refuses_open)."""
+    if side not in ALLOWED:
+        raise RefusedOrder(f"an order with side {side!r} isn't a buy or a sell")
+    if effect != ALLOWED[side]:
+        raise RefusedOrder(
+            f"a {side} order that would {effect!r} a position — the agent only "
+            "buys to open and sells to close what it holds")
+    n = contracts(qty)
+    if n is None or n < 1:
+        raise RefusedOrder(f"an order for {qty!r} contracts — the quantity must "
+                           "be a whole number above zero")
+    if side == "buy":
+        return n
+    held = contracts(held_long)
+    if held is None:
+        if broker_refuses_open:
+            return n
+        raise RefusedOrder("couldn't confirm what the account holds",
+                           "holdings_unknown")
+    if held < 1:
+        raise RefusedOrder("the account holds none of it to sell (or all of it "
+                           "is already being sold)", "nothing_held")
+    return min(n, held)
+
+
+class OrderId(str):
+    """An order id that also says how many contracts the order was for: a
+    sell is capped at what the account holds (check_order), so it can be
+    for fewer than the caller asked."""
+
+    def __new__(cls, oid, qty):
+        obj = super().__new__(cls, str(oid))
+        obj.qty = qty
+        return obj
+
+
+def refusal_text(broker_name, side, qty, contract, exc):
+    """Plain words for an order check_order() turned down."""
+    code = getattr(exc, "code", "invalid")
+    if code == "nothing_held":
+        return (f"your {broker_name} account shows none of {contract} "
+                "available to sell right now (another sell may be working on "
+                "it, a fill may not have settled, or it is gone), so the agent "
+                "sent no sell order: selling it now could open a short position. "
+                "The agent checks the account again and retries.")
+    if code == "holdings_unknown":
+        return (f"couldn't confirm what your {broker_name} account holds, so the "
+                f"sell for {contract} was held back: a sell of contracts the "
+                "account doesn't hold would open a short position, and "
+                f"{broker_name} isn't known to refuse one. The agent tries "
+                "again every loop.")
+    return (f"the agent refused to send a {side} order for {qty}x {contract}: "
+            f"{getattr(exc, 'reason', exc)}. Nothing was sent.")
+
+
+def report_refusal(broker_name, side, qty, contract, exc, expires_today=False):
+    """Tell the owner (broker_events, never raises) and the log."""
+    import broker_events
+    from platform_compat import safe_print
+    msg = refusal_text(broker_name, side, qty, contract, exc)
+    if expires_today and getattr(exc, "code", "") == "holdings_unknown":
+        msg += (f" {contract} EXPIRES TODAY: if the agent still can't read the "
+                f"account, sell it in the {broker_name} app before the close or "
+                "it may be exercised.")
+    safe_print(f"  ORDER NOT SENT: {msg}")
+    broker_events.report("order_failed" if side == "buy" else "exit_failed", msg,
+                         reason=getattr(exc, "code", "invalid"))
+    return msg
+
+
+def short_text(broker_name, contract, n):
+    """Plain words for a short position found at the broker."""
+    return (f"your {broker_name} account is SHORT {n}x {contract} — a position "
+            "this agent never opens on purpose. The agent did not trade it and "
+            "won't: close it yourself in the broker app (buying it back to close "
+            "is your decision). New entries are paused until you resume.")
+
 
 STATE_KEY = "unconfirmed_orders"
 ADOPTED_KEY = "adopted_buys"  # buys found on a later loop, for the agent to log

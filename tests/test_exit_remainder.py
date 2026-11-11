@@ -752,7 +752,8 @@ def test_alpaca_option_fills(monkeypatch):
 
 def test_moomoo_exit_partial_fill_keeps_the_rest(monkeypatch):
     from test_position_reads import _MMSDK
-    sdk = _MMSDK(sell_status="SUBMITTED", sell_dealt=4)
+    sdk = _MMSDK(sell_status="SUBMITTED", sell_dealt=4,
+                 positions=[{"code": "US.SPY991218C752000", "qty": 10}])
     monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
     broker_events.begin()
     key = "SPY|2099-12-18|752.0|C"
@@ -768,7 +769,7 @@ def test_moomoo_exit_partial_fill_keeps_the_rest(monkeypatch):
 
 def test_moomoo_exit_filled_is_booked_as_sold(monkeypatch):
     from test_position_reads import _MMSDK
-    sdk = _MMSDK()
+    sdk = _MMSDK(positions=[{"code": "US.SPY991218C752000", "qty": 2}])
     monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
     key = "SPY|2099-12-18|752.0|C"
     st = {"positions": {key: {"option_id": "US.SPY991218C752000", "qty": 2}}}
@@ -780,7 +781,8 @@ def test_moomoo_exit_filled_is_booked_as_sold(monkeypatch):
 
 def test_moomoo_unreadable_exit_is_assumed_sold_and_reported(monkeypatch):
     from test_position_reads import _MMSDK
-    sdk = _MMSDK(ord_ret=-1)
+    # the holdings read works; only the sell's own fill check can't be read
+    sdk = _MMSDK(fill_ret=-1, positions=[{"code": "US.SPY991218C752000", "qty": 2}])
     monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
     broker_events.begin()
     key = "SPY|2099-12-18|752.0|C"
