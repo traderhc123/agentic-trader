@@ -122,13 +122,35 @@ class _Resp:
         return self._body
 
 
+class _BadJSON(_Resp):
+    """A 200 whose body isn't JSON (a proxy's error page, a cut-off answer)."""
+
+    def __init__(self):
+        self.status_code, self.text = 200, "<html>gateway"
+
+    def json(self):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+
+def _pos_failure(how):
+    """One failed GET /v2/positions: `how` is "500", "timeout" or "badjson"."""
+    if how == "timeout":
+        raise requests.ReadTimeout("read timed out")
+    if how == "badjson":
+        return _BadJSON()
+    return _Resp(int(how), {"message": "down"})
+
+
 class AlpacaAPI:
     """Alpaca's REST API for one account. `held`/`avail` script the
     position (avail < held: an open sell is working on it); `pos_status`
-    the positions read; `reject` the next order's rejection."""
+    the positions read; `pos_fail` how the next `pos_down` positions reads
+    fail (-1: every one); `reject` the next order's rejection."""
 
-    def __init__(self, monkeypatch, held=0, avail=None, side="long", pos_status=200):
+    def __init__(self, monkeypatch, held=0, avail=None, side="long", pos_status=200,
+                 sym=OCC):
         self.held, self.avail, self.side, self.pos_status = held, avail, side, pos_status
+        self.sym, self.pos_fail, self.pos_down, self.pos_reads = sym, "500", 0, []
         self.posts, self.reject = [], None
         monkeypatch.setattr(alpaca.requests, "post", self.post)
         monkeypatch.setattr(alpaca.requests, "get", self.get)
@@ -143,12 +165,16 @@ class AlpacaAPI:
 
     def get(self, url, **kw):
         if url.endswith("/v2/positions"):
+            self.pos_reads.append(kw.get("timeout"))
+            if self.pos_down:
+                self.pos_down -= 1
+                return _pos_failure(self.pos_fail)
             if self.pos_status != 200:
                 return _Resp(self.pos_status, {"message": "down"})
             if not self.held:
                 return _Resp(200, [])
             avail = self.held if self.avail is None else self.avail
-            return _Resp(200, [{"symbol": OCC, "qty": str(self.held),
+            return _Resp(200, [{"symbol": self.sym, "qty": str(self.held),
                                 "qty_available": str(avail), "side": self.side,
                                 "asset_class": "us_option"}])
         if "/v2/orders/" in url:
@@ -212,13 +238,121 @@ def test_alpaca_short_position_is_never_traded(monkeypatch):
     assert "SHORT 2x" in rep["message"]
 
 
-def test_alpaca_unreadable_holdings_still_sell_to_close(monkeypatch):
-    """Alpaca itself refuses a sell_to_close of contracts that aren't there,
-    so an unreadable positions list doesn't hold the exit back."""
-    api = AlpacaAPI(monkeypatch, pos_status=503)
-    changed, _st = _alp_sell(api, qty=2)
+def test_alpaca_is_not_counted_on_to_refuse_an_opening_sell():
+    """Whether Alpaca enforces position_intent "sell_to_close" on a
+    single-leg option order isn't verified: until a paper-account test shows
+    it, the agent doesn't rely on it."""
+    assert alpaca.BROKER_REFUSES_OPENING_SELL is False
+
+
+@pytest.mark.parametrize("how", ["500", "503", "timeout", "badjson"])
+def test_alpaca_holdings_unreadable_holds_the_sell_back_until_readable(
+        monkeypatch, how):
+    """With what the account holds unreadable a sell could open a short:
+    it is NOT sent, the owner is told, and it goes out once the account can
+    be read again: capped at what the account holds."""
+    api = AlpacaAPI(monkeypatch, held=2)
+    api.pos_fail, api.pos_down = how, -1
+    changed, st = _alp_sell(api, qty=3)
+    assert api.posts == [] and not changed and st["positions"][KEY]["qty"] == 3
+    assert len(api.pos_reads) == 3                 # one read and two retries
+    assert order_guard.get(st, KEY) is None        # nothing is "unconfirmed"
+    (rep,) = broker_events.drain()
+    assert rep["reason"] == "holdings_unknown" and rep["kind"] == "exit_failed"
+    assert "couldn't confirm what your Alpaca account holds" in rep["message"]
+    assert "held back" in rep["message"] and "every loop" in rep["message"]
+    assert "EXPIRES TODAY" not in rep["message"]
+    api.pos_down = 0                               # the next loop: readable
+    assert alpaca.execute(alpaca.client(ALP), ALP, _exit_ev(), st)
     (body,) = api.posts
     assert body["qty"] == "2" and body["position_intent"] == "sell_to_close"
+    assert st["positions"][KEY]["qty"] == 1        # the rest: settled later
+
+
+@pytest.mark.parametrize("how", ["500", "timeout", "badjson"])
+@pytest.mark.parametrize("fails", [1, 2])
+def test_alpaca_holdings_read_that_fails_briefly_sells_in_the_same_loop(
+        monkeypatch, how, fails):
+    """One failed GET /v2/positions doesn't hold the sell back for a whole
+    loop: the read is tried again (twice at most, a second apart)."""
+    slept = []
+    monkeypatch.setattr(alpaca.time, "sleep", slept.append)
+    api = AlpacaAPI(monkeypatch, held=3)
+    api.pos_fail, api.pos_down = how, fails
+    changed, st = _alp_sell(api, qty=3)
+    (body,) = api.posts
+    assert body["qty"] == "3" and changed and st["positions"] == {}
+    assert len(api.pos_reads) == fails + 1 and _reasons() == []
+    assert slept[:fails] == [alpaca._HOLDINGS_RETRY_WAIT_S] * fails
+
+
+def test_alpaca_holdings_retries_add_at_most_five_seconds(monkeypatch):
+    """Worst case (every retry times out): the pauses plus the retries'
+    own time limits stay within about 5 s."""
+    slept = []
+    monkeypatch.setattr(alpaca.time, "sleep", slept.append)
+    api = AlpacaAPI(monkeypatch, held=3)
+    api.pos_fail, api.pos_down = "timeout", -1
+    _alp_sell(api, qty=3)
+    first, *retries = api.pos_reads
+    assert first == alpaca._TIMEOUT and len(retries) == 2
+    hold_back_waits = [s for s in slept if s == alpaca._HOLDINGS_RETRY_WAIT_S]
+    assert sum(retries) + sum(hold_back_waits) <= 5.0
+    assert api.posts == []
+
+
+def test_alpaca_refused_holdings_read_is_not_retried(monkeypatch):
+    """A 401/403 won't be different a second later: held back at once."""
+    api = AlpacaAPI(monkeypatch, held=3, pos_status=403)
+    changed, _st = _alp_sell(api, qty=3)
+    assert api.posts == [] and not changed and len(api.pos_reads) == 1
+    assert _reasons() == ["holdings_unknown"]
+
+
+def test_alpaca_held_back_sell_says_so_louder_on_expiry_day(monkeypatch):
+    today = datetime.now(robinhood.MARKET_TZ).date().isoformat()
+    ev = make_event(event="EXITED", expiry=today, event_id="x-1")
+    occ = alpaca._occ_symbol(ev)
+    api = AlpacaAPI(monkeypatch, held=1, sym=occ)
+    api.pos_down = -1
+    st = {"positions": {f"SPY|{today}|752.0|C": {"option_id": occ, "qty": 1}}}
+    assert not alpaca.execute(alpaca.client(ALP), ALP, ev, st)
+    assert api.posts == []
+    (rep,) = broker_events.drain()
+    assert rep["reason"] == "holdings_unknown"
+    assert "EXPIRES TODAY" in rep["message"] and "before the close" in rep["message"]
+    assert "Alpaca app" in rep["message"]
+
+
+def test_agent_retries_an_alpaca_sell_held_back_and_alerts_once_on_expiry_day(
+        home, no_policy, monkeypatch):
+    """Through the agent: the held-back exit stays owed (retried every
+    loop), the owner gets one high-priority alert on the expiry day, and
+    the sell goes out once the account can be read."""
+    sent = []
+    monkeypatch.setattr(agent, "notify", lambda cfg, msg, **kw: sent.append((msg, kw)))
+    monkeypatch.setattr(agent, "_problems_logged", set())
+    today = agent._et_now().date().isoformat()
+    ev = make_event(event="EXITED", expiry=today, event_id="x-today")
+    occ = alpaca._occ_symbol(ev)
+    key = f"SPY|{today}|752.0|C"
+    api = AlpacaAPI(monkeypatch, held=2, sym=occ)
+    api.pos_down = -1
+    st = {"positions": {key: {"option_id": occ, "qty": 2}}}
+    cfg = dict(ALP, position_sync=False)
+    for _loop in range(2):
+        with pytest.raises(agent.ExitNotDone):
+            agent.handle_event(dict(ev), cfg, st, alpaca, alpaca.client(cfg),
+                               lambda s: None)
+    assert api.posts == [] and st["positions"][key]["qty"] == 2
+    urgent = [m for m, kw in sent if kw.get("priority") == "high"]
+    assert len(urgent) == 1
+    assert "EXPIRES TODAY" in urgent[0] and "held back" in urgent[0]
+    api.pos_down = 0
+    agent.handle_event(dict(ev), cfg, st, alpaca, alpaca.client(cfg), lambda s: None)
+    (body,) = api.posts
+    assert body["qty"] == "2" and body["side"] == "sell"
+    assert key not in st["positions"]
 
 
 def test_alpaca_every_order_carries_its_position_intent(monkeypatch):
@@ -255,8 +389,9 @@ def test_alpaca_order_without_an_effect_is_refused(monkeypatch):
 def test_alpaca_no_position_to_close_answer_means_gone_not_unknown(monkeypatch):
     """Alpaca turns the sell_to_close down: the contracts aren't there. A
     clear answer — not an unconfirmed order to look up, and nothing to
-    send again until a read shows the contracts held."""
-    api = AlpacaAPI(monkeypatch, pos_status=503)   # holdings unreadable: sent
+    send again until a read shows the contracts held. (Here the owner sold
+    them in the app between the agent's read and its order.)"""
+    api = AlpacaAPI(monkeypatch, held=2)
     api.reject = (403, {"code": 40310000, "message": "insufficient qty available "
                                                      "for order (requested: 2, "
                                                      "available: 0)"})
@@ -268,7 +403,7 @@ def test_alpaca_no_position_to_close_answer_means_gone_not_unknown(monkeypatch):
     assert "none of" in rep["message"] and "right now" in rep["message"]
     assert "no short position" in rep["message"]
     assert "any more" not in rep["message"] and "doesn't hold" not in rep["message"]
-    api.pos_status = 200                               # readable now: holds none
+    api.held = 0                                       # the next read: holds none
     changed, st = _alp_sell(api, qty=2)
     assert len(api.posts) == 1 and not changed         # not sent again
 
@@ -972,6 +1107,7 @@ class Account:
         self.resting = {}       # sym -> contracts the owner's working sells hold
         self.last_check = None  # held_long the adapter's order check last saw
         self.misread, self.full_sells = [], 0
+        self.blind = []         # broker_refuses_open of each unread-holdings sell
 
     def sellable(self, sym):
         return self.held.get(sym, 0) - self.resting.get(sym, 0)
@@ -1017,9 +1153,11 @@ class Account:
 
 
 class AlpacaFront:
+    """`down`: how many of the next positions reads fail (an outage)."""
+
     def __init__(self, acct, monkeypatch, rng):
         self.acct, self.rng, self.lose_next = acct, rng, False
-        self.by_cid = {}
+        self.by_cid, self.down = {}, 0
         monkeypatch.setattr(alpaca.requests, "post", self.post)
         monkeypatch.setattr(alpaca.requests, "get", self.get)
         monkeypatch.setattr(alpaca.requests, "delete", lambda url, **kw: _Resp(204, {}))
@@ -1046,6 +1184,9 @@ class AlpacaFront:
 
     def get(self, url, **kw):
         if url.endswith("/v2/positions"):
+            if self.down:
+                self.down -= 1
+                return _Resp(503, {"message": "service unavailable"})
             return _Resp(200, [{"symbol": s, "qty": str(q),
                                 "qty_available": str(self.acct.sellable(s)),
                                 "side": "long" if q > 0 else "short",
@@ -1181,7 +1322,9 @@ def test_random_life_never_opens_a_short(home, no_policy, monkeypatch, name, see
     than the account holds — in random order. At every step, for every
     contract, the account is never short and no request that would make it
     short ever reached the broker. (position_sync is off: the adapters'
-    own check is all that stands between a stale ledger and a short.)"""
+    own check is all that stands between a stale ledger and a short.)
+    Alpaca's positions reads also go down for a while now and then: a sell
+    is then held back, never sent blind."""
     monkeypatch.setattr(agent, "notify", lambda *a, **kw: None)
     monkeypatch.setattr(agent, "_problems_logged", set())
     rng = random.Random(seed)
@@ -1190,6 +1333,8 @@ def test_random_life_never_opens_a_short(home, no_policy, monkeypatch, name, see
 
     def check_order(side, effect, qty, held_long, **kw):
         acct.last_check = held_long if side == "sell" else None
+        if side == "sell" and held_long is None:
+            acct.blind.append(kw.get("broker_refuses_open", False))
         return real_check(side, effect, qty, held_long, **kw)
     monkeypatch.setattr(order_guard, "check_order", check_order)
     unexpected = []
@@ -1200,7 +1345,10 @@ def test_random_life_never_opens_a_short(home, no_policy, monkeypatch, name, see
     state = {"positions": {}}
     sent = []
     n = 0
+    outage = random.Random(seed + 7919)  # its own draws: `rng` is unchanged
     for _step in range(70):
+        if name == "alpaca" and outage.random() < 0.15:
+            front.down = outage.choice([1, 2, 3, 6])
         roll = rng.random()
         c = rng.choice(CONTRACTS)
         n += 1
@@ -1241,6 +1389,9 @@ def test_random_life_never_opens_a_short(home, no_policy, monkeypatch, name, see
         assert all(q >= 0 for q in acct.resting.values()), acct.resting
     assert unexpected == []
     assert acct.misread == [], acct.misread
+    if name == "alpaca":  # Alpaca isn't counted on to refuse an opening sell
+        assert acct.blind, "no outage ever held a sell back: it tested nothing"
+        assert not any(acct.blind), "a sell went out with the holdings unread"
     assert any(o["side"] == "sell" and not o.get("owner") for o in acct.orders), \
         "the scenario never sold: it tested nothing"
     assert acct.full_sells, "no exit ever sold all the account could sell"

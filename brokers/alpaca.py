@@ -7,16 +7,19 @@ from a free alpaca.markets account; flip to live keys later).
 Orders use Alpaca's /v2/orders with the raw OCC option symbol
 (e.g. SPY260710C00752000), market, day — long single-leg only, matching the
 agent's contract: buy-to-open on ENTERED, sell-to-close on EXITED for
-positions this agent opened. Every order carries Alpaca's position_intent
-("buy_to_open" / "sell_to_close"), so Alpaca itself refuses a sell that
-would open a short; and a sell is never sent for more than the account
-holds (_order, order_guard.check_order). Requires options approval on the
-Alpaca account.
+positions this agent opened. A sell is never sent for more than the
+account holds, and while what the account holds can't be read no sell is
+sent at all (_order, order_guard.check_order). Every order also carries
+Alpaca's position_intent ("buy_to_open" / "sell_to_close"): a second layer,
+in case Alpaca enforces it (see BROKER_REFUSES_OPENING_SELL). Requires
+options approval on the Alpaca account.
 """
 
 import math
 import re
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -240,9 +243,18 @@ class _Unconfirmed(Exception):
 _OrderId = order_guard.OrderId  # an order id with .qty: what it was for
 
 
-# Position intent per side: Alpaca refuses a sell_to_close of contracts the
-# account doesn't hold instead of opening a short (cash-secured puts and
-# covered calls are allowed from options level 1).
+# Does Alpaca itself refuse a sell_to_close of an option the account doesn't
+# hold (instead of opening a short: cash-secured puts and covered calls are
+# allowed from options level 1)? Its docs list position_intent on the order
+# body but don't say single-leg option orders enforce it, and it hasn't been
+# tried on an account. So it is not counted on: while the holdings can't be
+# read, a sell is held back (order_guard.check_order), exactly as at moomoo.
+# Flip to True only after a paper-account test shows a sell_to_close with
+# nothing held is rejected.
+BROKER_REFUSES_OPENING_SELL = False
+
+# Position intent per side, sent with every order all the same: if Alpaca
+# does enforce it, it is a second layer behind the holdings check.
 _INTENT = {("buy", "open"): "buy_to_open", ("sell", "close"): "sell_to_close"}
 
 # Alpaca's answer to a sell_to_close with nothing (or too little) to close,
@@ -253,18 +265,47 @@ _NOTHING_TO_CLOSE_RX = re.compile(
     r"|no\s+(such\s+)?position|not\s+enough\s+(qty|quantity|contracts?)", re.I)
 
 
+# A failed holdings read before a sell is tried again this many times, this
+# far apart, each retry with this time limit: a passing hiccup doesn't hold a
+# sell back for a whole loop, and the worst case (every retry timing out)
+# adds 2 x (1 + 1.5) = 5 s.
+_HOLDINGS_RETRIES = 2
+_HOLDINGS_RETRY_WAIT_S = 1.0
+_HOLDINGS_RETRY_TIMEOUT_S = 1.5
+
+
+def _positions_rows(cfg):
+    """GET /v2/positions: the list of rows, or None when it can't be read.
+    A dropped connection, a timeout, a 5xx or 429 or a body that isn't a
+    list is tried again (_HOLDINGS_RETRIES); any other answer (a 401/403)
+    won't be different a second later."""
+    timeout = _TIMEOUT
+    for attempt in range(_HOLDINGS_RETRIES + 1):
+        if attempt:
+            time.sleep(_HOLDINGS_RETRY_WAIT_S)
+            timeout = _HOLDINGS_RETRY_TIMEOUT_S
+        try:
+            resp = requests.get(f"{_base(cfg)}/v2/positions",
+                                headers=_headers(cfg), timeout=timeout)
+            status = int(resp.status_code)
+            if status == 200:
+                rows = resp.json()
+                if isinstance(rows, list):
+                    return rows
+            elif status != 429 and status < 500:
+                return None
+        except Exception:
+            pass
+    return None
+
+
 def _sell_holding(cfg, occ):
     """(long contracts of occ the account can sell right now, short
     contracts of occ) from GET /v2/positions — qty_available is the holding
     minus what open sell orders are already selling. (None, None) when the
     account can't be read; a symbol not listed is held 0."""
-    try:
-        resp = requests.get(f"{_base(cfg)}/v2/positions", headers=_headers(cfg),
-                            timeout=_TIMEOUT)
-        rows = resp.json() if resp.status_code == 200 else None
-    except Exception:
-        return None, None
-    if not isinstance(rows, list):
+    rows = _positions_rows(cfg)
+    if rows is None:
         return None, None
     for row in rows:
         if not isinstance(row, dict) or not row.get("symbol"):
@@ -287,8 +328,15 @@ def _sell_holding(cfg, occ):
     return 0, 0
 
 
+def _expires_today(expiry):
+    try:
+        return str(expiry) == datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:
+        return False
+
+
 def _order(cfg, occ, side, qty, limit_price=None, client_order_id=None,
-           effect=None, contract=None):
+           effect=None, contract=None, expiry=None):
     """Submit one order. Returns its id (an _OrderId: .qty is how many
     contracts it was for), or None when it wasn't sent or Alpaca refused it;
     raises _Unconfirmed when there is no clear answer.
@@ -296,9 +344,10 @@ def _order(cfg, occ, side, qty, limit_price=None, client_order_id=None,
     THE ONLY place an Alpaca order is sent. It sends nothing but a
     buy-to-open or a sell-to-close (order_guard.check_order), and a sell
     never for more than Alpaca says the account holds, less what its open
-    sells are already selling. When the holdings can't be read the sell
-    goes out as before: its position_intent "sell_to_close" makes Alpaca
-    refuse it rather than open a short.
+    sells are already selling. While the holdings can't be read NO sell is
+    sent (BROKER_REFUSES_OPENING_SELL): the owner is told, louder on the
+    contract's expiry day (`expiry`), and the agent tries again on the
+    next loop.
 
     client_order_id: Alpaca accepts each one once per account, so a repeat
     of the same order is refused instead of buying or selling twice (that
@@ -314,10 +363,12 @@ def _order(cfg, occ, side, qty, limit_price=None, client_order_id=None,
                                  short=short, option_id=occ)
             return None
     try:
-        qty = order_guard.check_order(side, effect, qty, held,
-                                      broker_refuses_open=True)
+        qty = order_guard.check_order(
+            side, effect, qty, held,
+            broker_refuses_open=BROKER_REFUSES_OPENING_SELL)
     except order_guard.RefusedOrder as exc:
-        order_guard.report_refusal("Alpaca", side, qty, contract, exc)
+        order_guard.report_refusal("Alpaca", side, qty, contract, exc,
+                                   expires_today=_expires_today(expiry))
         return None
     body = {"symbol": occ, "qty": str(qty), "side": side,
             "type": "market", "time_in_force": "day",
@@ -400,7 +451,7 @@ def _send(cfg, state, pos_key, event, contract, occ, side, qty, limit=None):
     try:
         oid = _order(cfg, occ, side, qty, client_order_id=key,
                      effect="open" if side == "buy" else "close",
-                     contract=contract, **kw)
+                     contract=contract, expiry=event.get("expiry"), **kw)
     except _Unconfirmed as exc:
         qty = exc.qty if isinstance(exc.qty, int) else qty
         found = _order_by_key(cfg, key)

@@ -52,7 +52,7 @@ class RefusedOrder(Exception):
                        sell right now (none held, or every contract held is
                        being sold already — possibly only for a moment);
     "holdings_unknown" what the account holds can't be read, and this broker
-                       has no way to refuse an opening sell itself."""
+                       isn't known to refuse an opening sell itself."""
 
     def __init__(self, reason, code="invalid"):
         super().__init__(reason)
@@ -127,10 +127,10 @@ def refusal_text(broker_name, side, qty, contract, exc):
                 "The agent checks the account again and retries.")
     if code == "holdings_unknown":
         return (f"couldn't confirm what your {broker_name} account holds, so the "
-                f"sell for {contract} was held back: {broker_name} can't be told "
-                "to only close a position, and a sell of contracts the account "
-                "doesn't hold would open a short one. The agent tries again "
-                "every loop.")
+                f"sell for {contract} was held back: a sell of contracts the "
+                "account doesn't hold would open a short position, and "
+                f"{broker_name} isn't known to refuse one. The agent tries "
+                "again every loop.")
     return (f"the agent refused to send a {side} order for {qty}x {contract}: "
             f"{getattr(exc, 'reason', exc)}. Nothing was sent.")
 

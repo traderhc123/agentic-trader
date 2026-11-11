@@ -2810,7 +2810,8 @@ def _act_on_refusals(cfg, state, save_state, broker, pos_key, contract, ev,
                      reported):
     """What an adapter reported about an order it did NOT send
     (order_guard): a short position it saw is a fault for the owner; a
-    moomoo sell held back on the contract's expiry day is urgent."""
+    sell held back because the holdings couldn't be read (moomoo, Alpaca)
+    is urgent on the contract's expiry day."""
     for r in reported:
         why = r.get("reason")
         if why == "short_seen":

@@ -616,6 +616,8 @@ def test_alpaca_guard_sell_is_a_limit(monkeypatch):
     monkeypatch.setattr(alpaca.requests, "post",
                         lambda url, **kw: posted.append(kw["json"]) or Resp())
     monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": qty)
+    # the account holds the contract (no sell goes out without knowing that)
+    monkeypatch.setattr(alpaca, "_sell_holding", lambda cfg, occ: (1, 0))
     occ = "RIVN261106C00013500"
     state = {"positions": {KEY: {"option_id": occ, "qty": 1}}}
     assert alpaca.execute(None, {"alpaca_key_id": "k"}, agent._guard_event(KEY, DAY), state)
@@ -634,6 +636,8 @@ def test_alpaca_plain_exit_stays_market(monkeypatch):
     monkeypatch.setattr(alpaca.requests, "post",
                         lambda url, **kw: posted.append(kw["json"]) or Resp())
     monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": qty)
+    # the account holds the contract (no sell goes out without knowing that)
+    monkeypatch.setattr(alpaca, "_sell_holding", lambda cfg, occ: (1, 0))
     state = {"positions": {KEY: {"option_id": "RIVN261106C00013500", "qty": 1}}}
     ev = dict(agent._guard_event(KEY, DAY))
     ev.pop("exit_limit")
