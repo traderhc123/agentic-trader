@@ -1096,6 +1096,95 @@ def _pay_day_pass(cfg, state, body, save_state):
 
 _LAST_POLL = {"access": True}
 
+# Outside the feed window (agent._feed_window_now) the agent reads this feed
+# once an hour, not on every loop: it has never published a signal there.
+IDLE_READS = True
+
+# The same refusal again and again (one owner got the same 403 on every poll
+# for days): after REFUSAL_REPEATS identical refusals in a row the agent
+# waits REFUSAL_BACKOFF_S[0], then [1], ... (staying at the last) before the
+# next read, until any different answer arrives. Exits owed and the expiry
+# guard don't need the feed and keep running on every loop meanwhile;
+# Resume or "check now" reads at once. Not for 401/402 (the pass and
+# day-pass handshakes), feed_not_live / terms_acceptance_required (handled
+# below), or 5xx (a server outage: read again soon, for the exits).
+REFUSAL_REPEATS = 3
+REFUSAL_BACKOFF_S = (120, 240, 480, 900)
+_REFUSAL = {}
+
+
+def _now_s():
+    return time.time()
+
+
+def _refusal_key(resp):
+    """(status, error code, body hash) of a refusal the feed keeps giving,
+    or None for any other answer."""
+    import hashlib
+    status = getattr(resp, "status_code", 0)
+    if not isinstance(status, int) or not 400 <= status < 500 or status in (401, 402):
+        return None
+    try:
+        code = _error_code(resp)
+    except Exception:
+        code = None
+    if code in ("terms_acceptance_required", "feed_not_live"):
+        return None
+    code = str(code)[:80] if isinstance(code, str) and code else ""
+    body = getattr(resp, "content", None)
+    if not isinstance(body, (bytes, bytearray)):
+        body = str(getattr(resp, "text", "") or "").encode("utf-8", "replace")
+    return (status, code, hashlib.sha256(bytes(body)).hexdigest()[:16])
+
+
+def _note_feed_answer(resp):
+    """Count identical refusals; any other answer ends a back-off."""
+    key = _refusal_key(resp)
+    if key is None:
+        _REFUSAL.clear()
+        return
+    now = _now_s()
+    if _REFUSAL.get("key") != key:
+        _REFUSAL.clear()
+        _REFUSAL.update(key=key, count=0, since=now)
+    _REFUSAL["count"] += 1
+    n = _REFUSAL["count"]
+    if n >= REFUSAL_REPEATS:
+        step = min(n - REFUSAL_REPEATS, len(REFUSAL_BACKOFF_S) - 1)
+        _REFUSAL["next_at"] = now + REFUSAL_BACKOFF_S[step]
+
+
+def refusal_wait_until():
+    """Epoch seconds before which the agent should not read the feed again
+    (backing off after the same refusal), or None."""
+    return _REFUSAL.get("next_at")
+
+
+def refusal_info():
+    """{status, code, since, next_at} while backing off, else None."""
+    if not _REFUSAL.get("next_at"):
+        return None
+    status, code, _h = _REFUSAL["key"]
+    return {"status": status, "code": code, "since": _REFUSAL["since"],
+            "next_at": _REFUSAL["next_at"], "count": _REFUSAL["count"]}
+
+
+def payment_pending(cfg, state):
+    """True while a pass invoice or a wallet day-pass payment waits to be
+    decided (poll() is what checks them): the agent then reads on every
+    loop, also outside the feed window."""
+    if cfg.get("agenthc_api_key"):
+        return False
+    if isinstance(state.get("daypass_pending"), dict):
+        return True
+    cache = state.get("pass_status")
+    cache = cache if isinstance(cache, dict) else {}
+    for token in _pass_tokens(cfg):
+        rec = cache.get(_token_id(token))
+        if not isinstance(rec, dict) or rec.get("status") in (None, "pending"):
+            return True
+    return False
+
 
 def had_access():
     """Whether the last poll() could read ENTRY signals: False with no pass
@@ -1166,6 +1255,7 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
                         params={"limit": 20, "track": track},
                         headers=headers, timeout=15)
+    _note_feed_answer(resp)
     if (resp.status_code in (401, 402) and not _retried
             and not cfg.get("agenthc_api_key") and _pass_tokens(cfg)
             and headers.get("Authorization")):
@@ -1235,6 +1325,7 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
     resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
                         params={"limit": 20, "track": track},
                         headers={"Authorization": token}, timeout=15)
+    _note_feed_answer(resp)
     if resp.status_code in (401, 402) and not _retried:
         _refresh_pass(cfg, state, save_state, force=True)  # ended/refused: recheck
         return poll(cfg, state, save_state, _retried=True)
