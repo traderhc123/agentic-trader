@@ -1002,3 +1002,103 @@ def test_ended_day_pass_without_a_real_position_sends_nothing(monkeypatch):
     for state in (_ended_state(real=False), {**_ended_state(), "positions": {}}):
         assert agenthc.poll({}, state, lambda s: None) == []
     assert srv.calls == []
+
+
+# ── AT-5: wallet auto-pay takes over for entries during exits-only days ─────
+
+class _ExitsOnlyAndWalletServer(_PassAndWalletServer):
+    """The prepaid pass is used up (exits only); a request without a token
+    gets a day-pass invoice; the wallet's day-pass reads everything."""
+
+    def __init__(self):
+        super().__init__(status="exits_only", days_left=0)
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        r = super().get(url, params, headers, timeout)
+        if (not url.endswith("/pass")
+                and (headers or {}).get("Authorization") == PASS_TOK):
+            r._payload = {"events": [{"event": "EXITED", "ticker": "SPY",
+                                      "expiry": "2026-07-17", "strike": 600,
+                                      "type": "C", "occurred_at": "x"}],
+                          "pass_days_left": 0, "pass_exits_only": True}
+        return r
+
+
+def _feed_auths(srv):
+    return [h.get("Authorization") for u, h in srv.calls
+            if u.endswith("day-trade-ideas")]
+
+
+def test_exits_only_pass_and_recurring_on_buys_a_day_pass_for_entries(monkeypatch):
+    srv = _ExitsOnlyAndWalletServer()
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: None)
+    state = {"pass_status": {agenthc._token_id(PASS_TOK): {
+        "status": "exits_only", "until_ts": 9e12, "days_left": 0}}}
+    events = agenthc.poll(_wallet_cfg(), state, lambda s: None)
+    assert wallet.paid == [_invoice(12_000)]
+    assert _feed_auths(srv) == [None, "L402 MAC:preimage-abc"]
+    assert [e["event"] for e in events] == ["ENTERED"]
+    assert agenthc.had_access() is True
+    # the next polls read with the day-pass; no second purchase
+    agenthc.poll(_wallet_cfg(), state, lambda s: None)
+    assert len(wallet.paid) == 1
+    assert _feed_auths(srv)[-1] == "L402 MAC:preimage-abc"
+
+
+def test_exits_only_pass_still_reads_exits_when_the_purchase_fails(monkeypatch):
+    srv = _ExitsOnlyAndWalletServer()
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+
+    class Broke(FakeWallet):
+        def pay_invoice(self, invoice):
+            import lightning_wallet
+            raise lightning_wallet.PaymentRefused("Insufficient balance")
+
+        def payment_status(self, h):
+            return ("not_found", "")
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: Broke())
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: None)
+    state = {"pass_status": {agenthc._token_id(PASS_TOK): {
+        "status": "exits_only", "until_ts": 9e12, "days_left": 0}}}
+    events = agenthc.poll(_wallet_cfg(), state, lambda s: None)
+    assert [e["event"] for e in events] == ["EXITED"]
+    assert _feed_auths(srv) == [None, PASS_TOK]
+    assert _exit_flag() == (True, "") and agenthc.had_access() is False
+    # the retry waits: the next poll only reads the exits
+    agenthc.poll(_wallet_cfg(), state, lambda s: None)
+    assert _feed_auths(srv)[-1] == PASS_TOK and _feed_auths(srv).count(None) == 1
+
+
+def test_exits_only_pass_with_recurring_off_is_unchanged(monkeypatch):
+    srv = _ExitsOnlyAndWalletServer()
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: None)
+    state = {"pass_status": {agenthc._token_id(PASS_TOK): {
+        "status": "exits_only", "until_ts": 9e12, "days_left": 0}}}
+    cfg = {**_wallet_cfg(), "day_pass_recurring": False}
+    events = agenthc.poll(cfg, state, lambda s: None)
+    assert [e["event"] for e in events] == ["EXITED"]
+    assert _feed_auths(srv) == [PASS_TOK] and wallet.paid == []
+
+
+def test_no_day_pass_on_a_day_the_prepaid_pass_was_charged(monkeypatch):
+    srv = _ExitsOnlyAndWalletServer()
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: None)
+    state = {"pass_charged_day": "2026-07-15",
+             "pass_status": {agenthc._token_id(PASS_TOK): {
+                 "status": "exits_only", "until_ts": 9e12, "days_left": 0}}}
+    events = agenthc.poll(_wallet_cfg(), state, lambda s: None)
+    assert [e["event"] for e in events] == ["EXITED"]
+    assert _feed_auths(srv) == [PASS_TOK] and wallet.paid == []

@@ -610,6 +610,29 @@ def _live_daypass(state):
     return bool(tok.get("token") and tok.get("expires_at", 0) > time.time())
 
 
+def _token_status(state, token):
+    return ((state.get("pass_status") or {}).get(_token_id(token)) or {}).get("status")
+
+
+def _wallet_over_exits_only(cfg, state, save_state):
+    """Buy today's wallet day-pass while the prepaid pass only gets exits,
+    and read the feed with it. None when it was not bought (the caller
+    then reads the exits with the used-up pass)."""
+    track = "all" if cfg.get("include_other_trades") else "main"
+    try:
+        resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
+                         params={"limit": 20, "track": track}, timeout=15)
+        if resp.status_code != 402:
+            return None
+        if not _buy_day_pass(cfg, state, resp.json(), save_state):
+            return None
+    except Exception as exc:
+        print(f"Day-pass purchase didn't go through ({str(exc)[:160]}); exit "
+              "signals are still read with the used-up prepaid pass.")
+        return None
+    return poll(cfg, state, save_state, _retried=True)
+
+
 def _prepaid_active(cfg, state):
     """A prepaid pass with signal days left, as last checked (no request)."""
     cache = (state or {}).get("pass_status") or {}
@@ -1317,6 +1340,17 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             and not _live_daypass(state)):
         token = _refresh_pass(cfg, state, save_state)
         if token:
+            # A used-up pass only reads exits. With the wallet's recurring
+            # day-pass ON, today's day-pass brings the entries back (exits
+            # come with it); if it can't be bought now, the exits are still
+            # read with the used-up pass in this same poll.
+            if (not _retried and not undecided
+                    and _token_status(state, token) == "exits_only"
+                    and cfg.get("lnbits_url") and cfg.get("day_pass_recurring")
+                    and _pass_purchase_allowed(cfg, state, save_state)):
+                got = _wallet_over_exits_only(cfg, state, save_state)
+                if got is not None:
+                    return got
             return _poll_with_pass(cfg, state, save_state, token, _retried)
         cache = state.get("pass_status") or {}
         statuses = {(cache.get(_token_id(t)) or {}).get("status")
