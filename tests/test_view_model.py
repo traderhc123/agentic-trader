@@ -1316,3 +1316,24 @@ def test_a_renewal_or_balance_alert_shows_while_the_running_day_pass_reads(alert
     # an older lapse notice (no day-pass alert) still goes once entries read
     s = build(cfg=cfg, st={**st, "daypass_alert": None}, rt=runtime(feed_access=True))
     assert not [n for n in s["notices"] if n["code"] == "pass"]
+
+
+@pytest.mark.parametrize("alert", ["daypass_failed_notified",
+                                   "daypass_invoice_notified",
+                                   "daypass_low_balance_notified"])
+def test_a_day_pass_alert_is_not_shown_while_a_prepaid_pass_reads(alert):
+    """The wallet could not pay the day-pass, so the owner bought signal
+    days. The prepaid pass now reads entries; nothing clears the day-pass
+    alert while it does, but its 'no new trades' text is no longer true."""
+    text = ("Your agent's wallet could not pay for today's day-pass (10,000 "
+            "sats): the wallet did not make the payment. Nothing was paid. "
+            "Until a pass is paid the agent gets no new trades.")
+    cfg = {**LIVE_PASS, "lnbits_url": "https://wallet.example",
+           "day_pass_recurring": True}
+    st = {**state(**{SPY: real_pos()}),
+          "l402": {"token": "t", "expires_at": NOW.timestamp() - 3600},
+          "pass_status": {_tid("tok"): {"status": "active", "days_left": 3}},
+          "daypass_alert": alert, "pass_notice": text}
+    s = build(cfg=cfg, st=st, rt=runtime(feed_access=True))
+    assert s["signals"]["pass"]["kind"] == "prepaid"
+    assert not [n for n in s["notices"] if n["code"] == "pass"]

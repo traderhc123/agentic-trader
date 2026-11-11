@@ -1811,10 +1811,11 @@ def _pass_notice(cfg, state, signals=None):
     p = signals.get("pass") if isinstance(signals, dict) else None
     # the wallet could not renew the day-pass that still runs, or holds too
     # little for the next one: true while that pass still reads entries
-    # (the agent clears it once a day-pass is paid)
+    # (the agent clears it once a day-pass is paid). Only while the agent
+    # reads on the wallet day-pass: a prepaid pass or a key that reads now
+    # makes it untrue, and nothing clears it while they do
     if (state.get("daypass_alert") in _RUNNING_DAYPASS_ALERTS
-            and not (isinstance(p, dict)
-                     and p.get("kind") in ("subscription", "not_needed"))):
+            and (not isinstance(p, dict) or p.get("kind") == "day_pass")):
         return {"level": "warn", "code": "pass", "text": text}
     if isinstance(p, dict):
         if signals.get("entry_access") is True \
