@@ -1,6 +1,6 @@
 // Running totals of closed trades, one line per book (TradingView
 // Lightweight Charts, bundled; nothing is loaded at run time).
-// Real money = solid orange with round marks, practice = dashed periwinkle
+// Real money = solid blue with round marks, practice = dashed violet
 // with square marks: told apart by shape as well as colour. Left/right arrow
 // keys read each day; the same numbers are in the table under the chart.
 import { ColorType, CrosshairMode, LineStyle, createChart, type IChartApi, type ISeriesApi, type Time } from "lightweight-charts";
@@ -96,8 +96,13 @@ export default function ResultsChart({ model, label }: { model: ChartModel; labe
         practice.setMarkers([]);
         return;
       }
-      real.setMarkers(m.real.filter((p) => p.pnl != null).map((p) => ({ time: p.day as Time, position: "inBar" as const, shape: "circle" as const, color: css("real"), size: 0.8 })));
-      practice.setMarkers(m.practice.filter((p) => p.pnl != null).map((p) => ({ time: p.day as Time, position: "inBar" as const, shape: "square" as const, color: css("prac"), size: 0.8 })));
+      // Each day's mark is green for a winning day and red for a losing one. The
+      // line keeps its book colour (blue real, violet practice) and the shape
+      // (circle real, square practice) still tells the two books apart.
+      const dayColour = (p: DayPoint, flat: string) =>
+        p.pnl == null || p.pnl === 0 ? css(flat) : p.pnl > 0 ? css("gain-mark") : css("bad-mark");
+      real.setMarkers(m.real.filter((p) => p.pnl != null).map((p) => ({ time: p.day as Time, position: "inBar" as const, shape: "circle" as const, color: dayColour(p, "real"), size: 0.9 })));
+      practice.setMarkers(m.practice.filter((p) => p.pnl != null).map((p) => ({ time: p.day as Time, position: "inBar" as const, shape: "square" as const, color: dayColour(p, "prac"), size: 0.9 })));
     };
     repaint.current = paint;
     paint();

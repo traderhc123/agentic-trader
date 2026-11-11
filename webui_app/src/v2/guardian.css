@@ -1,54 +1,51 @@
 /* The /v2 ("Guardian") dashboard. Plain CSS, no framework: tokens first,
    then components. Ported from the approved design prototype.
    One rule about colour, in both themes:
-     SOLID ORANGE = real money / LIVE.   DASHED or HATCHED PERIWINKLE = practice.
-     GREY, dotted = unknown.   RED = a fault or a loss, nothing else.
-     GREEN = a gain, nothing else.   Buttons are ink. */
-/* ───────── Tokens ─────────
-   One rule: SOLID ORANGE = real money. DASHED / HATCHED PERIWINKLE = practice. GREY = unknown.
-   Red is only ever a fault or a loss. Green is only ever a gain. Buttons are ink. */
+     SOLID BLUE = real money / LIVE.   DASHED or HATCHED VIOLET = practice.
+     GREY, dotted = unknown.   GREEN = a gain, nothing else.
+     RED = a fault (always with an alert icon and words) or a loss (always
+     with its minus sign, or the word "lost"), nothing else; LIVE is never
+     red.   Buttons are ink.
+   Default: the navy palette of the classic dashboard (webui_app/src/index.css),
+   whatever the computer's setting, like the classic page. The light theme is
+   the owner's own choice (data-theme="light", remembered by main.tsx).
+   tests/test_v2_contrast.py checks the pairs the page uses, in both themes. */
 :root{
-  color-scheme:light;
-  --bg:#EDEFF2; --surface:#FFFFFF; --well:#F5F6F8; --sunk:#E3E6EB;
-  --ink:#111722; --ink2:#414A5A; --ink3:#5C6575;
-  --line:#D9DDE3; --line2:#7C8492;
-  --real:#E8590C; --on-real:#1A0E02; --real-ink:#9A3B00; --real-tint:#FDEADB; --real-line:#E7A46B;
-  --prac:#4A57D6; --prac-ink:#3340B5; --prac-tint:#ECEEFC; --prac-stripe:#CDD2F6;
-  --unk:#6A7180; --unk-tint:#E6E8EC; --unk-stripe:#D2D6DC;
-  --gain:#0B6B43; --gain-mark:#1E9A63;
-  --bad:#B3221E; --bad-tint:#FCEBEA; --bad-line:#E2A19E; --bad-mark:#D4483F;
-  --warn-ink:#5F4700; --warn-tint:#FFF4C2; --warn-line:#9A7A00;
-  --focus:#1F48D8;
-  --shadow:0 16px 48px rgba(17,23,34,.22);
+  color-scheme:dark;
+  /* surfaces: classic --bg, --panel, --panel-2, --raise, --line */
+  --bg:#090E17; --surface:#0D1420; --well:#111A29; --sunk:#172234;
+  /* text softened from the classic #E5EBF4 (15:1) to about 13:1 on the surface */
+  --ink:#D3DBE7; --ink2:#B4C0D2; --ink3:#8998B0;
+  --line:#1D293C; --line2:#5A6B88;
+  /* real money: --real for lines, marks and edges; --real-fill for large fills
+     (band, tags, the final go-LIVE button) with light text on it */
+  --real:#6E9BEA; --real-fill:#2F5DAE; --on-real:#EEF3FB;
+  --prac:#B48CFF; --prac-ink:#CDB4FF; --prac-tint:#1E1838; --prac-stripe:#3A2D66;
+  --unk:#8998B0; --unk-tint:#172234; --unk-stripe:#27364D;
+  --gain:#22C58E; --gain-mark:#22C58E;
+  --bad:#F2555E; --bad-tint:#3A1418; --bad-line:#8C2F36; --bad-mark:#F2555E;
+  --warn-ink:#E8A640; --warn-tint:#2B2009; --warn-line:#94702A;
+  --scrim:rgba(3,6,12,.65);
+  --shadow:0 16px 48px rgba(0,0,0,.6);
   --sans:"Segoe UI Variable Text","Segoe UI",-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Inter,Roboto,"Noto Sans",Arial,sans-serif;
   --display:"Segoe UI Variable Display","Segoe UI",-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue","Inter Display",Inter,Roboto,"Noto Sans",Arial,sans-serif;
   --r1:6px; --r2:10px; --r3:14px;
   --band-h:92px;
 }
-@media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){ color-scheme:dark;
-  --bg:#0F1218; --surface:#181C24; --well:#1F242D; --sunk:#272D38;
-  --ink:#F0F2F5; --ink2:#C2C7D1; --ink3:#9BA2AF;
-  --line:#2C323D; --line2:#768091;
-  --real:#E06C12; --on-real:#1A0E02; --real-ink:#FFB070; --real-tint:#372110; --real-line:#8C5420;
-  --prac:#98A4FF; --prac-ink:#B6BEFF; --prac-tint:#1B1F3D; --prac-stripe:#2D3468;
-  --unk:#8D94A0; --unk-tint:#232830; --unk-stripe:#333945;
-  --gain:#63D7A1; --gain-mark:#2FB57A;
-  --bad:#FF9189; --bad-tint:#3B1614; --bad-line:#8C3631; --bad-mark:#E5645B;
-  --warn-ink:#F3D36B; --warn-tint:#2F2808; --warn-line:#8F7613;
-  --focus:#A9B8FF;
-  --shadow:0 16px 48px rgba(0,0,0,.6); } }
-:root[data-theme="dark"]{ color-scheme:dark;
-  --bg:#0F1218; --surface:#181C24; --well:#1F242D; --sunk:#272D38;
-  --ink:#F0F2F5; --ink2:#C2C7D1; --ink3:#9BA2AF;
-  --line:#2C323D; --line2:#768091;
-  --real:#E06C12; --on-real:#1A0E02; --real-ink:#FFB070; --real-tint:#372110; --real-line:#8C5420;
-  --prac:#98A4FF; --prac-ink:#B6BEFF; --prac-tint:#1B1F3D; --prac-stripe:#2D3468;
-  --unk:#8D94A0; --unk-tint:#232830; --unk-stripe:#333945;
-  --gain:#63D7A1; --gain-mark:#2FB57A;
-  --bad:#FF9189; --bad-tint:#3B1614; --bad-line:#8C3631; --bad-mark:#E5645B;
-  --warn-ink:#F3D36B; --warn-tint:#2F2808; --warn-line:#8F7613;
-  --focus:#A9B8FF;
-  --shadow:0 16px 48px rgba(0,0,0,.6); }
+:root[data-theme="light"]{
+  color-scheme:light;
+  --bg:#EDEFF2; --surface:#FFFFFF; --well:#F5F6F8; --sunk:#E3E6EB;
+  --ink:#111722; --ink2:#414A5A; --ink3:#5C6575;
+  --line:#D9DDE3; --line2:#7C8492;
+  --real:#2F5DAE; --real-fill:#2F5DAE; --on-real:#FFFFFF;
+  --prac:#7A4CD9; --prac-ink:#5A2DBF; --prac-tint:#F1ECFC; --prac-stripe:#DDD0F7;
+  --unk:#6A7180; --unk-tint:#E6E8EC; --unk-stripe:#D2D6DC;
+  --gain:#0B6B43; --gain-mark:#1E9A63;
+  --bad:#B3221E; --bad-tint:#FCEBEA; --bad-line:#E2A19E; --bad-mark:#D4483F;
+  --warn-ink:#5F4700; --warn-tint:#FFF4C2; --warn-line:#9A7A00;
+  --scrim:rgba(15,17,22,.55);
+  --shadow:0 16px 48px rgba(17,23,34,.22);
+}
 
 *,*::before,*::after{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
@@ -90,8 +87,8 @@ h3{font-size:15px;line-height:1.3;letter-spacing:0}
 .btn-wide{width:100%}
 .btn-sm{min-height:32px;padding:4px 12px}
 /* the one place a mode colour is a button: the final confirmation that turns real money on */
-.btn-golive{background:var(--real);border-color:var(--real);color:var(--on-real)}
-.btn-golive:hover{background:var(--real);border-color:var(--on-real);filter:brightness(1.05)}
+.btn-golive{background:var(--real-fill);border-color:var(--real);color:var(--on-real)}
+.btn-golive:hover{background:var(--real-fill);border-color:var(--on-real);filter:brightness(1.1)}
 .btn .sq{width:9px;height:9px;border-radius:2px;flex:none}
 .sq-real{background:var(--real)}
 .sq-prac{background:repeating-linear-gradient(135deg,var(--prac) 0 2px,transparent 2px 4px);outline:1px dashed var(--prac);outline-offset:0}
@@ -99,7 +96,7 @@ h3{font-size:15px;line-height:1.3;letter-spacing:0}
 /* ───────── Money tags: solid = real, dashed = practice, hollow = no order ───────── */
 .tag{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:650;line-height:1;padding:4px 8px;border-radius:4px;white-space:nowrap;border:1px solid transparent;vertical-align:middle}
 .tag::before{content:"";width:8px;height:8px;border-radius:2px;flex:none}
-.tag-real{background:var(--real);color:var(--on-real);border-color:var(--real)}
+.tag-real{background:var(--real-fill);color:var(--on-real);border-color:var(--real)}
 .tag-real::before{background:var(--on-real)}
 .tag-prac{background:var(--prac-tint);color:var(--prac-ink);border:1px dashed var(--prac)}
 .tag-prac::before{background:repeating-linear-gradient(135deg,var(--prac) 0 2px,transparent 2px 4px);box-shadow:0 0 0 1px var(--prac)}
@@ -177,11 +174,11 @@ label{font-weight:600}
 .facts dd small{display:block;font-weight:400;font-size:13px;color:var(--ink2)}
 
 /* ───────── Dialog ───────── */
-.scrim{position:fixed;inset:0;background:rgba(15,17,22,.55);z-index:80;display:none;align-items:center;justify-content:center;padding:24px}
+.scrim{position:fixed;inset:0;background:var(--scrim);z-index:80;display:none;align-items:center;justify-content:center;padding:24px}
 .scrim.open{display:flex}
 .dialog{background:var(--surface);color:var(--ink);border-radius:var(--r3);box-shadow:var(--shadow);width:min(640px,100%);max-height:calc(100vh - 48px);overflow:auto;border:1px solid var(--line);display:flex;flex-direction:column}
 .dialog-strip{height:8px;flex:none;border-radius:var(--r3) var(--r3) 0 0}
-.dialog-live .dialog-strip{background:var(--real)}
+.dialog-live .dialog-strip{background:var(--real-fill)}
 .dialog-prac .dialog-strip{background:repeating-linear-gradient(135deg,var(--prac-tint) 0 8px,var(--prac) 8px 10px)}
 .dialog-top{padding:24px 24px 0}
 .dialog-top h2{font-size:20px;line-height:1.2}
@@ -263,13 +260,13 @@ html[data-mode="unknown"] .mode-id,html[data-mode="unknown"] .mode-say,
 html[data-mode="setup"] .mode-id,html[data-mode="setup"] .mode-say{background:var(--prac-tint);padding:3px 8px;border-radius:4px;flex:0 1 auto}
 html[data-mode="practice"] .run-ok{background:var(--prac-tint);padding-inline:8px;border-radius:4px}
 html[data-mode="practice"] .band-actions,html[data-mode="unknown"] .band-actions,html[data-mode="setup"] .band-actions{margin-left:auto}
-/* live: solid orange, dark ink on it. Impossible to miss, and not the colour of an error. */
-html[data-mode="live"] .band-mode{background:var(--real);color:var(--on-real);border-bottom:2px solid var(--real)}
-html[data-mode="live"] .mode-glyph{background:var(--on-real);box-shadow:0 0 0 3px rgba(26,14,2,.22)}
+/* live: solid blue, light text on it. Impossible to miss, and never the red of a fault or a loss. */
+html[data-mode="live"] .band-mode{background:var(--real-fill);color:var(--on-real);border-bottom:2px solid var(--real)}
+html[data-mode="live"] .mode-glyph{background:var(--on-real);box-shadow:0 0 0 3px rgba(0,0,0,.22)}
 html[data-mode="live"] .band-mode .btn{background:var(--surface);border-color:var(--surface);color:var(--ink)}
 html[data-mode="live"] .band-mode .btn:hover{background:var(--well)}
 html[data-mode="live"] .band-mode .btn-ghost{background:transparent;border-color:var(--on-real);color:var(--on-real)}
-html[data-mode="live"] .band-mode .btn-ghost:hover{background:rgba(26,14,2,.1)}
+html[data-mode="live"] .band-mode .btn-ghost:hover{background:rgba(255,255,255,.10)}
 html[data-mode="live"] .band-mode :focus-visible{outline-color:var(--on-real)}
 html[data-mode="live"] .run-off{border-color:var(--surface)}
 /* unknown / setup: grey hatch */
@@ -334,7 +331,9 @@ html[data-mode="unknown"] .mode-id,html[data-mode="unknown"] .mode-say,html[data
 .nav button[aria-current="page"]{background:var(--surface);color:var(--ink);font-weight:700;box-shadow:0 0 0 1px var(--line)}
 .nav .nl{flex:1;min-width:0}
 .nav .count{white-space:nowrap;font-size:13px;font-weight:600;color:var(--ink2)}
-.nav .count.alert{background:var(--bad);color:var(--surface);border-radius:999px;min-width:20px;height:20px;display:grid;place-items:center;padding:0 6px;font-weight:700}
+/* a problem: an alert icon on red, never red alone (red also means a loss) */
+.nav .count.alert{background:var(--bad);color:var(--surface);border-radius:999px;min-width:20px;height:20px;display:grid;place-items:center;padding:0 4px;font-weight:700}
+.nav .count.alert .ic{width:13px;height:13px;stroke-width:2.6}
 .side-foot{margin-top:auto;display:grid;gap:2px;padding-top:16px}
 .side-btn{font-size:14px}
 .side-foot .ver{font-size:13px;color:var(--ink3);padding:6px 12px 0}
@@ -574,7 +573,7 @@ main:focus{outline:none}
 .legendrow{display:flex;gap:8px 20px;flex-wrap:wrap;font-size:14px}
 .legendrow span{display:inline-flex;gap:8px;align-items:center}
 .glyph{width:14px;height:14px;border-radius:50%;display:inline-block;flex:none}
-.glyph-live{background:var(--real)}
+.glyph-live{background:var(--real-fill)}
 .glyph-prac{border:2px dashed var(--prac)}
 .glyph-unk{border:2px dotted var(--unk)}
 
@@ -585,7 +584,7 @@ main:focus{outline:none}
 .more-foot{display:flex;gap:8px;flex-wrap:wrap}
 
 /* ───────── Drawer ───────── */
-.drawer-scrim{position:fixed;inset:0;background:rgba(15,17,22,.45);z-index:75;display:none}
+.drawer-scrim{position:fixed;inset:0;background:var(--scrim);z-index:75;display:none}
 .drawer-scrim.open{display:block}
 .drawer{position:fixed;top:0;right:0;bottom:0;width:min(500px,100%);background:var(--surface);z-index:76;box-shadow:var(--shadow);transform:translateX(102%);transition:transform .18s ease-out;display:flex;flex-direction:column;border-left:1px solid var(--line);visibility:hidden}
 .drawer.open{transform:none;visibility:visible}
@@ -670,7 +669,8 @@ main:focus{outline:none}
   .tabs{display:grid;grid-template-columns:repeat(5,1fr);position:fixed;left:0;right:0;bottom:0;z-index:50;background:var(--surface);border-top:1px solid var(--line);padding:4px 6px calc(6px + env(safe-area-inset-bottom))}
   .tabs button{display:grid;justify-items:center;gap:2px;padding:6px 2px 4px;border:0;background:none;font-size:13px;font-weight:600;color:var(--ink2);border-radius:8px;min-height:52px;position:relative}
   .tabs button[aria-current="page"]{color:var(--ink);font-weight:700;background:var(--sunk)}
-  .tabs .pip{position:absolute;top:5px;right:calc(50% - 18px);width:9px;height:9px;border-radius:50%;background:var(--bad);border:2px solid var(--surface)}
+  .tabs .pip{position:absolute;top:2px;right:calc(50% - 22px);width:18px;height:18px;border-radius:50%;background:var(--bad);color:var(--surface);border:2px solid var(--surface);display:grid;place-items:center}
+  .tabs .pip .ic{width:10px;height:10px;stroke-width:3}
   .toast{bottom:84px}
   /* holdings become sentence cards */
   .hhead{display:none}
@@ -727,6 +727,7 @@ a.btn{text-decoration:none}
 .toast span{min-width:0;overflow-wrap:anywhere}
 .toast button{white-space:nowrap;flex:none}
 .toast-bad{box-shadow:var(--shadow),inset 4px 0 0 var(--bad-mark)}
+.toast > .ic{flex:none;margin-top:1px}
 @keyframes drawer-in{from{transform:translateX(24px);opacity:0}to{transform:none;opacity:1}}
 .drawer.open{animation:drawer-in .18s ease-out}
 .callout p{color:var(--ink2)}

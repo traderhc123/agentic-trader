@@ -131,11 +131,11 @@ export function ResultsView({ page }: { page: Page }) {
           <span className="legend">
             <span>
               <i className="key key-real" />
-              Real money {signed(R.total, 0)}
+              Real money <b className={tone(R.total)}>{signed(R.total, 0)}</b>
             </span>
             <span>
               <i className="key key-practice" />
-              Practice {signed(P.total, 0)}
+              Practice <b className={tone(P.total)}>{signed(P.total, 0)}</b>
             </span>
           </span>
         </div>

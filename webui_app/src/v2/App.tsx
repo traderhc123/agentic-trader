@@ -46,16 +46,13 @@ function viewFromHash(): View {
   return (VIEWS as string[]).includes(h) ? (h as View) : "today";
 }
 
+// The navy palette of the classic dashboard unless the owner chose the light
+// theme here (guardian.css): the computer's own light/dark setting does not
+// switch it, the same as the classic page.
 function useTheme() {
   const root = document.documentElement;
-  const read = () => (root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches);
+  const read = () => root.dataset.theme !== "light";
   const [dark, setDark] = useState(read);
-  useEffect(() => {
-    const mq = matchMedia("(prefers-color-scheme: dark)");
-    const on = () => setDark(read());
-    mq.addEventListener("change", on);
-    return () => mq.removeEventListener("change", on);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const toggle = useCallback(() => {
     const next = !read();
     root.dataset.theme = next ? "dark" : "light";
@@ -311,7 +308,8 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
                   {k === "holdings" && np > 0 && <span className="count">{np}</span>}
                   {k === "settings" && problems > 0 && (
                     <span className="count alert">
-                      1<span className="sr"> problem</span>
+                      <Icon name="alert" small />
+                      <span className="sr"> 1 problem</span>
                     </span>
                   )}
                   {k === "signals" && days != null && (
@@ -369,7 +367,9 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
               <span>{l}</span>
               {k === "more" && problems > 0 && (
                 <>
-                  <span className="pip" />
+                  <span className="pip">
+                    <Icon name="alert" small />
+                  </span>
                   <span className="sr">1 problem</span>
                 </>
               )}
@@ -394,6 +394,7 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
       <div className={`toast ${toast ? "open" : ""} ${toast && !toast.ok ? "toast-bad" : ""}`} role="status" aria-live="polite">
         {toast && (
           <>
+            {!toast.ok && <Icon name="alert" small />}
             <span>{toast.text}</span>
             <button onClick={() => setToast(null)}>Dismiss</button>
           </>
