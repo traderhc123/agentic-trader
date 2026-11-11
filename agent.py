@@ -4401,11 +4401,13 @@ def _broker_label(cfg, broker=None):
 
 
 def _signal_loss_warning(cfg, rec, keys, now_et, sell_m, close_m, broker=None,
-                         held=False, elsewhere=()):
+                         held=False, elsewhere=(), capped=False):
     """Note W: what the agent will do about the positions it can't get an
     exit signal for, and when. `held`: a full hold (agent.cmd_run), which
     blocks every order, this sale included. `elsewhere`: real rows opened
-    in another broker account or mode, which the agent never sells."""
+    in another broker account or mode, which the agent never sells.
+    `capped`: the day's warnings are used up (_signal_loss_warn_due), so
+    this loss is not sold today."""
     elsewhere = list(elsewhere)
     every = list(keys) + elsewhere
     one = len(every) == 1
@@ -4431,6 +4433,13 @@ def _signal_loss_warning(cfg, rec, keys, now_et, sell_m, close_m, broker=None,
                        f"yourself at {_broker_label(cfg, broker)}.")
     if not keys:
         return head + other.rstrip()
+    if capped:
+        configured = _et_hhmm(cfg, "signal_loss_sell_et", SIGNAL_LOSS_DEFAULT)
+        return head + (f"Exit signals have stopped and come back more than once "
+                       f"today, so the agent does not sell {it} on its own "
+                       f"today: watch {it} and sell {it} yourself at "
+                       f"{_broker_label(cfg, broker)}. If exit signals are still "
+                       f"missing tomorrow, it sells at {_hm(configured)} ET.")
     now_m = now_et.hour * 60 + now_et.minute
     at_m = max(sell_m, now_m + -(-SIGNAL_LOSS_LEAD_S // 60)
                + (1 if now_et.second else 0))
@@ -4616,6 +4625,22 @@ def _signal_loss_tick(cfg, state, save_state, broker, client, paused, now_et):
                                    broker, elsewhere=elsewhere)
         print(msg)
         notify(cfg, msg, priority="high")
+    elif (real and lasted and not paused and sell_m is not None
+            and rec.get("warned_day") != day
+            and int(_signal_loss_day(state, day).get("warns") or 0)
+            >= SIGNAL_LOSS_WARNS_A_DAY
+            and not _signal_loss_day(state, day).get("capped")):
+        # the day's warnings are used up, so this loss is never sold today
+        # (no sale without its own warning): say so once, the one note of
+        # the day that promises nothing
+        rec["capped_day"] = day
+        state["signal_loss_day"] = {**_signal_loss_day(state, day),
+                                    "day": day, "capped": True}
+        _signal_loss_save(state, save_state)
+        msg = _signal_loss_warning(cfg, rec, real, now_et, sell_m, close_m,
+                                   broker, elsewhere=elsewhere, capped=True)
+        print(msg)
+        notify(cfg, msg, priority="high")
     if paused or sell_m is None or now_m < sell_m:
         return []
     done = []
@@ -4696,7 +4721,8 @@ def signal_loss_banner(cfg, state, now_et=None, paused=False, acct=None):
         rec = state.get("signal_loss")
         day = now_et.date().isoformat()
         if (not isinstance(rec, dict) or day not in (
-                rec.get("warned_day"), rec.get("held_told_day"))
+                rec.get("warned_day"), rec.get("held_told_day"),
+                rec.get("capped_day"))
                 or not _in_session(cfg, now_et)):
             return []
         acct = acct or _signal_loss_acct(cfg)
@@ -4715,6 +4741,11 @@ def signal_loss_banner(cfg, state, now_et=None, paused=False, acct=None):
             text = (f"No exit signals reach the agent ({why}). It is on hold, "
                     f"so it does not sell your {what} itself while the hold "
                     f"lasts: sell {'it' if len(every) == 1 else 'them'} yourself.")
+        elif rec.get("capped_day") == day and rec.get("warned_day") != day:
+            text = (f"No exit signals reach the agent ({why}). They have "
+                    "stopped and come back more than once today, so it does "
+                    f"not sell your {what} itself today: sell "
+                    f"{'it' if len(every) == 1 else 'them'} yourself.")
         elif rec.get("warned_day") != day:
             return []   # told only about the hold, which has ended
         elif not real:

@@ -447,7 +447,40 @@ def test_a_late_loss_after_the_day_s_warnings_is_not_sold_unwarned(sent):
     assert agent.signal_loss_sell_at({}, state, et(15, 36)) is None
     for now in (et(15, 36), et(15, 50), et(15, 59)):
         assert _tick(state, b, now) == []
-    assert b.calls == [] and len(_warnings(sent)) == 2
+    # no warning of a sale: only the one note that it does not sell today
+    assert b.calls == [] and len(_warnings(sent)) == 3
+    assert not [w for w in _warnings(sent)[2:] if "If exit signals are not back" in w]
+
+
+def test_a_loss_past_the_day_s_warnings_still_tells_the_owner_once(sent):
+    """Losses 1 and 2 were warned and cleared; loss 3 lasts past the close.
+    It is not sold (no warning of a sale is left today), but the owner gets
+    one high-priority note that says so, and the classic banner says it
+    too. A fourth loss the same day sends nothing more."""
+    state = _state(KEY)
+    b = Broker()
+    for h, m in ((10, 0), (15, 15)):
+        _note(state, "lost", et(h, m), "feed_error")
+        _tick(state, b, et(h, m + 5))
+        _note(state, "ok", et(h, m + 5, s=30))
+    assert len(_warnings(sent)) == 2
+    _note(state, "lost", et(15, 22), "feed_error")
+    _tick(state, b, et(15, 27))
+    (w,) = _warnings(sent)[2:]
+    assert [p for m, p in sent if m == w] == ["high"]
+    assert "does not sell it on its own today" in w
+    assert "sell it yourself at" in w and "If exit signals are not back" not in w
+    assert "If exit signals are still missing tomorrow, it sells at 15:30 ET." in w
+    (ban,) = agent.signal_loss_banner({}, state, et(15, 28))
+    assert "does not sell your 1 real position itself today" in ban["text"]
+    assert "itself at" not in ban["text"]
+    for now in (et(15, 30), et(15, 45), et(15, 59)):
+        assert _tick(state, b, now) == []
+    assert b.calls == []
+    _note(state, "ok", et(15, 50))
+    _note(state, "lost", et(15, 51), "feed_error")
+    _tick(state, b, et(15, 57))
+    assert len(_warnings(sent)) == 3
 
 
 def test_the_second_warning_after_the_reminder_time_gives_its_own_notice(sent):
