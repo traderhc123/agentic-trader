@@ -26,7 +26,7 @@ import {
   type Book,
   type LimitKey,
 } from "../lib/settings";
-import { UNKNOWN, count, etDayKey, etWhen, plural, usd } from "../lib/format";
+import { UNKNOWN, count, etDayKey, etWhen, plural, signed, tone, usd } from "../lib/format";
 import { Icon, Stamp } from "../ui";
 import type { Page } from "../App";
 import { LimitsPanel } from "./Today";
@@ -646,7 +646,7 @@ export function RulesView({ page }: { page: Page }) {
           exp="When the day's closed trades have lost this much, the agent opens nothing new until the next day. It is not a stop-loss: it never sells anything."
           now={
             <>
-              <span className={lost > 0 ? "loss" : ""}>{usd(lost, 0)}</span> lost today
+              <span className={tone(-lost)}>{signed(-lost, 0)}</span> lost today
             </>
           }
         />

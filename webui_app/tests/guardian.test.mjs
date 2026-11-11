@@ -946,6 +946,20 @@ test("http: a write with no answer, or one it can't read, makes the page read th
   for (const t of [settingsDoubt(true, "", true), settingsDoubt(true, "x.", false)]) clean(t, "doubt");
 });
 
+test("money shown red always carries its sign (lost today included)", () => {
+  const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "../src/v2");
+  const files = ["views/Rules.tsx", "views/Today.tsx", "views/Pages.tsx", "views/Results.tsx", "views/Activity.tsx", "views/Signals.tsx", "views/Settings.tsx"];
+  for (const f of files) {
+    const src = fs.readFileSync(path.join(dir, f), "utf8");
+    // a span coloured as a loss whose amount is printed without a sign
+    assert.doesNotMatch(src, /"loss"[^>]*>\{usd\(/, f);
+  }
+  assert.equal(signed(-316, 0), "−$316");
+  assert.equal(tone(-316), "loss");
+  assert.equal(signed(-0, 0), "$0");
+  assert.equal(tone(-0), "");
+});
+
 test("signal days: 'Paid' only for the purchase this dialog made", () => {
   // an older pass is active: the pass check says "active", but this purchase is nowhere
   assert.equal(purchaseFate("new", { paid: ["old"], waiting: [] }), "gone");

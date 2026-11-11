@@ -391,7 +391,7 @@ export function LimitsPanel({ page, linkLabel = "Change limits" }: { page: Page;
           <div className="limit-top">
             <span>Lost today, of your daily loss limit</span>
             <b>
-              <span className={lost > 0 ? "loss" : ""}>{usd(lost, 0)}</span> <small>{L.max_daily_loss != null ? `of ${usd(L.max_daily_loss, 0)}` : "no limit set"}</small>
+              <span className={tone(-lost)}>{signed(-lost, 0)}</span> <small>{L.max_daily_loss != null ? `of ${usd(L.max_daily_loss, 0)}` : "no limit set"}</small>
             </b>
           </div>
           {L.max_daily_loss != null && (
