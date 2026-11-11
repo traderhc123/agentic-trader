@@ -11,6 +11,8 @@ import ast
 import json
 import os
 import random
+import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -39,6 +41,22 @@ def _fast(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda s: None)
     monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: False)
     broker_events.begin()
+
+
+def _adapter_waits(monkeypatch, module):
+    """The pauses `module`'s own code asks for, in order, on this test's
+    thread. The adapters call the one global time.sleep, which every other
+    thread in the process calls too (a daemon thread a dashboard test left
+    polling every 0.2 s, say): those are skipped, not recorded, so they can't
+    land in this list. Every sleep stays instant, as _fast makes it."""
+    waits, me = [], threading.get_ident()
+
+    def sleep(seconds):
+        if (threading.get_ident() == me
+                and sys._getframe(1).f_globals.get("__name__") == module.__name__):
+            waits.append(seconds)
+    monkeypatch.setattr(time, "sleep", sleep)
+    return waits
 
 
 def _exit_ev(**over):
@@ -275,29 +293,31 @@ def test_alpaca_holdings_read_that_fails_briefly_sells_in_the_same_loop(
         monkeypatch, how, fails):
     """One failed GET /v2/positions doesn't hold the sell back for a whole
     loop: the read is tried again (twice at most, a second apart)."""
-    slept = []
-    monkeypatch.setattr(alpaca.time, "sleep", slept.append)
+    slept = _adapter_waits(monkeypatch, alpaca)
     api = AlpacaAPI(monkeypatch, held=3)
     api.pos_fail, api.pos_down = how, fails
     changed, st = _alp_sell(api, qty=3)
     (body,) = api.posts
     assert body["qty"] == "3" and changed and st["positions"] == {}
     assert len(api.pos_reads) == fails + 1 and _reasons() == []
+    # one pause before each retry, in order, and no other holdings pause
+    # (what follows is the fill check's poll, _CONFIRM_WAIT_S = 0 here)
     assert slept[:fails] == [alpaca._HOLDINGS_RETRY_WAIT_S] * fails
+    assert alpaca._HOLDINGS_RETRY_WAIT_S not in slept[fails:]
 
 
 def test_alpaca_holdings_retries_add_at_most_five_seconds(monkeypatch):
     """Worst case (every retry times out): the pauses plus the retries'
     own time limits stay within about 5 s."""
-    slept = []
-    monkeypatch.setattr(alpaca.time, "sleep", slept.append)
+    slept = _adapter_waits(monkeypatch, alpaca)
     api = AlpacaAPI(monkeypatch, held=3)
     api.pos_fail, api.pos_down = "timeout", -1
     _alp_sell(api, qty=3)
     first, *retries = api.pos_reads
     assert first == alpaca._TIMEOUT and len(retries) == 2
-    hold_back_waits = [s for s in slept if s == alpaca._HOLDINGS_RETRY_WAIT_S]
-    assert sum(retries) + sum(hold_back_waits) <= 5.0
+    # nothing was sent, so every pause the adapter took is a holdings retry's
+    assert slept == [alpaca._HOLDINGS_RETRY_WAIT_S] * len(retries)
+    assert sum(retries) + sum(slept) <= 5.0
     assert api.posts == []
 
 
@@ -829,17 +849,16 @@ def test_moomoo_frequency_limit_waits_and_sells_instead_of_holding_back(
         monkeypatch, said):
     """A frequency-limit answer to the holdings read is not "unknown": the
     sell waits for the limit's window and goes out in the same loop."""
-    slept = []
-    monkeypatch.setattr(moomoo.time, "sleep", slept.append)
+    slept = _adapter_waits(monkeypatch, moomoo)
     sdk = LimitedMM(limited=2, said=said, held=3)
     changed, st = _mm_sell(monkeypatch, sdk, qty=3)
     assert [o["qty"] for o in sdk.placed] == [3] and changed
-    assert len(slept) >= 2 and _reasons() == []
+    # one wait per limited answer, the window's own back-off, in order
+    assert slept[:2] == list(moomoo._LIMIT_WAITS_S[:2]) and _reasons() == []
 
 
 def test_moomoo_frequency_limit_that_never_lifts_holds_the_sell_back(monkeypatch):
-    slept = []
-    monkeypatch.setattr(moomoo.time, "sleep", slept.append)
+    slept = _adapter_waits(monkeypatch, moomoo)
     sdk = LimitedMM(limited=10 ** 6, held=3)
     changed, _st = _mm_sell(monkeypatch, sdk, qty=3)
     assert sdk.placed == [] and not changed
@@ -848,8 +867,7 @@ def test_moomoo_frequency_limit_that_never_lifts_holds_the_sell_back(monkeypatch
 
 
 def test_moomoo_other_read_errors_hold_back_at_once(monkeypatch):
-    slept = []
-    monkeypatch.setattr(moomoo.time, "sleep", slept.append)
+    slept = _adapter_waits(monkeypatch, moomoo)
     sdk = LimitedMM(limited=1, said="disconnected", held=3)
     changed, _st = _mm_sell(monkeypatch, sdk, qty=3)
     assert sdk.placed == [] and slept == [] and _reasons() == ["holdings_unknown"]
