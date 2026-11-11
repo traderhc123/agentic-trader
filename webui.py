@@ -5683,8 +5683,15 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 extra={"real_positions": None if left is None else len(left)})
             if wait:
                 return wait
-            res = _source_save({"source": src, "source_url": p.get("url", ""),
-                                "scope": _scope_now()}, save)
+            back = {"source": src, "source_url": p.get("url", ""),
+                    "scope": _scope_now()}
+            saved_key = cfg.get("agenthc_api_key")
+            if src == "agenthc" and isinstance(saved_key, str) and saved_key.strip():
+                # the classic form with the key on file filled in: a
+                # subscriber with no pass or wallet can go back to AgentHC
+                # (the key is saved again as it is, nothing else changes)
+                back["agenthc_key"] = saved_key
+            res = _source_save(back, save)
             if res.get("ok"):
                 res = {"ok": True, "saved": True, "settings": _settings_view()}
             return res

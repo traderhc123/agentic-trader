@@ -78,3 +78,29 @@ def test_the_replace_flag_is_true_or_false_only(home, app, lnbits, start, payloa
     r = c.post("/api/v2/wallet/create", payload)
     assert r["ok"] is False and "needs_confirm" not in r, payload
     assert lnbits["made"] == [] and read_cfg(home) == start
+
+
+# ── signal source: a subscriber goes back to AgentHC signals ──
+
+@pytest.mark.parametrize("was", ["manual", "url"])
+def test_a_subscriber_with_only_a_key_can_switch_back_to_agenthc(home, app, was):
+    """No pass and no wallet, a subscription key on file: the preview is
+    offered, so the confirmed switch must work (it used to be refused with
+    the classic "buy a pass above", the token used up)."""
+    from test_v2_settings_api import same_effect
+    key = "ahc_fake_saved_key_24681357"
+    start = {**BASE, "source": was, "agenthc_api_key": key,
+             "include_other_trades": True}
+    if was == "url":
+        start["source_url"] = "https://feed.example/signals.json"
+    write_cfg(home, start)
+    c = app()
+    # the classic source form, with the key the owner has on file
+    out = same_effect(home, start,
+                      lambda: c.post("/api/source", {"source": "agenthc", "scope": "all",
+                                                     "agenthc_key": key}),
+                      lambda: c.confirmed("/api/v2/settings/source", {"source": "agenthc"}))
+    assert out == {**start, "source": "agenthc"}
+    write_cfg(home, start)
+    r = c.confirmed("/api/v2/settings/source", {"source": "agenthc"})
+    assert r["ok"] is True and r["saved"] is True and key not in json.dumps(r)
