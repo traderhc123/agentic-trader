@@ -842,8 +842,8 @@ def test_sources_keep_an_entry_a_feed_labels_short(home):
     ev = {"event": "ENTERED", "ticker": "SPY", "expiry": EXPIRY, "strike": 700,
           "type": "P", "event_id": "bear", "side": "short"}
     assert never_short_reason(ev, "ENTERED") == ""
-    assert [e["event_id"] for e in agenthc_day_trade_ideas._parse_events(
-        {"events": [ev]})] == ["bear"]
+    (kept,) = agenthc_day_trade_ideas._parse_events({"events": [ev]})
+    assert kept["event"] == "ENTERED" and kept["type"] == "P"
     for word in ("sell", "sell_to_open", "STO", "write", "sell_short"):
         assert never_short_reason(dict(ev, side=word), "ENTERED")
 
