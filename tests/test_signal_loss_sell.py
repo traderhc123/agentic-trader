@@ -57,9 +57,9 @@ def _state(*keys, since=None, cause="pass_ended", **row):
     return st
 
 
-def _tick(state, broker, now, cfg=None, paused=False):
+def _tick(state, broker, now, cfg=None, paused=False, **kw):
     return agent.signal_loss_tick(cfg or {}, state, lambda s: None, broker,
-                                  object(), paused=paused, now_et=now)
+                                  object(), paused=paused, now_et=now, **kw)
 
 
 def _note(state, status, now, cause="", cfg=None):
@@ -601,3 +601,19 @@ def test_with_rows_in_both_accounts_only_this_account_s_is_sold(sent):
     assert _tick(state, b, et(15, 30))
     assert [e["event_id"] for e in b.calls] == [f"no-signal|{KEY}|{DAY}"]
     assert TODAY_KEY in state["positions"]
+
+
+def test_a_restart_hold_of_a_few_seconds_sends_no_hold_note(sent):
+    """An update holds orders for a few seconds before the restart: that
+    blocks the sale for that loop only, and is no reason to tell the owner
+    the agent will not sell (the sale it announced still comes)."""
+    state = _state(KEY, since=et(14, 0))
+    b = Broker()
+    _tick(state, b, et(14, 5))
+    assert len(_warnings(sent)) == 1
+    for now in (et(15, 0), et(15, 30)):
+        assert _tick(state, b, now, paused=True, full_hold=False) == []
+    assert len(_warnings(sent)) == 1
+    assert not [m for m, _p in sent if "on hold" in m]
+    assert b.calls == []
+    assert _tick(state, b, et(15, 31)) and len(b.calls) == 1

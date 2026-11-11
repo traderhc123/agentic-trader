@@ -4571,20 +4571,26 @@ def _signal_loss_save(state, save_state):
 
 
 def signal_loss_tick(cfg, state, save_state, broker, client, paused=False,
-                     now_et=None):
+                     now_et=None, full_hold=None):
     """Once per heartbeat, right after the expiry guard: the no-signal
     warning, and from the sell time the no-signal sells (not while
-    `paused`: a full hold). Returns the lines of exits it placed. Never
-    raises."""
+    `paused`: no orders this loop). `full_hold`: the pause is a full hold
+    (a damaged state.json, a hand-off) that lasts until the owner acts, so
+    the owner is told the agent does not sell; not the few seconds before
+    a restart (default: `paused`). Returns the lines of exits it placed.
+    Never raises."""
     try:
         return _signal_loss_tick(cfg, state, save_state, broker, client,
-                                 paused, now_et or _et_now())
+                                 paused, now_et or _et_now(),
+                                 paused if full_hold is None else full_hold)
     except Exception as exc:
         print(f"no-signal sell error (non-fatal): {str(exc)[:150]}")
         return []
 
 
-def _signal_loss_tick(cfg, state, save_state, broker, client, paused, now_et):
+def _signal_loss_tick(cfg, state, save_state, broker, client, paused, now_et,
+                      full_hold=None):
+    full_hold = paused if full_hold is None else (paused and full_hold)
     rec = state.get("signal_loss")
     if not isinstance(rec, dict) or not isinstance(rec.get("since"), (int, float)):
         return []
@@ -4602,7 +4608,7 @@ def _signal_loss_tick(cfg, state, save_state, broker, client, paused, now_et):
     elsewhere = [k for k, r in rows if _signal_loss_elsewhere(r, acct)]
     real = [k for k, r in rows if _opened_live(r) and k not in elsewhere]
     lasted = now - float(rec["since"]) >= SIGNAL_LOSS_WARN_S
-    if (real or elsewhere) and lasted and paused \
+    if (real or elsewhere) and lasted and full_hold \
             and rec.get("held_told_day") != day:
         # a full hold blocks the sale: say so, once a day; this is no
         # notice of a sale (warned_at stays unset: once the hold ends the
@@ -7025,8 +7031,11 @@ def cmd_run(app_window=False):
         try:
             expiry_guard_tick(cfg, state, save_state, broker, client,
                               paused=held)
+            # the few seconds before a restart block this loop's sale
+            # but are no hold to tell the owner about
             signal_loss_tick(cfg, state, save_state, broker, client,
-                             paused=held)
+                             paused=held,
+                             full_hold=bool(held and _full_hold_note()))
         finally:
             transfer.CYCLE_IDLE.set()  # cycle over: state is saved
         try:
