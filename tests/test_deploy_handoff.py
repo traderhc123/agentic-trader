@@ -9,6 +9,7 @@ import base64
 import gzip
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -138,7 +139,19 @@ def deploy_route(home, tmp_path, monkeypatch):
     def make(running):
         webui.start_app(get_status=(lambda: {}) if running else None)
         return _FakeServer.handler.routes_post["/api/deploy"]
-    return make
+    before = set(threading.enumerate())
+    yield make
+    # A deploy with the agent running here starts a waiter that ends only
+    # once CONTROLS["stop"] is set (or after LOCAL_STOP_CAP_S). Release it
+    # and join it while the monkeypatched CONTROLS are still in place —
+    # otherwise the restore puts "stop" back to False and the waiter polls
+    # time.sleep(0.2) on into later tests.
+    webui.CONTROLS["stop"] = True
+    started = [t for t in threading.enumerate() if t not in before]
+    for t in started:
+        t.join(timeout=5)
+    alive = [t.name for t in started if t.is_alive()]
+    assert not alive, f"threads outlived the test: {alive}"
 
 
 def test_deploy_retires_this_computer(deploy_route, monkeypatch):
@@ -283,7 +296,7 @@ def test_resume_cannot_undo_the_handoff(deploy_route, monkeypatch):
     handled, reply = A._apply_command("resume")
     assert handled and "resume-here" in reply and "twice" in reply
     assert transfer.HANDOFF["hold"] is True
-    webui.CONTROLS["stop"] = True   # let the waiting thread go
+    # the deploy_route fixture releases and joins the waiting thread
 
 
 def test_resume_still_works_when_nothing_was_moved(deploy_route, home):
