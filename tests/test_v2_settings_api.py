@@ -370,6 +370,53 @@ def test_pass_buy_is_the_classic_handler_after_confirming(home, app, monkeypatch
     assert bought == [5, 5]
 
 
+def test_a_change_made_while_the_broker_checks_the_keys_stops_the_connect(home, app, monkeypatch):
+    """The classic connect asks the broker about the keys before it saves,
+    outside the settings lock. A change confirmed elsewhere in that window
+    (another tab going LIVE on the paper account it previewed) must not be
+    followed by a broker save the owner reviewed against the old settings."""
+    from brokers import alpaca
+    write_cfg(home, BASE)  # Practice, Alpaca paper
+    c = app()
+    data = {"broker": "alpaca", "values": {"alpaca_key_id": "AKLIVEKEY000111222",
+                                           "alpaca_secret": "LIVESECRET000111222333",
+                                           "alpaca_paper": False}}
+    first = c.post("/api/v2/broker/connect", data)
+    assert first["needs_confirm"] is True
+
+    def verify(cfg):  # meanwhile, the other tab's confirmed LIVE lands
+        write_cfg(home, {**read_cfg(home), "dry_run": False})
+        return True, "connected (test)"
+    monkeypatch.setattr(alpaca, "verify", verify)
+    r = c.post("/api/v2/broker/connect", {**data, "confirm": first["preview"]["token"]})
+    assert r == {"ok": False, "error": webui._REVIEW_AGAIN}
+    out = read_cfg(home)
+    assert out == {**BASE, "dry_run": False}  # LIVE stays on the paper account
+    assert c.get("/api/v2/settings")["broker"]["paper"] is True
+    # with nothing changed meanwhile, the same confirm goes through
+    monkeypatch.setattr(alpaca, "verify", lambda cfg: (True, "connected (test)"))
+    write_cfg(home, BASE)
+    r = c.confirmed("/api/v2/broker/connect", data)
+    assert r["ok"] is True and read_cfg(home)["alpaca_paper"] is False
+
+
+def test_a_change_made_while_the_invoice_is_made_stops_the_pass_buy(home, app, monkeypatch):
+    from sources import agenthc_day_trade_ideas as hc
+    write_cfg(home, BASE)
+    c = app()
+    first = c.post("/api/v2/pass/buy", {"days": 5})
+
+    def buy_pass(days, extend_token=None):  # meanwhile, a limit is raised
+        write_cfg(home, {**read_cfg(home), "budget_per_trade_usd": 5000.0})
+        return {"payment_request": "lnbc5fakeinvoice", "amount_sats": 500,
+                "amount_usd_approx": 5, "pass_token": "tok5",
+                "access_until": "2026-12-01"}
+    monkeypatch.setattr(hc, "buy_pass", buy_pass)
+    r = c.post("/api/v2/pass/buy", {"days": 5, "confirm": first["preview"]["token"]})
+    assert r == {"ok": False, "error": webui._REVIEW_AGAIN}
+    assert read_cfg(home) == {**BASE, "budget_per_trade_usd": 5000.0}
+
+
 def test_recurring_day_pass_is_the_classic_switch_after_confirming(home, app):
     start = {**BASE, "lnbits_url": "https://wallet.example",
              "lnbits_admin_key": SECRETS["lnbits_admin_key"]}

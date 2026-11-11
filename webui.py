@@ -3971,6 +3971,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "dry_run": bool(cfg.get("dry_run"))}
 
     def broker_connect(_h, data):
+        return _broker_connect(data, save)
+
+    def _broker_connect(data, save_now):
+        """The classic connect (/api/broker/connect). save_now: save(), or
+        for /v2 a save that first checks nothing changed since the preview."""
         if not A.consent_ok():
             return {"ok": False, "error": "accept the agreement first"}
         from brokers import BROKERS
@@ -3981,7 +3986,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         if not ok:
             return {"ok": False, "error": msg}
         pending["broker_last4"] = str(data.get("broker", ""))[:6]
-        save()
+        save_now()
         return {"ok": True, "note": msg}
 
     def update_check(_h):
@@ -4065,9 +4070,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
 
     def pass_buy(_h, data):
         """Invoice for N prepaid signal days; the user pays from any wallet."""
+        return _pass_buy_route(data, save)
+
+    def _pass_buy_route(data, save_now):
+        """The classic /api/pass/buy. save_now: as in _broker_connect."""
         if not A.consent_ok():
             return {"ok": False, "error": "accept the agreement first"}
-        return _pass_buy(cfg, save, data)
+        return _pass_buy(cfg, save_now, data)
 
     def pass_options_route(_h):
         from sources import agenthc_day_trade_ideas as hc
@@ -4538,6 +4547,23 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         problem = confirms.redeem(data.get("confirm"), route, payload, fp)
         return None if problem is None else {"ok": False, "error": problem}
 
+    class _Changed(Exception):
+        """config.json changed between a redeemed token and its save."""
+
+    def _save_if_unchanged(fp):
+        """save(), for a confirmed write whose classic handler asks the
+        broker or AgentHC something before it saves (outside CONFIG_LOCK,
+        so a slow answer never holds up the agent's own commands): it
+        saves only while config.json still has the fingerprint the token
+        was redeemed against, checked and written in one lock hold. Else
+        _Changed, and nothing is saved."""
+        def guarded():
+            with A.CONFIG_LOCK:
+                if _fingerprint() != fp:
+                    raise _Changed()
+                save()
+        return guarded
+
     def _change(key, label, saved_now, new, direction):
         return {"key": key, "label": label, "saved_now": saved_now,
                 "new": new, "direction": direction}
@@ -4881,9 +4907,15 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                              "after those at your current broker.")
             wait = _two_step("broker_connect", p, data, [_change(
                 "broker", "Broker account", before, after, direction)], notes)
+            fp = _fingerprint()  # what the token was just redeemed against
         if wait:
             return wait
-        res = broker_connect(None, p)
+        last4 = pending["broker_last4"]
+        try:
+            res = _broker_connect(p, _save_if_unchanged(fp))
+        except _Changed:
+            pending["broker_last4"] = last4
+            return {"ok": False, "error": _REVIEW_AGAIN}
         if res.get("ok"):
             res = {**res, "saved": True, "settings": _settings_view()}
         return res
@@ -4944,9 +4976,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "your wallet.",
                 "It does not switch between Practice and LIVE.",
                 does_not_trade])
+            fp = _fingerprint()  # what the token was just redeemed against
         if wait:
             return wait
-        return pass_buy(None, p)
+        try:
+            return _pass_buy_route(p, _save_if_unchanged(fp))
+        except _Changed:
+            return {"ok": False, "error": _REVIEW_AGAIN}
 
     @_v2
     def v2_recurring(data):
