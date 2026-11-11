@@ -392,6 +392,14 @@ STATES.update({
                          {"level": "warn", "code": "note",
                           "text": "Records could not be written to disk.",
                           "condition": "records_unwritten"}])),
+    # the AI helper proposed a code change that waits for the owner
+    "proposal-pending": (
+        LIVE, _state(True), _history(True),
+        runtime(proposal={"explanation": "Adds a connector for another broker.",
+                          "warnings": [], "changes": [{
+                              "path": "brokers/example.py", "content": "x = 1\n",
+                              "diff": "--- a/brokers/example.py\n+++ b/brokers/"
+                                      "example.py\n@@ -0,0 +1 @@\n+x = 1\n"}]})),
     # LIVE on a broker's paper-trading account
     "paper-account": (
         {**LIVE, "broker": "alpaca", "alpaca_paper": True},

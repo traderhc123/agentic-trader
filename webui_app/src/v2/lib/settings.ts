@@ -363,3 +363,19 @@ export function agreementWords(c: { accepted: boolean; on_file: boolean; accepte
     return `The agreement changed since you accepted it${when}${c.terms_version ? ` (version ${c.terms_version})` : ""}: the current one is version ${c.current_terms_version}, and the agent needs it accepted in setup.`;
   return "No accepted agreement is on file on this computer: the agent needs it accepted in setup.";
 }
+
+// ── a code change ───────────────────────────────────────────────────────────
+
+/** The sha256 (hex) of the diff exactly as this page shows it: what an
+ *  Apply is bound to (the server applies only the proposal whose diff has
+ *  it). null when this browser can't work it out (then nothing is applied). */
+export async function diffSha256(text: string): Promise<string | null> {
+  const subtle = (globalThis as { crypto?: Crypto }).crypto?.subtle;
+  if (!subtle) return null;
+  try {
+    const d = new Uint8Array(await subtle.digest("SHA-256", new TextEncoder().encode(text)));
+    return Array.from(d, (b) => b.toString(16).padStart(2, "0")).join("");
+  } catch {
+    return null;
+  }
+}

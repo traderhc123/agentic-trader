@@ -169,6 +169,12 @@ export interface Preview {
   agent_running?: boolean;
   /** start: the saved mode it starts in */
   mode?: "live" | "practice";
+  /** a code change: the sha256 of the diff it applies, its files, the AI's
+   *  warnings, and whether the agent restarts on it */
+  diff_sha256?: string;
+  files?: string[];
+  warnings?: string[];
+  restarts?: boolean;
 }
 
 /** Every /v2 write answers with one of these (HTTP 200). */
@@ -326,3 +332,13 @@ export interface TipInvoice {
 
 /** POST /api/tip/status */
 export type TipCheck = { ok: true; status: "pending" | "paid" | "expired" } | { ok: false; error: string; retry?: boolean; unknown?: boolean };
+
+// ── Settings → Code changes ─────────────────────────────────────────────────
+
+/** GET /api/proposal (classic, reused): the code change waiting for review. */
+export type ProposalView = { pending: false } | { pending: true; explanation: string; warnings: string[]; diff: string };
+
+/** POST /api/v2/proposal/apply, applied: the agent's own words. */
+export interface ApplyDone {
+  reply: string;
+}

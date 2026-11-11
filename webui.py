@@ -5400,6 +5400,97 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return wait
         return deploy(None, p)
 
+    # ── Settings → Code changes ──
+    @_v2
+    def v2_code(data):
+        """POST /api/v2/settings/code: let the AI helper propose code changes
+        (the key the chat's "self-edit on|off" writes). Proposing changes
+        nothing: every change is reviewed and applied on its own, in two
+        steps."""
+        p = _v2_payload(data, ("self_edit_enabled",))
+        if set(p) != {"self_edit_enabled"} or not isinstance(
+                p["self_edit_enabled"], bool):
+            raise _Invalid("Send self_edit_enabled: true or false. Nothing was "
+                           "changed.")
+        with A.CONFIG_LOCK:
+            _sync()
+            cfg["self_edit_enabled"] = p["self_edit_enabled"]
+            save()
+            return {"ok": True, "saved": True, "settings": _settings_view()}
+
+    @_v2
+    def v2_proposal_request(data):
+        """POST /api/v2/proposal/request: ask the AI helper to write a code
+        change (the chat's "code: …"), by calling self_edit.propose itself:
+        the words are only ever a request to the AI, never a command (no
+        apply_command), and proposing changes nothing until it is applied."""
+        import llm_client
+        import self_edit
+        p = _v2_payload(data, ("request",))
+        req = p.get("request")
+        if set(p) != {"request"} or not isinstance(req, str) or not req.strip():
+            raise _Invalid("Describe the change you want. Nothing was changed.")
+        if len(req) > 4000 or any(ord(ch) < 32 and ch not in "\n\t" for ch in req):
+            raise _Invalid("The description must be plain text of at most 4,000 "
+                           "characters. Nothing was changed.")
+        if not self_edit.enabled(cfg):
+            return {"ok": False, "error": "Turn on “Let the AI helper propose "
+                    "code changes” first. Nothing was changed."}
+        if not llm_client.configured(cfg):
+            return {"ok": False, "error": "Connect an AI helper first (Settings, "
+                    "under Connections). Nothing was changed."}
+        # as the chat's "code: …": the settings on disk, the request trimmed
+        ok, msg = self_edit.propose(A._load(A.CONFIG_PATH, {}) or {}, req.strip())
+        if not ok:
+            return {"ok": False, "error": msg}
+        return {"ok": True, "note": msg}
+
+    @_v2
+    def v2_proposal_apply(data):
+        """POST /api/v2/proposal/apply {diff_sha256}: apply the pending code
+        change and restart (the classic /api/proposal/apply), by the second
+        (confirmed) POST only. diff_sha256 is the sha256 of the diff the owner
+        read (GET /api/proposal); a proposal with any other diff is never
+        applied, however it got there."""
+        import re as _re
+        import self_edit
+        p = _v2_payload(data, ("diff_sha256",))
+        sha = p.get("diff_sha256")
+        if set(p) != {"diff_sha256"} or not isinstance(sha, str) \
+                or not _re.fullmatch(r"[0-9a-f]{64}", sha):
+            raise _Invalid("diff_sha256 must be the sha256 of the change you "
+                           "reviewed. Nothing was changed.")
+        prop = self_edit.current()
+        if not isinstance(prop, dict):
+            return {"ok": False, "error": "No code change is waiting. Nothing "
+                    "was changed."}
+        if self_edit.diff_sha256(prop) != sha:
+            return {"ok": False, "error": "The code change waiting is not the "
+                    "one you reviewed. Read it again. Nothing was changed."}
+        files = [str(ch.get("path", ""))[:200] for ch in prop.get("changes", [])
+                 if isinstance(ch, dict)]
+        restarts = get_status is not None
+        with A.CONFIG_LOCK:
+            wait = _two_step("proposal_apply", p, data, [_change(
+                "code", "The agent's code", "as it is now",
+                f"{len(files)} file{'s' if len(files) != 1 else ''} changed by "
+                "the AI helper", "neutral")], [
+                "It does not switch between Practice and LIVE, and does not "
+                "change any setting.",
+                "Files the agent may never rewrite (its agreement check, safety "
+                "rails, order code and this dashboard's server) are refused: "
+                "then nothing is applied and the change is thrown away.",
+                "If the new code does not compile or load, every file is put "
+                "back as it was and nothing restarts."],
+                extra={"diff_sha256": sha, "files": files[:50],
+                       "warnings": [str(w)[:300] for w in prop.get("warnings", [])][:20],
+                       "restarts": restarts})
+        if wait:
+            return wait
+        # the classic apply, held to the reviewed diff where it reads the file
+        ok, msg = self_edit.apply_and_restart(restart=restarts, expect_sha256=sha)
+        return {"ok": ok, "reply": msg} if ok else {"ok": False, "error": msg}
+
     W.routes_get = {"/api/state": state, "/api/rh/start": rh_start,
                     "/api/wallet/balance": wallet_balance,
                     "/api/deploy/status": deploy_status,
@@ -5471,7 +5562,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/v2/command": v2_command,
                      "/api/v2/agent/start": v2_agent_start,
                      "/api/v2/move/finish": v2_move_finish,
-                     "/api/v2/move/deploy": v2_move_deploy}
+                     "/api/v2/move/deploy": v2_move_deploy,
+                     "/api/v2/settings/code": v2_code,
+                     "/api/v2/proposal/request": v2_proposal_request,
+                     "/api/v2/proposal/apply": v2_proposal_apply}
 
     W.routes_get = {p: _fresh(fn) for p, fn in W.routes_get.items()}
     W.routes_post = {p: _fresh(fn) for p, fn in W.routes_post.items()}

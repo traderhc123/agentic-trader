@@ -132,6 +132,9 @@ export const API = {
   agentStart: "/api/v2/agent/start",
   moveFinish: "/api/v2/move/finish",
   moveDeploy: "/api/v2/move/deploy",
+  code: "/api/v2/settings/code",
+  proposalRequest: "/api/v2/proposal/request",
+  proposalApply: "/api/v2/proposal/apply",
   // classic, read-only (or saving nothing), reused as they are
   brokers: "/api/brokers",
   aiProviders: "/api/llm/providers",
@@ -151,4 +154,8 @@ export const API = {
   tipOptions: "/api/tip/options",
   tipCreate: "/api/tip/create",
   tipStatus: "/api/tip/status",
+  // Settings → Code changes: the change waiting (read), and rejecting it
+  // (it only throws the proposal away)
+  proposal: "/api/proposal",
+  proposalReject: "/api/proposal/reject",
 } as const;

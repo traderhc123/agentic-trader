@@ -58,6 +58,7 @@ import {
   CLASSIC,
   DEPLOY_REGIONS,
   agreementWords,
+  diffSha256,
   tipLapsed,
   ackGiven,
   SETUP_FROM_V2,
@@ -1348,4 +1349,47 @@ test("help and support: the classic help tools, the tip and the agreement, in Se
   assert.match(agreementWords({ ...c, accepted: false, current_terms_version: "4" }), /changed since you accepted it on 2026-10-01 \(version 3\): the current one is version 4/);
   assert.match(agreementWords({ ...c, accepted: false, on_file: false, accepted_at: null, terms_version: null }), /No accepted agreement/);
   for (const x of [c, { ...c, accepted: false }, { ...c, accepted: false, on_file: false, accepted_at: "junk", terms_version: null }, null]) clean(agreementWords(x), "agreement");
+});
+
+// ── PR 4 group 5: Settings → Code changes ──────────────────────────────────
+
+test("code changes: Apply is two steps bound to the sha256 of the diff shown; asking only proposes", async () => {
+  const { createHash } = await import("node:crypto");
+  for (const t of ["", "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n", "naïve → ünïcode ✓\r\n\ttabs"])
+    assert.equal(await diffSha256(t), createHash("sha256").update(t, "utf8").digest("hex"), JSON.stringify(t));
+  assert.equal(API.proposal, "/api/proposal");
+  assert.equal(API.proposalReject, "/api/proposal/reject");
+  assert.equal(API.proposalApply, "/api/v2/proposal/apply");
+  assert.equal(API.proposalRequest, "/api/v2/proposal/request");
+  assert.equal(API.code, "/api/v2/settings/code");
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "CodeDialogs.tsx"), "utf8");
+  // the sha of exactly the text shown, sent at both steps
+  assert.match(src, /sha: await diffSha256\(p\.diff\)/);
+  assert.match(src, /askPreview\(API\.proposalApply, \{ diff_sha256: shown\.sha \}\)/);
+  assert.match(src, /path=\{API\.proposalApply\}\s+payload=\{\{ diff_sha256: shown\.sha \}\}/);
+  assert.match(src, /<pre[^>]*>\s*\{shown\.p\.diff\}/);
+  // the request is only ever a request: the typed route, never the chat
+  assert.match(src, /send<\{ note\?: string \}>\(API\.proposalRequest, \{ request: t \}\)/);
+  assert.ok(!/\/api\/command|API\.command/.test(src));
+  // the dialog says the agent restarts
+  assert.match(src, /Apply and restart the agent/);
+  const set = fs.readFileSync(path.join(SRC, "v2", "views", "Settings.tsx"), "utf8");
+  for (const a of ["self-edit", "proposal", "proposal-request"]) {
+    assert.equal(ACTION_HOME[a], "settings", a);
+    assert.equal((set.match(new RegExp(`\\b(?:data-act|act)="${a}"`, "g")) || []).length, 1, a);
+  }
+  assert.match(set, /send\(API\.code, \{ self_edit_enabled: next \}\)/);
+});
+
+test("code changes: a pending change is one note on Today, linking to Settings", { skip }, () => {
+  for (const [name, s] of states) {
+    const ns = notes(s, linkOf(s, false), "today").filter((n) => n.codes.includes("proposal_pending"));
+    if (s.proposal?.pending && linkOf(s, false) === "ok") {
+      assert.equal(ns.length, 1, name);
+      assert.equal(ns[0].go, "settings", name);
+      clean(ns[0].title, name);
+      clean(ns[0].text, name);
+    } else if (!s.proposal?.pending) assert.equal(ns.length, 0, name);
+  }
+  assert.ok(states.some(([n]) => n === "proposal-pending"), "no fixture with a pending change");
 });

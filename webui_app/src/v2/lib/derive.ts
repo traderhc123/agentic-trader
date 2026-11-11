@@ -476,6 +476,17 @@ export function notes(s: Status, l: Link, here?: Go | "today" | "activity" | "re
         }),
       );
     }
+    if (s.proposal?.pending)
+      out.push(
+        note({
+          key: "proposal",
+          codes: ["proposal_pending"],
+          level: "info",
+          icon: "info",
+          title: "Your AI helper proposed a code change",
+          text: "Nothing changes until you read it and apply it, under Code changes in Settings.",
+        }),
+      );
   }
 
   // the agent's own messages: folded into the note about the same condition,

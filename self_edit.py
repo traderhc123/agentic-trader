@@ -473,12 +473,17 @@ def _app_port():
         return 8721
 
 
-def apply_and_restart(restart=True):
+def apply_and_restart(restart=True, expect_sha256=None):
     """Apply the pending proposal: backup -> write -> compile-check ->
-    import-check -> rollback on failure -> restart. Returns (ok, message)."""
+    import-check -> rollback on failure -> restart. Returns (ok, message).
+    expect_sha256: apply only the proposal whose shown diff has this sha256
+    (diff_sha256), the one the owner reviewed; any other is left as it is."""
     prop = current()
     if not prop:
         return False, "no pending proposal"
+    if expect_sha256 is not None and diff_sha256(prop) != expect_sha256:
+        return False, ("the proposal waiting is not the one you reviewed — "
+                       "nothing was applied; review it again")
 
     # Re-validate paths at apply time — never trust the stored proposal file.
     repo_real = os.path.realpath(_repo())

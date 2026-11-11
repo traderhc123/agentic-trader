@@ -19,6 +19,7 @@ import type { Page } from "../App";
 import { Row } from "./Pages";
 import { MoveDialog, StartDialog, StopDialog } from "./AgentDialogs";
 import { AgreementDialog, HelpTextDialog, TipDialog } from "./SupportDialogs";
+import { ProposalDialog, RequestDialog } from "./CodeDialogs";
 
 const SOURCE_NAMES: Record<string, string> = { agenthc: "AgentHC Day Trade Ideas" };
 const sourceName = (id: string) => (Object.prototype.hasOwnProperty.call(SOURCE_NAMES, id) ? SOURCE_NAMES[id] : id);
@@ -234,6 +235,7 @@ function BrokerDialog({ page, onClose }: { page: Page; onClose: () => void }) {
           </div>
         ),
       )}
+      <p className="small muted">Don't see your platform? Your AI helper can write a connector for it: Code changes, further down Settings.</p>
       <FieldError id={`${id}-e`} text={err} />
     </Dialog>
   );
@@ -522,6 +524,32 @@ function UpdateRow({ page }: { page: Page }) {
   );
 }
 
+/** Let the AI helper propose code changes: saves straight away (proposing
+ *  changes nothing; applying is two steps). */
+function SelfEditSwitch({ page }: { page: Page }) {
+  const v = page.settings.view;
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const save = async (next: boolean) => {
+    setBusy(true);
+    setErr("");
+    const r = await send(API.code, { self_edit_enabled: next });
+    if (!r.ok) {
+      setBusy(false);
+      return setErr(r.error);
+    }
+    const nv = await page.settings.reload();
+    setBusy(false);
+    page.say(true, `Saved. AI code proposals: ${!nv ? "not read back yet" : nv.code.self_edit_enabled ? "on" : "off"}.`);
+  };
+  return (
+    <>
+      <Switch act="self-edit" label="Let the AI helper propose code changes" on={v ? v.code.self_edit_enabled : null} busy={busy} disabled={!!cantEdit(page)} onChange={save} />
+      <FieldError id="self-edit-e" text={err} />
+    </>
+  );
+}
+
 // ── the page ────────────────────────────────────────────────────────────────
 
 export function SettingsView({ page }: { page: Page }) {
@@ -532,7 +560,7 @@ export function SettingsView({ page }: { page: Page }) {
   const a = s.agent;
   const v = page.settings.view;
   const why = cantEdit(page);
-  const [open, setOpen] = useState<"broker" | "ai" | "alerts" | "stop" | "start" | "move" | "netcheck" | "report" | "tip" | "agreement" | null>(null);
+  const [open, setOpen] = useState<"broker" | "ai" | "alerts" | "stop" | "start" | "move" | "netcheck" | "report" | "tip" | "agreement" | "proposal" | "request" | null>(null);
   const unfinished = setupUnfinished(v);
   const reload = page.settings.reload;
   useEffect(() => {
@@ -744,6 +772,49 @@ export function SettingsView({ page }: { page: Page }) {
           }
         />
       </section>
+      <section className={`panel ${page.stale ? "stale" : ""}`}>
+        <div className="ph">
+          <h2>Code changes</h2>
+        </div>
+        <Row
+          label="AI code proposals"
+          exp="On: you can ask your AI helper to change the agent's code, for example to add a broker. Every change waits here until you read it and apply it. Off: it never writes code."
+          act={<SelfEditSwitch page={page} />}
+        />
+        <Row
+          label="Waiting for you"
+          exp={s.proposal?.pending ? "Your AI helper proposed a code change. Nothing changes until you apply it." : "No code change is waiting."}
+          val={s.proposal?.pending ? <span className="tag tag-warn">To review</span> : undefined}
+          act={
+            <button className="btn btn-sm" data-act="proposal" aria-haspopup="dialog" disabled={page.link === "lost" || !s.proposal?.pending} onClick={() => setOpen("proposal")}>
+              Review…
+            </button>
+          }
+        />
+        <Row
+          label="Ask for a change"
+          exp={
+            !v
+              ? UNKNOWN
+              : !v.code.self_edit_enabled
+                ? "Turn on AI code proposals first."
+                : !v.ai.connected
+                  ? "Connect an AI helper first (Connections, above)."
+                  : "Describe what you want changed; your AI helper writes it and it waits here for you."
+          }
+          act={
+            <button
+              className="btn btn-sm"
+              data-act="proposal-request"
+              aria-haspopup="dialog"
+              disabled={!!why || !v?.code.self_edit_enabled || !v?.ai.connected}
+              onClick={() => setOpen("request")}
+            >
+              Describe a change…
+            </button>
+          }
+        />
+      </section>
       <section className="panel">
         <div className="ph">
           <h2>Help and support</h2>
@@ -795,6 +866,8 @@ export function SettingsView({ page }: { page: Page }) {
       {(open === "netcheck" || open === "report") && <HelpTextDialog kind={open} onClose={() => setOpen(null)} />}
       {open === "tip" && <TipDialog onClose={() => setOpen(null)} />}
       {open === "agreement" && <AgreementDialog onClose={() => setOpen(null)} />}
+      {open === "proposal" && <ProposalDialog page={page} onClose={() => setOpen(null)} />}
+      {open === "request" && <RequestDialog page={page} onClose={() => setOpen(null)} />}
     </div>
   );
 }

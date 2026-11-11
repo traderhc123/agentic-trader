@@ -52,7 +52,11 @@ export type ActionId =
   | "netcheck"
   | "report"
   | "tip"
-  | "agreement";
+  | "agreement"
+  // Settings → Code changes
+  | "self-edit"
+  | "proposal"
+  | "proposal-request";
 
 export type Home = "band" | View;
 
@@ -84,6 +88,9 @@ export const ACTION_HOME: Record<ActionId, Home> = {
   report: "settings",
   tip: "settings",
   agreement: "settings",
+  "self-edit": "settings",
+  proposal: "settings",
+  "proposal-request": "settings",
 };
 
 /** The source file each home's controls are written in (the source scan in
@@ -168,7 +175,7 @@ export function screenOf(view: View, s: Status, l: Link): Screen {
   else if (view === "settings") {
     links.push("signals");
     controls.push("broker", "ai", "alerts", "autostart", "open-at-login", "keep-awake", "move", "theme", "dashboard", "classic");
-    controls.push("netcheck", "report", "tip", "agreement");
+    controls.push("self-edit", "proposal", "proposal-request", "netcheck", "report", "tip", "agreement");
     controls.push(s.agent.running ? "stop" : "start");
   }
   return { conditions: ns.map((n) => n.codes), controls, links };
