@@ -53,7 +53,27 @@ import {
 } from "../src/v2/lib/derive.ts";
 import { UNKNOWN, ago, contractName, dayLong, etDayKey, etTime, etWhen, plural, signed, span, tone, usd } from "../src/v2/lib/format.ts";
 import { UPDATE } from "../src/v2/lib/copy.ts";
-import { postJson } from "../src/v2/lib/http.ts";
+import { API, FAILED, confirmBody, getJson, postJson, send } from "../src/v2/lib/http.ts";
+import {
+  MOVE_TOOL,
+  SETUP_FROM_V2,
+  confirmLabel,
+  limitMeans,
+  limitRange,
+  limitsPayload,
+  lossWords,
+  readNumber,
+  readTickers,
+  riskOf,
+  savedTickers,
+  sizeMeans,
+  sizeWords,
+  v2Words,
+  valueWords,
+} from "../src/v2/lib/settings.ts";
+import { ACTION_HOME, HOME_FILE, VIEWS, screenOf, todayLimitsLink } from "../src/v2/lib/screens.ts";
+import { returnTo } from "../src/lib/returnTo.ts";
+import { fileURLToPath } from "node:url";
 import { RANGES, addDays, axisMoney, chartModel, niceTicks, rangeStart } from "../src/v2/lib/chart.ts";
 import {
   CHECK_PATH,
@@ -404,7 +424,8 @@ test("the review states say what the agent can and can't do", { skip }, () => {
   }
   const lapsed = notes(get("pass-lapsed"), "ok");
   assert.ok(lapsed.some((n) => n.key === "pass"), "pass note on a waiting pass");
-  assert.ok(lapsed.some((n) => n.text.includes("has run out")), "the agent's own pass notice");
+  // the agent's own pass notice is kept, folded into the pass note (one fact, one place)
+  assert.ok(lapsed.some((n) => n.key === "pass" && n.agent.some((t) => t.includes("has run out"))), "the agent's own pass notice");
   assert.ok(notes(get("day-pass-refused"), "ok").some((n) => n.text.includes("refused")));
   // the expiry sell is off: never promised
   const off = get("expiry-guard-off");
@@ -813,4 +834,281 @@ test("chart: the money axis always has $0 and short labels", () => {
   assert.equal(axisMoney(12500), "$12.5k");
   assert.equal(axisMoney(100000000), "$100M");
   assert.equal(axisMoney(-2500000), "−$2.5M");
+});
+
+// ── settings forms (PR 3): words, checks, the typed client ──────────────────
+
+test("settings: what the owner types is read, or said wrong next to the field", () => {
+  const cap = limitRange(null, "max_entries_per_day");
+  assert.deepEqual(readNumber("3", cap), { ok: true, value: 3 });
+  for (const bad of ["", "abc", "2.5", "0", "1001", "-1", "NaN", "Infinity", "1e3x"]) {
+    const r = readNumber(bad, cap);
+    assert.equal(r.ok, false, bad);
+    clean(r.error, bad);
+    assert.match(r.error, /from 1 to 1,000/);
+  }
+  const loss = limitRange(null, "max_daily_loss_usd");
+  assert.deepEqual(readNumber("$1,150.50", loss), { ok: true, value: 1150.5 });
+  assert.deepEqual(readNumber("0", loss), { ok: true, value: 0 });
+  assert.match(readNumber("-5", loss).error, /0 turns the limit off/);
+  // the server's own ranges win when it sends them
+  const s = { limits: { allowed: { max_entries_per_day: [1, 20] } } };
+  assert.equal(readNumber("21", limitRange(s, "max_entries_per_day")).ok, false);
+  assert.deepEqual(readTickers("spy, QQQ $nvda spy"), { ok: true, value: ["SPY", "QQQ", "NVDA"] });
+  assert.deepEqual(readTickers(""), { ok: true, value: [] });
+  const t = readTickers("spy, 12x, b@d");
+  assert.equal(t.ok, false);
+  assert.match(t.error, /12x, b@d/);
+  assert.deepEqual(savedTickers("spy qqq"), ["SPY", "QQQ"]);
+  assert.deepEqual(savedTickers(null), []);
+});
+
+test("settings: a value and a change are always said in words, never null or NaN", () => {
+  const vals = [null, undefined, 0, 3, 1150, 2.5, true, false, "x", { mode: "budget", value: 500 }, { mode: "percent", value: 2.5 },
+    { mode: "contracts", value: 2 }, { mode: "budget", value: null }, { id: "alpaca", paper: true }, { id: null, paper: null }, "live", "practice"];
+  for (const key of ["trade_size.main", "trade_size.other", "max_daily_loss_usd", "max_entries_per_day", "max_open_positions", "broker", "mode", "signal_days", "day_pass_recurring", "robinhood", "anything"])
+    for (const v of vals) clean(valueWords(key, v), `${key}=${JSON.stringify(v)}`);
+  assert.equal(lossWords(0), "Off");
+  assert.equal(lossWords(null), "Off");
+  assert.equal(lossWords(300), "$300");
+  assert.equal(sizeWords(null, "other"), "Same as the main pick");
+  assert.equal(sizeWords({ mode: "budget", value: 1150 }), "$1,150 a trade");
+  clean(sizeMeans({ mode: "percent", value: 2.5 }, "main"), "percent");
+  for (const k of ["max_entries_per_day", "max_daily_loss_usd", "max_open_positions"])
+    for (const v of [0, 1, 3, 500]) clean(limitMeans(k, v, { mainUsd: v ? 500 : null, open: 2 }), `${k} ${v}`);
+  // the loss limit never says "stop-loss" and always says it never sells
+  assert.match(limitMeans("max_daily_loss_usd", 300, { mainUsd: null, open: 0 }), /never sells anything/);
+});
+
+test("settings: the confirm button is named after the change", () => {
+  const ch = (key, a, b, direction) => [{ key, label: key, saved_now: a, new: b, direction }];
+  assert.equal(confirmLabel(ch("trade_size.main", { mode: "budget", value: 500 }, { mode: "budget", value: 1150 }, "raises_risk")), "Raise to $1,150");
+  assert.equal(confirmLabel(ch("max_entries_per_day", 4, 2, "lowers_risk")), "Lower to 2");
+  assert.equal(confirmLabel(ch("max_daily_loss_usd", 300, 0, "raises_risk")), "Turn off the daily loss limit");
+  assert.equal(confirmLabel(ch("max_daily_loss_usd", null, 200, "lowers_risk")), "Set the limit to $200");
+  assert.equal(confirmLabel(ch("trade_size.other", { mode: "budget", value: 150 }, null, "neutral")), "Use the main-pick size");
+  assert.equal(confirmLabel(ch("trade_size.main", { mode: "budget", value: 500 }, { mode: "contracts", value: 2 }, "neutral")), "Change to 2 contracts");
+  assert.equal(confirmLabel([...ch("max_entries_per_day", 4, 2, "lowers_risk"), ...ch("max_open_positions", 8, 9, "raises_risk")]), "Save 2 changes");
+});
+
+test("settings: the page's risk reading follows the server's rules", () => {
+  // webui._risk_direction / _size_direction: bigger is riskier; no loss limit is the riskiest
+  assert.equal(riskOf("max_entries_per_day", 4, 5), "raises_risk");
+  assert.equal(riskOf("max_open_positions", 8, 3), "lowers_risk");
+  assert.equal(riskOf("max_daily_loss_usd", 300, 0), "raises_risk");
+  assert.equal(riskOf("max_daily_loss_usd", 0, 300), "lowers_risk");
+  assert.equal(riskOf("max_daily_loss_usd", null, 0), "neutral");
+  assert.equal(riskOf("max_daily_loss_usd", 300, 500), "raises_risk");
+  assert.equal(riskOf("trade_size.main", { mode: "budget", value: 500 }, { mode: "budget", value: 400 }), "lowers_risk");
+  assert.equal(riskOf("trade_size.main", { mode: "budget", value: 500 }, { mode: "percent", value: 1 }), "neutral");
+  assert.equal(riskOf("trade_size.other", null, { mode: "budget", value: 1 }), "neutral");
+});
+
+test("settings: a limits save sends only what changed, and never the mode", () => {
+  const saved = { limits: { max_entries_per_day: 4, max_daily_loss_usd: 300, max_open_positions: 8 } };
+  assert.deepEqual(limitsPayload(saved, { max_entries_per_day: 4, max_daily_loss_usd: 0 }), { max_daily_loss_usd: 0 });
+  assert.deepEqual(limitsPayload(saved, { main: { mode: "budget", value: 1150 } }), { trade_size: { main: { mode: "budget", value: 1150 } } });
+  assert.deepEqual(limitsPayload(saved, { other: null }), { trade_size: { other: { mode: "same" } } });
+  for (const p of [limitsPayload(saved, { max_open_positions: 9 }), limitsPayload(saved, {})])
+    for (const k of Object.keys(p)) assert.ok(!/dry|mode|paused/.test(k), k);
+});
+
+test("settings: the agent's words for the classic page say where it is in /v2", () => {
+  // the messages the agent and its signal source write (sources/agenthc_day_trade_ideas.py, agent.py)
+  const said = [
+    "Your AgentHC feed pass has run out — the agent gets no signals until you buy more signal days (dashboard → Settings → Signal source).",
+    "connect a different Lightning wallet, or buy signal days with a prepaid pass (dashboard → Settings → Signal source). If you know",
+    "Check it, or set up another wallet, in the dashboard (Settings → Signal source)",
+    "the wallet does not hold enough sats — add sats in the dashboard (Settings → Signal source)",
+    "Buy more signal days in the dashboard (Settings → Signal source).",
+    "buy more in the dashboard (Settings → Signal source); unused days carry over.",
+    "Trades can't be placed until it's back. Fix: reconnect it in Settings → Broker.",
+  ];
+  for (const t of said) {
+    const w = v2Words(t);
+    assert.ok(!/dashboard|Signal source|Settings → Broker/.test(w), w);
+    assert.match(w, /Signals & pass|Settings/);
+  }
+  assert.equal(v2Words("Signals resumed."), "Signals resumed.");
+});
+
+const fakeReply = (status, body, calls = []) => async (url, init) => {
+  calls.push({ url, init });
+  if (status === "down") throw new TypeError("Failed to fetch");
+  return { status, json: async () => (body === "not json" ? JSON.parse("{") : body) };
+};
+
+test("http: every /v2 write is one same-origin JSON POST; failures never claim nothing changed", async () => {
+  const calls = [];
+  const ok = await send(API.limits, { max_entries_per_day: 3 }, fakeReply(200, { ok: true, needs_confirm: true, preview: { changes: [], does_not: [], token: "t", expires_in_s: 120 } }, calls));
+  assert.equal(ok.needs_confirm, true);
+  assert.equal(calls[0].url, "/api/v2/settings/limits");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers["Content-Type"], "application/json");
+  assert.deepEqual(JSON.parse(calls[0].init.body), { max_entries_per_day: 3 });
+  assert.deepEqual(confirmBody({ a: 1 }, "tok"), { a: 1, confirm: "tok" });
+  assert.deepEqual(confirmBody({ a: 1 }, "tok", false), { a: 1, confirm: "tok", acknowledge: false });
+  const refused = await send(API.limits, {}, fakeReply(200, { ok: false, error: "max_entries_per_day must be from 1 to 1,000. Nothing was changed." }));
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /from 1 to 1,000/);
+  for (const [status, body, why] of [[401, {}, "locked"], [403, {}, "locked"], ["down", null, "network"], [500, {}, "server"], [200, "not json", "server"], [200, { nope: 1 }, "server"]]) {
+    const r = await send(API.rules, {}, fakeReply(status, body));
+    assert.equal(r.ok, false);
+    assert.equal(r.why, why, String(status));
+    clean(r.error, why);
+    if (why !== "locked") assert.match(r.error, /does not know whether/);
+  }
+  const g = await getJson(API.settings, fakeReply(200, { ok: true, fingerprint: "f" }));
+  assert.equal(g.ok, true);
+  assert.equal((await getJson(API.settings, fakeReply(401, {}))).why, "locked");
+  assert.equal((await getJson(API.settings, fakeReply("down", null))).why, "network");
+  for (const f of Object.values(FAILED)) for (const t of Object.values(f)) clean(t, "failure words");
+  // /v2 sends no free text: the classic command route is only the fixed "stop"
+  for (const [k, p] of Object.entries(API)) if (k !== "classicCommand") assert.ok(p !== "/api/command", k);
+});
+
+test("the setup wizard goes back to /v2 only when /v2 sent the owner there", () => {
+  assert.equal(SETUP_FROM_V2, "/setup?from=v2");
+  assert.equal(returnTo("?from=v2"), "/v2");
+  assert.equal(returnTo("?ui=classic&from=v2"), "/v2");
+  // without it, or with anything else, exactly where it went before
+  for (const q of ["", "?from=dash", "?from=https://evil.example", "?from=/v2", "?from=v2&from=v2", "?from=V2", "?from=", "?from=//evil"])
+    assert.equal(returnTo(q), "/dash", q);
+});
+
+// ── no redundancy: one fact, one place; one action, one home ────────────────
+
+const sentences = (t) =>
+  String(t ?? "")
+    .split(/(?<=[.!?])\s+/)
+    .map((x) => x.toLowerCase().replace(/[^a-z0-9$ ]+/g, " ").replace(/\s+/g, " ").trim())
+    .filter((x) => x.split(" ").length >= 4);
+
+test("no redundancy: each condition once per screen, each link once, every control in its one home", { skip }, () => {
+  for (const [name, s] of states)
+    for (const failing of [false, true]) {
+      const l = linkOf(s, failing);
+      for (const view of VIEWS) {
+        const where = `${name}${failing ? " (fetch failing)" : ""} / ${view}`;
+        const sc = screenOf(view, s, l);
+        // one note per condition
+        const codes = sc.conditions.flat();
+        assert.equal(new Set(codes).size, codes.length, `${where}: a condition twice: ${codes}`);
+        // at most one link to a page, never to the page itself
+        assert.equal(new Set(sc.links).size, sc.links.length, `${where}: two links to one page: ${sc.links}`);
+        assert.ok(!sc.links.includes(view), `${where}: links to itself`);
+        // every control is in its home (the band is on every screen)
+        for (const a of sc.controls) assert.ok(ACTION_HOME[a] === "band" || ACTION_HOME[a] === view, `${where}: ${a} is not at home here`);
+        assert.equal(new Set(sc.controls).size, sc.controls.length, `${where}: a control twice: ${sc.controls}`);
+      }
+      // every agent message shows once: folded into its condition's note, or alone
+      const ns = notes(s, l, "today");
+      const told = ns.flatMap((n) => [n.text, ...n.agent]);
+      for (const x of s.notices) assert.equal(told.filter((t) => t === v2Words(x.text)).length <= 1, true, `${name}: "${x.text}" twice`);
+      // nothing points into the classic pages
+      for (const n of ns) for (const t of [n.title, n.text, ...n.agent]) assert.ok(!/dashboard\s*(→|->)|Settings\s*(→|->)\s*(Signal|Broker)/.test(t), `${name}: ${t}`);
+      // band = mode and run-state, vitals = readings, notes = what needs the owner,
+      // the statement = the state: no sentence said twice among them
+      const b = bandModel(s, l);
+      const st = statement(s, l);
+      const parts = {
+        band: [b.say[0], b.say[1], b.run.text + b.run.long].join(" "),
+        vitals: vitals(s, l).map((v) => `${v.bold}${v.text}. ${v.tail ?? ""}`).join(" "),
+        notes: ns.map((n) => `${n.title}. ${n.text}`).join(" "),
+        statement: `${st.h} ${st.lead}`,
+      };
+      const seen = new Map();
+      for (const [part, text] of Object.entries(parts))
+        for (const x of new Set(sentences(text))) {
+          assert.ok(!seen.has(x) || seen.get(x) === part, `${name}: "${x}" in both ${seen.get(x)} and ${part}`);
+          seen.set(x, part);
+        }
+    }
+});
+
+test("no redundancy: the operator's example is one note, in the dashboard's words", { skip }, () => {
+  const get = (n) => states.find(([x]) => x === n)[1];
+  const s = get("pass-lapsed");
+  const ns = notes(s, "ok", "today");
+  const pass = ns.filter((n) => n.codes.includes("signal_pass"));
+  assert.equal(pass.length, 1, JSON.stringify(ns));
+  assert.equal(pass[0].key, "pass"); // the dashboard's note, not "From your agent"
+  assert.match(pass[0].title, /signal pass/i);
+  assert.equal(pass[0].agent.length, 1); // the agent's message is folded in, with /v2's words
+  assert.match(pass[0].agent[0], /\(Signals & pass\)/);
+  assert.ok(!ns.some((n) => n.title.startsWith("From your agent")), JSON.stringify(ns));
+  assert.equal(pass[0].go, "signals");
+  // the broker down, said by the agent too: one note, raised to the agent's level
+  const b = get("broker-down-agent-says-so");
+  const bn = notes(b, "ok", "today");
+  const down = bn.filter((n) => n.codes.includes("broker_down"));
+  assert.equal(down.length, 1);
+  assert.equal(down[0].level, "crit");
+  assert.match(down[0].agent[0], /in Settings, under Connections/);
+  // a message about a condition with no dashboard note: shown once, by itself
+  assert.equal(bn.filter((n) => n.codes.includes("records_unwritten")).length, 1);
+  // Today's limits panel drops its link when a note links to Rules & limits already
+  const cash = get("low-cash");
+  assert.ok(notes(cash, "ok", "today").some((n) => n.go === "rules"));
+  assert.equal(todayLimitsLink(cash, "ok"), false);
+  assert.equal(todayLimitsLink(get("live"), "ok"), true);
+  // the band's own buttons are never repeated in a note
+  for (const [, x] of states) for (const n of notes(x, linkOf(x, false), "today")) assert.ok(n.go == null || ["settings", "signals", "rules", "holdings"].includes(n.go));
+});
+
+const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
+function sources(dir) {
+  const out = [];
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...sources(p));
+    else if (/\.(tsx?|mjs)$/.test(e.name)) out.push(p);
+  }
+  return out;
+}
+const rel = (p) => path.relative(path.join(SRC, "v2"), p).split(path.sep).join("/");
+
+test("no redundancy: every control is written in its home's file, once per kind of action", () => {
+  const files = sources(path.join(SRC, "v2")).filter((p) => p.endsWith(".tsx"));
+  const where = new Map();
+  for (const f of files) {
+    const text = fs.readFileSync(f, "utf8");
+    for (const m of text.matchAll(/\b(?:data-act|act)="([a-z-]+)"/g)) {
+      if (!where.has(m[1])) where.set(m[1], new Set());
+      where.get(m[1]).add(rel(f));
+    }
+  }
+  for (const [a, fs_] of where) {
+    assert.ok(Object.prototype.hasOwnProperty.call(ACTION_HOME, a), `data-act="${a}" is not a known action (lib/screens.ts)`);
+    assert.deepEqual([...fs_], [HOME_FILE[ACTION_HOME[a]]], `${a} has a control outside its home: ${[...fs_]}`);
+  }
+  for (const a of Object.keys(ACTION_HOME)) assert.ok(where.has(a), `${a} has no control at all`);
+});
+
+test("the settings never leave /v2: every remaining link to /setup or /dash is on the list", () => {
+  const files = sources(path.join(SRC, "v2"));
+  const found = [];
+  for (const f of files) {
+    const text = fs.readFileSync(f, "utf8");
+    for (const m of text.matchAll(/["'`](\/(?:setup|dash)\b[^"'`]*)["'`]/g)) found.push(`${rel(f)} ${m[1]}`);
+  }
+  // each one, and why it stays:
+  assert.deepEqual(found.sort(), [
+    // the constants the links use (Band's start link; Settings' move link)
+    "lib/settings.ts /dash#move",
+    "lib/settings.ts /setup?from=v2",
+    // the Waiting screen, shown when there is no status to draw Settings from
+    "App.tsx /dash",
+    // Settings → This dashboard: the one "Back to the classic dashboard"
+    "views/Settings.tsx /dash",
+  ].sort());
+  assert.equal(MOVE_TOOL, "/dash#move");
+  // the start link (shown only when no agent runs) returns to /v2
+  assert.match(fs.readFileSync(path.join(SRC, "v2", "Band.tsx"), "utf8"), /href=\{SETUP_FROM_V2\}/);
+  // the setup wizard's own links and its hop after starting honour from=v2
+  for (const f of ["wizard/Wizard.tsx", "wizard/steps.tsx"]) {
+    const t = fs.readFileSync(path.join(SRC, f), "utf8");
+    assert.ok(!/["']\/dash["']/.test(t), `${f} still goes to /dash by itself`);
+    assert.match(t, /returnTo\(\)/);
+  }
 });
