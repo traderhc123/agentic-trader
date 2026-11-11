@@ -1933,6 +1933,26 @@ test("the no-signal sell: one positions note says when, in the dashboard's words
   for (const p of off.positions.filter((x) => x.real)) assert.ok(!/It sells this at/.test(nextSay(p, off).text));
 });
 
+test("the no-signal sell while the pass is active but the feed is not live: no 'sold on exit signals'", { skip }, () => {
+  const s = states.find(([n]) => n === "signal-loss-feed-not-live")[1];
+  assert.equal(s.signals.exit_loss.armed, true);
+  assert.equal(s.real_positions_managed, false);
+  const ns = notes(s, "ok", "today");
+  const pos = ns.filter((n) => n.codes.includes("positions_unmanaged"));
+  assert.equal(pos.length, 1);
+  assert.equal(
+    pos[0].text,
+    "No exit signals reach the agent (the signal feed can't be read). It sells your 5 real positions itself at 3:30 PM ET unless they are back.",
+  );
+  assert.deepEqual(pos[0].agent, []);
+  for (const p of s.positions.filter((x) => x.real)) {
+    const say = nextSay(p, s);
+    assert.ok(!/at its exit signal/.test(say.text), say.text);
+    assert.match(say.text, /It sells this at 3:30 PM ET today unless they are back\./, p.id);
+  }
+  assert.match(answerWhy("closing", s.capabilities.closing, s), /It sells your real positions itself at 3:30 PM ET/);
+});
+
 test("the pass's last days are said on /v2, about new trades only", { skip }, () => {
   const get = (n) => states.find(([x]) => x === n)[1];
   const one = notes(get("pass-one-day-left"), "ok", "today").filter((n) => n.key === "pass");

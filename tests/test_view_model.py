@@ -1286,6 +1286,36 @@ def test_the_no_signal_warning_is_part_of_the_positions_condition():
     assert c["level"] == "urgent"
 
 
+@pytest.mark.parametrize("cause,why", [("feed_not_live", "feed_unreachable"),
+                                       ("feed_refused", "feed_unreachable"),
+                                       ("pass_unchecked", "pass_unchecked"),
+                                       ("pass_ended", "no_exit_signals")])
+def test_positions_are_not_said_to_sell_on_exit_signals_during_a_loss(cause, why):
+    """The prepaid pass is active, but AgentHC answers feed_not_live: the
+    read raises nothing (poll ok) and the agent records a loss and arms its
+    sale. The positions, the closing answer and the band follow the
+    agent's own record, never 'sold on its exit signal'."""
+    since = datetime(2026, 11, 9, 19, 0, tzinfo=timezone.utc)      # 14:00 ET
+    warned = datetime(2026, 11, 9, 19, 5, tzinfo=timezone.utc)
+    st = {**state(**{SPY: real_pos()}),
+          "pass_status": {_tid("tok"): {"status": "active", "days_left": 3}},
+          "signal_loss": {"since": since.timestamp(), "cause": cause,
+                          "warned_at": warned.timestamp(),
+                          "warned_day": TODAY}}
+    s = build(cfg=LIVE_PASS, st=st,
+              rt=runtime(feed_access=False, poll_ok=True))
+    assert s["signals"]["exit_loss"]["armed"] is True
+    assert s["real_positions_managed"] is False
+    assert s["unmanaged_reason"] == why
+    (p,) = s["positions"]
+    assert p["next"]["action"] != "sell_on_exit"
+    assert s["capabilities"]["closing"]["state"] == "cant"
+    # exit signals back (no loss record): sold on its exit signals again
+    ok = build(cfg=LIVE_PASS, st={**st, "signal_loss": None},
+               rt=runtime(feed_access=True, poll_ok=True))
+    assert ok["real_positions_managed"] is True
+
+
 def test_exit_loss_is_not_armed_when_nothing_will_sell():
     since = datetime(2026, 11, 9, 19, 0, tzinfo=timezone.utc)
     st = {**state(**{SPY: real_pos()}),

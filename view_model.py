@@ -1683,7 +1683,7 @@ def _exits_cut_off(state, signals, market_open, now):
     "pass_unchecked" (a prepaid pass it could not check with AgentHC) or
     "feed_unreachable" (its last read of the feed failed) — else None. The
     cases where sources.agenthc_day_trade_ideas.poll returns no events
-    without raising."""
+    without raising, and the agent's own loss record (state signal_loss)."""
     if not signals["reading"]:
         return None  # not reading at all: the hold / pause says why
     p = signals["pass"]
@@ -1704,6 +1704,17 @@ def _exits_cut_off(state, signals, market_open, now):
                          # read still had no access
                          or (market_open and signals["entry_access"] is False)))):
             return "no_exit_signals"
+    # the agent's own record that no exit signal reaches it (a read that
+    # raised nothing but saw no exits: feed_not_live, a refusal back-off,
+    # a pass the cache still calls active): agent.signal_loss_tick acts on
+    # it, so the positions say the same
+    x = signals.get("exit_loss")
+    if isinstance(x, dict):
+        if x.get("cause") == "pass_unchecked":
+            return "pass_unchecked"
+        if x.get("cause") in ("feed_error", "feed_not_live", "feed_refused"):
+            return "feed_unreachable"
+        return "no_exit_signals"
     if signals["last_poll_ok"] is False:
         return "feed_unreachable"
     return None

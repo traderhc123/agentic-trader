@@ -437,8 +437,25 @@ def _signal_loss():
         for w in banner]))
 
 
+def _signal_loss_feed():
+    """The prepaid pass is active, but AgentHC answers feed_not_live from
+    1:00 PM ET: each read raises nothing and sees no exits. The agent
+    records the loss and arms its 3:30 PM sale (review: the positions
+    must not say they sell on their exit signals)."""
+    import agent as A
+    cfg = LIVE
+    st = {**_state(True), **_pass_state(3, "active"),
+          "signal_loss": {"since": _T - 6060, "cause": "feed_not_live",
+                          "warned_at": _T - 5760, "warned_day": TODAY}}
+    banner = A.signal_loss_banner(cfg, st, NOW.astimezone(A.MARKET_TZ))
+    return (cfg, st, _history(True), runtime(feed_access=False, notices=[
+        {**w, "code": "signal_loss", "condition": "positions_unmanaged"}
+        for w in banner]))
+
+
 STATES.update({
     "signal-loss-sell": _signal_loss(),
+    "signal-loss-feed-not-live": _signal_loss_feed(),
     # one signal day left on the prepaid pass; then its last day
     "pass-one-day-left": (LIVE, {**_state(True), **_pass_state(1, "active")},
                           _history(True), runtime()),
