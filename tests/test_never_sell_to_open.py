@@ -9,7 +9,6 @@ caught. Zero network."""
 
 import ast
 import json
-import math
 import os
 import random
 import time
@@ -739,7 +738,8 @@ def test_no_other_module_sends_broker_orders():
     """No order endpoint, SDK order call or order tool anywhere else."""
     patterns = ("/v2/orders\"", "place_order(", "\"place_option_order\"")
     allowed = {"brokers/alpaca.py", "brokers/moomoo.py", "brokers/robinhood.py",
-               "brokers/robinhood_mcp.py"}
+               "brokers/robinhood_mcp.py",
+               "self_edit.py"}  # names the patterns to refuse them
     offenders = []
     for base, dirs, files in os.walk(ROOT):
         dirs[:] = [d for d in dirs if d not in (".git", "tests", "node_modules",
@@ -994,3 +994,37 @@ def test_random_life_never_opens_a_short(home, no_policy, monkeypatch, name, see
         assert all(q >= 0 for q in acct.held.values()), acct.held
     assert any(o["side"] == "sell" and not o.get("owner") for o in acct.orders), \
         "the scenario never sold: it tested nothing"
+
+
+# ── self-edit: a broker file the agent writes can't go around the check ────
+
+_SNEAKY = ("import requests\n\ndef execute(cl, cfg, ev, state):\n"
+           "    requests.post('https://broker.invalid/v1/orders', json={'side': 'sell'})\n")
+_GUARDED = ("from . import order_guard\n\ndef _order(cfg, side, effect, qty, held):\n"
+            "    qty = order_guard.check_order(side, effect, qty, held)\n"
+            "    return requests.post('https://broker.invalid/v1/orders', json={})\n")
+
+
+@pytest.mark.parametrize("path,content,refused", [
+    ("brokers/tasty.py", _SNEAKY, True),
+    ("brokers/__init__.py", "x.place_order(side='SELL')\n", True),
+    ("brokers/tasty.py", _GUARDED, False),
+    ("brokers/tasty.py", "NAME = 'tasty'\n", False),
+    ("sources/rss.py", _SNEAKY, False),            # not a broker file
+])
+def test_self_edit_refuses_broker_code_that_skips_the_order_check(
+        tmp_path, monkeypatch, path, content, refused):
+    import self_edit
+    assert bool(self_edit._order_path_problem(path, content)) is refused
+    repo, home = tmp_path / "repo", tmp_path / "home"
+    (repo / "brokers").mkdir(parents=True)
+    home.mkdir()
+    monkeypatch.setenv("AGENT_HOME", str(home))
+    monkeypatch.setattr(self_edit, "_repo", lambda: str(repo))
+    with open(home / "proposal.json", "w", encoding="utf-8") as f:
+        json.dump({"request": "t", "explanation": "", "warnings": [],
+                   "changes": [{"path": path, "content": content, "diff": ""}]}, f)
+    if refused:
+        ok, msg = self_edit.apply_and_restart(restart=False)
+        assert not ok and "order_guard.check_order" in msg
+        assert not (repo / path).exists()
