@@ -6,7 +6,7 @@ Sources: `dash-inventory.md` / `dash-rows.json` (D-1..D-75) and `setup-half.md` 
 
 **Counts at the inventory (before PR 4):** 93 rows. 23 already in /v2, 22 planned in PR 1-3, **37 missing** (13 of them money-affecting or irreversible), 7 first-run-only, 4 not applicable.
 
-**Counts now (PR 4 finished):** 93 rows: **82 in /v2**, **11 classic-only**, each with its reason (7 first-run wizard, 2 free-text commands, 1 second home for the AI key, 1 replaced by the Results chart). No row is missing or planned. Server routes: every key of `W.routes_get` / `W.routes_post` is *v2* or *classic* below, and no *pending* row is left. Server: 22 GET + 28 POST routes, each with a /v2 use or a classic-only reason. Every route in `W.routes_get`/`W.routes_post` is named by at least one row, and so is every `/api/` string in `webui_app/src`. No route was found without a row.
+**Counts now (PR 4 finished, plus the no-signal sell time, P-94):** 94 rows: **83 in /v2**, **11 classic-only**, each with its reason (7 first-run wizard, 2 free-text commands, 1 second home for the AI key, 1 replaced by the Results chart). No row is missing or planned. Server routes: every key of `W.routes_get` / `W.routes_post` is *v2* or *classic* below, and no *pending* row is left. Server: 22 GET + 28 POST routes, each with a /v2 use or a classic-only reason. Every route in `W.routes_get`/`W.routes_post` is named by at least one row, and so is every `/api/` string in `webui_app/src`. No route was found without a row.
 
 Status values (final): `in-v2 (where)` = in /v2, with the PR (and PR 4 group) that put it there · `classic-only: why` = deliberately not in /v2, with its reason in *Classic-only, because…* (the first-run wizard rows stay at `/setup`). The inventory's own values (`missing`, `planned PR n`, `first-run-only`, `n/a`) are kept in the text below where it describes how the list was made.
 
@@ -54,6 +54,12 @@ Stage C (groups 8-11, the review findings, the closing work), same branch:
   - *"Today so far · Opened" used the UTC day.* `Book.opened_today` counts the Eastern day the panel describes (tested at 19:30 and 20:30 ET on a summer day, either side of midnight UTC). The daily limit keeps its UTC-day count, as the agent does.
 
 - **Second review (PR 4 itself): fixed.** Wallet create checks the agreement, takes `replace` as true/false only and never overwrites a save that landed during the LNbits call; a subscriber with only a key can switch the source back to AgentHC; code-change Apply is bound to the whole diff against the files as they are (cut or out-of-date changes are refused, and the dialog says so and offers no Apply); the login link follows the dashboard switch; the wallet page link is never kept in the page (a blocked popup asks to allow pop-ups and click again); Start in practice says "Starting…" with no Cancel and shows the agent's autostart note; the cloud move keeps the classic guidance (cloud-init log, Droplets page, `ssh -L` from the address) and its preview says DigitalOcean may use a nearby region or a bigger size; field errors sit next to their fields and are tied to them; the code-change dialog says "restart" only when the server says it restarts; the by-day table explains its paid-day marks; the two-step test harness checks that every refusal leaves all of config.json and no old-wallet file.
+
+After PR 4, branch `fix/pass-lapse-exit-protection` (the no-signal sell):
+
+- **P-94, the no-signal sell time**: `no_signal_sell_et` on `POST /api/v2/settings/limits`, two-step, through `agent._expiry_setting` (the chat's own check) into the chat's key `signal_loss_sell_et`. Equivalent to `no-signal sell off|HH:MM|on` (on = 15:30; tested). 09:30-15:59 or "off"; the preview's direction: off raises the risk, a later time raises it, an earlier one or switching it on lowers it, and the dialog says why. Its one row is in Rules & limits, in a *When no exit signals arrive* panel right after *On expiry day*. `GET /api/v2/settings` gains `no_signal {sell_et, today_et, default, allowed}`.
+- **One note per condition**: the pass note speaks about new trades only (no held-positions sentence: that is the positions note's). While the agent will sell what it holds for lack of exit signals (`signals.exit_loss.armed`), the positions note says so itself ("No exit signals reach the agent (why). It sells your N real positions itself at T unless they are back."), each real position and the closing answer say the same time, and the agent's own line about it (notice code `signal_loss`) is not repeated. The pass's last days ("1 signal day left", "Last signal day") are a pass note. A day-pass renewal failure or a low wallet balance is shown while the running day-pass still reads entries. A test runs every fixture state and fails if the pass note describes held positions or shares a sentence with the positions note.
+- **Activity**: the reason codes `signal_loss` (the sale), `after_signal_loss_sell` and `pass_wont_cover` (the entries skipped after it, and while the wallet day-pass ends before the close), each skip stopped at its own entry check (`exits_reachable`, `pass_covers_close`).
 
 Closing: this table now says, for every row, where it is in /v2 or why it is classic-only. The route test (`test_every_route_has_a_v2_caller_or_a_classic_only_reason`) also fails if a *pending* row is left or a *classic* route is missing from the list in *Classic-only, because…*.
 
@@ -169,6 +175,7 @@ Closing: this table now says, for every row, where it is in /v2 or why it is cla
 | P-91 | control | Setup assistant (answers about setup steps) | webui.py:1059-1071 ask :1722 · Wizard.tsx:369-400 · handler webui.py:4232 | POST /api/ask | no | classic-only: first-run wizard (Classic-only §1) | /setup (its prompt is about setup); /v2 uses P-15 | — | S-55 |
 | P-92 | control | Wizard 'Dashboard' links and post-start redirect | webui.py:662, :667 · Wizard.tsx:143 · steps.tsx:851 location='/dash' | — | no | in-v2 (PR 3 + PR 4 group 1) | ?from=v2 returns to /v2 (PR 3); without it, the remembered dashboard (4b) | — | S-57 |
 | P-93 | control | Show-only chat commands: status, rules, autostart, start at login, expiry guard, expiry alert | agent.py:5065 _SHOW_COMMANDS, :5156, :5282 | POST /api/command | no | classic-only: free-text show commands; each reading has a /v2 home (Classic-only §2) | Each reading has its /v2 home (band/vitals/Today, P-35, P-64, P-39, P-63) | — | D-63 |
+| P-94 | control | No-signal sell time (on / off / HH:MM ET, 09:30-15:59): when no exit signal can reach the agent, it sells what it holds then, at least 15 minutes after warning | chat no-signal sell [on\|off\|HH:MM] agent._expiry_command | POST /api/command | **yes** | in-v2 (`fix/pass-lapse-exit-protection`) | Rules & limits → When no exit signals arrive → 'No-signal sell time' row, right after the expiry-day sell time | POST /api/v2/settings/limits {no_signal_sell_et} (two-step) through agent._expiry_setting; GET /api/v2/settings no_signal | — |
 
 ## Server routes (`W.routes_get` / `W.routes_post`, webui.py:4212-4268)
 
@@ -273,6 +280,7 @@ Every route below is registered in `W.routes_get`/`W.routes_post`, so it inherit
 | `POST /api/v2/agent/start` | start_local (same refusals) | two-step when saved mode is LIVE | P-08 |
 | `POST /api/v2/settings/computer +open_dashboard_at_login, +dashboard` | same config keys as the chat command / 4b | direct | P-66, P-71 |
 | `POST /api/v2/settings/limits +expiry_sell_et` | helper split out of agent._expiry_command | two-step | P-39 |
+| `POST /api/v2/settings/limits +no_signal_sell_et` | the same helper, into the chat's key signal_loss_sell_et | two-step | P-94 |
 | `POST /api/v2/settings/alerts +expiry_alert_et` | same helper | direct | P-63 |
 | `POST /api/v2/settings/signals {scope, dry_run_preview}` | source_scope(); chat 'preview on\|off' key | two-step when scope is sent | P-43, P-49 |
 | `POST /api/v2/settings/source {source, url, agenthc_key}` | helper split out of source() | two-step | P-42, P-44 |
@@ -490,6 +498,7 @@ Every command `agent._apply_command` (agent.py:5027-5290) accepts. Statuses are 
 | `policy off`/`disable policy` (:5161) | written rules → .disabled | no* | Rules → Written rules "Turn off" (P-38) | in-v2 (PR 3) |
 | `expiry guard on\|off\|HH:MM` (:4639) | expiry_guard_et | **yes** | Rules → On expiry day → Expiry-day sell time (P-39) | in-v2 (PR 4 group 8) |
 | `expiry alert on\|off\|HH:MM` (:4639) | expiry_alert_et | no | Settings → Alerts (P-63) | in-v2 (PR 4 group 6) |
+| `no-signal sell on\|off\|HH:MM` | signal_loss_sell_et | **yes** | Rules → When no exit signals arrive → No-signal sell time (P-94) | in-v2 (`fix/pass-lapse-exit-protection`) |
 | `autostart on\|off`/`start at login on\|off` (:5123) | OS autostart | no | Settings → This computer (P-64) | in-v2 (PR 3) |
 | `keep awake on\|off`/`stay awake on\|off` (:5128) | keep_awake | no | Settings → This computer (P-65) | in-v2 (PR 3) |
 | `open at login on\|off`/`open dashboard at login on\|off` (:5136) | open_dashboard_at_login | no | Settings → This computer (P-66) | in-v2 (PR 4 group 3) |

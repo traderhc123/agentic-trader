@@ -19,6 +19,7 @@ import {
   ANSWER_LOOK,
   CHECK_FALLBACK,
   CHECK_LABELS,
+  EXIT_LOSS_WHY,
   EXPIRY_OFF,
   FALLBACK_TITLE,
   REASONS,
@@ -30,6 +31,7 @@ import {
   describe,
   expiryWill,
   nextSay,
+  sellsFor,
   sellsHow,
   tagOf,
 } from "../src/v2/lib/copy.ts";
@@ -87,6 +89,7 @@ import {
   limitRange,
   limitsPayload,
   lossWords,
+  noSignalPayload,
   purchaseFate,
   readNumber,
   readTickers,
@@ -1840,4 +1843,178 @@ test("review: the paid-day marks say how they relate to the result on paid signa
   assert.match(src, /\{days\.slice\(0, showN\)\.some\(\(d\) => paidMark\(s, d\.day\)\) && \(/);
   assert.match(src, /counts the trades opened on those days,\s+so it need not add up from the rows marked here/);
   assert.match(src, /opened on \{plural\(pd\.real\.days, "paid signal day"\)\}, counted on the day each was\s+opened/);
+});
+
+
+// ── no exit signals: one note for the positions, one for the pass ──────────
+
+/** Whether a sentence speaks about what the agent already holds. */
+const HELD = /\b(real positions?|positions? (?:it|you) holds?|what it holds|what you hold|open positions?|watch (?:it|them|your)|sell (?:it|them) yourself|already open(?:ed)?)\b/i;
+
+test("no exit signals: the words are the agent's, for every cause", { skip }, () => {
+  const codes = load("codes.json");
+  assert.deepEqual(Object.keys(EXIT_LOSS_WHY).sort(), [...codes.exit_loss_causes].sort());
+  for (const cause of codes.exit_loss_causes) assert.equal(EXIT_LOSS_WHY[cause], codes.exit_loss_why[cause], cause);
+});
+
+test("no redundancy: the pass note never describes held positions, and never shares a sentence with the positions note", { skip }, () => {
+  for (const [name, s] of states)
+    for (const failing of [false, true]) {
+      const ns = notes(s, linkOf(s, failing), "today");
+      const pass = ns.filter((n) => n.key === "pass");
+      assert.ok(pass.length <= 1, name);
+      for (const n of pass) assert.ok(!HELD.test(`${n.title}. ${n.text}`), `${name}: the pass note speaks about held positions: ${n.text}`);
+      const pos = ns.filter((n) => n.codes.includes("positions_unmanaged"));
+      assert.ok(pos.length <= 1, name);
+      if (pass.length && pos.length) {
+        const a = new Set(sentences(`${pass[0].title}. ${pass[0].text} ${pass[0].agent.join(" ")}`));
+        for (const x of sentences(`${pos[0].title}. ${pos[0].text} ${pos[0].agent.join(" ")}`)) assert.ok(!a.has(x), `${name}: "${x}" in both`);
+      }
+    }
+});
+
+test("status none with one real position: one pass note, one positions note, nothing from the agent", { skip }, () => {
+  const base = states.find(([n]) => n === "pass-lapsed")[1];
+  const one = base.positions.find((p) => p.real);
+  const s = {
+    ...base,
+    notices: [],
+    conditions: base.conditions.map((c) => ({ ...c, notices: [] })),
+    positions: [one],
+    real_positions: 1,
+    signals: { ...base.signals, pass: { ...base.signals.pass, kind: "none", status: "none" } },
+  };
+  const ns = notes(s, "ok", "today");
+  const pass = ns.filter((n) => n.key === "pass");
+  assert.equal(pass.length, 1);
+  assert.equal(pass[0].title, "No signal pass");
+  assert.equal(pass[0].text, "The agent takes no new trades until it has a pass.");
+  assert.equal(ns.filter((n) => n.codes.includes("positions_unmanaged")).length, 1);
+  assert.ok(!ns.some((n) => n.title.startsWith("From your agent")), JSON.stringify(ns));
+});
+
+test("the no-signal sell: one positions note says when, in the dashboard's words", { skip }, () => {
+  const s = states.find(([n]) => n === "signal-loss-sell")[1];
+  assert.equal(s.signals.exit_loss.armed, true);
+  assert.equal(sellsFor(s), "3:30 PM ET");
+  const ns = notes(s, "ok", "today");
+  const pos = ns.filter((n) => n.codes.includes("positions_unmanaged"));
+  assert.equal(pos.length, 1);
+  assert.equal(pos[0].title, "5 real positions: no exit signals");
+  assert.equal(
+    pos[0].text,
+    "No exit signals reach the agent (your signal pass has run out). It sells your 5 real positions itself at 3:30 PM ET unless they are back.",
+  );
+  // the agent's own line says the same: not repeated, not shown alone
+  assert.deepEqual(pos[0].agent, []);
+  const told = ns.flatMap((n) => [n.text, ...n.agent]);
+  assert.ok(!told.some((t) => /It sells your 5 real positions itself at 3:30 PM ET unless they are back\.$/.test(t) && t !== pos[0].text), JSON.stringify(told));
+  assert.ok(!ns.some((n) => n.title.startsWith("From your agent")), JSON.stringify(ns));
+  // the pass note: new trades only
+  const pass = ns.filter((n) => n.key === "pass");
+  assert.equal(pass.length, 1);
+  assert.equal(pass[0].text, "Your signal pass is used up, expired or waiting for payment, so the agent takes no new trades.");
+  // each real position and the closing answer say the same time
+  for (const p of s.positions.filter((x) => x.real)) {
+    const say = nextSay(p, s);
+    assert.equal(say.look, "bad");
+    assert.match(say.text, /^No exit signals reach the agent\. It sells this at 3:30 PM ET today unless they are back\./, p.id);
+  }
+  assert.equal(
+    answerWhy("closing", s.capabilities.closing, s),
+    "No exit signals reach the agent. It sells your real positions itself at 3:30 PM ET today unless they are back.",
+  );
+  // not armed (the sell is off, too late, or a hold): the plain positions note, the agent's line folded in
+  const off = { ...s, signals: { ...s.signals, exit_loss: { ...s.signals.exit_loss, armed: false, sell_at: null } } };
+  const offPos = notes(off, "ok", "today").filter((n) => n.codes.includes("positions_unmanaged"));
+  assert.equal(offPos.length, 1);
+  assert.notEqual(offPos[0].title, "5 real positions: no exit signals");
+  assert.equal(offPos[0].agent.length, 1);
+  for (const p of off.positions.filter((x) => x.real)) assert.ok(!/It sells this at/.test(nextSay(p, off).text));
+});
+
+test("the no-signal sell counts only the positions it sells (one is in another account)", { skip }, () => {
+  const s0 = states.find(([n]) => n === "signal-loss-sell")[1];
+  const [first, ...rest] = s0.positions.filter((x) => x.real);
+  const other = { ...first, next: { ...first.next, action: "unmanaged", reason_code: "other_account" } };
+  const s = { ...s0, positions: s0.positions.map((p) => (p === first ? other : p)) };
+  const pos = notes(s, "ok", "today").filter((n) => n.codes.includes("positions_unmanaged"));
+  assert.equal(pos.length, 1);
+  assert.equal(
+    pos[0].text,
+    `No exit signals reach the agent (your signal pass has run out). It sells your ${rest.length} real positions itself at 3:30 PM ET unless they are back. It does not sell the other 1: each position says why.`,
+  );
+  // none it sells: the plain positions note, never a sale time
+  const none = { ...s0, positions: s0.positions.map((p) => (p.real ? { ...p, next: { ...p.next, action: "unmanaged", reason_code: "other_account" } } : p)) };
+  const nonePos = notes(none, "ok", "today").filter((n) => n.codes.includes("positions_unmanaged"));
+  assert.equal(nonePos.length, 1);
+  assert.ok(!/itself at 3:30 PM ET/.test(nonePos[0].text), nonePos[0].text);
+});
+
+test("the no-signal sell while the pass is active but the feed is not live: no 'sold on exit signals'", { skip }, () => {
+  const s = states.find(([n]) => n === "signal-loss-feed-not-live")[1];
+  assert.equal(s.signals.exit_loss.armed, true);
+  assert.equal(s.real_positions_managed, false);
+  const ns = notes(s, "ok", "today");
+  const pos = ns.filter((n) => n.codes.includes("positions_unmanaged"));
+  assert.equal(pos.length, 1);
+  assert.equal(
+    pos[0].text,
+    "No exit signals reach the agent (the signal feed can't be read). It sells your 5 real positions itself at 3:30 PM ET unless they are back.",
+  );
+  assert.deepEqual(pos[0].agent, []);
+  for (const p of s.positions.filter((x) => x.real)) {
+    const say = nextSay(p, s);
+    assert.ok(!/at its exit signal/.test(say.text), say.text);
+    assert.match(say.text, /It sells this at 3:30 PM ET today unless they are back\./, p.id);
+  }
+  assert.match(answerWhy("closing", s.capabilities.closing, s), /It sells your real positions itself at 3:30 PM ET/);
+});
+
+test("the pass's last days are said on /v2, about new trades only", { skip }, () => {
+  const get = (n) => states.find(([x]) => x === n)[1];
+  const one = notes(get("pass-one-day-left"), "ok", "today").filter((n) => n.key === "pass");
+  assert.equal(one.length, 1);
+  assert.equal(one[0].title, "1 signal day left");
+  assert.equal(one[0].text, "The next day AgentHC publishes a trade is the last one your pass covers for new trades.");
+  assert.equal(one[0].go, "signals");
+  const last = notes(get("pass-last-day"), "ok", "today").filter((n) => n.key === "pass");
+  assert.equal(last.length, 1);
+  assert.equal(last[0].title, "Last signal day");
+  // plenty of days left: no note
+  assert.ok(!notes(get("live"), "ok", "today").some((n) => n.key === "pass"));
+});
+
+test("the day-pass renewal failure shows while the running pass still reads entries", { skip }, () => {
+  const s = states.find(([n]) => n === "daypass-renewal-failed")[1];
+  assert.equal(s.signals.entry_access, true);
+  const ns = notes(s, "ok", "today").filter((n) => n.codes.includes("signal_pass"));
+  assert.equal(ns.length, 1);
+  assert.match(ns[0].text, /could not pay for today's day-pass/);
+  assert.match(ns[0].text, /on Signals & pass|\(Signals & pass\)/);
+  assert.ok(!/Settings\s*→/.test(ns[0].text), ns[0].text);
+});
+
+test("rules & limits: the no-signal sell time is a two-step limits save next to the expiry sell", () => {
+  assert.equal(valueWords("no_signal_sell_et", "15:30"), "3:30 PM ET");
+  assert.equal(valueWords("no_signal_sell_et", null), "Off");
+  assert.equal(confirmLabel([{ key: "no_signal_sell_et", label: "No-signal sell time", saved_now: "15:30", new: null, direction: "raises_risk" }]), "Turn off the no-signal sell");
+  assert.equal(confirmLabel([{ key: "no_signal_sell_et", label: "No-signal sell time", saved_now: "15:30", new: "14:00", direction: "lowers_risk" }]), "Sell at 2:00 PM ET");
+  // off, or later, raises the risk; earlier, or on, lowers it
+  assert.equal(riskOf("no_signal_sell_et", "15:30", null), "raises_risk");
+  assert.equal(riskOf("no_signal_sell_et", "15:30", "15:50"), "raises_risk");
+  assert.equal(riskOf("no_signal_sell_et", "15:30", "14:00"), "lowers_risk");
+  assert.equal(riskOf("no_signal_sell_et", null, "15:30"), "lowers_risk");
+  assert.deepEqual(noSignalPayload("15:30", true, ""), { ok: true, value: "off" });
+  assert.deepEqual(noSignalPayload("15:30", false, "15:30"), { ok: true, value: undefined });
+  assert.equal(noSignalPayload("15:30", false, "16:00").ok, false);
+  // one control, in Rules & limits, on the limits route, two steps, right after the expiry sell
+  const src = RULES_SRC();
+  assert.match(src, /const payload = \{ no_signal_sell_et: parsed\.value \};\s*const a = await askPreview\(API\.limits, payload\)/);
+  assert.match(src, /<ReviewDialog\s+path=\{API\.limits\}[\s\S]*?Turn off the no-signal sell\?/);
+  assert.equal((src.match(/data-row="no_signal_sell"/g) || []).length, 1);
+  assert.ok(src.indexOf("<ExpiryRow page={page} />") < src.indexOf("<NoSignalRow page={page} />"));
+  assert.ok(src.indexOf("<NoSignalRow page={page} />") - src.indexOf("<ExpiryRow page={page} />") < 400, "next to the expiry sell");
+  for (const f of sources(path.join(SRC, "v2")).filter((p) => p.endsWith(".tsx")))
+    if (rel(f) !== "views/Rules.tsx") assert.ok(!/no_signal_sell_et/.test(fs.readFileSync(f, "utf8")), `${rel(f)} sets the no-signal sell time`);
 });

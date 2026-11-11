@@ -11,7 +11,7 @@
 //     presented as current: the mode is "unknown" and every panel is stamped
 //     "as of" the last report.
 import type { Activity, Book, Condition, Iso, Notice, Position, Status } from "../../lib/viewModel";
-import { GUARD_STILL, UNMANAGED_FALLBACK, UNMANAGED_SHORT, UNMANAGED_WHY, answerWhy, describe, leftToday, nextSay, own, sizeEach, type Go, type IconName, type NextSay } from "./copy.ts";
+import { GUARD_STILL, UNMANAGED_FALLBACK, UNMANAGED_SHORT, UNMANAGED_WHY, answerWhy, describe, exitLossWhy, leftToday, nextSay, own, sellsFor, sizeEach, type Go, type IconName, type NextSay } from "./copy.ts";
 import { hintWords, v2Words } from "./settings.ts";
 import { contractName, etDayKey, etTime, etWhen, dayLong, plural, span, secondsBetween, usd } from "./format.ts";
 
@@ -56,11 +56,26 @@ export function unwatched(s: Status): Position[] {
   return list.length ? list : rp;
 }
 
+/** How many of these real positions the no-signal sell acts on: those
+ *  not sold only because no exit signal reaches the agent (a position in
+ *  another broker account, past expiry or with no bid is not sold). */
+function selling(rp: Position[]): number {
+  return rp.filter((p) => GUARD_STILL.includes(p.next.reason_code)).length;
+}
+
 /** "Your 5 real positions are" / "1 of your 5 real positions is" */
 function notSold(s: Status): string {
   const n = s.real_positions;
   const k = unwatched(s).length;
   return k >= n ? `Your ${plural(n, "real position")} ${their(n, "is", "are")}` : `${k} of your ${plural(n, "real position")} ${their(k, "is", "are")}`;
+}
+
+/** "… not being sold by the agent right now." — or, while it will sell
+ *  them itself for lack of exit signals, what is true until then (the
+ *  positions note says when). */
+function notSoldNow(s: Status, loud = false): string {
+  if (sellsFor(s)) return `${notSold(s)} not being sold on exit signals: none reach the agent.`;
+  return `${notSold(s)} ${loud ? "NOT" : "not"} being sold by the agent right now.`;
 }
 
 /** Dollars paid for a set of positions; null when any of them has no
@@ -137,7 +152,7 @@ export function bandModel(s: Status, l: Link): BandModel {
     let rest = " New trades are only recorded.";
     if (n && s.real_positions_managed)
       rest += ` Your ${plural(n, "real position")} ${their(n, "is", "are")} still sold for real on ${their(n, "its exit signal", "their exit signals")}.`;
-    else if (n) rest += ` ${notSold(s)} NOT being sold by the agent right now.`;
+    else if (n) rest += ` ${notSoldNow(s, true)}`;
     else rest += ` Nothing is sent to ${brokerName(s)}.`;
     say = ["Pretend money.", rest];
   }
@@ -388,7 +403,23 @@ export function notes(s: Status, l: Link, here?: Go | "today" | "activity" | "re
           (s.broker.last_error ? ` The broker's last answer: “${s.broker.last_error}”.` : ""),
       }),
     );
-  else if (l === "ok" && n && !s.real_positions_managed) {
+  else if (l === "ok" && n && !s.real_positions_managed && sellsFor(s) && s.signals.exit_loss && selling(rp) > 0) {
+    // no exit signals, and the agent sells what it holds itself before the
+    // close: the one note about these positions (the agent's own line about
+    // it is this same fact, so it is not folded in again below)
+    out.push(
+      note({
+        key: "unmanaged",
+        codes: ["positions_unmanaged"],
+        level: "crit",
+        icon: "alert",
+        title: `${plural(n, "real position")}: no exit signals`,
+        text:
+          `No exit signals reach the agent (${exitLossWhy(s.signals.exit_loss)}). It sells your ${plural(selling(rp), "real position")} itself at ${sellsFor(s)} unless they are back.` +
+          (selling(rp) < n ? ` It does not sell the other ${n - selling(rp)}: each position says why.` : ""),
+      }),
+    );
+  } else if (l === "ok" && n && !s.real_positions_managed) {
     const lost = unwatched(s);
     // with no exit signals the expiry sell still acts: not "nobody is selling it"
     const exp = lost.find(
@@ -449,8 +480,9 @@ export function notes(s: Status, l: Link, here?: Go | "today" | "activity" | "re
     // "no signals" would be false whatever the prepaid pass says
     const reading = s.signals.entry_access === true;
     const lacking = p.status === "exits_only" || p.status === "none" || p.status === "waiting" || p.status === "unknown";
+    // The pass note is about NEW trades only. What happens to what the
+    // agent holds is the positions note's (one note per condition).
     if (l === "ok" && lacking && !reading && p.kind !== "not_needed") {
-      const held = n ? ` Until then, watch your ${plural(n, "real position")} and sell ${their(n, "it", "them")} yourself at ${b}.` : "";
       out.push(
         note({
           key: "pass",
@@ -469,14 +501,28 @@ export function notes(s: Status, l: Link, here?: Go | "today" | "activity" | "re
                   : "No signal pass",
           text:
             p.status === "exits_only"
-              ? "The agent still receives exit signals for what it holds, so open positions are still sold. It takes no new trades until you add signal days."
+              ? "Your signal days are used up. The agent takes no new trades until you add signal days."
               : p.status === "unknown"
-                ? `The agent could not check your signal pass with AgentHC (the check failed, or has not run yet). Until it can, it reads no signals: no new trades, and no exit signals for what it holds.${held}`
+                ? "The agent could not check your signal pass with AgentHC (the check failed, or has not run yet). Until it can, it takes no new trades."
                 : p.status === "waiting" && p.auto_pay
-                  ? "Your wallet's auto-pay buys a day-pass on the agent's next read of the feed on a market day. Until it has one, the agent receives no signals: no new trades, and no exit signals for what it holds."
+                  ? "Your wallet's auto-pay buys a day-pass on the agent's next read of the feed on a market day. Until it has one, the agent takes no new trades."
                   : p.status === "waiting"
-                    ? `Your signal pass is used up, expired or waiting for payment, so the agent receives no signals: no new trades, and no exit signals for what it holds.${held}`
-                    : `Without a pass the agent receives no signals: no new trades, and no exit signals for what it holds.${held}`,
+                    ? "Your signal pass is used up, expired or waiting for payment, so the agent takes no new trades."
+                    : "The agent takes no new trades until it has a pass.",
+        }),
+      );
+    } else if (l === "ok" && p.kind === "prepaid" && p.status === "active" && (p.last_day || p.days_left === 1)) {
+      // the last signal day: said before it runs out, here only
+      out.push(
+        note({
+          key: "pass",
+          codes: ["signal_pass"],
+          level: "warn",
+          icon: "info",
+          title: p.last_day ? "Last signal day" : "1 signal day left",
+          text: p.last_day
+            ? "Today is the last day your signal pass covers new trades. Add signal days to keep getting new trades."
+            : "The next day AgentHC publishes a trade is the last one your pass covers for new trades.",
         }),
       );
     }
@@ -526,9 +572,13 @@ export function notes(s: Status, l: Link, here?: Go | "today" | "activity" | "re
     const idx = c.notices.filter((i) => i >= 0 && i < s.notices.length && !used.has(i));
     if (!idx.length) continue;
     idx.forEach((i) => used.add(i));
-    const texts = [...new Set(idx.map((i) => v2Words(s.notices[i].text)))];
-    const lvl = LEVEL_OF[c.level] ?? "info";
     const home = out.find((x) => x.codes.includes(c.code));
+    // the positions note says the no-signal sell itself, from the data: the
+    // agent's line about it (code signal_loss) would say it a second time
+    const saysSale = home?.key === "unmanaged" && sellsFor(s) != null;
+    const kept = idx.filter((i) => !(saysSale && s.notices[i].code === "signal_loss"));
+    const texts = [...new Set(kept.map((i) => v2Words(s.notices[i].text)))];
+    const lvl = LEVEL_OF[c.level] ?? "info";
     if (home) {
       for (const t of texts) if (!home.agent.includes(t)) home.agent.push(t);
       if (RANK[lvl] > RANK[home.level]) home.level = lvl;
@@ -643,7 +693,7 @@ export function statement(s: Status, l: Link): Statement {
           ? `Your ${plural(n, "real position")} will be sold when ${their(n, "its exit signal arrives", "their exit signals arrive")}. Press Resume to allow new trades again.`
           : n
             ? // in practice the band says it already (it states what happens to real positions)
-              `${live ? `${notSold(s)} not being sold by the agent right now. ` : ""}Press Resume to allow new trades again.`
+              `${live ? `${notSoldNow(s)} ` : ""}Press Resume to allow new trades again.`
             : "No real position is open. Press Resume to allow new trades again.",
       empty: false,
     };
@@ -657,7 +707,7 @@ export function statement(s: Status, l: Link): Statement {
     };
   if (live) {
     const left = leftToday(s);
-    const held = s.real_positions_managed ? sells : `${notSold(s)} not being sold by the agent right now.`;
+    const held = s.real_positions_managed ? sells : notSoldNow(s);
     const lead =
       o.state !== "yes"
         ? `${answerWhy("opening", o, s)}${n ? " " + held : ""}`

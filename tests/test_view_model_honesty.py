@@ -167,7 +167,8 @@ def test_a_running_wallet_day_pass_is_the_pass_the_agent_reads_with():
                                      "expires_at": NOW.timestamp() + 3600}}
     s = build({**WALLET, "feed_pass": {"token": "tok"}}, st)
     assert s["signals"]["pass"] == {"kind": "day_pass", "status": "active",
-                                    "days_left": None, "auto_pay": True}
+                                    "days_left": None, "auto_pay": True,
+                                    "last_day": False, "exits_until": None}
     assert s["positions"][0]["next"]["action"] == "sell_on_exit"
     assert s["real_positions_managed"] is True
     caps = s["capabilities"]

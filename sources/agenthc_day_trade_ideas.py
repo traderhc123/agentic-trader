@@ -59,6 +59,24 @@ _PENDING_ALERT_S = 600          # undecided this long: tell the owner
 _PENDING_MAX_AGE_S = 24 * 3600  # undecided this long: stop waiting for it
 
 
+# The pass notices (Discord/ntfy/Telegram + dashboard) say what the pass
+# means for NEW trades only. What happens to positions the agent already
+# holds is said once, by the agent's no-signal warning (agent.py,
+# signal_loss_tick) and the dashboard's positions note.
+_SETTINGS = "dashboard → Settings → Signal source"
+PASS_LOW_TEXT = ("Your signal pass has {n} signal day(s) left. Buy more in the "
+                 "dashboard (Settings → Signal source); unused days carry over.")
+PASS_LAST_DAY_TEXT = ("Today is the last day your signal pass covers new "
+                      f"trades. Buy more signal days ({_SETTINGS}) to keep "
+                      "getting new trades. Exit signals for trades already "
+                      "open keep arriving.")
+PASS_USED_UP_TEXT = ("Your signal pass is used up: no new trades until you buy "
+                     f"more signal days ({_SETTINGS}). Exit signals for the "
+                     "trades your agent already opened still arrive.")
+PASS_RUN_OUT_TEXT = ("Your signal pass has run out: no new trades until you "
+                     f"buy more signal days ({_SETTINGS}).")
+
+
 class PassUnavailable(RuntimeError):
     """The feed server isn't selling prepaid passes (yet)."""
 
@@ -496,6 +514,8 @@ def _refresh_pass(cfg, state, save_state, force=False):
                 rec = {"status": fresh.get("status"), "until_ts": until_ts,
                        "days_left": fresh.get("days_left", fresh.get("trading_days_left")),
                        "checked": now, "first_seen": rec.get("first_seen", now)}
+                if fresh.get("exits_until"):
+                    rec["exits_until"] = _iso_ts(fresh["exits_until"]) or None
                 cache[tid] = rec
                 save_state(state)
         if rec.get("status") in _USABLE:
@@ -542,16 +562,21 @@ def _daypass_alert(cfg, state, save_state, key, text):
         save_state(state)
 
 
+def _entry_read(state, save_state):
+    """The feed was just read with entry access: a saved pass notice (a
+    lapse, a used-up pass) is no longer true, so it goes. A current wallet
+    day-pass alert stays: it is cleared when that problem ends."""
+    if state.get("pass_notice") and not state.get("daypass_alert"):
+        state.pop("pass_notice", None)
+        save_state(state)
+
+
 def _daypass_alert_clear(state):
     """Take a day-pass alert off the dashboard. Returns True when it did."""
     if not state.pop("daypass_alert", None):
         return False
     state.pop("pass_notice", None)
     return True
-
-
-_NO_SIGNALS = ("no new entries, and no exit signals for positions it holds, so "
-               "watch those yourself")
 
 
 def _retry_text():
@@ -583,6 +608,99 @@ def _live_daypass(state):
     """True while a wallet-paid 24h day-pass token is still running."""
     tok = (state or {}).get("l402") or {}
     return bool(tok.get("token") and tok.get("expires_at", 0) > time.time())
+
+
+def _token_status(state, token):
+    return ((state.get("pass_status") or {}).get(_token_id(token)) or {}).get("status")
+
+
+def _wallet_over_exits_only(cfg, state, save_state):
+    """Buy today's wallet day-pass while the prepaid pass only gets exits,
+    and read the feed with it. None when it was not bought (the caller
+    then reads the exits with the used-up pass)."""
+    track = "all" if cfg.get("include_other_trades") else "main"
+    try:
+        resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
+                         params={"limit": 20, "track": track}, timeout=15)
+        if resp.status_code != 402:
+            return None
+        if not _buy_day_pass(cfg, state, resp.json(), save_state):
+            return None
+    except Exception as exc:
+        print(f"Day-pass purchase didn't go through ({str(exc)[:160]}); exit "
+              "signals are still read with the used-up prepaid pass.")
+        return None
+    return poll(cfg, state, save_state, _retried=True)
+
+
+def _prepaid_may_take_over(cfg, state):
+    """A prepaid pass that may give entries once the wallet day-pass ends:
+    one with signal days left as last checked, or one the agent has not
+    been able to check (a pass the owner just bought in the dashboard has
+    no status here until the agent asks AgentHC about it). No request."""
+    cache = (state or {}).get("pass_status") or {}
+    return any((cache.get(_token_id(t)) or {}).get("status") in (None, "active")
+               for t in _pass_tokens(cfg))
+
+
+def _close_ts(cfg, day):
+    """Epoch seconds of the market close on `day` (a date)."""
+    from brokers import market_hours
+    close = market_hours.close_minute(cfg, day)
+    return datetime(day.year, day.month, day.day, close // 60, close % 60,
+                    tzinfo=MARKET_TZ).timestamp()
+
+
+def entry_cover(cfg, state, close_ts):
+    """(ok, until_ts): can a position opened now still get its exit signal
+    until `close_ts` (today's close)? False only while the feed is read with
+    a wallet day-pass that ends before then and no other pass takes over
+    (a new one is not paid yet; a prepaid pass not checked yet counts as
+    taking over). until_ts = when that day-pass ends (None without one).
+    An API key, a prepaid pass and other sources: always ok."""
+    if cfg.get("agenthc_api_key") or not _live_daypass(state):
+        return True, None
+    until = float((state.get("l402") or {}).get("expires_at") or 0)
+    if until >= close_ts or _prepaid_may_take_over(cfg, state):
+        return True, until
+    return False, until
+
+
+def _renew_daypass(cfg, state, save_state):
+    """Recurring day-pass ON and the running wallet day-pass ends before
+    today's close: buy today's pass first (from 08:30 ET on a trading day,
+    the usual one-a-day and spending limits), so it never runs out between
+    an entry and its exit. A purchase that fails or isn't decided yet
+    leaves the running pass in use. Never while a prepaid pass may take
+    over when the day-pass ends: its status is asked first (poll() does not
+    ask while a day-pass runs, so a pass bought in the dashboard since then
+    is unknown here), and a pass that can't be checked counts as taking
+    over — the wallet never pays on an unknown."""
+    tok = state.get("l402") or {}
+    if not cfg.get("day_pass_recurring") or state.get("daypass_pending"):
+        return
+    now = _now_et()
+    if _next_buy_time(cfg, now) is not None:
+        return   # not a trading day, before 08:30, or past the close
+    running = float(tok.get("expires_at") or 0)
+    if running >= _close_ts(cfg, now.date()):
+        return
+    if _pass_tokens(cfg):
+        _refresh_pass(cfg, state, save_state)
+        if _prepaid_may_take_over(cfg, state):
+            return
+    if not _pass_purchase_allowed(cfg, state, save_state):
+        return
+    track = "all" if cfg.get("include_other_trades") else "main"
+    try:
+        resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
+                         params={"limit": 20, "track": track}, timeout=15)
+        if resp.status_code == 402:
+            _buy_day_pass(cfg, state, resp.json(), save_state,
+                          running_until=running)
+    except Exception as exc:
+        print(f"Day-pass renewal didn't go through ({str(exc)[:160]}); the "
+              "running pass is still used.")
 
 
 def _headers(cfg, state):
@@ -702,7 +820,7 @@ def _no_receipt_text(sats):
             "receipt (the \"preimage\") that AgentHC needs to open the feed, "
             "so that pass could not be used. To stop this from costing you "
             "every day, your agent will NOT buy another day-pass with this "
-            f"wallet. It gets no signals — {_NO_SIGNALS}. To start again: "
+            "wallet. The agent gets no new trades. To start again: "
             "connect a different Lightning wallet, or buy signal days with a "
             "prepaid pass (dashboard → Settings → Signal source). If you "
             "know the wallet is fixed, switch 'Recurring day-pass' off and "
@@ -852,10 +970,31 @@ def _daypass_paid(state, pending, preimage):
                      "paid_day": pending.get("day")}
     state.pop("daypass_pending", None)
     state.pop("daypass_retry_at", None)
+    state.pop("daypass_retry_why", None)
     state.pop("daypass_no_receipt", None)   # this wallet does give receipts
     _daypass_alert_clear(state)
     if isinstance(pending.get("day"), str):
         _record_paid_day(state, pending["day"])
+
+
+def _check_balance(cfg, state, save_state, wallet, paid_sats):
+    """Right after a day-pass was paid: one balance read. A wallet that holds
+    less than that pass cost can't buy the next one, so the owner hears it
+    the day before. A balance that can't be read is ignored."""
+    try:
+        bal = wallet.balance_sats()
+        ends = datetime.fromtimestamp(float(state["l402"]["expires_at"]), MARKET_TZ)
+    except Exception:
+        return
+    if isinstance(bal, bool) or not isinstance(bal, int) or bal >= int(paid_sats or 0):
+        return
+    _daypass_alert(
+        cfg, state, save_state, "daypass_low_balance_notified",
+        f"Your agent's wallet has {bal:,} sats left, less than one day-pass "
+        f"(about {int(paid_sats):,} sats). Add sats in the dashboard (Settings "
+        "→ Signal source). If it cannot buy the next pass, the agent takes no "
+        f"new trades from {ends.hour}:{ends.minute:02d} ET on "
+        f"{ends:%A %b} {ends.day}.")
 
 
 def _settle_daypass(cfg, state, save_state, wallet=None):
@@ -901,6 +1040,7 @@ def _settle_daypass(cfg, state, save_state, wallet=None):
     if status == "paid" and preimage:
         _daypass_paid(state, pending, preimage)
         save_state(state)
+        _check_balance(cfg, state, save_state, wallet, amount)
         return "paid"
     payable_s = max(_INVOICE_LIFETIME_S, bolt11_expiry_s(pending.get("invoice")) or 0)
     if status == "failed" or (status == "not_found" and (
@@ -942,7 +1082,7 @@ def _settle_daypass(cfg, state, save_state, wallet=None):
                 "undecided. The agent can't ask the previous wallet about it "
                 "any more, so it will not pay again from the new wallet for "
                 "now — it might pay twice for the same day. Until this is "
-                f"sorted out it gets no signals — {_NO_SIGNALS}. It buys "
+                "sorted out the agent gets no new trades. It buys "
                 "again once a day has passed since that payment. If you "
                 "switch back to the previous wallet, the agent asks it again "
                 "and uses the pass if it was paid. (When a wallet is "
@@ -953,8 +1093,8 @@ def _settle_daypass(cfg, state, save_state, wallet=None):
                 f"Your agent asked its wallet to pay {amount:,} sats for "
                 "today's day-pass, and the wallet has not said yet whether the "
                 "payment went through. The agent will not pay again while this "
-                "payment is undecided, so it gets no signals for now — "
-                f"{_NO_SIGNALS}. It keeps asking the wallet and uses the pass "
+                "payment is undecided, so for now the agent gets no new "
+                "trades. It keeps asking the wallet and uses the pass "
                 "as soon as the payment is confirmed. If the payment failed — "
                 "or the wallet still has no record of it once the invoice has "
                 "expired, about an hour after it was issued — the sats are "
@@ -963,30 +1103,40 @@ def _settle_daypass(cfg, state, save_state, wallet=None):
     return "unknown"
 
 
-def _buy_day_pass(cfg, state, body, save_state):
+def _running_text(running_until):
+    """For a failed renewal while a day-pass is still running."""
+    t = datetime.fromtimestamp(float(running_until), MARKET_TZ)
+    return (f"The pass it has runs until {t.hour}:{t.minute:02d} ET; it opens "
+            "no new trades today because that is before the close.")
+
+
+def _buy_day_pass(cfg, state, body, save_state, running_until=None):
     """Pay the 402 Lightning invoice; cache the 24h L402 token in state.
     Returns True when the pass is ready to use, False when the payment was
     sent but isn't decided yet (it is settled on a later poll). Raises when
     nothing was paid; another try is then held off for _PAY_RETRY_S, because
     every try makes the server create one more invoice. An invoice the agent
     refuses to pay is also reported to the owner (once a day): until it is
-    sorted out the agent has no pass, so no signals."""
+    sorted out the agent has no pass, so no signals. `running_until`: a renewal
+    while the current pass still runs until then (the alerts say so)."""
     try:
-        return _pay_day_pass(cfg, state, body, save_state)
+        return _pay_day_pass(cfg, state, body, save_state, running_until)
     except Exception as exc:
         state["daypass_retry_at"] = time.time() + _PAY_RETRY_S
+        state["daypass_retry_why"] = getattr(exc, "loss_code", "day_pass_failed")
         save_state(state)
         if isinstance(exc, InvoiceRefused):
+            then = (_running_text(running_until) if running_until
+                    else "Until a day-pass is paid the agent gets no new trades.")
             _daypass_alert(
                 cfg, state, save_state, "daypass_invoice_notified",
-                f"Your agent did not buy today's day-pass. {exc} Until a "
-                f"day-pass is paid the agent gets no signals — {_NO_SIGNALS}. "
+                f"Your agent did not buy today's day-pass. {exc} {then} "
                 f"{_retry_text()} If this keeps happening, update the agent "
                 "or contact AgentHC.")
         raise
 
 
-def _pay_day_pass(cfg, state, body, save_state):
+def _pay_day_pass(cfg, state, body, save_state, running_until=None):
     wallet = wallet_from_cfg(cfg)
     if wallet is None:
         raise RuntimeError(
@@ -1072,13 +1222,16 @@ def _pay_day_pass(cfg, state, body, save_state):
                        "the dashboard (Settings → Signal source)")
             else:
                 why = "the wallet did not make the payment"
+            then = (_running_text(running_until) if running_until
+                    else "Until a pass is paid the agent gets no new trades.")
             _daypass_alert(
                 cfg, state, save_state, "daypass_failed_notified",
                 "Your agent's wallet could not pay for today's day-pass "
-                f"({amount:,} sats): {why}. Nothing was paid. Until a pass is "
-                f"paid the agent gets no signals — {_NO_SIGNALS}. "
+                f"({amount:,} sats): {why}. Nothing was paid. {then} "
                 f"{_retry_text()}")
-            raise RuntimeError(f"Day-pass payment failed — nothing was paid: {reason}")
+            err = RuntimeError(f"Day-pass payment failed — nothing was paid: {reason}")
+            err.loss_code = "day_pass_short" if short else "day_pass_failed"
+            raise err
         if outcome != "paid":
             if outcome == "unknown":
                 print(f"Day-pass payment of {amount:,} sats: the wallet has "
@@ -1090,11 +1243,115 @@ def _pay_day_pass(cfg, state, body, save_state):
     else:
         _daypass_paid(state, pending, preimage)
         save_state(state)
+        _check_balance(cfg, state, save_state, wallet, amount)
     print("Day-pass active for ~23h.")
     return True
 
 
-_LAST_POLL = {"access": True}
+_LAST_POLL = {"access": True, "exits": True, "why": ""}
+
+
+def _no_read(why):
+    """A poll() that read nothing: no entry and no exit signals. `why` is
+    the exit_loss_reason() code."""
+    _LAST_POLL["why"] = why
+    return []
+
+
+def _holds_real_position(state):
+    """The agent's ledger holds a position bought with a real order (the
+    reading of agent._opened_live: a row that says neither way is real)."""
+    rows = (state or {}).get("positions")
+    for row in (rows.values() if isinstance(rows, dict) else ()):
+        if isinstance(row, dict) and (row.get("live") is True or (
+                not row.get("dry") and row.get("option_id") != "dry")):
+            return True
+    return False
+
+
+def _ended_daypass_exits(cfg, state, save_state):
+    """The wallet path has no pass to read with: while a real position is
+    open, offer the day-pass that ended (AgentHC can still serve the exits
+    of trades entered while it ran). Returns its EXITED events (never an
+    entry), or None: nothing to offer, or AgentHC answered with an error.
+    A 401/402 means it doesn't (an older server: one invoice, once), so the
+    token is not offered again."""
+    tok = (state or {}).get("l402")
+    if (cfg.get("agenthc_api_key") or not isinstance(tok, dict)
+            or not tok.get("token") or tok.get("exits_done")
+            or float(tok.get("expires_at") or 0) > time.time()
+            or not _holds_real_position(state)):
+        return None
+    track = "all" if cfg.get("include_other_trades") else "main"
+    try:
+        resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
+                         params={"limit": 20, "track": track},
+                         headers={"Authorization": tok["token"]}, timeout=15)
+        if resp.status_code in (401, 402):
+            tok["exits_done"] = True
+            save_state(state)
+            return None
+        if resp.status_code != 200:
+            return None
+        events = [e for e in _parse_events(resp.json()) if e["event"] == "EXITED"]
+    except Exception:
+        return None
+    _LAST_POLL["exits"] = True   # exits only: entry access stays False
+    return events
+
+
+def _day_pass_loss_code(cfg, state, now=None):
+    """Why the wallet path has no day-pass to read with, as the code the
+    agent's no-signal warning turns into the owner's fix (no request, no
+    change; the same order as _pass_purchase_allowed):
+    day_pass_undecided  a payment the wallet hasn't decided yet;
+    day_pass_off        Recurring day-pass is off: the wallet never buys;
+    day_pass_short      the last payment failed: not enough sats;
+    day_pass_failed     the last payment failed otherwise (wallet down or
+                        gone, invoice refused, a wallet without receipts);
+    no_day_pass         anything else (today already paid once, the
+                        daily cap, the market closed)."""
+    if state.get("daypass_pending"):
+        return "day_pass_undecided"
+    now = now or _now_et()
+    day = now.strftime("%Y-%m-%d")
+    if (state.get("pass_charged_day") == day
+            or (_one_pass_a_day(cfg) and _autopay_spent_today(state, now)["count"] >= 1)
+            or _next_buy_time(cfg, now) is not None):
+        return "no_day_pass"
+    if not cfg.get("day_pass_recurring"):
+        return "day_pass_off"
+    if isinstance(state.get("daypass_no_receipt"), dict):
+        return "day_pass_failed"
+    if time.time() < float(state.get("daypass_retry_at") or 0):
+        why = state.get("daypass_retry_why")
+        return why if why in ("day_pass_short", "day_pass_failed") else "day_pass_failed"
+    return "no_day_pass"
+
+
+def _no_day_pass(cfg, state, save_state):
+    """No wallet day-pass to read with (and none bought now)."""
+    got = _ended_daypass_exits(cfg, state, save_state)
+    return got if got is not None else _no_read(_day_pass_loss_code(cfg, state))
+
+
+def had_exit_access():
+    """Whether the last poll() could read EXIT signals: True after every
+    read the feed answered (entries and exits, or a used-up pass's exits
+    only), False when it returned without reading (no pass or day-pass,
+    a pass not paid or not checked, a refused day-pass, a feed that isn't
+    publishing). The agent sells a held position before the close when
+    this stays False (agent.signal_loss_tick)."""
+    return bool(_LAST_POLL["exits"])
+
+
+def exit_loss_reason():
+    """Why the last poll() read no exit signals ("" when it did):
+    pass_unchecked, pass_unpaid, pass_ended, day_pass_refused,
+    feed_not_live, or a _day_pass_loss_code (no_day_pass, day_pass_off,
+    day_pass_short, day_pass_failed, day_pass_undecided). Also set when
+    poll() raised because the wallet could not pay for the day-pass."""
+    return "" if _LAST_POLL["exits"] else str(_LAST_POLL.get("why") or "")
 
 # Outside the feed window (agent._feed_window_now) the agent reads this feed
 # once an hour, not on every loop: it has never published a signal there.
@@ -1143,6 +1400,9 @@ def _note_feed_answer(resp):
     if key is None:
         _REFUSAL.clear()
         return
+    # no exit signal from this read either: the same cause as the back-off
+    # that follows (the no-signal sell, agent._note_exit_source)
+    _LAST_POLL["why"] = "feed_refused"
     now = _now_s()
     if _REFUSAL.get("key") != key:
         _REFUSAL.clear()
@@ -1203,7 +1463,8 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     shadow book — several entries a day; your daily entry cap and budget
     still apply per trade).
     """
-    _LAST_POLL["access"] = False  # until the feed is actually read (below)
+    # until the feed is actually read (below)
+    _LAST_POLL.update(access=False, exits=False, why="")
     # A wallet day-pass payment saved earlier and not decided yet: ask the
     # wallet first. Paid → its token is used below; still undecided → the
     # wallet path stops further down (never a second payment for one day).
@@ -1218,6 +1479,17 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             and not _live_daypass(state)):
         token = _refresh_pass(cfg, state, save_state)
         if token:
+            # A used-up pass only reads exits. With the wallet's recurring
+            # day-pass ON, today's day-pass brings the entries back (exits
+            # come with it); if it can't be bought now, the exits are still
+            # read with the used-up pass in this same poll.
+            if (not _retried and not undecided
+                    and _token_status(state, token) == "exits_only"
+                    and cfg.get("lnbits_url") and cfg.get("day_pass_recurring")
+                    and _pass_purchase_allowed(cfg, state, save_state)):
+                got = _wallet_over_exits_only(cfg, state, save_state)
+                if got is not None:
+                    return got
             return _poll_with_pass(cfg, state, save_state, token, _retried)
         cache = state.get("pass_status") or {}
         statuses = {(cache.get(_token_id(t)) or {}).get("status")
@@ -1226,16 +1498,17 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             # Status check failed (network/server error): the pass may well
             # be fine. Wait for the next poll — never pay the wallet on an
             # unknown, or the owner pays twice for the same day.
-            return []
+            return _no_read("pass_unchecked")
         if not (cfg.get("lnbits_url") and cfg.get("day_pass_recurring")):
             if "pending" in statuses:
-                return []  # invoice shown, not paid yet — nothing to read
+                return _no_read("pass_unpaid")  # invoice shown, not paid yet
             _pass_notice(cfg, state, save_state, "pass_expired_notified",
-                         "Your AgentHC feed pass has run out — the agent gets no "
-                         "signals until you buy more signal days (dashboard → "
-                         "Settings → Signal source).")
-            return []
+                         PASS_RUN_OUT_TEXT)
+            return _no_read("pass_ended")
         # else: fall through to the wallet's daily auto-pay
+    if (not _retried and not undecided and not cfg.get("agenthc_api_key")
+            and _live_daypass(state)):
+        _renew_daypass(cfg, state, save_state)
     # Skip the request entirely when access is impossible: no API key, no
     # live day-pass token, and buying one isn't allowed right now (recurring
     # OFF, or weekend). Every such GET makes the server mint a Lightning
@@ -1243,15 +1516,16 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     # cadence that's ~1,000 doomed invoices a day against the publisher's
     # node. The once-per-day notify inside _pass_purchase_allowed still fires.
     if undecided and not _headers(cfg, state):
-        return []
+        return _no_day_pass(cfg, state, save_state)
     if not _headers(cfg, state) and not _pass_purchase_allowed(cfg, state, save_state):
-        return []
+        return _no_day_pass(cfg, state, save_state)
     track = "all" if cfg.get("include_other_trades") else "main"
     headers = _headers(cfg, state)
     daypass = None if cfg.get("agenthc_api_key") else (state.get("l402") or {})
     if (daypass and headers.get("Authorization") and not _retried
             and time.time() - float(daypass.get("refused_at") or 0) < _REFUSED_RETRY_S):
-        return []  # AgentHC refused this paid pass a moment ago: offer it again later
+        # AgentHC refused this paid pass a moment ago: offer it again later
+        return _no_read("day_pass_refused")
     resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
                         params={"limit": 20, "track": track},
                         headers=headers, timeout=15)
@@ -1279,16 +1553,22 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             "AgentHC refused the day-pass your agent's wallet paid for "
             "today. The agent will NOT buy another one today. It keeps "
             f"offering the paid pass every {_REFUSED_RETRY_S // 60} minutes; "
-            "until AgentHC accepts it the agent gets no signals — no new "
-            "entries, and no exit signals for positions it holds, so watch "
-            "those yourself. If this doesn't clear up, contact AgentHC with "
+            "until AgentHC accepts it the agent gets no new trades. If this "
+            "doesn't clear up, contact AgentHC with "
             "the time of the payment from your wallet's payment list.")
-        return []
+        return _no_read("day_pass_refused")
     if resp.status_code == 402 and not _retried:
         if undecided or not _pass_purchase_allowed(cfg, state, save_state):
-            return []
-        if not _buy_day_pass(cfg, state, resp.json(), save_state):
-            return []
+            return _no_day_pass(cfg, state, save_state)
+        try:
+            bought = _buy_day_pass(cfg, state, resp.json(), save_state)
+        except Exception:
+            # nothing was paid (reported already); the error still reaches
+            # the loop, which records this cause and not an unreadable feed
+            _LAST_POLL["why"] = _day_pass_loss_code(cfg, state)
+            raise
+        if not bought:
+            return _no_day_pass(cfg, state, save_state)
         return poll(cfg, state, save_state, _retried=True)
     if resp.status_code == 401 and not _retried and not cfg.get("agenthc_api_key"):
         state.pop("l402", None)  # stale day-pass token — re-buy on next 402
@@ -1300,7 +1580,8 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             accept_terms(cfg)
             return poll(cfg, state, save_state, _retried=True)
         if isinstance(detail, dict) and detail.get("error") == "feed_not_live":
-            return []  # feed exists but isn't publishing yet — keep polling
+            # feed exists but isn't publishing yet — keep polling
+            return _no_read("feed_not_live")
         raise RuntimeError(f"403 from feed: {str(detail)[:200]}")
     resp.raise_for_status()
     if headers.get("Authorization"):
@@ -1316,7 +1597,8 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
         if (now.weekday() < 5 and 9 * 60 + 30 <= minute < 16 * 60
                 and _record_paid_day(state, now.strftime("%Y-%m-%d"))):
             save_state(state)
-    _LAST_POLL["access"] = True
+    _LAST_POLL.update(access=True, exits=True)
+    _entry_read(state, save_state)
     return _parse_events(resp.json())
 
 
@@ -1332,7 +1614,7 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
     if resp.status_code == 403:
         detail = resp.json().get("detail", {})
         if isinstance(detail, dict) and detail.get("error") == "feed_not_live":
-            return []
+            return _no_read("feed_not_live")
         raise RuntimeError(f"403 from feed: {str(detail)[:200]}")
     resp.raise_for_status()
     body = resp.json()
@@ -1347,26 +1629,38 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
             save_state(state)
     left = body.get("pass_days_left", body.get("pass_trading_days_left"))
     exits_only = bool(body.get("pass_exits_only"))
-    _LAST_POLL["access"] = not exits_only
+    # a used-up pass still reads the exits: exit access, no entry access
+    _LAST_POLL.update(access=not exits_only, exits=True)
     rec = state.setdefault("pass_status", {}).get(_token_id(token))
     if rec is not None:
         new_status = "exits_only" if exits_only else "active"
-        if rec.get("days_left") != left or rec.get("status") != new_status:
+        until = (_iso_ts(body.get("pass_exits_until")) or None) if exits_only else None
+        if (rec.get("days_left") != left or rec.get("status") != new_status
+                or rec.get("exits_until") != until):
             rec["days_left"] = left
             rec["status"] = new_status
+            if until:
+                rec["exits_until"] = until
+            else:
+                rec.pop("exits_until", None)
             save_state(state)
     if exits_only:
         _pass_notice(cfg, state, save_state, "pass_used_up_notified",
-                     "Your AgentHC feed pass is used up — for a few more days "
-                     "the agent still gets EXIT signals (so open positions can "
-                     "close), but no new entries. Buy more signal days in the "
-                     "dashboard (Settings → Signal source).")
-    elif isinstance(left, int) and left <= PASS_LOW_DAYS:
-        _pass_notice(cfg, state, save_state, "pass_low_notified",
-                     f"Your AgentHC feed pass has {left} signal day(s) left — "
-                     "buy more in the dashboard (Settings → Signal source); "
-                     "unused days carry over.")
-    return _parse_events(body)
+                     PASS_USED_UP_TEXT)
+    else:
+        _entry_read(state, save_state)
+        if left == 0 and body.get("pass_charged_today"):
+            _pass_notice(cfg, state, save_state, "pass_last_day_notified",
+                         PASS_LAST_DAY_TEXT)
+        elif isinstance(left, int) and left <= PASS_LOW_DAYS:
+            _pass_notice(cfg, state, save_state, "pass_low_notified",
+                         PASS_LOW_TEXT.format(n=left))
+    events = _parse_events(body)
+    if exits_only:
+        # a used-up pass gets no entries: should the reply carry one anyway
+        # (a server bug, a malformed answer), it never reaches the agent
+        events = [e for e in events if e["event"] == "EXITED"]
+    return events
 
 
 def pass_summary(cfg, state):
@@ -1381,7 +1675,7 @@ def pass_summary(cfg, state):
                                  and best.get("status") != "active")):
             best = rec
     if best and best.get("status") == "exits_only":
-        return "prepaid pass used up — exit signals only for a few days; buy more"
+        return "prepaid pass used up — exit signals only; buy more"
     if best:
         left = best.get("days_left")
         return (f"prepaid pass · {left} signal day(s) left" if left is not None

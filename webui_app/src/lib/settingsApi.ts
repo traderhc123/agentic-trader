@@ -67,6 +67,8 @@ export interface SettingsView {
   };
   /** the expiry sell and its alert (HH:MM ET; null = off); null: not known */
   expiry: Expiry | null;
+  /** the no-signal sell (the chat's "no-signal sell"); null: not known */
+  no_signal: NoSignal | null;
   code: { self_edit_enabled: boolean };
   /** the agreement on file (its text: GET /api/v2/agreement) */
   consent: Consent;
@@ -121,6 +123,16 @@ export interface Expiry {
   effective_today: { sell_et: string | null; alert_et: string | null; close_et: string | null; early_close: boolean };
   /** the classic status line ("sells at 15:45 ET, alert at 15:50 ET") */
   described: string;
+  allowed: [string, string];
+}
+
+export interface NoSignal {
+  /** HH:MM ET; null = off */
+  sell_et: string | null;
+  /** today's time (an early close moves it earlier); null = off */
+  today_et: string | null;
+  /** the time "on" means */
+  default: string;
   allowed: [string, string];
 }
 

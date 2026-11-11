@@ -685,3 +685,87 @@ def test_past_expiry_close_follows_early_closes(monkeypatch):
     at.update(h=16, m=0)
     assert agent._past_expiry_close(key)
     assert agent._past_expiry_close("SPY|2026-11-19|600.0|C")      # yesterday's
+
+
+# ── the no-signal sell: when the loop records that exits can't be read ──────
+
+def test_a_poll_that_raises_records_the_lost_exit_source_before_the_re_raise(
+        home, monkeypatch, sent, clock):
+    """No exit owed: the poll's error is re-raised at once (a heartbeat
+    error). The loss is on record anyway, from the first failed read."""
+    state = {"seen": [], "positions": {KEY: {"option_id": "stub", "qty": 1}}}
+    _broker, saved = run_loop(home, monkeypatch, state,
+                              [ConnectionError("feed unreachable"),
+                               ConnectionError("feed unreachable")], clock=clock)
+    loss = saved["signal_loss"]
+    assert loss["cause"] == "feed_error"
+    assert loss["since"] == START.timestamp()   # the first failed read
+
+
+def test_a_poll_that_raises_records_the_cause_the_source_gives(
+        home, monkeypatch, sent, clock):
+    """The wallet could not pay for today's day-pass: the read raised, but
+    the source says why, and that is the cause on record (the warning then
+    says to add sats), not an unreadable feed."""
+    class ShortWallet:
+        @staticmethod
+        def poll(cfg, st, save_state):
+            raise RuntimeError("Day-pass payment failed — nothing was paid")
+
+        had_exit_access = staticmethod(lambda: False)
+        exit_loss_reason = staticmethod(lambda: "day_pass_short")
+    state = {"seen": [], "positions": {KEY: {"option_id": "stub", "qty": 1}}}
+    _broker, saved = run_loop(home, monkeypatch, state, [[]], clock=clock,
+                              source=ShortWallet)
+    assert saved["signal_loss"]["cause"] == "day_pass_short"
+
+
+def test_a_read_that_works_clears_the_record(home, monkeypatch, sent, clock):
+    state = {"seen": [], "positions": {KEY: {"option_id": "stub", "qty": 1}}}
+    seen = []
+
+    def before_poll(n, b):
+        seen.append(json.loads((home / "state.json").read_text(
+            encoding="utf-8")).get("signal_loss"))
+    _broker, saved = run_loop(home, monkeypatch, state,
+                              [ConnectionError("feed unreachable"), []], clock=clock,
+                              before_poll=before_poll)
+    assert seen[0] is None and seen[1]["cause"] == "feed_error"
+    assert "signal_loss" not in saved
+
+
+def test_a_source_without_exit_access_records_why(home, monkeypatch, sent, clock):
+    class NoPass:
+        @staticmethod
+        def poll(cfg, st, save_state):
+            return []
+
+        had_access = staticmethod(lambda: False)
+        had_exit_access = staticmethod(lambda: False)
+        exit_loss_reason = staticmethod(lambda: "pass_ended")
+    state = {"seen": [], "positions": {KEY: {"option_id": "stub", "qty": 1}}}
+    _broker, saved = run_loop(home, monkeypatch, state, [[]], clock=clock,
+                              source=NoPass)
+    assert saved["signal_loss"]["cause"] == "pass_ended"
+
+
+def test_a_feed_skipped_for_a_pause_records_nothing(home, monkeypatch, sent, clock):
+    """Paused with only a practice position, on the pay-per-day feed: the
+    feed is not read on purpose, which is not a lost exit source."""
+    import sources
+
+    class PaidFeed:
+        @staticmethod
+        def poll(cfg, st, save_state):
+            raise AssertionError("not read while the pause skips the feed")
+    monkeypatch.setitem(sources.SOURCES, "agenthc", PaidFeed)
+    monkeypatch.setitem(agent.SOURCES, "agenthc", PaidFeed)
+    state = {"seen": [], "positions": {KEY: {"option_id": "dry", "qty": 1,
+                                             "dry": True}}}
+    _broker, saved = run_loop(home, monkeypatch, dict(state), [[], []], clock=clock,
+                              config={"source": "agenthc", "paused": True})
+    assert "signal_loss" not in saved
+    # not paused, the same failing read is a lost exit source
+    _broker, saved = run_loop(home, monkeypatch, dict(state), [[], []], clock=clock,
+                              config={"source": "agenthc"})
+    assert saved["signal_loss"]["cause"] == "feed_error"

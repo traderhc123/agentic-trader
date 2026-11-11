@@ -265,7 +265,11 @@ def test_frontend_words_cover_every_code_and_every_state(tmp_path):
         "reason_codes": vm.REASON_CODES, "answer_states": vm.ANSWER_STATES,
         "answer_reasons": vm.ANSWER_REASONS, "next_actions": vm.NEXT_ACTIONS,
         "next_reasons": vm.NEXT_REASONS,
-        "unmanaged_reasons": vm.UNMANAGED_REASONS}), encoding="utf-8")
+        "unmanaged_reasons": vm.UNMANAGED_REASONS,
+        "exit_loss_causes": vm.EXIT_LOSS_CAUSES,
+        # the agent's own words for why no exit signal reaches it: /v2 says
+        # the same (copy.ts EXIT_LOSS_WHY)
+        "exit_loss_why": agent._SIGNAL_LOSS_WHY}), encoding="utf-8")
     # Keep the parent environment: node.exe cannot start on Windows without
     # SystemRoot. Decode as UTF-8 on every platform. Ask for TAP explicitly:
     # newer Node versions print the "spec" summary ("ℹ fail 0") by default

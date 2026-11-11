@@ -100,6 +100,11 @@ def _sell(cfg):
     return None if v == "off" else v
 
 
+def _no_signal(cfg):
+    v = cfg.get("signal_loss_sell_et", "15:30")
+    return None if v == "off" else v
+
+
 def _settings(tab):
     """A made-up GET /api/v2/settings for the tab's state (same shape)."""
     cfg = tab["cfg"]
@@ -134,6 +139,8 @@ def _settings(tab):
                                        "close_et": "16:00", "early_close": False},
                    "described": "sells at 15:45 ET, alert at 15:50 ET",
                    "allowed": ["09:30", "15:59"]},
+        "no_signal": {"sell_et": _no_signal(cfg), "today_et": _no_signal(cfg),
+                      "default": "15:30", "allowed": ["09:30", "15:59"]},
         "code": {"self_edit_enabled": bool(cfg.get("self_edit_enabled"))},
         "consent": {"accepted": True, "on_file": True,
                     "accepted_at": "2026-10-01T12:00:00+00:00",
@@ -248,6 +255,13 @@ def _v2_post(tab, path, data):
             new["expiry_guard_et"] = data["expiry_sell_et"]
             before, after = _sell(cfg), _sell(new)
             changes.append({"key": "expiry_sell_et", "label": "Expiry-day sell time",
+                            "saved_now": before, "new": after,
+                            "direction": "raises_risk" if after is None or (before and after > before)
+                            else "lowers_risk"})
+        if "no_signal_sell_et" in data and data["no_signal_sell_et"] != (cfg.get("signal_loss_sell_et") or "15:30"):
+            new["signal_loss_sell_et"] = data["no_signal_sell_et"]
+            before, after = _no_signal(cfg), _no_signal(new)
+            changes.append({"key": "no_signal_sell_et", "label": "No-signal sell time",
                             "saved_now": before, "new": after,
                             "direction": "raises_risk" if after is None or (before and after > before)
                             else "lowers_risk"})

@@ -460,7 +460,8 @@ def test_wallet_with_no_record_after_a_lost_answer_waits_for_the_invoice_to_expi
         assert _poll(CFG, state) == [] and "daypass_pending" in state
     assert wallet.paid == [] and feed.minted == 1
     assert len(alerts) == 1 and "once the invoice has expired" in alerts[0]
-    assert "no exit signals" in alerts[0]
+    assert "the agent gets no new trades" in alerts[0]
+    assert "position" not in alerts[0]
     clock.tick(minutes=6)                      # 66 minutes: the invoice is dead
     assert len(_poll(CFG, state)) == 1         # released, bought for real
     assert len(wallet.paid) == 1 and feed.minted == 2
@@ -551,7 +552,8 @@ def test_wallet_changed_while_a_payment_is_undecided_never_pays_twice(
     assert wallet_b.paid == [] and asked_b == [] and feed.minted == 1
     assert state["daypass_pending"]["macaroon"] == "MAC1"   # A's pass is kept
     assert len(alerts) == 1 and "wallet was changed" in alerts[0]
-    assert "no exit signals" in alerts[0]
+    assert "the agent gets no new trades" in alerts[0]
+    assert "position" not in alerts[0]
     wallet_a.settle()                          # A's payment went through after all
     cfg = dict(CFG, **WALLET_A)                # …and the owner switched back
     assert len(agenthc.poll(cfg, state, lambda s: None)) == 1
@@ -588,7 +590,8 @@ def test_wallet_that_pays_without_a_receipt_is_not_used_again(
     assert len(alerts) == 3                    # Wed, then a reminder Thu and Fri
     for text in alerts:
         assert "sats left the wallet" in text and "NOT buy another" in text
-        assert "10,000 sats" in text and "no exit signals" in text
+        assert "10,000 sats" in text and "agent gets no new trades" in text
+        assert "position" not in text
         assert "has not said yet" not in text
     assert state["pass_notice"] == alerts[0]   # and it stays on the dashboard
 
@@ -674,7 +677,8 @@ def test_invoice_the_agent_refuses_is_reported_to_the_owner_once_a_day(
     text = alerts[0]
     assert text.startswith("Your agent did not buy today's day-pass.")
     assert words in text and "Nothing was paid" in text
-    assert "no exit signals for positions it holds" in text
+    assert "the agent gets no new trades" in text
+    assert "position" not in text and "watch" not in text
     assert "8:30 AM ET on the next market day" in text
     assert "{" not in text                     # no raw server text
     assert state["pass_notice"] == text        # on the dashboard too
@@ -706,7 +710,8 @@ def test_failed_payment_alert_says_what_happens_next_in_plain_words(
     assert "HTTP" not in text and "{" not in text and "detail" not in text
     assert "every 5 minutes until today's market close" in text
     assert "from 8:30 AM ET on the next market day" in text
-    assert "no exit signals for positions it holds" in text
+    assert "the agent gets no new trades" in text
+    assert "position" not in text and "watch" not in text
     # and that is what it does: funded at 4:10 PM, nothing is bought tonight
     wallet.pay_invoice = lambda invoice: Wallet.pay_invoice(wallet, invoice)
     clock.now = datetime(2026, 7, 15, 16, 10, tzinfo=agenthc.MARKET_TZ)
@@ -952,3 +957,280 @@ def test_wallet_says_not_sent_only_when_the_request_never_left(
     assert isinstance(err.value, lightning_wallet.PaymentNotSent) is never_left
     assert not isinstance(err.value, lightning_wallet.PaymentRefused)
     assert ("nothing was sent" in str(err.value)) is never_left
+
+
+# ── AT-3: a day-pass that does not end mid-session unnoticed ────────────────
+
+def _et(h, m, day=15):
+    return datetime(2026, 7, day, h, m, tzinfo=agenthc.MARKET_TZ)
+
+
+def _running(until):
+    """A wallet day-pass bought yesterday that runs until `until` today."""
+    return {"l402": {"token": "L402 OLD:pre", "expires_at": until.timestamp(),
+                     "paid_day": "2026-07-14"}}
+
+
+class BalanceWallet(Wallet):
+    def __init__(self, mode="ok", balance=100_000):
+        super().__init__(mode)
+        self.balance, self.asked = balance, 0
+
+    def balance_sats(self):
+        self.asked += 1
+        if isinstance(self.balance, Exception):
+            raise self.balance
+        return self.balance
+
+
+def test_renewal_before_the_open_when_the_pass_ends_mid_session(
+        monkeypatch, clock, alerts):
+    clock.now = _et(8, 30)
+    feed, wallet = Feed(sats=10_000), BalanceWallet()
+    _setup(monkeypatch, feed, wallet)
+    state = _running(_et(12, 0))
+    events = _poll(CFG, state)
+    assert len(wallet.paid) == 1 and feed.minted == 1
+    assert state["l402"]["token"] == "L402 MAC1:pre0001"
+    assert state["l402"]["paid_day"] == "2026-07-15"
+    assert feed.gets == [None, "L402 MAC1:pre0001"]   # read with the new pass
+    assert len(events) == 1
+    # one pass a day: no second payment
+    for _ in range(12):
+        clock.tick(minutes=30)
+        _poll(CFG, state)
+    assert len(wallet.paid) == 1 and feed.minted == 1
+
+
+def test_no_renewal_before_0830_or_when_the_pass_covers_the_close(
+        monkeypatch, clock, alerts):
+    feed, wallet = Feed(sats=10_000), BalanceWallet()
+    _setup(monkeypatch, feed, wallet)
+    clock.now = _et(8, 29)
+    state = _running(_et(12, 0))
+    _poll(CFG, state)
+    assert wallet.paid == [] and None not in feed.gets
+    clock.now = _et(8, 30)
+    state = _running(_et(16, 5))
+    _poll(CFG, state)
+    assert wallet.paid == [] and None not in feed.gets
+
+
+def test_failed_renewal_keeps_and_reads_with_the_running_pass(
+        monkeypatch, clock, alerts):
+    clock.now = _et(8, 30)
+    feed, wallet = Feed(sats=10_000), BalanceWallet(mode="refuse")
+    _setup(monkeypatch, feed, wallet)
+    state = _running(_et(12, 0))
+    events = _poll(CFG, state)
+    assert len(events) == 1                         # read with the old pass
+    assert state["l402"]["token"] == "L402 OLD:pre"
+    assert feed.gets == [None, "L402 OLD:pre"]
+    (text,) = alerts
+    assert text.startswith("Your agent's wallet could not pay for today's "
+                           "day-pass (10,000 sats): the wallet does not hold "
+                           "enough sats")
+    assert ("Nothing was paid. The pass it has runs until 12:00 ET; it opens no "
+            "new trades today because that is before the close.") in text
+    assert "every 5 minutes" in text
+    # the next try waits the usual 5 minutes, and still reads meanwhile
+    clock.tick(minutes=2)
+    assert len(_poll(CFG, state)) == 1 and feed.minted == 1
+    clock.tick(minutes=4)
+    _poll(CFG, state)
+    assert feed.minted == 2
+
+
+def test_recurring_off_sends_no_renewal_request(monkeypatch, clock, alerts):
+    clock.now = _et(8, 30)
+    feed, wallet = Feed(sats=10_000), BalanceWallet()
+    _setup(monkeypatch, feed, wallet)
+    state = _running(_et(12, 0))
+    assert len(_poll({}, state)) == 1
+    assert feed.gets == ["L402 OLD:pre"] and wallet.paid == []
+
+
+def test_entry_cover_with_a_day_pass_that_ends_before_the_close(clock):
+    close_ts = _et(16, 0).timestamp()
+    ok, until = agenthc.entry_cover({}, _running(_et(12, 0)), close_ts)
+    assert ok is False and until == _et(12, 0).timestamp()
+    assert agenthc.entry_cover({}, _running(_et(16, 30)), close_ts)[0] is True
+    assert agenthc.entry_cover({"agenthc_api_key": "k"}, _running(_et(12, 0)),
+                               close_ts)[0] is True
+    assert agenthc.entry_cover({}, {}, close_ts)[0] is True
+    # a prepaid pass with days left takes over when the day-pass ends
+    cfg = {"feed_pass": {"token": "P"}}
+    st = {**_running(_et(12, 0)), "pass_status": {
+        agenthc._token_id("P"): {"status": "active", "days_left": 3}}}
+    assert agenthc.entry_cover(cfg, st, close_ts)[0] is True
+
+
+class PassFeed(Feed):
+    """Feed + the prepaid pass status route: `passes` maps a token to the
+    status /pass answers (an Exception: the check fails)."""
+
+    def __init__(self, passes, **kw):
+        super().__init__(**kw)
+        self.passes, self.checks = passes, []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        if url.endswith("/pass"):
+            tok = (headers or {}).get("Authorization")
+            self.checks.append(tok)
+            st = self.passes[tok]
+            if isinstance(st, Exception):
+                raise st
+            return Resp({"status": st, "access_until": "2030-01-02T00:00:00+00:00",
+                         "days_left": 3 if st == "active" else 0})
+        return super().get(url, params, headers, timeout)
+
+
+def test_no_renewal_while_a_new_prepaid_pass_may_take_over(
+        monkeypatch, clock, alerts):
+    """The owner bought a prepaid pass in the dashboard last night: its
+    token is in the config, but the agent never asked about it (it reads
+    with the running day-pass). The wallet must not pay for a day-pass the
+    prepaid pass makes unnecessary, and entries stay open (the prepaid pass
+    takes over when the day-pass ends)."""
+    clock.now = _et(8, 30)
+    cfg = {**CFG, "lnbits_url": "https://w", "feed_pass": {"token": "P"}}
+    close_ts = _et(16, 0).timestamp()
+    for status in ("active", RuntimeError("status down")):
+        feed, wallet = PassFeed({"P": status}, sats=10_000), BalanceWallet()
+        _setup(monkeypatch, feed, wallet)
+        state = _running(_et(12, 0))
+        # before any poll: a pass the agent has not checked may take over
+        assert agenthc.entry_cover(cfg, state, close_ts)[0] is True
+        events = _poll(cfg, state)
+        assert wallet.paid == [] and feed.minted == 0, status
+        assert feed.checks == ["P"]
+        assert len(events) == 1 and state["l402"]["token"] == "L402 OLD:pre"
+        assert agenthc.entry_cover(cfg, state, close_ts)[0] is True
+
+
+def test_renewal_when_the_prepaid_pass_is_used_up_or_unpaid(
+        monkeypatch, clock, alerts):
+    """A prepaid pass that only gets exits, or an invoice nobody paid, does
+    not take over the entries: the running day-pass is renewed as before."""
+    clock.now = _et(8, 30)
+    cfg = {**CFG, "lnbits_url": "https://w", "feed_pass": {"token": "P"}}
+    close_ts = _et(16, 0).timestamp()
+    for status in ("exits_only", "pending"):
+        feed, wallet = PassFeed({"P": status}, sats=10_000), BalanceWallet()
+        _setup(monkeypatch, feed, wallet)
+        state = _running(_et(12, 0))
+        _poll(cfg, state)
+        assert len(wallet.paid) == 1, status
+        assert state["l402"]["token"] == "L402 MAC1:pre0001"
+        state = _running(_et(12, 0))
+        state["pass_status"] = {agenthc._token_id("P"): {"status": status}}
+        assert agenthc.entry_cover(cfg, state, close_ts)[0] is False
+
+
+class NotSentWallet(Wallet):
+    def pay_invoice(self, invoice):
+        raise lightning_wallet.PaymentNotSent("wallet server unreachable")
+
+
+def _loss():
+    return agenthc.had_exit_access(), agenthc.exit_loss_reason()
+
+
+def test_no_day_pass_says_what_the_owner_can_change(monkeypatch, clock, alerts):
+    """Why no day-pass reads the feed: the agent's no-signal warning tells
+    the owner what to do from this code, so each cause gets its own."""
+    cfg = {**CFG, "lnbits_url": "https://w"}
+    # Recurring day-pass OFF: the wallet never buys, adding sats won't help
+    feed = Feed(sats=10_000)
+    _setup(monkeypatch, feed, Wallet())
+    assert _poll({"lnbits_url": "https://w"}, {}) == []
+    assert _loss() == (False, "day_pass_off") and feed.gets == []
+    # the wallet is short of sats: the failed payment raises (a heartbeat
+    # error), but the cause is the wallet, not an unreadable feed — and it
+    # stays so while the agent waits to try again
+    _setup(monkeypatch, Feed(sats=10_000), Wallet(mode="refuse"))
+    state = {}
+    assert _poll(cfg, state) is None
+    assert _loss() == (False, "day_pass_short")
+    clock.tick(minutes=2)
+    assert _poll(cfg, state) == []
+    assert _loss() == (False, "day_pass_short")
+    # any other failed payment (here: the wallet can't be reached)
+    _setup(monkeypatch, Feed(sats=10_000), NotSentWallet())
+    state = {}
+    assert _poll(cfg, state) is None
+    assert _loss() == (False, "day_pass_failed")
+    clock.tick(minutes=2)
+    assert _poll(cfg, state) == []
+    assert _loss() == (False, "day_pass_failed")
+    # paid, the wallet hasn't said whether it went through: the agent waits
+    _setup(monkeypatch, Feed(sats=10_000), Wallet(mode="hang"))
+    state = {}
+    assert _poll(cfg, state) == []
+    assert _loss() == (False, "day_pass_undecided")
+    assert _poll(cfg, state) == []
+    assert _loss() == (False, "day_pass_undecided")
+    # today's day-pass was already paid once (its token was lost): no
+    # second purchase today
+    _setup(monkeypatch, Feed(sats=10_000), Wallet())
+    state = {"autopay_spent": {"day": "2026-07-15", "sats": 10_000, "count": 1}}
+    assert _poll(cfg, state) == []
+    assert _loss() == (False, "no_day_pass")
+
+
+def test_entry_is_skipped_when_the_day_pass_ends_before_the_close(
+        monkeypatch, home, no_policy):
+    import agent
+    from conftest import StubBroker
+    monkeypatch.setattr(agent, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_problems_logged", set())
+    now = _et(10, 0)
+    monkeypatch.setattr(agent, "_et_now", lambda: now)
+    monkeypatch.setattr(agenthc, "time",
+                        types.SimpleNamespace(time=now.timestamp,
+                                              strftime=now.strftime))
+    ev = {"event": "ENTERED", "ticker": "SPY", "expiry": "2026-07-17",
+          "strike": 600.0, "type": "C", "event_id": "e1"}
+    b = StubBroker()
+    st = {"positions": {}, **_running(_et(12, 0))}
+    out = agent.handle_event(ev, {"source": "agenthc"}, st, b, object(),
+                             lambda s: None)
+    assert out and "SKIPPED" in out and "12:00 ET" in out and b.calls == []
+    row = agent._read_trade_log()[-1]
+    assert row["action"] == "skip_rule" and row["ui"]["code"] == "pass_wont_cover"
+    st = {"positions": {}, **_running(_et(16, 30))}
+    agent.handle_event({**ev, "event_id": "e2"}, {"source": "agenthc"}, st, b,
+                       object(), lambda s: None)
+    assert len(b.calls) == 1
+
+
+def test_low_balance_after_a_purchase_alerts_once(monkeypatch, clock, alerts):
+    feed, wallet = Feed(sats=10_000), BalanceWallet(balance=4_000)
+    _setup(monkeypatch, feed, wallet)
+    state = {}
+    assert len(_poll(CFG, state)) == 1
+    assert wallet.asked == 1
+    (text,) = alerts
+    ends = datetime.fromtimestamp(state["l402"]["expires_at"], agenthc.MARKET_TZ)
+    assert text == ("Your agent's wallet has 4,000 sats left, less than one "
+                    "day-pass (about 10,000 sats). Add sats in the dashboard "
+                    "(Settings → Signal source). If it cannot buy the next "
+                    "pass, the agent takes no new trades from "
+                    f"{ends.hour}:{ends.minute:02d} ET on Thursday Jul 16.")
+    for _ in range(5):
+        clock.tick(minutes=30)
+        _poll(CFG, state)
+    assert len(alerts) == 1 and wallet.asked == 1
+
+
+def test_a_failed_balance_read_is_ignored(monkeypatch, clock, alerts):
+    feed = Feed(sats=10_000)
+    wallet = BalanceWallet(balance=lightning_wallet.WalletError("down"))
+    _setup(monkeypatch, feed, wallet)
+    state = {}
+    assert len(_poll(CFG, state)) == 1 and alerts == []
+    wallet.balance = 50_000          # enough: nothing to say
+    state.pop("l402")
+    state.pop("autopay_spent")
+    _poll(CFG, state)
+    assert alerts == []

@@ -16,6 +16,8 @@ export const ENTRY_CHECKS = [
   { id: "signal_fresh", kinds: ["skip_stale"] },
   { id: "not_paused", kinds: ["skip_paused"] },
   { id: "before_expiry_guard", kinds: ["skip_rule"] },
+  { id: "exits_reachable", kinds: ["skip_rule"] },
+  { id: "pass_covers_close", kinds: ["skip_rule"] },
   { id: "daily_cap", kinds: ["skip_daily_cap"] },
   { id: "position_cap", kinds: ["skip_position_cap"] },
   { id: "daily_loss", kinds: ["skip_daily_loss"] },
@@ -61,6 +63,9 @@ export const REASON_CODES = [
   "expiry_guard",
   "exit_remainder",
   "closed_outside",
+  "signal_loss",
+  "after_signal_loss_sell",
+  "pass_wont_cover",
   "buy_unconfirmed",
   "sell_unconfirmed",
   "buy_partly_filled",
@@ -191,6 +196,8 @@ export interface Signals {
   /** feed = the feed's own time; activity_log = when the agent last logged handling a signal */
   last_signal_from: "feed" | "activity_log" | null;
   pass: Pass;
+  /** null while exit signals can reach the agent; else since when they can't and why */
+  exit_loss: ExitLoss | null;
   /** practice mode with the AgentHC feed: what the owner's rules would have taken from the feed's closed trades of the past days (dry_run_preview); null when it is off or does not apply */
   preview: WouldHave | null;
 }
@@ -227,6 +234,19 @@ export interface Pass {
   status: "active" | "exits_only" | "waiting" | "none" | "unknown";
   days_left: number | null;
   auto_pay: boolean;
+  /** today is the last day the prepaid pass covers new trades (its last signal day was charged today) */
+  last_day: boolean;
+  /** when a used-up pass stops getting exit signals, if AgentHC said */
+  exits_until: Iso | null;
+}
+
+export interface ExitLoss {
+  since: Iso;
+  cause: "pass_ended" | "pass_unpaid" | "pass_unchecked" | "no_day_pass" | "day_pass_off" | "day_pass_short" | "day_pass_failed" | "day_pass_undecided" | "day_pass_refused" | "feed_error" | "feed_not_live" | "feed_refused";
+  /** when the agent sells what it holds today because of it (the no-signal sell); null = it won't today */
+  sell_at: Iso | null;
+  /** true: the agent will sell its positions itself at sell_at unless exit signals come back */
+  armed: boolean;
 }
 
 export interface Market {
