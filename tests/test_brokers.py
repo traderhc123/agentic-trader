@@ -525,7 +525,13 @@ class _FakeTradeCtx:
     def get_acc_list(self):
         return self.sdk.RET_OK, _FakeDF([{"acc_id": 1}])
 
+    def position_list_query(self, **kw):  # what the account holds
+        return self.sdk.RET_OK, _FakeDF([{"code": c, "qty": q}
+                                         for c, q in self.sdk.holdings.items()])
+
     def order_list_query(self, **kw):  # the exit's fill check: filled
+        if not kw.get("order_id"):
+            return self.sdk.RET_OK, _FakeDF([])  # no other order working
         qty = self.sdk.orders[-1]["qty"] if self.sdk.orders else 0
         return self.sdk.RET_OK, _FakeDF([{"order_id": kw.get("order_id"),
                                           "order_status": "FILLED_ALL",
@@ -554,10 +560,11 @@ class _FakeSDK:
     class SecurityFirm:
         FUTUINC = "FUTUINC"
 
-    def __init__(self, ask=1.5):
+    def __init__(self, ask=1.5, holdings=None):
         self.orders = []
         self.unlocked = []
         self._ask = ask
+        self.holdings = dict(holdings or {})  # code -> contracts held
 
     def OpenSecTradeContext(self, **kw):
         return _FakeTradeCtx(self)
@@ -613,7 +620,7 @@ def test_moomoo_execute_entry_dedupes(monkeypatch):
 
 
 def test_moomoo_execute_exit_closes_what_it_opened(monkeypatch):
-    sdk = _FakeSDK(ask=2.0)
+    sdk = _FakeSDK(ask=2.0, holdings={"US.SPY260710C752000": 2})
     monkeypatch.setattr(moomoo, "_sdk", lambda: sdk)
     state = {"positions": {"SPY|2026-07-10|752.0|C":
                            {"option_id": "US.SPY260710C752000", "qty": 2}}}

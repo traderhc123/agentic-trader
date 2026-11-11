@@ -52,6 +52,7 @@ class FakeMoomoo:
         self.bid, self.ask = bid, ask
         self.quote_error, self.quote_ret = quote_error, quote_ret
         self.orders = []
+        self.holdings = {CODE: 2}  # the account holds the ledger rows' contract
 
     def OpenQuoteContext(self, **kw):
         sdk = self
@@ -78,9 +79,15 @@ class FakeMoomoo:
                 return sdk.RET_OK, _Rows([{"order_id": f"mm-{len(sdk.orders)}"}])
 
             def order_list_query(self, **kw):
+                if not kw.get("order_id"):  # no other order is working
+                    return sdk.RET_OK, _Rows([])
                 return sdk.RET_OK, _Rows([{"order_id": kw.get("order_id"),
                                            "order_status": "FILLED_ALL",
                                            "dealt_qty": sdk.orders[-1]["qty"]}])
+
+            def position_list_query(self, **kw):  # what the account holds
+                return sdk.RET_OK, _Rows([{"code": c, "qty": q}
+                                          for c, q in sdk.holdings.items()])
 
             def close(self):
                 pass

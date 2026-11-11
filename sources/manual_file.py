@@ -23,6 +23,8 @@ import hashlib
 import json
 import os
 
+from sources import log_ignored, never_short_reason
+
 NAME = "manual"
 DESCRIPTION = "Your own commands from a local commands.jsonl file (self-directed)"
 
@@ -46,8 +48,14 @@ def poll(cfg, state, save_state=lambda s: None):
                 cmd = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(cmd, dict):
+                continue
             action = str(cmd.get("action", "")).lower()
-            if action not in ("enter", "exit"):
+            event = {"enter": "ENTERED", "exit": "EXITED"}.get(action, action)
+            raw = {k: v for k, v in cmd.items() if k != "action"}
+            why = never_short_reason(raw, event)
+            if why:
+                log_ignored("commands.jsonl", cmd, why)
                 continue
             try:
                 events.append({

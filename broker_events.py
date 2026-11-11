@@ -42,14 +42,21 @@ NOTIFY = {"order_failed", "skip_budget", "skip_no_quote", "skip_no_contract",
           "broker_lookup_failed"}
 
 
-def report(kind, message, placed=False):
+def report(kind, message, placed=False, reason=None, **facts):
     """Called by broker adapters. Never raises. placed=True for a problem
     with an order that went in and may have filled (the alert then says
-    "check this trade" instead of "trade NOT placed")."""
+    "check this trade" instead of "trade NOT placed"). reason: why an order
+    was NOT sent (brokers/order_guard.py: "nothing_held",
+    "holdings_unknown", "short_seen", "invalid") — the agent acts on it;
+    facts: extra values that go with it (e.g. short=n)."""
     try:
-        ev = {"kind": str(kind), "message": str(message)[:400]}
+        ev = {"kind": str(kind), "message": str(message)[:600]}
         if placed:
             ev["placed"] = True
+        if reason:
+            ev["reason"] = str(reason)
+        for k, v in facts.items():
+            ev[k] = v
         _events.append(ev)
     except Exception:
         pass
