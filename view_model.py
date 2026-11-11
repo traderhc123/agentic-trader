@@ -1632,18 +1632,19 @@ def _pass(cfg, state, now):
     return none
 
 
-def _exit_loss(cfg, state, now, blocked=False):
+def _exit_loss(cfg, state, now, blocked=False, acct=None):
     """Since when no exit signal can reach the agent and why, and when it
     sells what it holds because of that (agent.signal_loss_tick) — None
     while exit signals arrive. `blocked`: nothing will sell then (the agent
-    is stopped or on a full hold, or practice mode holds real sells)."""
+    is stopped or on a full hold, or practice mode holds real sells).
+    `acct`: the broker account in use (rows from another are never sold)."""
     import agent as A
     rec = state.get("signal_loss")
     if not isinstance(rec, dict) or _num(rec.get("since")) is None:
         return None
     try:
         at = None if blocked else A.signal_loss_sell_at(
-            cfg, state, now.astimezone(A.MARKET_TZ))
+            cfg, state, now.astimezone(A.MARKET_TZ), acct=acct)
     except Exception:
         at = None   # can't tell: never promise a sale
     if at:
@@ -2053,7 +2054,7 @@ def build_status(cfg, state, rows, runtime=None, now=None,
         "last_signal_from": signal_from,
         "pass": _pass(cfg, state, now),
         "exit_loss": _exit_loss(cfg, state, now, blocked=bool(
-            not running or hold or c["holds_real_sells"])),
+            not running or hold or c["holds_real_sells"]), acct=c["acct"]),
         "preview": _would_have(rt.get("preview")),
     }
     market = _market(cfg, now)

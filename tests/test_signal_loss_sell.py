@@ -526,3 +526,45 @@ def test_the_activity_rows_have_their_own_codes_and_checks(monkeypatch, no_polic
     ids = vm.check_ids()
     assert ids.index("before_expiry_guard") < ids.index("exits_reachable") \
         < ids.index("pass_covers_close") < ids.index("daily_cap")
+
+
+# ── a row from another broker account or mode (review) ──────────────────────
+
+def test_a_row_from_another_account_is_never_promised_a_sale(sent):
+    """The agent never sells a row opened in another broker account or
+    mode (_check_before_exit: blocked): no warning, banner or sell time
+    promises that it does, and no sale is tried for it."""
+    state = _state(KEY, since=et(13, 0), acct="robinhood:someother")
+    b = Broker()
+    assert _tick(state, b, et(13, 10)) == []
+    (w,) = _warnings(sent)
+    assert "RIVN 2026-11-13 $13.5 C" in w
+    assert "If exit signals are not back" not in w and "sells it itself" not in w
+    assert "different broker account or mode" in w
+    assert "sell it yourself at" in w
+    assert agent.signal_loss_sell_at({}, state, et(13, 20)) is None
+    (ban,) = agent.signal_loss_banner({}, state, et(13, 20))
+    assert "itself at" not in ban["text"]
+    assert "different broker account or mode" in ban["text"]
+    for t in ((15, 30), (15, 40), (15, 50)):
+        assert _tick(state, b, et(*t)) == []
+    assert b.calls == [] and KEY in state["positions"]
+    assert not [r for r in _log() if r.get("action") in ("exit", "exit_failed")]
+
+
+def test_with_rows_in_both_accounts_only_this_account_s_is_sold(sent):
+    here = agent._account_tag({}, None, object())
+    state = _state(KEY, since=et(13, 0), acct=here)
+    state["positions"][TODAY_KEY] = {"option_id": "opt-2", "qty": 1,
+                                     "live": True, "acct": "robinhood:other"}
+    b = Broker()
+    _tick(state, b, et(13, 10))
+    (w,) = _warnings(sent)
+    assert "the agent sells RIVN 2026-11-13 $13.5 C itself" in w
+    assert "It does not sell SPY 2026-11-06 $600.0 P" in w
+    (ban,) = agent.signal_loss_banner({}, state, et(13, 20))
+    assert "It sells your 1 real position itself at 15:30 ET" in ban["text"]
+    assert "does not sell the other 1" in ban["text"]
+    assert _tick(state, b, et(15, 30))
+    assert [e["event_id"] for e in b.calls] == [f"no-signal|{KEY}|{DAY}"]
+    assert TODAY_KEY in state["positions"]

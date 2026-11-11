@@ -1933,6 +1933,24 @@ test("the no-signal sell: one positions note says when, in the dashboard's words
   for (const p of off.positions.filter((x) => x.real)) assert.ok(!/It sells this at/.test(nextSay(p, off).text));
 });
 
+test("the no-signal sell counts only the positions it sells (one is in another account)", { skip }, () => {
+  const s0 = states.find(([n]) => n === "signal-loss-sell")[1];
+  const [first, ...rest] = s0.positions.filter((x) => x.real);
+  const other = { ...first, next: { ...first.next, action: "unmanaged", reason_code: "other_account" } };
+  const s = { ...s0, positions: s0.positions.map((p) => (p === first ? other : p)) };
+  const pos = notes(s, "ok", "today").filter((n) => n.codes.includes("positions_unmanaged"));
+  assert.equal(pos.length, 1);
+  assert.equal(
+    pos[0].text,
+    `No exit signals reach the agent (your signal pass has run out). It sells your ${rest.length} real positions itself at 3:30 PM ET unless they are back. It does not sell the other 1: each position says why.`,
+  );
+  // none it sells: the plain positions note, never a sale time
+  const none = { ...s0, positions: s0.positions.map((p) => (p.real ? { ...p, next: { ...p.next, action: "unmanaged", reason_code: "other_account" } } : p)) };
+  const nonePos = notes(none, "ok", "today").filter((n) => n.codes.includes("positions_unmanaged"));
+  assert.equal(nonePos.length, 1);
+  assert.ok(!/itself at 3:30 PM ET/.test(nonePos[0].text), nonePos[0].text);
+});
+
 test("the no-signal sell while the pass is active but the feed is not live: no 'sold on exit signals'", { skip }, () => {
   const s = states.find(([n]) => n === "signal-loss-feed-not-live")[1];
   assert.equal(s.signals.exit_loss.armed, true);

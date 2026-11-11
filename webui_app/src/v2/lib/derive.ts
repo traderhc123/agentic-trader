@@ -56,6 +56,13 @@ export function unwatched(s: Status): Position[] {
   return list.length ? list : rp;
 }
 
+/** How many of these real positions the no-signal sell acts on: those
+ *  not sold only because no exit signal reaches the agent (a position in
+ *  another broker account, past expiry or with no bid is not sold). */
+function selling(rp: Position[]): number {
+  return rp.filter((p) => GUARD_STILL.includes(p.next.reason_code)).length;
+}
+
 /** "Your 5 real positions are" / "1 of your 5 real positions is" */
 function notSold(s: Status): string {
   const n = s.real_positions;
@@ -396,7 +403,7 @@ export function notes(s: Status, l: Link, here?: Go | "today" | "activity" | "re
           (s.broker.last_error ? ` The broker's last answer: “${s.broker.last_error}”.` : ""),
       }),
     );
-  else if (l === "ok" && n && !s.real_positions_managed && sellsFor(s) && s.signals.exit_loss) {
+  else if (l === "ok" && n && !s.real_positions_managed && sellsFor(s) && s.signals.exit_loss && selling(rp) > 0) {
     // no exit signals, and the agent sells what it holds itself before the
     // close: the one note about these positions (the agent's own line about
     // it is this same fact, so it is not folded in again below)
@@ -407,7 +414,9 @@ export function notes(s: Status, l: Link, here?: Go | "today" | "activity" | "re
         level: "crit",
         icon: "alert",
         title: `${plural(n, "real position")}: no exit signals`,
-        text: `No exit signals reach the agent (${exitLossWhy(s.signals.exit_loss)}). It sells your ${plural(n, "real position")} itself at ${sellsFor(s)} unless they are back.`,
+        text:
+          `No exit signals reach the agent (${exitLossWhy(s.signals.exit_loss)}). It sells your ${plural(selling(rp), "real position")} itself at ${sellsFor(s)} unless they are back.` +
+          (selling(rp) < n ? ` It does not sell the other ${n - selling(rp)}: each position says why.` : ""),
       }),
     );
   } else if (l === "ok" && n && !s.real_positions_managed) {

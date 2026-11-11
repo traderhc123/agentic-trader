@@ -4364,6 +4364,22 @@ def _signal_loss_time(cfg, day):
     return max(_OPEN_MIN, at - (_REGULAR_CLOSE_MIN - _close_min(cfg, day)))
 
 
+def _signal_loss_elsewhere(row, acct):
+    """True for a real row opened in another broker account or mode than
+    the one the agent uses now (`acct`): the agent never sells it
+    (_check_before_exit: "blocked"), so no warning, banner or sell time
+    promises a sale of it."""
+    return bool(acct and _opened_live(row) and row.get("acct")
+                and row["acct"] != acct)
+
+
+def _signal_loss_acct(cfg, broker=None, client=None):
+    try:
+        return _account_tag(cfg, broker, client)
+    except Exception:
+        return None
+
+
 def _signal_loss_rows(state):
     """[(key, row)] ledger rows that hold contracts or have an order
     working, of every expiry."""
@@ -4385,16 +4401,26 @@ def _broker_label(cfg, broker=None):
 
 
 def _signal_loss_warning(cfg, rec, keys, now_et, sell_m, close_m, broker=None,
-                         held=False):
+                         held=False, elsewhere=()):
     """Note W: what the agent will do about the positions it can't get an
     exit signal for, and when. `held`: a full hold (agent.cmd_run), which
-    blocks every order, this sale included."""
-    one = len(keys) == 1
+    blocks every order, this sale included. `elsewhere`: real rows opened
+    in another broker account or mode, which the agent never sells."""
+    elsewhere = list(elsewhere)
+    every = list(keys) + elsewhere
+    one = len(every) == 1
     it = "it" if one else "them"
-    contracts = ", ".join(_contract_label(k) for k in keys)
+    contracts = ", ".join(_contract_label(k) for k in every)
     head = (f"agentic-trader: no exit signals have reached your agent since "
             f"{_clock_et(rec['since'], now_et)} ET ({_signal_loss_why(rec.get('cause'))}). "
             f"It holds {contracts}. ")
+    other = ""
+    if elsewhere:
+        o = "it" if len(elsewhere) == 1 else "them"
+        other = (f"It does not sell {', '.join(_contract_label(k) for k in elsewhere)}"
+                 f" ({'it was' if o == 'it' else 'they were'} opened in a "
+                 "different broker account or mode than the agent uses now): "
+                 f"sell {o} yourself at {_broker_label(cfg, broker)}. ")
     if held:
         return head + (f"The agent is on hold, so it places no orders: it does "
                        f"not sell {it} while the hold lasts. Watch {it} and sell "
@@ -4403,18 +4429,26 @@ def _signal_loss_warning(cfg, rec, keys, now_et, sell_m, close_m, broker=None,
         return head + (f"The agent will not sell {it} on its own (the no-signal "
                        f"sell is switched off): watch {it} and sell {it} "
                        f"yourself at {_broker_label(cfg, broker)}.")
+    if not keys:
+        return head + other.rstrip()
     now_m = now_et.hour * 60 + now_et.minute
     at_m = max(sell_m, now_m + -(-SIGNAL_LOSS_LEAD_S // 60)
                + (1 if now_et.second else 0))
     if at_m >= close_m:
         configured = _et_hhmm(cfg, "signal_loss_sell_et", SIGNAL_LOSS_DEFAULT)
-        return head + ("The market closes before the agent would sell (it gives "
-                       "15 minutes' notice first), so it does not sell today. If "
-                       "exit signals are still missing tomorrow, it sells at "
-                       f"{_hm(configured)} ET.")
+        return head + other + (
+            "The market closes before the agent would sell (it gives "
+            "15 minutes' notice first), so it does not sell today. If "
+            "exit signals are still missing tomorrow, it sells at "
+            f"{_hm(configured)} ET.")
     fix = _signal_loss_fix(cfg, rec.get("cause"))
-    return head + (f"If exit signals are not back by {_hm(at_m)} ET today, the "
-                   f"agent sells {it} itself, with a limit order 5% under the "
+    # with rows it won't sell listed too, name the ones it sells
+    sold = (", ".join(_contract_label(k) for k in keys) if elsewhere else it)
+    one = len(keys) == 1
+    it = "it" if one else "them"
+    return head + other + (
+                   f"If exit signals are not back by {_hm(at_m)} ET today, the "
+                   f"agent sells {sold} itself, with a limit order 5% under the "
                    f"bid, so {'it is' if one else 'they are'} not carried past "
                    "the close with nobody watching. This is not a price stop: "
                    "it happens only because the signals stopped. "
@@ -4555,32 +4589,39 @@ def _signal_loss_tick(cfg, state, save_state, broker, client, paused, now_et):
     sell_m = _signal_loss_time(cfg, day)
     now = now_et.timestamp()
     now_m = now_et.hour * 60 + now_et.minute
-    real = [k for k, r in rows if _opened_live(r)]
+    acct = _signal_loss_acct(cfg, broker, client)
+    elsewhere = [k for k, r in rows if _signal_loss_elsewhere(r, acct)]
+    real = [k for k, r in rows if _opened_live(r) and k not in elsewhere]
     lasted = now - float(rec["since"]) >= SIGNAL_LOSS_WARN_S
-    if real and lasted and paused and rec.get("held_told_day") != day:
+    if (real or elsewhere) and lasted and paused \
+            and rec.get("held_told_day") != day:
         # a full hold blocks the sale: say so, once a day; this is no
         # notice of a sale (warned_at stays unset: once the hold ends the
         # real warning goes out, and the sale waits SIGNAL_LOSS_LEAD_S)
         rec["held_told_day"] = day
         _signal_loss_save(state, save_state)
         msg = _signal_loss_warning(cfg, rec, real, now_et, sell_m, close_m,
-                                   broker, held=True)
+                                   broker, held=True, elsewhere=elsewhere)
         print(msg)
         notify(cfg, msg, priority="high")
-    elif (real and lasted and not paused and rec.get("warned_day") != day
+    elif ((real or elsewhere) and lasted and not paused
+            and rec.get("warned_day") != day
             and _signal_loss_warn_due(state, day, sell_m, now_m)):
         rec["warned_at"], rec["warned_day"] = now, day
         told = _signal_loss_day(state, day)
         state["signal_loss_day"] = {**told, "day": day,
                                     "warns": int(told.get("warns") or 0) + 1}
         _signal_loss_save(state, save_state)
-        msg = _signal_loss_warning(cfg, rec, real, now_et, sell_m, close_m, broker)
+        msg = _signal_loss_warning(cfg, rec, real, now_et, sell_m, close_m,
+                                   broker, elsewhere=elsewhere)
         print(msg)
         notify(cfg, msg, priority="high")
     if paused or sell_m is None or now_m < sell_m:
         return []
     done = []
     for key, row in rows:
+        if key in elsewhere:
+            continue   # never sold from here: the warning said so
         if _opened_live(row):
             told = rec.get("warned_at") if rec.get("warned_day") == day else None
         else:  # practice rows: no warning goes out for them
@@ -4594,19 +4635,22 @@ def _signal_loss_tick(cfg, state, save_state, broker, client, paused, now_et):
     return done
 
 
-def signal_loss_sell_at(cfg, state, now_et=None):
+def signal_loss_sell_at(cfg, state, now_et=None, acct=None):
     """When today's no-signal sell will act (epoch seconds) while the agent
     has lost its exit source and holds a position: the sell time, or 15
     minutes after the warning when that is later (a warning still to come
     counts from when it can go out). None when nothing is lost or held, the
-    sell is off, it is not a trading day, or the close comes first. Never
-    raises."""
+    sell is off, it is not a trading day, or the close comes first. Rows
+    from another broker account or mode (`acct`: the one in use, from cfg
+    when not given) are never sold, so they don't count. Never raises."""
     try:
         now_et = now_et or _et_now()
         rec = state.get("signal_loss")
         if not isinstance(rec, dict) or not isinstance(rec.get("since"), (int, float)):
             return None
-        rows = _signal_loss_rows(state)
+        acct = acct or _signal_loss_acct(cfg)
+        rows = [(k, r) for k, r in _signal_loss_rows(state)
+                if not _signal_loss_elsewhere(r, acct)]
         if not rows or not is_trading_day(cfg, now_et.date()):
             return None
         day = now_et.date().isoformat()
@@ -4641,11 +4685,12 @@ def signal_loss_sell_at(cfg, state, now_et=None):
         return None
 
 
-def signal_loss_banner(cfg, state, now_et=None, paused=False):
+def signal_loss_banner(cfg, state, now_et=None, paused=False, acct=None):
     """The classic dashboard's line while the owner has been warned today
     that the agent sells what it holds for lack of exit signals:
     [{"level": "urgent", "text": ...}] or []. `paused`: a full hold, which
-    blocks that sale. Never raises."""
+    blocks that sale. `acct`: the broker account in use (from cfg when not
+    given); rows from another are never sold. Never raises."""
     try:
         now_et = now_et or _et_now()
         rec = state.get("signal_loss")
@@ -4654,18 +4699,30 @@ def signal_loss_banner(cfg, state, now_et=None, paused=False):
                 rec.get("warned_day"), rec.get("held_told_day"))
                 or not _in_session(cfg, now_et)):
             return []
-        real = [k for k, r in _signal_loss_rows(state) if _opened_live(r)]
-        if not real:
+        acct = acct or _signal_loss_acct(cfg)
+        every = [(k, r) for k, r in _signal_loss_rows(state) if _opened_live(r)]
+        if not every:
             return []
+        real = [k for k, r in every if not _signal_loss_elsewhere(r, acct)]
+        m = len(every) - len(real)
         why = _signal_loss_why(rec.get("cause"))
-        what = f"{len(real)} real position{'' if len(real) == 1 else 's'}"
-        at = signal_loss_sell_at(cfg, state, now_et)
+
+        def count(n):
+            return f"{n} real position{'' if n == 1 else 's'}"
+        what = count(len(every))
+        at = signal_loss_sell_at(cfg, state, now_et, acct=acct)
         if paused:
             text = (f"No exit signals reach the agent ({why}). It is on hold, "
                     f"so it does not sell your {what} itself while the hold "
-                    f"lasts: sell {'it' if len(real) == 1 else 'them'} yourself.")
+                    f"lasts: sell {'it' if len(every) == 1 else 'them'} yourself.")
         elif rec.get("warned_day") != day:
             return []   # told only about the hold, which has ended
+        elif not real:
+            text = (f"No exit signals reach the agent ({why}). Your {what} "
+                    f"{'was' if m == 1 else 'were'} opened in a different "
+                    "broker account or mode than the agent uses now, so it "
+                    f"does not sell {'it' if m == 1 else 'them'}: sell "
+                    f"{'it' if m == 1 else 'them'} yourself.")
         elif _signal_loss_time(cfg, day) is None:
             text = (f"No exit signals reach the agent ({why}). The no-signal "
                     f"sell is off: sell your {what} yourself.")
@@ -4675,9 +4732,12 @@ def signal_loss_banner(cfg, state, now_et=None, paused=False):
         else:
             t = datetime.fromtimestamp(at, MARKET_TZ)
             text = (f"No exit signals reach the agent ({why}). It sells your "
-                    f"{what} itself at "
+                    f"{count(len(real))} itself at "
                     f"{_hm(t.hour * 60 + t.minute + (1 if t.second else 0))} ET "
-                    "unless they are back.")
+                    "unless they are back."
+                    + (f" It does not sell the other {m}, opened in a "
+                       "different broker account or mode: sell "
+                       f"{'it' if m == 1 else 'them'} yourself." if m else ""))
         return [{"level": "urgent", "text": text}]
     except Exception:
         return []
@@ -6596,7 +6656,8 @@ def cmd_run(app_window=False):
             # the owner's Pause doesn't stop the expiry guard; a full hold does
             "expiry_warnings": _durability_banner() + expiry_banner(
                 c, st, paused=bool(_full_hold_note()), acct=_status_acct(c))
-            + signal_loss_banner(c, st, paused=bool(_full_hold_note())),
+            + signal_loss_banner(c, st, paused=bool(_full_hold_note()),
+                                 acct=_status_acct(c)),
             "problems": _problems_with_ai_block(c),
             "budget_hints": _budget_hints(c),
             "would_have": dry_run_preview.summary(c),
@@ -6637,7 +6698,8 @@ def cmd_run(app_window=False):
             out += [{**w, "code": "signal_loss",
                      "condition": "positions_unmanaged"}
                     for w in signal_loss_banner(
-                        c, st, paused=bool(_full_hold_note()))]
+                        c, st, paused=bool(_full_hold_note()),
+                        acct=_status_acct(c))]
             if cash.get("warning"):
                 out.append({"level": "warn", "code": "low_cash",
                             "condition": "low_cash", "text": cash["warning"]})
