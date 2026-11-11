@@ -769,3 +769,42 @@ a.btn{text-decoration:none}
 .upd-list h4{font:650 15px/1.35 var(--sans)}
 .upd-list pre{white-space:pre-wrap;word-break:break-word;font:13px/1.45 ui-monospace,Consolas,Menlo,monospace;background:var(--well);border:1px solid var(--line);border-radius:6px;padding:8px 12px;max-height:12rem;overflow:auto}
 .upd-said{white-space:pre-wrap;overflow-wrap:anywhere}
+
+/* ───────── Settings forms: edit in place, confirm against the server's preview ───────── */
+.editor .field{min-width:0}
+.editor-row .field{flex:1 1 180px}
+.input-num{max-width:200px;font-weight:700}
+.input-money .input-num{max-width:200px}
+textarea.input{min-height:120px;resize:vertical;font-size:15px;line-height:1.45}
+.risk.down .ic{color:var(--ink2)}
+.risk.same{border-style:dashed}
+.changes{display:grid;gap:12px}
+.change-row{display:grid;gap:8px}
+.change-row h4{font:650 14px/1.3 var(--sans);color:var(--ink2)}
+.change .new{color:var(--ink)}
+.doesnot{display:grid;gap:4px;list-style:disc;padding-left:20px}
+.callout-bad{border-color:var(--bad-line);background:var(--bad-tint)}
+.callout-bad p{color:var(--ink)}
+.rule-text{grid-column:1 / -1;margin-top:8px;white-space:pre-wrap;font-size:14px;color:var(--ink2);border-left:3px solid var(--line2);padding-left:12px;overflow-wrap:anywhere}
+.bolt{display:block;font:13px/1.4 ui-monospace,Consolas,Menlo,monospace;background:var(--well);border:1px solid var(--line);border-radius:6px;padding:8px 12px;word-break:break-all;max-height:6.5em;overflow:auto;user-select:all}
+.note .agent-said{grid-column:2;margin-top:4px}
+.note .agent-said p{grid-column:auto;margin-top:4px}
+/* an on/off setting: the word says the state, the knob shows it */
+.switch{gap:10px;min-width:96px;justify-content:flex-start}
+.switch .knob{position:relative;width:34px;height:20px;border-radius:999px;border:1.5px solid var(--line2);background:var(--sunk);flex:none}
+.switch .knob::after{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:var(--ink3)}
+.switch[aria-checked="true"] .knob{background:var(--ink);border-color:var(--ink)}
+.switch[aria-checked="true"] .knob::after{left:16px;background:var(--surface)}
+.switch[aria-checked="mixed"] .knob{border-style:dotted}
+.setrow .act .err{margin-top:6px;white-space:normal;max-width:240px}
+@media (max-width:760px){
+  .input-num,.input-money .input-num{max-width:none}
+  .editor{padding:12px}
+  .editor-row .btn{flex:1 1 auto}
+  .setrow .act .err{max-width:none}
+  .switch{min-height:44px}
+}
+@media (max-width:760px){
+  /* a wide value (the frame legend) goes under its label on a phone */
+  .setrow .val:has(.legendrow){grid-row:auto;grid-column:1 / -1;justify-self:start;text-align:left}
+}
