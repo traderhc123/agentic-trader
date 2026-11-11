@@ -7,7 +7,7 @@
 // server said so, and the page then reads the settings again and shows them.
 import { useId, useState, type ReactNode } from "react";
 import type { Change, Direction, Preview } from "../lib/settingsApi";
-import { DIRECTION_WORDS, confirmLabel, valueWords } from "./lib/settings";
+import { DIRECTION_WORDS, ackGiven, confirmLabel, valueWords } from "./lib/settings";
 import { confirmBody, send, type Sent } from "./lib/http";
 import { Dialog, Icon } from "./ui";
 
@@ -103,7 +103,9 @@ export function ReviewDialog<Done>({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [again, setAgain] = useState(false);
-  const [ticked, setTicked] = useState(false);
+  // the token of the preview the box was ticked for (see ackGiven)
+  const [tickedFor, setTickedFor] = useState<string | null>(null);
+  const ticked = ackGiven(tickedFor, preview.token);
   const ackId = useId();
 
   const go = async () => {
@@ -142,7 +144,7 @@ export function ReviewDialog<Done>({
         <>
           {ack && !again && (
             <label className="check ack">
-              <input type="checkbox" checked={ticked} onChange={(e) => setTicked(e.target.checked)} />
+              <input type="checkbox" checked={ticked} onChange={(e) => setTickedFor(e.target.checked ? preview.token : null)} />
               <span id={ackId}>{ack}</span>
             </label>
           )}

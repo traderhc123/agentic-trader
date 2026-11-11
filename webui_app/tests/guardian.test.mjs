@@ -56,6 +56,7 @@ import { UPDATE } from "../src/v2/lib/copy.ts";
 import { API, FAILED, confirmBody, getJson, postJson, send } from "../src/v2/lib/http.ts";
 import {
   MOVE_TOOL,
+  ackGiven,
   SETUP_FROM_V2,
   confirmLabel,
   limitMeans,
@@ -912,6 +913,17 @@ test("settings: a limits save sends only what changed, and never the mode", () =
   assert.deepEqual(limitsPayload(saved, { other: null }), { trade_size: { other: { mode: "same" } } });
   for (const p of [limitsPayload(saved, { max_open_positions: 9 }), limitsPayload(saved, {})])
     for (const k of Object.keys(p)) assert.ok(!/dry|mode|paused/.test(k), k);
+});
+
+test("going LIVE: a tick given for one preview never confirms another", () => {
+  assert.equal(ackGiven(null, "t1"), false);
+  assert.equal(ackGiven("t1", "t1"), true);
+  // the settings changed, Review again brought a new preview: unticked
+  assert.equal(ackGiven("t1", "t2"), false);
+  // and the dialog keeps the tick as that token, never as a bare true/false
+  const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../src/v2/Forms.tsx"), "utf8");
+  assert.match(src, /const ticked = ackGiven\(tickedFor, preview\.token\)/);
+  assert.doesNotMatch(src, /setTicked\(/);
 });
 
 test("settings: a Robinhood sign-in is over when the agent says so, however it ended", () => {

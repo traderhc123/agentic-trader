@@ -238,6 +238,13 @@ export function v2Words(text: string): string {
     .replace(new RegExp(String.raw`\s*\(dashboard${to}[^)]*\)`, "gi"), " (Settings)");
 }
 
+// ── the going-LIVE tick box ──────────────────────────────────────────────────
+
+/** The tick box beside "Go LIVE" confirms ONE preview: it is remembered as
+ *  the token of the preview it was ticked for, so any new preview (Review
+ *  again, or the server answering with a fresh one) starts unticked. */
+export const ackGiven = (tickedFor: string | null, token: string): boolean => tickedFor !== null && tickedFor === token;
+
 // ── the Robinhood sign-in, as the agent saw it end ──────────────────────────
 
 /** Where Robinhood takes applications for options trading (the classic
