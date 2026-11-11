@@ -54,7 +54,7 @@ function UnsoldList({ p, after }: { p: Preview; after: string }) {
 }
 
 /** While the first POST asks the server for its preview, or when it gives none. */
-function Asking({ title, ask, onClose }: { title: string; ask: { kind: "asking" } | Asked; onClose: () => void }) {
+export function Asking({ title, ask, onClose }: { title: string; ask: { kind: "asking" } | Asked; onClose: () => void }) {
   return (
     <Dialog
       title={title}
@@ -85,7 +85,7 @@ function Asking({ title, ask, onClose }: { title: string; ask: { kind: "asking" 
   );
 }
 
-function usePreview(path: string, payload: Record<string, unknown>) {
+export function usePreview(path: string, payload: Record<string, unknown>) {
   const [ask, setAsk] = useState<{ kind: "asking" } | Asked>({ kind: "asking" });
   useEffect(() => {
     askPreview(path, payload).then(setAsk);

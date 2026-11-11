@@ -5,18 +5,18 @@
 // page says "paid" only when the agent's own pass check says so. The wallet
 // is shown here, read-only.
 import { useEffect, useRef, useState } from "react";
-import type { Invoice, PassCheck, PassOptions, Preview, WalletBalance } from "../../lib/settingsApi";
+import type { Invoice, PassCheck, PassOptions, Preview, WalletBalance, WalletPage } from "../../lib/settingsApi";
 import type { Status } from "../../lib/viewModel";
-import { FieldError, ReviewDialog, SettingsDoubt, askPreview } from "../Forms";
-import { API, getJson } from "../lib/http";
-import { purchaseFate } from "../lib/settings";
-import { UNKNOWN, count, etDayKey, etWhen, plural, usd } from "../lib/format";
-import { Dialog, Stamp } from "../ui";
+import { FieldError, ReviewDialog, SettingsDoubt, Switch, askPreview } from "../Forms";
+import { API, getJson, send } from "../lib/http";
+import { purchaseFate, scopeWords, sourceWords } from "../lib/settings";
+import { UNKNOWN, count, etDayKey, etWhen, plural, tone, usd } from "../lib/format";
+import { Dialog, Icon, Stamp } from "../ui";
 import { PayCode } from "./Pay";
+import { Row } from "./Pages";
+import { ConnectWalletDialog, CreateWalletDialog, FundDialog, KeyDialog, RecurringDialog, ScopeDialog, SourceDialog } from "./SignalsDialogs";
 import type { Page } from "../App";
 
-const SOURCE_NAMES: Record<string, string> = { agenthc: "AgentHC Day Trade Ideas" };
-const sourceName = (id: string) => (Object.prototype.hasOwnProperty.call(SOURCE_NAMES, id) ? SOURCE_NAMES[id] : id);
 
 const PASS_KIND: Record<Status["signals"]["pass"]["kind"], string> = {
   prepaid: "Prepaid signal days",
@@ -241,10 +241,148 @@ function BuyDays({ page, onClose }: { page: Page; onClose: () => void }) {
   );
 }
 
-function Wallet({ page }: { page: Page }) {
+type Open = "source" | "scope" | "key" | "wallet-create" | "wallet-connect" | "wallet-fund" | "recurring" | null;
+
+/** Where the signals come from: the source, which AgentHC signals, and the
+ *  subscription key. One control each. */
+function SourcePanel({ page, open }: { page: Page; open: (o: Open) => void }) {
+  const v = page.settings.view;
+  const why = page.link === "lost" ? "This page can't reach the agent, so nothing can be changed right now." : !v ? page.settings.error || "Reading your settings…" : "";
+  const hc = v?.signals.source === "agenthc";
+  return (
+    <section className="panel">
+      <div className="ph">
+        <h2>Signal source</h2>
+      </div>
+      <Row
+        label="Source"
+        exp={!v ? UNKNOWN : sourceWords({ source: v.signals.source, site: v.signals.source_site })}
+        act={
+          <button className="btn btn-sm" data-act="source" aria-haspopup="dialog" disabled={!!why} title={why || undefined} onClick={() => open("source")}>
+            Change…
+          </button>
+        }
+      />
+      {hc && v && (
+        <Row
+          label="Which signals"
+          exp={`${scopeWords(v.signals.include_other_trades ? "all" : "main")}.${v.signals.include_other_trades ? " Other trades are sized as Rules & limits says." : ""}`}
+          act={
+            <button className="btn btn-sm" data-act="scope" aria-haspopup="dialog" disabled={!!why} onClick={() => open("scope")}>
+              {v.signals.include_other_trades ? "Main pick only…" : "Take other trades too…"}
+            </button>
+          }
+        />
+      )}
+      {hc && v && (
+        <Row
+          label="Subscription key"
+          exp={
+            v.signals.api_key.set
+              ? `Set${v.signals.api_key.last4 ? `, ending ${v.signals.api_key.last4}` : ""}. With a key, the agent needs no signal days.`
+              : "Not set. An AgentHC Premium key reads the signals instead of signal days."
+          }
+          act={
+            <button className="btn btn-sm" data-act="api-key" aria-haspopup="dialog" disabled={!!why} onClick={() => open("key")}>
+              {v.signals.api_key.set ? "Replace…" : "Add a key…"}
+            </button>
+          }
+        />
+      )}
+    </section>
+  );
+}
+
+/** Practice mode: what the owner's rules would have taken from the feed's
+ *  closed trades of the past days, and its on/off switch (one home). */
+function PreviewPanel({ page }: { page: Page }) {
+  const v = page.settings.view;
+  const w = page.s.signals.preview;
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const on = v ? v.signals.dry_run_preview : null;
+  const save = async (next: boolean) => {
+    setBusy(true);
+    setErr("");
+    const r = await send(API.signals, { dry_run_preview: next });
+    if (!r.ok) {
+      setBusy(false);
+      return setErr(r.error);
+    }
+    const nv = await page.settings.reload();
+    setBusy(false);
+    page.refresh();
+    page.say(true, `Saved. Practice preview: ${!nv ? "not read back yet" : nv.signals.dry_run_preview ? "on" : "off"}.`);
+  };
+  return (
+    <section className="panel">
+      <div className="ph">
+        <h2>What it would have taken</h2>
+        <Switch act="preview" label="Practice preview" on={on} busy={busy} disabled={page.link === "lost"} onChange={save} />
+      </div>
+      <div className="pb">
+        <FieldError id="preview-e" text={err} />
+        {on === false ? (
+          <p className="small muted">Off. On: in practice mode, this lists the feed's closed trades of the past days and whether your rules would have taken each one.</p>
+        ) : !w ? (
+          <p className="small muted">Nothing to show yet: the agent fills this in from the feed's closed trades on its next read.</p>
+        ) : w.unavailable || w.error ? (
+          <p className="small muted">{w.error ? `The last refresh failed: ${w.error}` : "The feed does not offer closed trades to preview right now."}</p>
+        ) : (
+          <>
+            <p>
+              <b>{plural(w.would_take, "trade")}</b> in the past {plural(w.days, "day")} would have been taken: {count(w.wins)} won, {count(w.breakeven)} broke even,{" "}
+              {count(w.losses)} lost
+              {w.avg_paper_pnl_pct != null && (
+                <>
+                  , <span className={tone(w.avg_paper_pnl_pct)}>{w.avg_paper_pnl_pct > 0 ? "+" : w.avg_paper_pnl_pct < 0 ? "−" : ""}{Math.abs(w.avg_paper_pnl_pct).toFixed(1)}%</span> on average
+                </>
+              )}
+              .
+            </p>
+            <p className="small muted">Paper results of the feed's own trades, not your orders: no money was involved.{w.updated_at ? ` Updated ${etWhen(w.updated_at, etDayKey(page.s.as_of))}.` : ""}</p>
+            {w.rows.length > 0 && (
+              <div className="tbl-wrap">
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>Day</th>
+                      <th>Contract</th>
+                      <th>Your rules</th>
+                      <th>Paper result</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {w.rows.map((r, i) => (
+                      <tr key={`${r.date}-${r.contract}-${i}`}>
+                        <td>{r.date}</td>
+                        <td>{r.contract}</td>
+                        <td>{r.would_take ? "Would take it" : `Would skip it${r.skip_reason ? `: ${r.skip_reason}` : ""}`}</td>
+                        <td className={tone(r.paper_pnl_pct)}>
+                          {r.paper_pnl_pct == null ? UNKNOWN : `${r.paper_pnl_pct > 0 ? "+" : r.paper_pnl_pct < 0 ? "−" : ""}${Math.abs(r.paper_pnl_pct).toFixed(1)}%`}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/** The agent's payment wallet: what it is and holds, and every control for
+ *  it (make / replace, add sats, use your own, the page link, recurring). */
+function WalletPanel({ page, open }: { page: Page; open: (o: Open) => void }) {
   const v = page.settings.view;
   const on = v?.signals.wallet_connected;
+  const w = v?.signals.wallet;
   const [bal, setBal] = useState<string>("");
+  const [link, setLink] = useState<{ err?: string; url?: string } | null>(null);
+  const lost = page.link === "lost" || !v;
   useEffect(() => {
     if (!on) return;
     let live = true;
@@ -257,34 +395,106 @@ function Wallet({ page }: { page: Page }) {
     return () => {
       live = false;
     };
-  }, [on]);
+  }, [on, w?.site]);
+  // the page link opens the wallet: fetched by POST only on this click,
+  // into a window opened by the click itself
+  const openPage = async () => {
+    setLink(null);
+    const win = window.open("", "_blank");
+    const r = await send<WalletPage>(API.walletPage, {});
+    const url = r.ok ? (r as unknown as WalletPage).url : "";
+    if (!r.ok || typeof url !== "string" || !/^https?:\/\//.test(url)) {
+      win?.close();
+      return setLink({ err: r.ok ? "The agent did not hand back a wallet page." : r.error });
+    }
+    if (win) {
+      win.opener = null;
+      win.location.href = url;
+    } else setLink({ url });
+  };
   return (
     <section className="panel">
       <div className="ph">
         <h2>Payment wallet</h2>
-        <span className="meta">Shown here; not changed from this page</span>
+        <span className="meta">The agent's own Lightning wallet, for paying day-passes by itself</span>
       </div>
-      <div className="pb">
-        <ul className="tally">
-          <li>
-            <span>Wallet</span>
-            <b>{v == null ? UNKNOWN : on ? "Connected" : "None"}</b>
-          </li>
-          {on && (
-            <li>
-              <span>In the wallet</span>
-              <b>{bal || "reading…"}</b>
-            </li>
-          )}
-          <li>
-            <span>Buys a day-pass by itself</span>
-            <b>{v == null ? UNKNOWN : v.signals.recurring ? "On" : "Off"}</b>
-          </li>
-        </ul>
-        <p className="small muted" style={{ marginTop: 8 }}>
-          Signal days bought here are paid from any Lightning wallet app you choose; this wallet is not needed for that.
-        </p>
-      </div>
+      <Row
+        label="Wallet"
+        exp={!v ? UNKNOWN : on ? `At ${w?.site ?? "an LNbits server"}.${on ? ` In it: ${bal || "reading…"}.` : ""}` : "None. Signal days bought on this page are paid from any wallet app you choose; this wallet is not needed for that."}
+        act={
+          <span className="row-acts">
+            {on && (
+              <button className="btn btn-sm btn-primary" data-act="wallet-fund" aria-haspopup="dialog" disabled={lost} onClick={() => open("wallet-fund")}>
+                Add sats…
+              </button>
+            )}
+            <button className="btn btn-sm" data-act="wallet-create" aria-haspopup="dialog" disabled={lost} onClick={() => open("wallet-create")}>
+              {on ? "Replace with a new wallet…" : "Make the agent's wallet…"}
+            </button>
+          </span>
+        }
+      />
+      {on && w?.warning && (
+        <div className="pb">
+          <div className="callout callout-warn" role="note">
+            <p>
+              <Icon name="alert" small />
+              {w.warning}
+            </p>
+          </div>
+        </div>
+      )}
+      {on && w?.page_on_file && (
+        <Row
+          label="Wallet page"
+          exp={
+            link?.err ? (
+              <span className="err">{link.err}</span>
+            ) : link?.url ? (
+              <>
+                Your browser blocked the new window:{" "}
+                <a href={link.url} target="_blank" rel="noopener noreferrer">
+                  open the wallet page
+                </a>
+                .
+              </>
+            ) : (
+              "Opens the wallet in LNbits. Whoever has this link can spend from the wallet, so this page never shows it."
+            )
+          }
+          act={
+            <button className="btn btn-sm" data-act="wallet-page" disabled={lost} onClick={openPage}>
+              <Icon name="ext" small />
+              Open the wallet page
+            </button>
+          }
+        />
+      )}
+      <Row
+        label="Your own LNbits wallet"
+        exp="Point the agent at a wallet you run instead. The current wallet's details are saved to a file first."
+        act={
+          <button className="btn btn-sm" data-act="wallet-connect" aria-haspopup="dialog" disabled={lost} onClick={() => open("wallet-connect")}>
+            Use my own wallet…
+          </button>
+        }
+      />
+      <Row
+        label="Buys a day-pass by itself"
+        exp={
+          !v
+            ? UNKNOWN
+            : v.signals.recurring
+              ? `On: each market day it reads signals, the agent pays that day's pass from this wallet${w?.autopay_cap_sats ? `, at most ${count(w.autopay_cap_sats)} sats each` : ""}.`
+              : "Off: the agent never spends from its wallet by itself."
+        }
+        val={v ? <span className="tag tag-plain">{v.signals.recurring ? "On" : "Off"}</span> : undefined}
+        act={
+          <button className="btn btn-sm" data-act="recurring" aria-haspopup="dialog" disabled={lost || (!on && !v?.signals.recurring)} onClick={() => open("recurring")}>
+            {v?.signals.recurring ? "Turn off…" : "Turn on…"}
+          </button>
+        }
+      />
     </section>
   );
 }
@@ -295,6 +505,7 @@ export function SignalsView({ page }: { page: Page }) {
   const p = sig.pass;
   const c = s.results.signal_cost;
   const [buying, setBuying] = useState(false);
+  const [open, setOpen] = useState<Open>(null);
   const reload = page.settings.reload;
   useEffect(() => {
     reload();
@@ -308,8 +519,8 @@ export function SignalsView({ page }: { page: Page }) {
         <div>
           <h1>Signals & pass</h1>
           <p>
-            Your agent acts on trade signals from its signal source{sig.source ? ` (${sourceName(sig.source)})` : ""}. This page shows what access it has
-            and when it last heard from the source, and is where you buy signal days.
+            Your agent acts on trade signals from its signal source. This page shows what access it has and when it last heard from the source, and is
+            where you choose the source, buy signal days and look after the agent's payment wallet.
           </p>
         </div>
         {page.stale && <Stamp at={page.asOf} />}
@@ -399,8 +610,17 @@ export function SignalsView({ page }: { page: Page }) {
           </div>
         </section>
       </div>
-      <Wallet page={page} />
+      <SourcePanel page={page} open={setOpen} />
+      {s.mode === "practice" && <PreviewPanel page={page} />}
+      <WalletPanel page={page} open={setOpen} />
       {buying && <BuyDays page={page} onClose={() => setBuying(false)} />}
+      {open === "source" && page.settings.view && <SourceDialog page={page} onClose={() => setOpen(null)} />}
+      {open === "scope" && page.settings.view && <ScopeDialog page={page} onClose={() => setOpen(null)} />}
+      {open === "key" && page.settings.view && <KeyDialog page={page} onClose={() => setOpen(null)} />}
+      {open === "wallet-create" && page.settings.view && <CreateWalletDialog page={page} onClose={() => setOpen(null)} />}
+      {open === "wallet-connect" && page.settings.view && <ConnectWalletDialog page={page} onClose={() => setOpen(null)} />}
+      {open === "wallet-fund" && page.settings.view && <FundDialog page={page} onClose={() => setOpen(null)} />}
+      {open === "recurring" && page.settings.view && <RecurringDialog page={page} onClose={() => setOpen(null)} />}
     </div>
   );
 }

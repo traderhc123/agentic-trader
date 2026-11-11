@@ -35,6 +35,15 @@ export type ActionId =
   | "policy"
   // Signals & pass
   | "buy-days"
+  | "source"
+  | "scope"
+  | "api-key"
+  | "preview"
+  | "wallet-create"
+  | "wallet-fund"
+  | "wallet-connect"
+  | "wallet-page"
+  | "recurring"
   // Settings
   | "broker"
   | "ai"
@@ -72,6 +81,15 @@ export const ACTION_HOME: Record<ActionId, Home> = {
   filters: "rules",
   policy: "rules",
   "buy-days": "signals",
+  source: "signals",
+  scope: "signals",
+  "api-key": "signals",
+  preview: "signals",
+  "wallet-create": "signals",
+  "wallet-fund": "signals",
+  "wallet-connect": "signals",
+  "wallet-page": "signals",
+  recurring: "signals",
   broker: "settings",
   ai: "settings",
   alerts: "settings",
@@ -171,7 +189,10 @@ export function screenOf(view: View, s: Status, l: Link): Screen {
     links.push("results");
     if (statement(s, l).empty || todayLimitsLink(s, l)) links.push("rules");
   } else if (view === "rules") controls.push("limits", "size", "filters", "policy");
-  else if (view === "signals") controls.push("buy-days");
+  else if (view === "signals") {
+    controls.push("buy-days", "source", "scope", "api-key", "wallet-create", "wallet-fund", "wallet-connect", "wallet-page", "recurring");
+    if (s.mode === "practice") controls.push("preview");
+  }
   else if (view === "settings") {
     links.push("signals");
     controls.push("broker", "ai", "alerts", "autostart", "open-at-login", "keep-awake", "move", "theme", "dashboard", "classic");

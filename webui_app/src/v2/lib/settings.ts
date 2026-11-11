@@ -187,6 +187,15 @@ export function valueWords(key: string, v: unknown): string {
   if (key === "robinhood") return v ? "Signed in" : "Not signed in";
   if (key === "agent") return v === "running" ? "Running" : v === "stopped" ? "Stopped" : "not known";
   if (key === "this_computer" && typeof v === "string" && v) return v.charAt(0).toUpperCase() + v.slice(1);
+  if (key === "source") return sourceWords(v as SourceShown | null);
+  if (key === "scope") return scopeWords(v);
+  if (key === "wallet") {
+    const w = v as { site?: string | null; new?: boolean } | null;
+    if (!w) return "None";
+    return `${w.new ? "A new wallet" : "Your own wallet"}${w.site ? ` at ${w.site}` : ""}`;
+  }
+  if (key === "wallet_fund") return isNum(v) ? `${count(v)} sats` : "not set";
+  if (key === "code" && typeof v === "string" && v) return v.charAt(0).toUpperCase() + v.slice(1);
   if (typeof v === "boolean") return v ? "On" : "Off";
   if (isNum(v)) return count(v);
   if (v == null || v === "") return "not set";
@@ -417,4 +426,35 @@ export function brokerWarning(v: SettingsView | null | undefined): string {
   if (v?.broker?.warning === "options_off")
     return "Options trading is not turned on in this Robinhood account, so Robinhood rejects the agent's orders until you apply for it at Robinhood.";
   return "";
+}
+
+// ── the signal source ───────────────────────────────────────────────────────
+
+export interface SourceShown {
+  source: string | null;
+  site?: string | null;
+}
+
+/** "AgentHC Day Trade Ideas", "Your own commands file", "A JSON feed at x". */
+export function sourceWords(v: SourceShown | null | undefined): string {
+  if (!v?.source) return "None chosen";
+  if (v.source === "agenthc") return "AgentHC Day Trade Ideas";
+  if (v.source === "manual") return "Your own commands file (commands.jsonl)";
+  if (v.source === "url") return v.site ? `A JSON feed at ${v.site}` : "A JSON feed";
+  return v.source;
+}
+
+export const scopeWords = (v: unknown): string => (v === "all" ? "The main pick and other trades" : v === "main" ? "The main pick only" : "not known");
+
+/** A feed or wallet address the agent accepts (the classic form's rule). */
+export function readAddress(text: string): Parsed<string> {
+  const t = String(text ?? "").trim();
+  if (/^https:\/\/[^\s/]+/.test(t) || /^http:\/\/(127\.0\.0\.1|localhost)([:/]|$)/.test(t)) return { ok: true, value: t };
+  return { ok: false, error: "Enter an address starting with https:// (or one on this computer)." };
+}
+
+/** Sats to add to the wallet: a whole number from 1,000 up to the wallet's
+ *  invoice cap when it has said one (the server refuses anything else). */
+export function readSats(text: string, cap: number | null | undefined): Parsed {
+  return readNumber(text, { low: 1000, high: cap && cap >= 1000 ? cap : 100_000_000, whole: true });
 }

@@ -59,6 +59,10 @@ import {
   DEPLOY_REGIONS,
   agreementWords,
   brokerWarning,
+  readAddress,
+  readSats,
+  scopeWords,
+  sourceWords,
   diffSha256,
   etClockWords,
   expiryAlertPayload,
@@ -1429,4 +1433,70 @@ test("connections: the expiry-day warning time, and Robinhood's options warning 
   assert.equal(brokerWarning({ broker: { warning: null } }), "");
   assert.equal(brokerWarning(null), "");
   assert.match(src, /\{brokerWarning\(v\)\}\{" "\}\s*<a href=\{RH_OPTIONS_URL\}/);
+});
+
+// ── PR 4 group 7: Signals & pass ───────────────────────────────────────────
+
+test("signals & pass: source, scope, key, preview and the wallet, each one control there, each the typed route", () => {
+  assert.deepEqual(
+    [API.source, API.signals, API.recurring, API.walletCreate, API.walletFund, API.walletConnect, API.walletPage, API.walletQuote, API.walletBalance],
+    ["/api/v2/settings/source", "/api/v2/settings/signals", "/api/v2/wallet/recurring", "/api/v2/wallet/create", "/api/v2/wallet/fund", "/api/v2/wallet/connect", "/api/v2/wallet/page", "/api/wallet/quote", "/api/wallet/balance"],
+  );
+  const acts = ["source", "scope", "api-key", "preview", "wallet-create", "wallet-fund", "wallet-connect", "wallet-page", "recurring"];
+  const sig = fs.readFileSync(path.join(SRC, "v2", "views", "Signals.tsx"), "utf8");
+  for (const a of acts) {
+    assert.equal(ACTION_HOME[a], "signals", a);
+    assert.equal((sig.match(new RegExp(`\\b(?:data-act|act)="${a}"`, "g")) || []).length, 1, a);
+  }
+  const dlg = fs.readFileSync(path.join(SRC, "v2", "views", "SignalsDialogs.tsx"), "utf8");
+  // two steps (the server's preview, then the token) for everything but the key
+  assert.match(dlg, /askPreview\(API\.source, payload\)/);
+  assert.match(dlg, /usePreview\(API\.signals, payload\)/);
+  assert.match(dlg, /usePreview\(API\.walletCreate, payload\)/);
+  assert.match(dlg, /askPreview\(API\.walletFund, \{ sats: n\.value \}\)/);
+  assert.match(dlg, /askPreview\(API\.walletConnect, payload\)/);
+  assert.match(dlg, /usePreview\(API\.recurring, payload\)/);
+  // the key is written, saved straight away, never read back
+  assert.match(dlg, /send\(API\.source, \{ agenthc_key: k \}\)/);
+  assert.ok(!/value=\{v\.signals\.api_key/.test(dlg));
+  // the preview switch saves straight away on the same route
+  assert.match(sig, /send\(API\.signals, \{ dry_run_preview: next \}\)/);
+  // the wallet page link: fetched by POST, only in the click's handler, never read by a GET
+  const all = sources(path.join(SRC, "v2")).map((f) => [rel(f), fs.readFileSync(f, "utf8")]);
+  const pageUses = all.flatMap(([f, t]) => [...t.matchAll(/(\w+)(?:<\w+>)?\(API\.walletPage\b/g)].map((m) => `${f} ${m[1]}`));
+  assert.deepEqual(pageUses, ["views/Signals.tsx send"]);
+  assert.match(sig, /const openPage = async \(\) => \{[\s\S]*?window\.open\("", "_blank"\)[\s\S]*?send<WalletPage>\(API\.walletPage, \{\}\)/);
+  assert.match(sig, /data-act="wallet-page" disabled=\{lost\} onClick=\{openPage\}/);
+  for (const [f, t] of all) assert.ok(!/lnbits_wallet_page|wallet\?usr=/.test(t), f);
+  // the words
+  assert.equal(sourceWords({ source: "agenthc" }), "AgentHC Day Trade Ideas");
+  assert.equal(sourceWords({ source: "url", site: "feed.example" }), "A JSON feed at feed.example");
+  assert.equal(sourceWords({ source: "manual" }), "Your own commands file (commands.jsonl)");
+  assert.equal(sourceWords(null), "None chosen");
+  assert.equal(scopeWords("all"), "The main pick and other trades");
+  assert.equal(scopeWords("main"), "The main pick only");
+  assert.equal(valueWords("source", { source: "url", site: "feed.example" }), "A JSON feed at feed.example");
+  assert.equal(valueWords("scope", "all"), "The main pick and other trades");
+  assert.equal(valueWords("wallet", null), "None");
+  assert.equal(valueWords("wallet", { site: "demo.lnbits.com", new: true }), "A new wallet at demo.lnbits.com");
+  assert.equal(valueWords("wallet", { site: "lnbits.own.example", new: false }), "Your own wallet at lnbits.own.example");
+  assert.equal(valueWords("wallet_fund", 25000), "25,000 sats");
+  // what the owner types: the classic form's address rule; sats from 1,000 to the wallet's cap
+  assert.deepEqual(readAddress(" https://feed.example/x "), { ok: true, value: "https://feed.example/x" });
+  assert.equal(readAddress("http://localhost:8080/f").ok, true);
+  for (const bad of ["http://feed.example", "ftp://x", "", "https://", "feed.example"]) assert.equal(readAddress(bad).ok, false, bad);
+  assert.deepEqual(readSats("25,000", null), { ok: true, value: 25000 });
+  assert.equal(readSats("999", null).ok, false);
+  assert.equal(readSats("100001", 100000).ok, false);
+  assert.match(readSats("100001", 100000).error, /100,000/);
+  assert.equal(readSats("2.5", null).ok, false);
+});
+
+test("signals & pass: the practice preview panel (and its switch) only in practice mode", { skip }, () => {
+  for (const [name, s] of states) {
+    const sc = screenOf("signals", s, linkOf(s, false));
+    assert.equal(sc.controls.includes("preview"), s.mode === "practice", name);
+  }
+  const sig = fs.readFileSync(path.join(SRC, "v2", "views", "Signals.tsx"), "utf8");
+  assert.match(sig, /\{s\.mode === "practice" && <PreviewPanel page=\{page\} \/>\}/);
 });

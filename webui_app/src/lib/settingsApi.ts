@@ -100,6 +100,10 @@ export interface SettingsView {
     dry_run_preview: boolean;
     recurring: boolean;
     wallet_connected: boolean;
+    /** a JSON feed's host name only (its address may carry a token); null otherwise */
+    source_site: string | null;
+    /** the payment wallet, secret-free (its page link only via POST /api/v2/wallet/page) */
+    wallet: WalletView;
     api_key: Secret;
     pass_on_file: boolean;
     /** signal-day purchases on file by id: paid, or an invoice that can still be paid
@@ -341,4 +345,41 @@ export type ProposalView = { pending: false } | { pending: true; explanation: st
 /** POST /api/v2/proposal/apply, applied: the agent's own words. */
 export interface ApplyDone {
   reply: string;
+}
+
+// ── Signals & pass → signal source and payment wallet ─────────────────────
+
+export interface WalletView {
+  /** the wallet's host name; null when there is no wallet */
+  site: string | null;
+  /** a public test server's warning, or null */
+  warning: string | null;
+  /** a wallet page link is on file (open it with POST /api/v2/wallet/page) */
+  page_on_file: boolean;
+  /** the most one day-pass payment may cost; null: not set */
+  autopay_cap_sats: number | null;
+  /** the wallet's largest invoice, when it has said; null: not known */
+  invoice_cap_sats: number | null;
+  /** where a new wallet would be made, and its test-server warning */
+  new_site: string | null;
+  new_warning: string | null;
+}
+
+/** GET /api/wallet/quote?sats=N (classic, reused): what N sats are worth now. */
+export type WalletQuote =
+  | { ok: true; btc_usd: number; usd: number; day_passes: number; day_pass_sats: number; suggested_sats: number; invoice_cap: number | null }
+  | { ok: false; error: string };
+
+/** POST /api/v2/wallet/fund, confirmed: the invoice to pay into the agent's wallet. */
+export interface FundInvoice {
+  bolt11: string;
+  sats: number;
+  /** said when the wallet made a smaller invoice than asked (its own cap) */
+  note: string;
+  qr: number[][] | null;
+}
+
+/** POST /api/v2/wallet/page */
+export interface WalletPage {
+  url: string;
 }

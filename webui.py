@@ -3736,6 +3736,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         return {"ok": True}
 
     def source(_h, data):
+        return _source_save(data, save)
+
+    def _source_save(data, save_now):
+        """The classic /api/source. save_now: save(), or for /v2 a save that
+        first checks nothing changed since the preview."""
         if not A.consent_ok():
             return {"ok": False, "error": "accept the agreement first"}
         src = data.get("source")
@@ -3781,7 +3786,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 return {"ok": False,
                         "error": "buy a pass above (or, under Advanced, set up a "
                                  "wallet or API key)"}
-        save()
+        save_now()
         return {"ok": True, "note": note}
 
     def llm_providers(_h):
@@ -4155,6 +4160,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             sats = max(1000, int(data.get("sats") or 50000))
         except (TypeError, ValueError):
             return {"ok": False, "error": "enter a sats amount"}
+        return _wallet_fund_invoice(w, sats, save)
+
+    def _wallet_fund_invoice(w, sats, save_now):
+        """The classic /api/wallet/fund's invoice for `sats` into wallet `w`
+        (learning the instance's per-invoice cap from a refusal: save_now
+        saves it). /v2 calls it after the owner confirmed the amount."""
         note = ""
         cap = int(cfg.get("lnbits_max_invoice_sats") or 0)
         if cap and sats > cap:
@@ -4170,7 +4181,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             if not new_cap or new_cap >= sats:
                 return {"ok": False, "error": str(exc)[:200]}
             cfg["lnbits_max_invoice_sats"] = new_cap
-            save()
+            save_now()
             try:
                 bolt11 = w.create_invoice(new_cap, memo="fund agentic-trader")
             except (WalletError, ValueError) as exc2:
@@ -4739,11 +4750,36 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                         "recurring": bool(cfg.get("day_pass_recurring")),
                         "wallet_connected": bool(cfg.get("lnbits_url")
                                                  and cfg.get("lnbits_admin_key")),
+                        # a JSON feed's site only (its address may carry a token)
+                        "source_site": (_host_only(cfg["source_url"])
+                                        if cfg.get("source") == "url"
+                                        and cfg.get("source_url") else None),
+                        "wallet": _wallet_view(),
                         "api_key": _secret(cfg.get("agenthc_api_key")),
                         "pass_on_file": bool(cfg.get("feed_pass")
                                              or cfg.get("feed_pass_pending")),
                         "purchases": _pass_purchases()},
         }
+
+    def _wallet_view():
+        """The payment wallet, secret-free: its site, the test-server
+        warning, whether a wallet page link is on file (the link itself only
+        through POST /api/v2/wallet/page), the caps; and where a new wallet
+        would be made."""
+        import lightning_wallet
+        url = str(cfg.get("lnbits_url") or "")
+        new = str(lightning_wallet.DEFAULT_LNBITS or "")
+        cap = cfg.get("max_autopay_sats")
+        inv = cfg.get("lnbits_max_invoice_sats")
+        whole = lambda v: (int(v) if isinstance(v, (int, float))  # noqa: E731
+                           and not isinstance(v, bool) and v > 0 else None)
+        return {"site": _host_only(url) if url else None,
+                "warning": lightning_wallet.demo_warning(url) or None,
+                "page_on_file": bool(cfg.get("lnbits_wallet_page")),
+                "autopay_cap_sats": whole(cap),
+                "invoice_cap_sats": whole(inv),
+                "new_site": _host_only(new) if new else None,
+                "new_warning": lightning_wallet.demo_warning(new) or None}
 
     def _expiry_view():
         """The expiry sell and its alert, as saved and as they fall today
@@ -5506,6 +5542,291 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         ok, msg = self_edit.apply_and_restart(restart=restarts, expect_sha256=sha)
         return {"ok": ok, "reply": msg} if ok else {"ok": False, "error": msg}
 
+    # ── Signals & pass ──
+    def _scope_now():
+        """The saved "which signals" as the classic source form sends it, so
+        a /v2 save through _source_save never changes it."""
+        return "all" if cfg.get("include_other_trades") else "main"
+
+    def _source_now():
+        return {"source": cfg.get("source") or None,
+                "site": (_host_only(cfg["source_url"])
+                         if cfg.get("source") == "url" and cfg.get("source_url")
+                         else None)}
+
+    def _feed_url_ok(url):
+        # the classic source form's rule for a feed or wallet address
+        return (url.startswith("https://") or url.startswith("http://127.0.0.1")
+                or url.startswith("http://localhost"))
+
+    def _no_agenthc_access():
+        return not (cfg.get("agenthc_api_key") or cfg.get("feed_pass")
+                    or cfg.get("feed_pass_pending")
+                    or (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")))
+
+    @_v2
+    def v2_source(data):
+        """POST /api/v2/settings/source: the signal source (two steps:
+        {source: "agenthc" | "manual" | "url", url}) or, on its own, the
+        AgentHC subscription key ({agenthc_key}, saved straight away; never
+        sent back). Both through the classic /api/source code, with the saved
+        "which signals" choice passed along unchanged."""
+        p = _v2_payload(data, ("source", "url", "agenthc_key"))
+        if "agenthc_key" in p:
+            if set(p) != {"agenthc_key"}:
+                raise _Invalid("Send the subscription key on its own. Nothing "
+                               "was changed.")
+            key = _v2_text(p["agenthc_key"], "agenthc_key", longest=500)
+            with A.CONFIG_LOCK:
+                _sync()
+                if cfg.get("source", "agenthc") != "agenthc":
+                    raise _Invalid("The subscription key is for the AgentHC "
+                                   "signal source: choose it first. Nothing was "
+                                   "changed.")
+                res = _source_save({"source": "agenthc", "scope": _scope_now(),
+                                    "agenthc_key": key}, save)
+                if res.get("ok"):
+                    res = {"ok": True, "saved": True,
+                           "note": "Subscription key saved.",
+                           "settings": _settings_view()}
+                return res
+        src = p.get("source")
+        if src not in ("agenthc", "manual", "url"):
+            raise _Invalid('source must be "agenthc", "manual" or "url". Nothing '
+                           "was changed.")
+        if src == "url":
+            url = _v2_text(p.get("url"), "url", longest=2000)
+            if not _feed_url_ok(url):
+                raise _Invalid("url must start with https:// (or be on this "
+                               "computer). Nothing was changed.")
+            p = {"source": "url", "url": url}
+        elif set(p) != {"source"}:
+            raise _Invalid("url goes with source 'url' only. Nothing was "
+                           "changed.")
+        with A.CONFIG_LOCK:
+            _sync()
+            before, after = _source_now(), {
+                "source": src, "site": _host_only(p["url"]) if src == "url" else None}
+            if before == after and (src != "url" or cfg.get("source_url") == p["url"]):
+                return {"ok": True, "saved": False,
+                        "note": "Nothing to change: that is your signal source already."}
+            if src == "agenthc" and _no_agenthc_access():
+                raise _Invalid("To read AgentHC's signals the agent needs signal "
+                               "days, a subscription key or a payment wallet: "
+                               "add one on this page first. Nothing was changed.")
+            left = _real_left()
+            wait = _two_step("source", p, data, [_change(
+                "source", "Signal source", before, after, "neutral")], [
+                "It does not switch between Practice and LIVE.", does_not_trade,
+                "Positions the agent holds now are sold on exit signals from "
+                "the new source only: if it never sends one for them, sell "
+                "them yourself at your broker."],
+                extra={"real_positions": None if left is None else len(left)})
+            if wait:
+                return wait
+            res = _source_save({"source": src, "source_url": p.get("url", ""),
+                                "scope": _scope_now()}, save)
+            if res.get("ok"):
+                res = {"ok": True, "saved": True, "settings": _settings_view()}
+            return res
+
+    @_v2
+    def v2_signals(data):
+        """POST /api/v2/settings/signals: which AgentHC signals (scope "main"
+        or "all": the classic /api/source/scope, two steps) and the practice
+        preview on/off (the key the chat's "preview on|off" writes; straight
+        away when sent alone)."""
+        p = _v2_payload(data, ("scope", "dry_run_preview"))
+        if not p:
+            raise _Invalid("Send scope and/or dry_run_preview. Nothing was "
+                           "changed.")
+        if "scope" in p and p["scope"] not in ("main", "all"):
+            raise _Invalid('scope must be "main" or "all". Nothing was changed.')
+        if "dry_run_preview" in p and not isinstance(p["dry_run_preview"], bool):
+            raise _Invalid("dry_run_preview must be true or false. Nothing was "
+                           "changed.")
+        with A.CONFIG_LOCK:
+            _sync()
+            changes = []
+            if "scope" in p:
+                if cfg.get("source", "agenthc") != "agenthc":
+                    raise _Invalid("Which signals is a choice of the AgentHC "
+                                   "source only. Nothing was changed.")
+                if p["scope"] != _scope_now():
+                    changes.append(_change(
+                        "scope", "Which signals", _scope_now(), p["scope"],
+                        "raises_risk" if p["scope"] == "all" else "lowers_risk"))
+            if changes:
+                wait = _two_step("signals", p, data, changes, [
+                    "It does not switch between Practice and LIVE.",
+                    does_not_trade,
+                    "It does not change your trade sizes: other trades are "
+                    "sized as Rules & limits says."])
+                if wait:
+                    return wait
+            elif "dry_run_preview" not in p:
+                return {"ok": True, "saved": False,
+                        "note": "Nothing to change: that is your setting already."}
+            if "dry_run_preview" in p:
+                cfg["dry_run_preview"] = p["dry_run_preview"]
+            if changes:
+                res = source_scope(None, {"scope": p["scope"]})  # saves
+                if not res.get("ok"):
+                    return res
+            else:
+                save()
+            return {"ok": True, "saved": True, "settings": _settings_view()}
+
+    def _wallet_now():
+        return ({"site": _host_only(cfg["lnbits_url"])}
+                if cfg.get("lnbits_url") and cfg.get("lnbits_admin_key") else None)
+
+    def _wallet_notes(had):
+        return ([("Your current wallet is not emptied or deleted: sats left in "
+                  "it stay there. Its details are saved to a file in the "
+                  "agent's folder first, so you can still open it.")]
+                if had else []) + [
+            "It does not switch between Practice and LIVE.", does_not_trade]
+
+    @_v2
+    def v2_wallet_create(data):
+        """POST /api/v2/wallet/create: make the agent's own wallet (the
+        classic /api/wallet/create), or replace it ({replace: true}), by the
+        second (confirmed) POST only. The new wallet's page link is never
+        sent back (it opens the wallet: POST /api/v2/wallet/page)."""
+        import lightning_wallet
+        p = _v2_payload(data, ("replace",))
+        with A.CONFIG_LOCK:
+            _sync()
+            had = _wallet_now()
+            if had and p != {"replace": True}:
+                raise _Invalid("Your agent already has a wallet: send replace: "
+                               "true to replace it. Nothing was changed.")
+            if not had and p not in ({}, {"replace": False}):
+                raise _Invalid("There is no wallet to replace. Nothing was "
+                               "changed.")
+            new = str(lightning_wallet.DEFAULT_LNBITS or "")
+            changes = [_change("wallet", "Payment wallet", had,
+                               {"site": _host_only(new), "new": True}, "neutral")]
+            if cfg.get("source") != "agenthc":
+                changes.append(_change("source", "Signal source", _source_now(),
+                                       {"source": "agenthc", "site": None}, "neutral"))
+            wait = _two_step("wallet_create", p, data, changes, [
+                "It does not put any sats in the new wallet: it starts empty."]
+                + _wallet_notes(bool(had)),
+                extra={"warning": lightning_wallet.demo_warning(new) or None})
+        if wait:
+            return wait
+        # LNbits is asked outside the lock; _wallet_create saves only the
+        # wallet's own keys (and the source), onto the file as it is then
+        res = _wallet_create(cfg, save, {"replace": True} if had else {})
+        if not res.get("ok"):
+            return {"ok": False, "error": res.get("error")
+                    or "The wallet was not made. Nothing was changed."}
+        note = "Wallet made. It starts empty."
+        if res.get("old_wallet_file"):
+            note += (" Your old wallet was not deleted: if it still holds sats, "
+                     "move them to the new one. Its details are saved in "
+                     f"{res['old_wallet_file']}.")
+        return {"ok": True, "saved": True, "note": note,
+                "warning": res.get("warning") or None,
+                "old_wallet_file": res.get("old_wallet_file") or None,
+                "settings": _settings_view()}
+
+    @_v2
+    def v2_wallet_fund(data):
+        """POST /api/v2/wallet/fund {sats}: an invoice to add sats to the
+        agent's wallet (the classic /api/wallet/fund's), made by the second
+        (confirmed) POST only. The classic form raises a small amount to
+        1,000 sats and cuts a big one to the wallet's invoice cap; /v2
+        refuses both and says the range."""
+        p = _v2_payload(data, ("sats",))
+        with A.CONFIG_LOCK:
+            _sync()
+            w = _wallet()
+            if w is None:
+                raise _Invalid("Your agent has no wallet yet: make one first. "
+                               "Nothing was changed.")
+            cap = int(cfg.get("lnbits_max_invoice_sats") or 0)
+            sats = _v2_number(p.get("sats"), "sats", 1000, cap or 100_000_000,
+                              whole=True)
+            p = {"sats": sats}
+            auto = cfg.get("max_autopay_sats")
+            wait = _two_step("wallet_fund", p, data, [_change(
+                "wallet_fund", "Add to the agent's wallet", None, sats,
+                "neutral")], [
+                "Nothing is paid yet: the next step shows a Lightning invoice, "
+                "and nothing is paid until you pay it from your own wallet app.",
+                ("The agent spends from this wallet only on day-passes, each "
+                 f"capped at {int(auto):,} sats." if isinstance(auto, (int, float))
+                 and not isinstance(auto, bool) else
+                 "The agent spends from this wallet only on day-passes."),
+                "It does not switch between Practice and LIVE.", does_not_trade])
+        if wait:
+            return wait
+        return _wallet_fund_invoice(w, sats, save)
+
+    @_v2
+    def v2_wallet_connect(data):
+        """POST /api/v2/wallet/connect {url, admin_key}: use your own LNbits
+        wallet instead of the agent's (the classic /api/source's wallet
+        part: it checks the wallet answers, and saves the old one's details
+        to a file first), by the second (confirmed) POST only. The key is
+        never sent back."""
+        p = _v2_payload(data, ("url", "admin_key"))
+        url = _v2_text(p.get("url"), "url", longest=500)
+        key = _v2_text(p.get("admin_key"), "admin_key", longest=500)
+        if not _feed_url_ok(url):
+            raise _Invalid("url must start with https:// (or be on this "
+                           "computer). Nothing was changed.")
+        p = {"url": url, "admin_key": key}
+        with A.CONFIG_LOCK:
+            _sync()
+            had = _wallet_now()
+            if had and cfg.get("lnbits_admin_key") == key and cfg.get("lnbits_url") == url:
+                return {"ok": True, "saved": False,
+                        "note": "Nothing to change: that is your wallet already."}
+            changes = [_change("wallet", "Payment wallet", had,
+                               {"site": _host_only(url), "new": False}, "neutral")]
+            if cfg.get("source") != "agenthc":
+                changes.append(_change("source", "Signal source", _source_now(),
+                                       {"source": "agenthc", "site": None}, "neutral"))
+            same_wallet = bool(had) and cfg.get("lnbits_admin_key") == key
+            wait = _two_step("wallet_connect", p, data, changes,
+                             ["The agent checks the wallet answers before it "
+                              "saves anything."] + _wallet_notes(bool(had) and not same_wallet))
+            fp = _fingerprint()  # what the token was just redeemed against
+            scope = _scope_now()
+        if wait:
+            return wait
+        try:
+            res = _source_save({"source": "agenthc", "scope": scope,
+                                "lnbits_url": url, "lnbits_key": key},
+                               _save_if_unchanged(fp))
+        except _Changed:
+            return {"ok": False, "error": _REVIEW_AGAIN}
+        if res.get("ok"):
+            res = {**res, "saved": True, "settings": _settings_view()}
+        return res
+
+    @_v2
+    def v2_wallet_page(data):
+        """POST /api/v2/wallet/page: the agent's wallet page link, for the
+        button that opens it (a bearer link: whoever has it can spend the
+        wallet, so it is never in a GET, a page or a log)."""
+        _v2_payload(data, ())
+        with A.CONFIG_LOCK:
+            _sync()
+            page = str(cfg.get("lnbits_wallet_page") or "")
+        if not (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")) or not page:
+            return {"ok": False, "error": "No wallet page is on file for your "
+                    "agent's wallet (a wallet you connected yourself opens "
+                    "from your own LNbits)."}
+        if not page.startswith("https://") and not _feed_url_ok(page):
+            return {"ok": False, "error": "The wallet page on file is not a web "
+                    "address this page can open."}
+        return {"ok": True, "url": page}
+
     W.routes_get = {"/api/state": state, "/api/rh/start": rh_start,
                     "/api/wallet/balance": wallet_balance,
                     "/api/deploy/status": deploy_status,
@@ -5580,7 +5901,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/v2/move/deploy": v2_move_deploy,
                      "/api/v2/settings/code": v2_code,
                      "/api/v2/proposal/request": v2_proposal_request,
-                     "/api/v2/proposal/apply": v2_proposal_apply}
+                     "/api/v2/proposal/apply": v2_proposal_apply,
+                     "/api/v2/settings/source": v2_source,
+                     "/api/v2/settings/signals": v2_signals,
+                     "/api/v2/wallet/create": v2_wallet_create,
+                     "/api/v2/wallet/fund": v2_wallet_fund,
+                     "/api/v2/wallet/connect": v2_wallet_connect,
+                     "/api/v2/wallet/page": v2_wallet_page}
 
     W.routes_get = {p: _fresh(fn) for p, fn in W.routes_get.items()}
     W.routes_post = {p: _fresh(fn) for p, fn in W.routes_post.items()}
@@ -5992,6 +6319,16 @@ def _leave_after_import(exc):
 
 
 # ── the dashboard (served BY the running agent) ──────────────────────────────
+
+def _host_only(url):
+    """A link cut down to its host name ("demo.lnbits.com"), or None: no
+    scheme, login, path or query."""
+    from urllib.parse import urlparse
+    try:
+        return (urlparse(str(url or "")).hostname or None)
+    except ValueError:
+        return None
+
 
 def _site_only(url):
     """A link cut down to its site: no login, path or query (where feed

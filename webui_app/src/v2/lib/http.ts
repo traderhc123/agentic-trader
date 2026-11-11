@@ -133,6 +133,13 @@ export const API = {
   moveFinish: "/api/v2/move/finish",
   moveDeploy: "/api/v2/move/deploy",
   code: "/api/v2/settings/code",
+  source: "/api/v2/settings/source",
+  signals: "/api/v2/settings/signals",
+  recurring: "/api/v2/wallet/recurring",
+  walletCreate: "/api/v2/wallet/create",
+  walletFund: "/api/v2/wallet/fund",
+  walletConnect: "/api/v2/wallet/connect",
+  walletPage: "/api/v2/wallet/page",
   proposalRequest: "/api/v2/proposal/request",
   proposalApply: "/api/v2/proposal/apply",
   // classic, read-only (or saving nothing), reused as they are
@@ -142,6 +149,7 @@ export const API = {
   passOptions: "/api/pass/options",
   passStatus: "/api/pass/status",
   walletBalance: "/api/wallet/balance",
+  walletQuote: "/api/wallet/quote",
   // the move file: made, then downloaded (a GET the browser saves)
   moveExport: "/api/move/export",
   moveDownload: "/api/move/download",
