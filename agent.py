@@ -5769,8 +5769,6 @@ def cmd_run(app_window=False):
         feed_note = _feed_schedule_note(c, source)
         return {
             "mode": "DRY-RUN" if c.get("dry_run") else "LIVE",
-            # when the signal feed was last read with success (epoch s)
-            "feed_read_at": FEED_GATE["read_at"],
             # also on a full hold: a damaged state.json (the dashboard then
             # offers Resume, which is what ends it) or a hand-off to a
             # server (Resume answers why not). "hold": the dashboard then
