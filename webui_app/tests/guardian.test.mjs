@@ -40,6 +40,9 @@ import {
   bookTodayNote,
   dayBooks,
   dayTally,
+  dayWhole,
+  paidMark,
+  problemGroups,
   isStale,
   linkOf,
   nextFor,
@@ -53,10 +56,15 @@ import {
 } from "../src/v2/lib/derive.ts";
 import { UNKNOWN, ago, contractName, dayLong, etDayKey, etTime, etWhen, plural, signed, span, tone, usd } from "../src/v2/lib/format.ts";
 import { UPDATE } from "../src/v2/lib/copy.ts";
-import { API, FAILED, confirmBody, getJson, onUnknownWrite, postJson, send } from "../src/v2/lib/http.ts";
+import { API, FAILED, askAgent, confirmBody, getJson, onUnknownWrite, postJson, send } from "../src/v2/lib/http.ts";
 import {
   CLASSIC,
   DEPLOY_REGIONS,
+  SIZING_DISCLAIMER,
+  expiryTimePayload,
+  hintPayload,
+  hintSize,
+  hintWords,
   agreementWords,
   brokerWarning,
   readAddress,
@@ -1170,7 +1178,11 @@ test("no redundancy: the operator's example is one note, in the dashboard's word
   const cash = get("low-cash");
   assert.ok(notes(cash, "ok", "today").some((n) => n.go === "rules"));
   assert.equal(todayLimitsLink(cash, "ok"), false);
-  assert.equal(todayLimitsLink(get("live"), "ok"), true);
+  // (live: its budget hint's note links to Rules & limits already)
+  const live = get("live");
+  assert.equal(todayLimitsLink(live, "ok"), false);
+  const noHint = { ...live, limits: { ...live.limits, budget_hints: [] }, conditions: live.conditions.filter((c) => c.code !== "budget_too_small") };
+  assert.equal(todayLimitsLink(noHint, "ok"), true);
   // the band's own buttons are never repeated in a note
   for (const [, x] of states) for (const n of notes(x, linkOf(x, false), "today")) assert.ok(n.go == null || ["settings", "signals", "rules", "holdings"].includes(n.go));
 });
@@ -1225,7 +1237,8 @@ test("the settings never leave /v2: every remaining link to /setup or /dash is o
   // setup here; the classic page only from This dashboard
   const uses = (name) =>
     files.filter((f) => new RegExp(`\\b${name}\\b`).test(fs.readFileSync(f, "utf8").replace(/^import .*$/gm, ""))).map(rel).filter((f) => f !== "lib/settings.ts").sort();
-  assert.deepEqual(uses("SETUP_FROM_V2"), ["views/AgentDialogs.tsx", "views/Settings.tsx"]);
+  // (Today: the one note about a changed agreement, accepted in setup)
+  assert.deepEqual(uses("SETUP_FROM_V2"), ["views/AgentDialogs.tsx", "views/Settings.tsx", "views/Today.tsx"]);
   assert.deepEqual(uses("CLASSIC"), ["views/Settings.tsx"]);
   // starting the agent never goes through setup: the band points at Settings
   const band = fs.readFileSync(path.join(SRC, "v2", "Band.tsx"), "utf8");
@@ -1500,3 +1513,247 @@ test("signals & pass: the practice preview panel (and its switch) only in practi
   const sig = fs.readFileSync(path.join(SRC, "v2", "views", "Signals.tsx"), "utf8");
   assert.match(sig, /\{s\.mode === "practice" && <PreviewPanel page=\{page\} \/>\}/);
 });
+
+// ── PR 4 group 8: Rules & limits ───────────────────────────────────────────
+
+const RULES_SRC = () => fs.readFileSync(path.join(SRC, "v2", "views", "Rules.tsx"), "utf8");
+
+test("rules & limits: the expiry-day sell time is a two-step limits save, said in words", () => {
+  // the words of a preview line and of the confirm button
+  assert.equal(valueWords("expiry_sell_et", "15:30"), "3:30 PM ET");
+  assert.equal(valueWords("expiry_sell_et", null), "Off");
+  clean(valueWords("expiry_sell_et", 5), "sell time, not a time");
+  assert.equal(confirmLabel([{ key: "expiry_sell_et", label: "x", saved_now: "15:45", new: "15:30", direction: "lowers_risk" }]), "Sell at 3:30 PM ET");
+  assert.equal(confirmLabel([{ key: "expiry_sell_et", label: "x", saved_now: "15:45", new: null, direction: "raises_risk" }]), "Turn off the expiry-day sell");
+  // the page's own risk reading follows webui._expiry_direction
+  assert.equal(riskOf("expiry_sell_et", "15:45", null), "raises_risk");
+  assert.equal(riskOf("expiry_sell_et", null, "15:45"), "lowers_risk");
+  assert.equal(riskOf("expiry_sell_et", "15:30", "15:50"), "raises_risk");
+  assert.equal(riskOf("expiry_sell_et", "15:30", "10:15"), "lowers_risk");
+  assert.equal(riskOf("expiry_sell_et", "15:30", "15:30"), "neutral");
+  // only what changed is sent; off is "off"; the chat's range
+  assert.deepEqual(expiryTimePayload("15:45", false, "15:30"), { ok: true, value: "15:30" });
+  assert.deepEqual(expiryTimePayload("15:45", false, "15:45"), { ok: true, value: undefined });
+  assert.deepEqual(expiryTimePayload("15:45", true, ""), { ok: true, value: "off" });
+  assert.equal(expiryTimePayload("15:45", false, "16:00").ok, false);
+  // one control, in Rules & limits, on the limits route, two steps
+  const src = RULES_SRC();
+  assert.match(src, /const payload = \{ expiry_sell_et: parsed\.value \};\s*const a = await askPreview\(API\.limits, payload\)/);
+  assert.match(src, /<ReviewDialog\s+path=\{API\.limits\}[\s\S]*?Turn off the expiry-day sell\?/);
+  assert.equal((src.match(/data-row="expiry_sell"/g) || []).length, 1);
+  // the "Always on" list no longer says it (one place for the sell time)
+  const always = src.slice(src.indexOf("<h2>Always on</h2>"), src.indexOf("<h2>Which signals to take</h2>"));
+  assert.ok(!/[Ee]xpiry/.test(always), "the sell time is still in Always on");
+  for (const f of sources(path.join(SRC, "v2")).filter((p) => p.endsWith(".tsx")))
+    if (rel(f) !== "views/Rules.tsx") assert.ok(!/expiry_sell_et/.test(fs.readFileSync(f, "utf8")), `${rel(f)} sets the sell time`);
+});
+
+test("rules & limits: the budget hint pre-fills its book's size form with what typing it sends", { skip }, () => {
+  const live = states.find(([n]) => n === "live")[1];
+  const hints = live.limits.budget_hints;
+  assert.deepEqual(hints.map((h) => [h.book, h.suggest]), [["main", 1150], ["other", 300]]);
+  for (const h of hints) {
+    clean(hintWords(h), `hint ${h.book}`);
+    // "Use $S" is the size form with $S typed in: the same save
+    assert.deepEqual(hintSize(h), { mode: "budget", value: h.suggest });
+    assert.deepEqual(hintPayload(h), { trade_size: { [h.book]: { mode: "budget", value: h.suggest } } });
+  }
+  assert.equal(hintWords(hints[0]), "2 signals today cost more than your $500 main-pick size: one contract was $1,120 to $1,240. $1,150 would have taken 1 of them.");
+  const src = RULES_SRC();
+  // the size form's own payload, and the hint only opens that form
+  assert.match(src, /const payload = \{ trade_size: \{ \[book\]: same \? \{ mode: "same" \} : \{ mode, value: parsed\.value \} \} \};/);
+  assert.match(src, /onClick=\{\(\) => open0\(hintSize\(h\)\)\}/);
+  assert.match(src, /<SizeRow page=\{page\} book="main" hints=\{hints\("main"\)\} \/>/);
+  // Today says it once, as a note that links here
+  for (const [name, s] of states) {
+    const ns = notes(s, linkOf(s, false), "today").filter((n) => n.codes.includes("budget_too_small"));
+    assert.equal(ns.length, s.limits.budget_hints.length && !isStale(linkOf(s, false)) ? 1 : 0, name);
+  }
+  const n = notes(live, "ok", "today").find((x) => x.codes.includes("budget_too_small"));
+  assert.match(n.text, /\$1,150 would have taken/);
+});
+
+test("rules & limits: the adviser notice is said once, in the trade-size confirm dialog", () => {
+  assert.match(SIZING_DISCLAIMER, /^Nobody here is an investment adviser/);
+  let uses = 0;
+  for (const f of sources(path.join(SRC, "v2"))) {
+    const t = fs.readFileSync(f, "utf8");
+    if (rel(f) === "lib/settings.ts") continue;
+    assert.ok(!t.includes("investment adviser"), `${rel(f)} says it in its own words`);
+    uses += (t.match(/\{SIZING_DISCLAIMER\}/g) || []).length;
+  }
+  assert.equal(uses, 1);
+  const src = RULES_SRC();
+  const size = src.slice(src.indexOf("function SizeRow"), src.indexOf("function ExpiryRow"));
+  assert.match(size, /\{SIZING_DISCLAIMER\}/);
+});
+
+test("rules & limits: today's use is said once per limit, and every rule is listed", () => {
+  const src = RULES_SRC();
+  assert.ok(!/LimitsPanel/.test(src), "Rules & limits shows Today's limits panel again");
+  for (const words of ["used today", "lost today", "open now"]) assert.equal(src.split(words).length - 1, 1, words);
+  // PR 3 acceptance, checked here: all six built-in filters, the written
+  // rules with their off switch, and no "does not list them yet"
+  for (const k of ["rule_tickers", "rule_skip_tickers", "rule_sides", "rule_min_strike", "rule_loss_streak"]) assert.match(src, new RegExp(`\\["${k}", "`), k);
+  assert.match(src, /rule_skip_0dte: on/);
+  assert.match(src, /save\(null\)[\s\S]{0,40}Turn off written rules/);
+  assert.ok(!/does not list them yet/.test(src));
+});
+
+// ── PR 4 group 9: Results ──────────────────────────────────────────────────
+
+test("results: the result on paid signal days, and the paid-day marker in the by-day table", { skip }, () => {
+  const live = states.find(([n]) => n === "live")[1];
+  const pd = live.results.paid_days.real;
+  assert.ok(pd && pd.closed > 0 && pd.days > 0);
+  for (const d of pd.paid_on) assert.equal(paidMark(live, d), "paid signal day", d);
+  assert.equal(paidMark(live, "2026-10-01"), "");
+  // the practice week before paid days were recorded: estimated
+  assert.deepEqual(live.results.paid_days.practice.estimated_on.sort(), ["2026-10-28", "2026-10-29", "2026-10-30"]);
+  assert.equal(paidMark(live, "2026-10-28"), "paid signal day (estimated)");
+  assert.equal(paidMark({ ...live, results: { ...live.results, paid_days: { real: { ...pd, paid_on: [], estimated_on: ["2026-10-28"] }, practice: null } } }, "2026-10-28"), "paid signal day (estimated)");
+  assert.equal(paidMark({ ...live, results: { ...live.results, paid_days: { real: null, practice: null } } }, pd.paid_on[0]), "");
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "Results.tsx"), "utf8");
+  assert.match(src, /Result on paid signal days/);
+  assert.match(src, /<b className=\{tone\(pd\.real\.pnl\)\}>\{signed\(pd\.real\.pnl\)\}<\/b>/);
+  assert.match(src, /Each trade counts on the day it closed \(ET\)/);
+  assert.match(src, /paidMark\(s, d\.day\)/);
+});
+
+// ── PR 4 group 10: Today and Activity ──────────────────────────────────────
+
+test("ask your agent: one typed POST of the question, answers only, kept in the page", async () => {
+  assert.equal(API.ask, "/api/v2/ask");
+  assert.equal(ACTION_HOME.ask, "today");
+  const calls = [];
+  const ok = async (url, init) => (calls.push([url, init]), new Response(JSON.stringify({ ok: true, answer: "Because it cost too much." }), { status: 200 }));
+  assert.deepEqual(await askAgent("why the skip?", ok), { ok: true, answer: "Because it cost too much." });
+  assert.equal(calls[0][0], "/api/v2/ask");
+  assert.equal(calls[0][1].method, "POST");
+  assert.deepEqual(JSON.parse(calls[0][1].body), { question: "why the skip?" });
+  // the agent's refusal in its words; no answer = the read failures' words
+  const said = async () => new Response(JSON.stringify({ ok: false, error: "No AI helper is connected." }), { status: 200 });
+  assert.deepEqual(await askAgent("x", said), { ok: false, error: "No AI helper is connected." });
+  assert.deepEqual(await askAgent("x", async () => { throw new Error("down"); }), { ok: false, error: FAILED.network.read });
+  assert.deepEqual(await askAgent("x", async () => new Response("", { status: 401 })), { ok: false, error: FAILED.locked.read });
+  assert.deepEqual(await askAgent("x", async () => new Response("<html>", { status: 200 })), { ok: false, error: FAILED.server.read });
+  // a failed question never makes the page doubt its settings (it changed nothing)
+  let doubted = 0;
+  const off = onUnknownWrite(() => doubted++);
+  await askAgent("x", async () => { throw new Error("down"); });
+  off();
+  assert.equal(doubted, 0);
+  const today = fs.readFileSync(path.join(SRC, "v2", "views", "Today.tsx"), "utf8");
+  assert.equal((today.match(/data-act="ask"/g) || []).length, 1);
+  assert.match(today, /const r = await askAgent\(q\);/);
+  assert.ok(!/API\.command|\/api\/command|send\(/.test(today), "Today sends something else");
+  // the conversation lives in the page (this visit), never in storage
+  assert.match(today, /page\.addTalk\(\{ q, a: r\.answer/);
+  assert.ok(!/localStorage|sessionStorage/.test(today));
+});
+
+test("activity: problems grouped by kind, with how many, the newest and its fix", () => {
+  const p = (n, code, sym, hint = null) =>
+    row({ n, action: code === "order_rejected" ? "order_failed" : "skip_no_quote", reason_code: code, contract: { symbol: sym, expiry: "2026-11-13", strike: 100, side: "C" }, contract_text: `${sym} x`, stopped_at_check: "broker_order", hint, at: `2026-11-09T1${n}:00:00Z` });
+  // newest first: 3 problems of 2 kinds, and a line that is not a problem
+  const rows = [p(5, "order_rejected", "AAPL", "Add cash."), p(4, "no_quote", "PLTR"), p(3, "order_rejected", "META"), row({ n: 2 })];
+  const g = problemGroups(rows, "Robinhood");
+  assert.deepEqual(g.map((x) => [x.key, x.n, x.last.n]), [["order_rejected", 2, 5], ["no_quote", 1, 4]]);
+  assert.equal(g[0].hint, "Add cash.");
+  for (const x of g) {
+    clean(x.label, x.key);
+    assert.ok(!x.label.includes("AAPL") && !x.label.includes("PLTR"), x.label);
+  }
+  assert.deepEqual(problemGroups([row()], "Robinhood"), []);
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "Activity.tsx"), "utf8");
+  assert.match(src, /filter === "problem" \? problemGroups\(list, s\.broker\.name\)/);
+  assert.match(src, /onClick=\{\(\) => page\.openEv\(g\.last\.n\)\}/);
+});
+
+test("activity: problems by kind count every problem line of each fixture once", { skip }, () => {
+  for (const [name, s] of states) {
+    const g = problemGroups(s.activity.rows, s.broker.name);
+    const n = s.activity.rows.filter((e) => describe(e, s.broker.name).cat === "problem").length;
+    assert.equal(g.reduce((a, x) => a + x.n, 0), n, name);
+    assert.equal(new Set(g.map((x) => x.key)).size, g.length, name);
+  }
+});
+
+test("activity: a day the page has only part of is never summed as the whole day", { skip }, () => {
+  const e = (n, day) => row({ n, at: `${day}T15:00:00Z` });
+  const loaded = [e(9, "2026-11-09"), e(8, "2026-11-09"), e(7, "2026-11-06")];
+  // the server's count: the 6th has 4 lines, 1 loaded
+  assert.equal(dayWhole("2026-11-09", loaded, 2, true), true);
+  assert.equal(dayWhole("2026-11-06", loaded, 4, true), false);
+  assert.equal(dayWhole("2026-11-06", loaded, 1, true), true);
+  // no count: whole when an older day is loaded, or nothing older is left
+  assert.equal(dayWhole("2026-11-09", loaded, undefined, true), true);
+  assert.equal(dayWhole("2026-11-06", loaded, undefined, true), false);
+  assert.equal(dayWhole("2026-11-06", loaded, undefined, false), true);
+  assert.equal(dayWhole("", [row({ n: 1, at: null })], undefined, true), false);
+  // a fixture's first page: its oldest day is cut, its newest is whole
+  const live = states.find(([n]) => n === "live")[1];
+  const lines = Object.fromEntries(live.activity.day_lines.map((d) => [d.day, d.lines]));
+  const days = [...new Set(live.activity.rows.map((r) => etDayKey(r.at)))];
+  const more = live.activity.next != null;
+  assert.ok(more, "the fixture's log is longer than one page");
+  assert.equal(dayWhole(days[0], live.activity.rows, lines[days[0]], more), true);
+  assert.equal(dayWhole(days[days.length - 1], live.activity.rows, lines[days[days.length - 1]], more), false);
+  // the partial day's header has no sums: no P&L and no counts as totals
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "Activity.tsx"), "utf8");
+  const partial = src.slice(src.indexOf("if (!whole) {"), src.indexOf("const c = (f: (e: Row) => boolean)"));
+  assert.ok(partial.length > 0 && !/tot\(|signed\(|bought|sold/.test(partial), partial);
+  assert.match(partial, /of \$\{plural\(of, "line"\)\} loaded/);
+  // and the chip counts say they are of the lines loaded
+  assert.match(src, /The counts are of the \{plural\(loaded, "line"\)\} loaded so far/);
+});
+
+test("today so far: Opened is the Eastern day's count from the view-model", { skip }, () => {
+  for (const [name, s] of states) {
+    const d = dayBooks(s);
+    const want = s.mode !== "live" ? s.results.practice.opened_today : s.broker.paper_account ? s.results.paper_account.opened_today + s.results.real.opened_today : s.results.real.opened_today;
+    assert.equal(d.openedN, want, name);
+    assert.ok(Number.isInteger(d.openedN), name);
+  }
+  const today = fs.readFileSync(path.join(SRC, "v2", "views", "Today.tsx"), "utf8");
+  const day = today.slice(today.indexOf("function DayPanel"), today.indexOf("export function SignalCostLine"));
+  assert.ok(!/used_today/.test(day), "Today so far reads the limit's UTC-day count");
+  assert.match(day, /plural\(books\.openedN, books\.opened\)/);
+  assert.match(day, /dayWhole\(today, page\.rows, page\.feed\.dayLines\[today\], page\.hasOlder\)/);
+});
+
+test("a changed agreement: one note on Today, to the setup wizard where it is accepted", { skip }, () => {
+  for (const [name, s] of states) {
+    const ns = notes(s, linkOf(s, false), "today").filter((n) => n.codes.includes("consent_needed"));
+    const on = (s.conditions ?? []).some((c) => c.code === "consent_needed") && !isStale(linkOf(s, false));
+    assert.equal(ns.length, on ? 1 : 0, name);
+    if (on) {
+      assert.equal(ns[0].setup, true);
+      assert.equal(ns[0].go, null);
+      clean(ns[0].title, name);
+      clean(ns[0].text, name);
+    }
+  }
+  assert.ok(states.some(([n]) => n === "agreement-changed"), "no fixture with a changed agreement");
+  const today = fs.readFileSync(path.join(SRC, "v2", "views", "Today.tsx"), "utf8");
+  assert.match(today, /\{n\.setup && \([\s\S]*?href=\{SETUP_FROM_V2\}/);
+});
+
+// ── PR 4 group 11: what the inventory found said twice ─────────────────────
+
+test("no redundancy: the theme, the classic page and Move each have one place", () => {
+  const files = sources(path.join(SRC, "v2")).filter((p) => p.endsWith(".tsx"));
+  const count_ = (re) => files.reduce((a, f) => a + (fs.readFileSync(f, "utf8").match(re) || []).length, 0);
+  assert.equal(count_(/data-act="theme"/g), 1);
+  assert.equal(count_(/data-act="classic"/g), 1);
+  assert.equal(count_(/data-act="move"/g), 1);
+  // Move is made in the page: no link out of /v2 for it
+  const dlg = fs.readFileSync(path.join(SRC, "v2", "views", "AgentDialogs.tsx"), "utf8");
+  assert.ok(!/href=\{?["'`]\/(setup|dash)/.test(dlg));
+  // the sidebar and More carry no theme or classic-page control
+  for (const f of ["App.tsx", "views/Pages.tsx"]) {
+    const t = fs.readFileSync(path.join(SRC, "v2", f), "utf8");
+    assert.ok(!/toggleTheme\}|data-act="(theme|classic)"/.test(t), f);
+  }
+});
+

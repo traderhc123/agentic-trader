@@ -7,6 +7,7 @@
 // the owner's risk in the confirm dialog, always comes from the server's own
 // preview (POST without `confirm`), never from here.
 import type { Change, Direction, Purchases, SettingsView, SignInEnd, SizeMode, SizeSpec, Unsold } from "../../lib/settingsApi";
+import type { BudgetHint } from "../../lib/viewModel";
 import { count, plural, usd } from "./format.ts";
 
 /** The first-run wizard is the only page /v2 sends the owner to (to finish
@@ -196,6 +197,7 @@ export function valueWords(key: string, v: unknown): string {
   }
   if (key === "wallet_fund") return isNum(v) ? `${count(v)} sats` : "not set";
   if (key === "code" && typeof v === "string" && v) return v.charAt(0).toUpperCase() + v.slice(1);
+  if (key === "expiry_sell_et") return v == null || typeof v === "string" ? etClockWords(v) : "not known";
   if (typeof v === "boolean") return v ? "On" : "Off";
   if (isNum(v)) return count(v);
   if (v == null || v === "") return "not set";
@@ -219,6 +221,7 @@ export function confirmLabel(changes: Change[]): string {
     if (lossWords(c.saved_now) === "Off") return `Set the limit to ${to}`;
   }
   if (c.key === "trade_size.other" && c.new == null) return "Use the main-pick size";
+  if (c.key === "expiry_sell_et") return c.new == null ? "Turn off the expiry-day sell" : `Sell at ${to}`;
   const short = to.replace(/ a (trade|day)$| at once$/, "");
   return c.direction === "raises_risk" ? `Raise to ${short}` : c.direction === "lowers_risk" ? `Lower to ${short}` : `Change to ${short}`;
 }
@@ -227,6 +230,16 @@ export function confirmLabel(changes: Change[]): string {
  *  types ("This raises your risk"). Same rules as webui._risk_direction:
  *  bigger is riskier, and no daily loss limit is the riskiest. */
 export function riskOf(key: string, old: unknown, next: unknown): Direction {
+  if (key === "expiry_sell_et") {
+    // "HH:MM" or null (off): off raises the risk, a later time holds the
+    // contract longer into its last day (webui._expiry_direction)
+    const a = old as string | null;
+    const b = next as string | null;
+    if (a === b) return "neutral";
+    if (b == null) return "raises_risk";
+    if (a == null) return "lowers_risk";
+    return b > a ? "raises_risk" : "lowers_risk";
+  }
   if (key === "trade_size.main" || key === "trade_size.other") {
     const a = old as SizeSpec | null;
     const b = next as SizeSpec | null;
@@ -409,13 +422,38 @@ export function etClockWords(hhmm: string | null | undefined): string {
   return `${h % 12 || 12}:${m[2]} ${h < 12 ? "AM" : "PM"} ET`;
 }
 
-/** The expiry alert part of an alerts save: only when it differs from what
- *  is saved (null = off). Undefined: leave it as it is. */
-export function expiryAlertPayload(saved: string | null | undefined, off: boolean, text: string): Parsed<string | undefined> {
+/** An expiry-day time for a save (the sell time on the limits route, the
+ *  alert on the alerts route): only when it differs from what is saved
+ *  (null = off). Undefined: leave it as it is. */
+export function expiryTimePayload(saved: string | null | undefined, off: boolean, text: string): Parsed<string | undefined> {
   if (off) return { ok: true, value: saved == null ? undefined : "off" };
   const t = readEtTime(text);
   if (!t.ok) return t;
   return { ok: true, value: t.value === saved ? undefined : t.value };
+}
+
+export const expiryAlertPayload = expiryTimePayload;
+
+// ── trade size: the wizard's words, and the budget hint ─────────────────────
+
+/** The classic sizing step's notice (wizard Sizing), said once in /v2: in
+ *  the trade-size confirm dialog. */
+export const SIZING_DISCLAIMER =
+  "Nobody here is an investment adviser and none of this software can advise position sizing. This number is your decision, made with money you can afford to lose entirely.";
+
+/** The size a budget hint suggests, as the trade-size form takes it. */
+export const hintSize = (h: BudgetHint): SizeSpec => ({ mode: "budget", value: h.suggest });
+
+/** The limits save "Use $S" leads to: exactly what typing $S in that book's
+ *  trade-size form sends (the classic hint button's "set [other ]budget S"). */
+export const hintPayload = (h: BudgetHint) => ({ trade_size: { [h.book]: { mode: "budget", value: h.suggest } } });
+
+/** One budget hint in words (agent._budget_hints, as the classic "why no
+ *  trades" panel said it). */
+export function hintWords(h: BudgetHint): string {
+  const which = h.book === "other" ? "other-trades" : "main-pick";
+  const cost = h.max_cost > h.min_cost ? `${money(h.min_cost)} to ${money(h.max_cost)}` : money(h.min_cost);
+  return `${plural(h.skipped, "signal")} today cost more than your ${money(h.budget)} ${which} size: one contract was ${cost}. ${money(h.suggest)} would have taken ${h.would_take} of them.`;
 }
 
 // ── the broker's own warning ────────────────────────────────────────────────

@@ -28,6 +28,8 @@ export type ActionId =
   | "to-live"
   | "retry"
   | "update"
+  // Today
+  | "ask"
   // Rules & limits
   | "limits"
   | "size"
@@ -76,6 +78,7 @@ export const ACTION_HOME: Record<ActionId, Home> = {
   "to-live": "band",
   retry: "band",
   update: "band",
+  ask: "today",
   limits: "rules",
   size: "rules",
   filters: "rules",
@@ -184,6 +187,7 @@ export function screenOf(view: View, s: Status, l: Link): Screen {
   if (bandStartLink(view, s, l)) links.push("settings");
   const controls = bandControls(s, l);
   if (view === "today") {
+    controls.push("ask");
     if (s.positions.length) links.push("holdings");
     if (todayHasDay(s, l)) links.push("activity");
     links.push("results");

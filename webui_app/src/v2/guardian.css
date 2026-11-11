@@ -788,6 +788,8 @@ textarea.input{min-height:120px;resize:vertical;font-size:15px;line-height:1.45}
 .callout-warn{border-color:var(--warn-line);background:var(--warn-tint)}
 .callout-warn p{color:var(--ink)} .callout-warn .ic{color:var(--warn-ink)}
 .rule-text{grid-column:1 / -1;margin-top:8px;white-space:pre-wrap;font-size:14px;color:var(--ink2);border-left:3px solid var(--line2);padding-left:12px;overflow-wrap:anywhere}
+.setrow-hint{grid-column:1 / -1;margin-top:8px;display:flex;gap:8px 12px;align-items:center;flex-wrap:wrap;padding:8px 12px;border:1px solid var(--line2);border-radius:var(--r1);background:var(--well);font-size:14px}
+.setrow-hint > span{flex:1 1 260px;min-width:0}
 .bolt{display:block;font:13px/1.4 ui-monospace,Consolas,Menlo,monospace;background:var(--well);border:1px solid var(--line);border-radius:6px;padding:8px 12px;word-break:break-all;max-height:6.5em;overflow:auto;user-select:all}
 .note .agent-said{grid-column:2;margin-top:4px}
 .note .agent-said p{grid-column:auto;margin-top:4px}
@@ -838,3 +840,19 @@ textarea.input{min-height:120px;resize:vertical;font-size:15px;line-height:1.45}
 .choices .check span{display:grid;gap:2px}
 .choices .check small{font-weight:400}
 .ph .switch{margin-left:auto}
+.paid-mark{display:block;font:400 12px/1.3 var(--sans);color:var(--ink2);margin-top:2px}
+.a-ask{margin-top:16px}
+.ask{display:grid;gap:6px}
+.ask label{font-weight:650;font-size:14px}
+.ask .editor-row .input{flex:1 1 240px;min-width:0}
+.talk{list-style:none;margin:0 0 12px;padding:0;display:grid;gap:10px;max-height:420px;overflow:auto}
+.talk li{display:grid;gap:4px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+.talk p{margin:0;font-size:15px;overflow-wrap:anywhere;white-space:pre-wrap}
+.talk b{display:inline-block;min-width:3.5em;font-size:13px;color:var(--ink2)}
+.pgroups{list-style:none;margin:0;padding:0}
+.pgroups li + li{border-top:1px solid var(--line)}
+.pgroup{display:grid;gap:2px;width:100%;text-align:left;padding:10px 16px;min-height:44px;background:none;border:0;color:inherit;font:inherit;cursor:pointer}
+.pgroup:hover{background:var(--well)}
+.pg-t{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.pg-n{font:700 14px/1 var(--mono);color:var(--ink2)}
+.pg-s,.pg-h{font-size:14px;color:var(--ink2);overflow-wrap:anywhere}

@@ -5,7 +5,7 @@
 import { useMemo, useState } from "react";
 import type { Book, Status } from "../../lib/viewModel";
 import { type ChartModel, type Range, RANGES, chartModel, isRange } from "../lib/chart";
-import { PAPER_BOOK_CAPTION, bookToday, bookTodayNote, realBookCaption } from "../lib/derive";
+import { PAPER_BOOK_CAPTION, bookToday, bookTodayNote, paidMark, realBookCaption } from "../lib/derive";
 import { dayLong, etDayKey, plural, signed, tone } from "../lib/format";
 import { Stamp, Tag } from "../ui";
 import type { Page } from "../App";
@@ -189,6 +189,7 @@ export function ResultsView({ page }: { page: Page }) {
     );
   const c = s.results.signal_cost;
   const net = c.applies && c.usd_paid != null ? R.total - c.usd_paid : null;
+  const pd = s.results.paid_days;
   return (
     <div className="view">
       {head}
@@ -202,6 +203,7 @@ export function ResultsView({ page }: { page: Page }) {
         <section className={`panel ${page.stale ? "stale" : ""}`}>
           <div className="ph">
             <h2>Result by day</h2>
+            <span className="meta">Each trade counts on the day it closed (ET)</span>
           </div>
           <div className="tbl-wrap stale-c">
             <table className="tbl tbl-days">
@@ -223,6 +225,7 @@ export function ResultsView({ page }: { page: Page }) {
                     <th scope="row">
                       {d.day === today ? "Today, " : ""}
                       {dayLong(d.day)}
+                      {paidMark(s, d.day) && <small className="paid-mark">{paidMark(s, d.day)}</small>}
                     </th>
                     {cell(d.real)}
                     {cell(d.practice)}
@@ -271,6 +274,29 @@ export function ResultsView({ page }: { page: Page }) {
                   <strong>After signal cost</strong>
                 </span>
                 <b className={tone(net)}>{signed(net)}</b>
+              </li>
+            )}
+            {pd.real && (
+              <li className="sep" data-paid="real">
+                <span>
+                  Result on paid signal days
+                  <small>
+                    {plural(pd.real.closed, "real-money trade")} opened on {plural(pd.real.days, "paid signal day")}, counted on the day each was
+                    opened.
+                  </small>
+                </span>
+                <b className={tone(pd.real.pnl)}>{signed(pd.real.pnl)}</b>
+              </li>
+            )}
+            {pd.practice && pd.practice.closed > 0 && (
+              <li data-paid="practice">
+                <span>
+                  <Tag kind="prac" />
+                  <small>
+                    {plural(pd.practice.closed, "practice trade")} opened on {plural(pd.practice.days, "paid signal day")}. Never counted as money.
+                  </small>
+                </span>
+                <b className={`${tone(pd.practice.pnl)} soft`}>{signed(pd.practice.pnl)}</b>
               </li>
             )}
           </ul>

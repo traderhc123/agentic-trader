@@ -117,6 +117,37 @@ export function confirmBody(payload: Record<string, unknown>, token: string, ack
   return acknowledge === undefined ? { ...payload, confirm: token } : { ...payload, confirm: token, acknowledge };
 }
 
+/** One question to the agent and its answer, kept in the page only (this
+ *  visit: never stored, never sent back). */
+export interface Turn {
+  q: string;
+  a: string;
+  /** when the answer came, as the page's clock read it */
+  at: string;
+}
+
+/** POST /api/v2/ask: the agent's answer, or why there is none. Answer-only
+ *  (the server never runs a command from it), so a failed request changes
+ *  nothing and never makes the page doubt its settings. */
+export async function askAgent(question: string, f: Fetch = browserFetch): Promise<{ ok: true; answer: string } | { ok: false; error: string }> {
+  let r: Response;
+  try {
+    r = await postJson(API.ask, { question }, undefined, f);
+  } catch {
+    return { ok: false, error: FAILED.network.read };
+  }
+  if (r.status === 401 || r.status === 403) return { ok: false, error: FAILED.locked.read };
+  let j: { ok?: unknown; answer?: unknown; error?: unknown } | null = null;
+  try {
+    j = await r.json();
+  } catch {
+    /* not JSON */
+  }
+  if (r.status !== 200 || !j || typeof j !== "object") return { ok: false, error: FAILED.server.read };
+  if (j.ok === true && typeof j.answer === "string") return { ok: true, answer: j.answer };
+  return { ok: false, error: typeof j.error === "string" && j.error ? j.error : FAILED.server.read };
+}
+
 // The routes /v2 uses. One list, so a test can see every one of them.
 export const API = {
   settings: "/api/v2/settings",
@@ -142,6 +173,8 @@ export const API = {
   walletPage: "/api/v2/wallet/page",
   proposalRequest: "/api/v2/proposal/request",
   proposalApply: "/api/v2/proposal/apply",
+  // Today → Ask your agent: answers only, never a command
+  ask: "/api/v2/ask",
   // classic, read-only (or saving nothing), reused as they are
   brokers: "/api/brokers",
   aiProviders: "/api/llm/providers",

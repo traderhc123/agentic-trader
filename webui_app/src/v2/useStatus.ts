@@ -45,6 +45,13 @@ function merge(a: Activity[], b: Activity[]): Activity[] {
   return [...m.values()].sort((x, y) => y.n - x.n);
 }
 
+/** A page's day_lines as {day: lines} (none from a server that sends none). */
+function linesOf(page: ActivityPage): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const d of Array.isArray(page.day_lines) ? page.day_lines : []) if (d && typeof d.lines === "number") out[d.day] = d.lines;
+  return out;
+}
+
 export interface StatusFeed {
   status: Status | null;
   fetching: Fetching;
@@ -52,6 +59,9 @@ export interface StatusFeed {
   failing: boolean;
   /** every Activity row loaded this visit, newest first */
   rows: Activity[];
+  /** each loaded market day's line count in the whole log (ActivityPage.
+   *  day_lines), so a day the page has only part of is never summed as whole */
+  dayLines: Record<string, number>;
   total: number;
   canLoadOlder: boolean;
   loadingOlder: boolean;
@@ -66,6 +76,7 @@ export function useStatus(): StatusFeed {
   const [failing, setFailing] = useState(false);
   const [rows, setRows] = useState<Activity[]>([]);
   const [total, setTotal] = useState(0);
+  const [dayLines, setDayLines] = useState<Record<string, number>>({});
   const [olderDone, setOlderDone] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState("");
@@ -97,13 +108,16 @@ export function useStatus(): StatusFeed {
       });
     // More new rows arrived than one page holds: the rows between were never fetched.
     const gap = more && prevMax != null && pageMin != null && pageMin > prevMax + 1;
+    const lines = linesOf(page);
     if (replaced || gap) {
       gen.current++;
       olderLoaded.current = false;
+      setDayLines(lines);
       setRows(first);
       setOlderDone(!more);
       setOlderError("");
     } else {
+      setDayLines((d) => ({ ...d, ...lines }));
       setRows((p) => merge(p, first));
       if (!olderLoaded.current) setOlderDone(!more);
     }
@@ -181,6 +195,7 @@ export function useStatus(): StatusFeed {
         return;
       }
       olderLoaded.current = true;
+      setDayLines((d) => ({ ...linesOf(page), ...d }));
       setRows((p) => merge(p, page.rows));
       setOlderDone(page.next == null || page.rows.length === 0);
     } catch {
@@ -190,5 +205,5 @@ export function useStatus(): StatusFeed {
     }
   }, [loadingOlder]);
 
-  return { status, fetching, failing, rows, total, canLoadOlder, loadingOlder, olderError, loadOlder, refresh };
+  return { status, fetching, failing, rows, dayLines, total, canLoadOlder, loadingOlder, olderError, loadOlder, refresh };
 }

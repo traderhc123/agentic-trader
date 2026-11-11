@@ -17,7 +17,7 @@ import { RulesView } from "./views/Rules";
 import { SettingsView } from "./views/Settings";
 import { SignalsView } from "./views/Signals";
 import { useSettings, type SettingsFeed } from "./useSettings";
-import { API, onUnknownWrite, send } from "./lib/http";
+import { API, onUnknownWrite, send, type Turn } from "./lib/http";
 import { VIEWS, type View } from "./lib/screens";
 import { ResultsView } from "./views/Results";
 import { Today } from "./views/Today";
@@ -50,6 +50,9 @@ export interface Page {
   say: (ok: boolean, text: string) => void;
   /** read the status again now (after a save) */
   refresh: () => void;
+  /** Today's "Ask your agent" conversation, this visit only */
+  talk: Turn[];
+  addTalk: (t: Turn) => void;
 }
 
 function viewFromHash(): View {
@@ -205,6 +208,8 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
   const [posId, setPosId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null);
+  const [talk, setTalk] = useState<Turn[]>([]);
+  const addTalk = useCallback((t: Turn) => setTalk((x) => [...x, t].slice(-50)), []);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>();
   const main = useRef<HTMLElement>(null);
   const theme = useTheme();
@@ -308,6 +313,8 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
     settings,
     say,
     refresh: () => void feed.refresh(),
+    talk,
+    addTalk,
   };
   const ev = evN != null ? feed.rows.find((e) => e.n === evN) : undefined;
   const pos = posId != null ? status.positions.find((p) => p.id === posId) : undefined;
