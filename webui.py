@@ -5509,6 +5509,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "this_computer", "Where the agent runs", "this computer",
                 f"a new DigitalOcean server ({region})", "neutral")], [
                 "DigitalOcean bills your own account for the server.",
+                f"If DigitalOcean has no room for the $6 server in {region} "
+                "right now, the agent makes it in a nearby region instead, or, "
+                f"if none has room, as a bigger size in {region} that costs a "
+                "little more. What it made is said once the server exists.",
                 "It does not sell anything: open positions stay open at your "
                 "broker; the server sells them on their exit signals.",
                 "It does not leave this computer trading: once the server is "

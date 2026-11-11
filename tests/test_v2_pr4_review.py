@@ -217,3 +217,23 @@ def test_the_login_link_opens_the_chosen_dashboard(home, app, monkeypatch):
     # the setup server (no agent behind it) is not the agent's dashboard
     monkeypatch.setattr(webui, "_app_v2", lambda: "<!doctype html><title>v2</title>")
     assert _get_raw(app(), path)[:2] == (302, "/dash")
+
+
+# ── the cloud move: the preview says where and what size it may really be ──
+
+@pytest.mark.parametrize("region", ["nyc3", "lon1"])
+def test_the_cloud_move_preview_says_it_may_use_another_region_or_size(home, app, monkeypatch, region):
+    """provision.pick_region_and_size may make the server in a nearby region
+    or at a bigger, pricier size: the confirmed preview says so before the
+    owner's DigitalOcean account is billed."""
+    import provision
+    monkeypatch.setattr(provision, "pick_region_and_size",
+                        lambda *a: pytest.fail("the preview asked DigitalOcean"))
+    write_cfg(home, BASE)
+    c = app()
+    first = c.post("/api/v2/move/deploy", {"token": "dop_v1_faketoken0022", "region": region})
+    said = " ".join(first["preview"]["does_not"])
+    assert first["needs_confirm"] is True
+    assert f"no room for the $6 server in {region}" in said
+    assert "nearby region" in said and "costs a little more" in said
+    assert read_cfg(home) == BASE
