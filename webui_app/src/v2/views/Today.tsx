@@ -2,13 +2,13 @@
 // is held and what the agent will do with it, what the agent is doing right
 // now, today's limits, today so far, money so far.
 import type { Activity, Position, Status } from "../../lib/viewModel";
-import { answerLook, answerWhy, describe, sellsHow } from "../lib/copy";
+import { answerLook, answerWhy, describe, sellsHow, type Go } from "../lib/copy";
+import { notesOn, todayHasDay, todayLimitsLink } from "../lib/screens";
 import {
   brokerLabel,
   dayBooks,
   dayTally,
   nextFor,
-  notes,
   paidFor,
   practicePositions,
   realPositions,
@@ -22,45 +22,41 @@ import type { Page } from "../App";
 
 // ── notes ───────────────────────────────────────────────────────────────────
 
-const NOTE_ACTION: Record<Note["actions"][number], string> = {
-  resume: "Resume",
-  start: "Open setup to start it",
-  retry: "Try again",
-  settings: "Open Settings",
+/** A note's one link: the page that owns what to do about it. */
+const GO_WORDS: Record<Go, string> = {
+  settings: "Settings",
   signals: "Signals & pass",
   rules: "Rules & limits",
+  holdings: "Holdings",
 };
 
-export function Notes({ page, crit }: { page: Page; crit: boolean }) {
-  const list = notes(page.s, page.link).filter((n) => (n.level === "crit") === crit);
-  if (!list.length) return null;
+/** The needs-you notes, one per condition (lib/derive.notes). Each links at
+ *  most once, to the page that owns the action; the band's own buttons
+ *  (Resume, Try again, start) are never repeated here. */
+export function Notes({ page, list, crit }: { page: Page; list: Note[]; crit?: boolean }) {
+  const shown = crit === undefined ? list : list.filter((n) => (n.level === "crit") === crit);
+  if (!shown.length) return null;
+  const urgent = shown.every((n) => n.level === "crit");
   return (
-    <section className="notes" aria-label={crit ? "Needs you now" : "Good to know today"}>
-      {list.map((n) => (
-        <div key={n.key} className={`note note-${n.level}`} role={crit ? "alert" : undefined}>
+    <section className="notes" aria-label={urgent ? "Needs you now" : "Good to know today"}>
+      {shown.map((n) => (
+        <div key={n.key} className={`note note-${n.level}`} role={n.level === "crit" ? "alert" : undefined} data-codes={n.codes.join(" ")}>
           <Icon name={n.icon} />
           <h3>{n.title}</h3>
           <p>{n.text}</p>
-          {n.actions.length > 0 && (
+          {n.agent.length > 0 && (
+            <details className="tech agent-said">
+              <summary>Your agent's own message</summary>
+              {n.agent.map((t) => (
+                <p key={t}>{t}</p>
+              ))}
+            </details>
+          )}
+          {n.go && (
             <div className="note-act">
-              {n.actions.map((a) =>
-                a === "start" ? (
-                  <a key={a} className="btn btn-primary" href="/setup">
-                    {NOTE_ACTION[a]}
-                  </a>
-                ) : (
-                  <button
-                    key={a}
-                    className={`btn ${a === "resume" ? "btn-primary" : ""}`}
-                    disabled={page.busy && (a === "resume" || a === "retry")}
-                    onClick={() =>
-                      a === "resume" ? page.act("resume") : a === "retry" ? page.act("retry") : page.go(a === "settings" ? "settings" : a)
-                    }
-                  >
-                    {NOTE_ACTION[a]}
-                  </button>
-                ),
-              )}
+              <button className="btn" data-go={n.go} onClick={() => page.go(n.go as Go)}>
+                {GO_WORDS[n.go]}
+              </button>
             </div>
           )}
         </div>
@@ -135,7 +131,7 @@ function StatementBlock({ page }: { page: Page }) {
             </li>
           </ol>
           <div>
-            <button className="btn" onClick={() => page.go("rules")}>
+            <button className="btn" data-go="rules" onClick={() => page.go("rules")}>
               Review my rules and limits
             </button>
           </div>
@@ -265,7 +261,7 @@ function HoldingsPanel({ page }: { page: Page }) {
         <h2>Holding now</h2>
         <span className="ph-r">
           {page.stale && <Stamp at={page.asOf} />}
-          <button className="btn btn-quiet btn-sm" onClick={() => page.go("holdings")}>
+          <button className="btn btn-quiet btn-sm" data-go="holdings" onClick={() => page.go("holdings")}>
             All holdings
           </button>
         </span>
@@ -363,7 +359,7 @@ export function LimitsPanel({ page, linkLabel = "Change limits" }: { page: Page;
         <span className="ph-r">
           {page.stale && <Stamp at={page.asOf} />}
           {linkLabel && (
-            <button className="btn btn-quiet btn-sm" onClick={() => page.go("rules")}>
+            <button className="btn btn-quiet btn-sm" data-go="rules" onClick={() => page.go("rules")}>
               {linkLabel}
             </button>
           )}
@@ -477,8 +473,7 @@ function DayPanel({ page }: { page: Page }) {
   const today = etDayKey(s.as_of);
   const live = s.mode === "live";
   const t = dayTally(page.rows, today, page.hasOlder, s.broker.name);
-  const anyToday = page.rows.some((e) => etDayKey(e.at) === today);
-  if (!anyToday) return null;
+  if (!todayHasDay(s, page.link)) return null;
   const books = dayBooks(s);
   const opened = live ? s.limits.used_today.real : s.limits.used_today.practice;
   const least = t.complete ? "" : "at least ";
@@ -488,7 +483,7 @@ function DayPanel({ page }: { page: Page }) {
         <h2>Today so far</h2>
         <span className="ph-r">
           {page.stale && <Stamp at={page.asOf} />}
-          <button className="btn btn-quiet btn-sm" onClick={() => page.go("activity")}>
+          <button className="btn btn-quiet btn-sm" data-go="activity" onClick={() => page.go("activity")}>
             All activity
           </button>
         </span>
@@ -582,7 +577,7 @@ function MoneyPanel({ page }: { page: Page }) {
         <h2>Money so far</h2>
         <span className="ph-r">
           {page.stale && <Stamp at={page.asOf} />}
-          <button className="btn btn-quiet btn-sm" onClick={() => page.go("results")}>
+          <button className="btn btn-quiet btn-sm" data-go="results" onClick={() => page.go("results")}>
             Full results
           </button>
         </span>
@@ -636,11 +631,12 @@ function MoneyPanel({ page }: { page: Page }) {
 
 export function Today({ page }: { page: Page }) {
   const empty = statement(page.s, page.link).empty;
+  const list = notesOn("today", page.s, page.link);
   return (
     <div className="view">
-      <Notes page={page} crit />
+      <Notes page={page} list={list} crit />
       <StatementBlock page={page} />
-      <Notes page={page} crit={false} />
+      <Notes page={page} list={list} crit={false} />
       <div className="today-grid">
         <div className="stack">
           <HoldingsPanel page={page} />
@@ -648,7 +644,7 @@ export function Today({ page }: { page: Page }) {
         </div>
         <div className="stack">
           <DoingPanel page={page} />
-          <LimitsPanel page={page} />
+          <LimitsPanel page={page} linkLabel={todayLimitsLink(page.s, page.link) ? "Change limits" : null} />
           {!empty && <MoneyPanel page={page} />}
         </div>
       </div>

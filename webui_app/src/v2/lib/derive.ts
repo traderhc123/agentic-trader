@@ -10,8 +10,9 @@
 //   - when the agent is not answering, or this page can't fetch, nothing is
 //     presented as current: the mode is "unknown" and every panel is stamped
 //     "as of" the last report.
-import type { Activity, Book, Iso, Position, Status } from "../../lib/viewModel";
-import { GUARD_STILL, UNMANAGED_FALLBACK, UNMANAGED_SHORT, UNMANAGED_WHY, answerWhy, describe, leftToday, nextSay, own, sizeEach, type IconName, type NextSay } from "./copy.ts";
+import type { Activity, Book, Condition, Iso, Notice, Position, Status } from "../../lib/viewModel";
+import { GUARD_STILL, UNMANAGED_FALLBACK, UNMANAGED_SHORT, UNMANAGED_WHY, answerWhy, describe, leftToday, nextSay, own, sizeEach, type Go, type IconName, type NextSay } from "./copy.ts";
+import { v2Words } from "./settings.ts";
 import { contractName, etDayKey, etTime, etWhen, dayLong, plural, span, secondsBetween, usd } from "./format.ts";
 
 /** How this page is connected to the agent. Independent of mode and pause.
@@ -113,10 +114,9 @@ export function bandModel(s: Status, l: Link): BandModel {
     return {
       frame: "unknown",
       word: "Mode unknown",
-      say:
-        l === "lost"
-          ? ["", `This window can't reach your agent. Its last report, at ${etTime(s.as_of)}, said ${modeWord(s)}.`]
-          : ["", `The agent has not reported since ${etTime(asOf(s, l))}. Its last report said ${modeWord(s)}.`],
+      // the run-state block says why ("No connection", "Not answering");
+      // the Today statement says what that means: the band only the mode
+      say: ["", `Its last report, at ${etTime(asOf(s, l))}, said ${modeWord(s)}.`],
       run,
       title: `${run.text} · Agentic Trader`,
       announce: `Mode unknown. ${l === "lost" ? "This window can't reach the agent." : "The agent is not answering."}`,
@@ -126,10 +126,7 @@ export function bandModel(s: Status, l: Link): BandModel {
   const run: Run = own(RUN, s.pause.kind) ?? { kind: "paused", icon: "pause", text: "Paused", long: "" };
   let say: [string, string];
   if (l === "stopped") {
-    say = [
-      live ? "Real money is the saved mode." : "Pretend money is the saved mode.",
-      " The agent is stopped, so nothing is bought, sold or watched until it is started.",
-    ];
+    say = [live ? "Real money is the saved mode." : "Pretend money is the saved mode.", " It applies when the agent is started again."];
   } else if (live) {
     say = [
       "Real money.",
@@ -274,58 +271,115 @@ export function marketVital(s: Status, now: Iso): Vital {
 }
 
 // ── needs-you notes ─────────────────────────────────────────────────────────
+//
+// One fact, one place: each condition is one note. When the agent's own
+// message ("From your agent") is about a condition the dashboard has a note
+// for, the two are one note in the dashboard's (tested) words, with the
+// agent's message folded in under it; they are matched by the view-model's
+// condition codes (Status.conditions), never by comparing text. A note links
+// at most once to the page that owns what to do about it, and no two notes
+// on a screen link to the same page.
+
+/** A note's condition: the view-model's codes, plus "link_lost" (this page
+ *  can't reach the agent: a fact only the page knows). */
+export type NoteCode = Condition | "link_lost";
 
 export interface Note {
   key: string;
+  /** the conditions this note states; the first is its own */
+  codes: NoteCode[];
   level: "crit" | "warn" | "info";
   icon: IconName;
   title: string;
   text: string;
-  actions: ("resume" | "start" | "retry" | "settings" | "signals" | "rules")[];
+  /** the agent's own messages about the same condition, in its words */
+  agent: string[];
+  /** the one page this note links to (the page that owns the action), or none */
+  go: Go | null;
 }
 
-export function notes(s: Status, l: Link): Note[] {
+/** Where a condition is dealt with in /v2 (null: the band's own buttons, or
+ *  nothing the owner can do here). */
+export const CONDITION_GO: Record<NoteCode, Go | null> = {
+  link_lost: null,
+  agent_stopped: null,
+  agent_not_answering: null,
+  state_hold: null,
+  handoff_hold: null,
+  restarting: null,
+  paused: null,
+  settings_unreadable: "settings",
+  ai_needed: "settings",
+  broker_down: "settings",
+  positions_unmanaged: "holdings",
+  low_cash: "rules",
+  daily_cap_reached: "rules",
+  daily_loss_reached: "rules",
+  position_cap_reached: "rules",
+  signal_pass: "signals",
+  feed_unreachable: "signals",
+  records_unwritten: null,
+  backup_failing: null,
+  second_copy: null,
+  position_expired: "holdings",
+  position_expiring_unsold: "holdings",
+  position_expiring: "holdings",
+};
+
+const LEVEL_OF: Record<Notice["level"], Note["level"]> = { urgent: "crit", warn: "warn", info: "info" };
+const RANK: Record<Note["level"], number> = { info: 0, warn: 1, crit: 2 };
+
+/** Every note for this state. `here`: the page they are shown on (a note
+ *  never links to the page it is on). */
+export function notes(s: Status, l: Link, here?: Go | "today" | "activity" | "results" | "more"): Note[] {
   const out: Note[] = [];
   const rp = realPositions(s);
   const n = s.real_positions;
   const b = brokerName(s);
   const expiring = rp.find((p) => p.expires_today);
   const expText = expiring ? ` ${contractName(expiring.contract, expiring.label)} expires today.` : "";
+  const note = (x: Omit<Note, "agent" | "go"> & { go?: Go | null }): Note => ({ agent: [], ...x, go: x.go === undefined ? CONDITION_GO[x.codes[0]] : x.go });
   if (l === "lost" || l === "silent")
-    out.push({
-      key: "link",
-      level: "crit",
-      icon: "alert",
-      title: n ? `Nobody may be watching your ${plural(n, "real position")}` : "The agent may have stopped",
-      text:
-        (l === "lost"
-          ? "This page has stopped getting answers. If the agent has stopped, it is not buying or selling anything."
-          : "The server answers, but the agent's loop has gone quiet. While it is quiet it is not buying or selling anything.") +
-        (n ? ` Look after the positions yourself at ${b} until it answers.` : "") +
-        expText,
-      actions: ["retry"],
-    });
+    out.push(
+      note({
+        key: "link",
+        codes: [l === "lost" ? "link_lost" : "agent_not_answering"],
+        level: "crit",
+        icon: "alert",
+        title: n ? `Nobody may be watching your ${plural(n, "real position")}` : "The agent may have stopped",
+        text:
+          (l === "lost"
+            ? "This page has stopped getting answers. If the agent has stopped, it is not buying or selling anything."
+            : "The server answers, but the agent's loop has gone quiet. While it is quiet it is not buying or selling anything.") +
+          (n ? ` Look after the positions yourself at ${b} until it answers.` : "") +
+          expText,
+      }),
+    );
   else if (l === "stopped" && n)
-    out.push({
-      key: "stopped",
-      level: "crit",
-      icon: "alert",
-      title: `Nobody is selling your ${plural(n, "real position")}`,
-      text: `The agent is stopped, so exit signals and the expiry sell are not acted on. Start it again, or look after ${their(n, "the position", "the positions")} yourself at ${b}.${expText}`,
-      actions: ["start"],
-    });
+    out.push(
+      note({
+        key: "stopped",
+        codes: ["agent_stopped"],
+        level: "crit",
+        icon: "alert",
+        title: `Nobody is selling your ${plural(n, "real position")}`,
+        text: `Exit signals and the expiry sell are not acted on while the agent is stopped. Start it again, or look after ${their(n, "the position", "the positions")} yourself at ${b}.${expText}`,
+      }),
+    );
   else if (l === "ok" && s.broker.connected === false)
-    out.push({
-      key: "broker",
-      level: "crit",
-      icon: "plug",
-      title: `${b} is not connected${s.broker.since ? `, since ${etTime(s.broker.since)}` : ""}`,
-      text:
-        `The agent can't buy or sell until it is connected again.` +
-        (n ? ` Your ${plural(n, "real position")} ${their(n, "is", "are")} not being sold on exit signals.${expText}` : "") +
-        (s.broker.last_error ? ` The broker's last answer: “${s.broker.last_error}”.` : ""),
-      actions: ["settings"],
-    });
+    out.push(
+      note({
+        key: "broker",
+        codes: ["broker_down", ...(n && !s.real_positions_managed ? (["positions_unmanaged"] as NoteCode[]) : [])],
+        level: "crit",
+        icon: "plug",
+        title: `Connect ${b} again`,
+        text:
+          `Until it is connected, the agent can't place or sell any order there.` +
+          (n ? ` Your ${plural(n, "real position")} ${their(n, "is", "are")} not being sold on exit signals.${expText}` : "") +
+          (s.broker.last_error ? ` The broker's last answer: “${s.broker.last_error}”.` : ""),
+      }),
+    );
   else if (l === "ok" && n && !s.real_positions_managed) {
     const lost = unwatched(s);
     // with no exit signals the expiry sell still acts: not "nobody is selling it"
@@ -333,56 +387,53 @@ export function notes(s: Status, l: Link): Note[] {
       (p) => p.expires_today && !(p.next.expiry_guard_at && GUARD_STILL.includes(p.next.reason_code)),
     );
     const k = lost.length;
-    out.push({
-      key: "unmanaged",
-      level: "crit",
-      icon: "alert",
-      title: exp
-        ? `${contractName(exp.contract, exp.label)} expires today and nobody is selling it`
-        : `${notSold(s)} not being sold by the agent`,
-      text:
-        (own(UNMANAGED_WHY, s.unmanaged_reason) ?? 'Holdings says which, under "What the agent will do".') +
-        (s.pause.can_resume ? " Press Resume to put the agent back on watch, or" : " Until that changes,") +
-        ` look after ${their(k, "it", "them")} yourself at ${b}.` +
-        (exp ? " Left alone, an expiring contract can be exercised or expire worthless." : ""),
-      actions: s.pause.can_resume ? ["resume"] : [],
-    });
+    out.push(
+      note({
+        key: "unmanaged",
+        codes: ["positions_unmanaged", ...(exp ? (["position_expiring_unsold"] as NoteCode[]) : [])],
+        level: "crit",
+        icon: "alert",
+        title: exp
+          ? `${contractName(exp.contract, exp.label)} expires today and nobody is selling it`
+          : `${notSold(s)} not being sold by the agent`,
+        text:
+          (own(UNMANAGED_WHY, s.unmanaged_reason) ?? 'Holdings says which, under "What the agent will do".') +
+          (s.pause.can_resume ? " Press Resume to put the agent back on watch, or" : " Until that changes,") +
+          ` look after ${their(k, "it", "them")} yourself at ${b}.` +
+          (exp ? " Left alone, an expiring contract can be exercised or expire worthless." : ""),
+      }),
+    );
   }
-  for (const [i, x] of s.notices.entries())
-    out.push({
-      key: `notice-${i}`,
-      level: x.level === "urgent" ? "crit" : x.level === "warn" ? "warn" : "info",
-      icon: x.level === "urgent" ? "alert" : "info",
-      title: x.level === "urgent" ? "From your agent: needs you" : "From your agent",
-      text: x.text,
-      actions: [],
-    });
   if (!isStale(l)) {
     if (!s.agent.settings_readable)
-      out.push({
-        key: "settings",
-        level: "warn",
-        icon: "info",
-        title: "The settings file can't be read right now",
-        text: "The values shown are the ones the agent is running on. Saving a setting is refused until the file is readable again.",
-        actions: ["settings"],
-      });
+      out.push(
+        note({
+          key: "settings",
+          codes: ["settings_unreadable"],
+          level: "warn",
+          icon: "info",
+          title: "The settings file can't be read right now",
+          text: "The values shown are the ones the agent is running on. Saving a setting is refused until the file is readable again.",
+        }),
+      );
     const c = s.limits.cash;
     if (c.low && s.broker.buying_power != null && s.broker.connected !== false) {
       const m = s.limits.trade_size.main;
-      out.push({
-        key: "cash",
-        level: "warn",
-        icon: "info",
-        title: `Only ${usd(s.broker.buying_power)} cash at ${b}`,
-        text:
-          (c.low_reason === "under_trade_size" && m.usd != null
-            ? `That is less than one trade at your ${usd(m.usd, 0)} size, so real buy orders would be rejected.`
-            : "That is too little for the agent to buy with, so real buy orders would be rejected.") +
-          ` Add cash at ${b}, or lower your trade size. Selling is not affected.` +
-          (s.mode === "practice" ? " You are in practice mode, so nothing is blocked now." : ""),
-        actions: ["rules"],
-      });
+      out.push(
+        note({
+          key: "cash",
+          codes: ["low_cash"],
+          level: "warn",
+          icon: "info",
+          title: `Add cash at ${b}, or lower your trade size`,
+          text:
+            (c.low_reason === "under_trade_size" && m.usd != null
+              ? `${usd(s.broker.buying_power)} is less than one trade at your ${usd(m.usd, 0)} size, so real buy orders would be rejected.`
+              : `${usd(s.broker.buying_power)} is too little for the agent to buy with, so real buy orders would be rejected.`) +
+            " Selling is not affected." +
+            (s.mode === "practice" ? " You are in practice mode, so nothing is blocked now." : ""),
+        }),
+      );
     }
     const p = s.signals.pass;
     // a last read of the feed that saw entry signals saw the exits too: the
@@ -392,33 +443,88 @@ export function notes(s: Status, l: Link): Note[] {
     const lacking = p.status === "exits_only" || p.status === "none" || p.status === "waiting" || p.status === "unknown";
     if (l === "ok" && lacking && !reading && p.kind !== "not_needed") {
       const held = n ? ` Until then, watch your ${plural(n, "real position")} and sell ${their(n, "it", "them")} yourself at ${b}.` : "";
-      out.push({
-        key: "pass",
-        level: "warn",
-        icon: "info",
-        title:
-          p.status === "exits_only"
-            ? "No signal days left for new trades"
-            : p.status === "unknown"
-              ? "Your signal pass could not be checked"
-              : p.status === "waiting"
-                ? p.auto_pay
-                  ? "No signal pass for today yet"
-                  : "No usable signal pass"
-                : "No signal pass",
-        text:
-          p.status === "exits_only"
-            ? "The agent still receives exit signals for what it holds, so open positions are still sold. It takes no new trades until you add signal days."
-            : p.status === "unknown"
-              ? `The agent could not check your signal pass with AgentHC (the check failed, or has not run yet). Until it can, it reads no signals: no new trades, and no exit signals for what it holds. It checks again on each read.${held}`
-              : p.status === "waiting" && p.auto_pay
-                ? "Your wallet's auto-pay buys a day-pass on the agent's next read of the feed on a market day. Until it has one, the agent receives no signals: no new trades, and no exit signals for what it holds."
+      out.push(
+        note({
+          key: "pass",
+          codes: ["signal_pass"],
+          level: "warn",
+          icon: "info",
+          title:
+            p.status === "exits_only"
+              ? "No signal days left for new trades"
+              : p.status === "unknown"
+                ? "Your signal pass could not be checked"
                 : p.status === "waiting"
-                  ? `Your signal pass is used up, expired or waiting for payment, so the agent receives no signals: no new trades, and no exit signals for what it holds.${held}`
-                  : `Without a pass the agent receives no signals: no new trades, and no exit signals for what it holds.${held}`,
-        actions: ["signals"],
-      });
+                  ? p.auto_pay
+                    ? "No signal pass for today yet"
+                    : "No usable signal pass"
+                  : "No signal pass",
+          text:
+            p.status === "exits_only"
+              ? "The agent still receives exit signals for what it holds, so open positions are still sold. It takes no new trades until you add signal days."
+              : p.status === "unknown"
+                ? `The agent could not check your signal pass with AgentHC (the check failed, or has not run yet). Until it can, it reads no signals: no new trades, and no exit signals for what it holds.${held}`
+                : p.status === "waiting" && p.auto_pay
+                  ? "Your wallet's auto-pay buys a day-pass on the agent's next read of the feed on a market day. Until it has one, the agent receives no signals: no new trades, and no exit signals for what it holds."
+                  : p.status === "waiting"
+                    ? `Your signal pass is used up, expired or waiting for payment, so the agent receives no signals: no new trades, and no exit signals for what it holds.${held}`
+                    : `Without a pass the agent receives no signals: no new trades, and no exit signals for what it holds.${held}`,
+        }),
+      );
     }
+  }
+
+  // the agent's own messages: folded into the note about the same condition,
+  // else one note per condition, else (about nothing the view-model knows)
+  // as they are, each text once
+  const used = new Set<number>();
+  for (const c of s.conditions ?? []) {
+    const idx = c.notices.filter((i) => i >= 0 && i < s.notices.length && !used.has(i));
+    if (!idx.length) continue;
+    idx.forEach((i) => used.add(i));
+    const texts = [...new Set(idx.map((i) => v2Words(s.notices[i].text)))];
+    const lvl = LEVEL_OF[c.level] ?? "info";
+    const home = out.find((x) => x.codes.includes(c.code));
+    if (home) {
+      for (const t of texts) if (!home.agent.includes(t)) home.agent.push(t);
+      if (RANK[lvl] > RANK[home.level]) home.level = lvl;
+      continue;
+    }
+    out.push(
+      note({
+        key: `cond-${c.code}`,
+        codes: [c.code],
+        level: lvl,
+        icon: lvl === "crit" ? "alert" : "info",
+        title: lvl === "crit" ? "From your agent: needs you" : "From your agent",
+        text: texts[0],
+      }),
+    );
+    out[out.length - 1].agent.push(...texts.slice(1));
+  }
+  const seen = new Set<string>();
+  for (const [i, x] of s.notices.entries()) {
+    if (used.has(i)) continue;
+    const text = v2Words(x.text);
+    if (seen.has(text)) continue;
+    seen.add(text);
+    out.push({
+      key: `notice-${i}`,
+      codes: [],
+      level: LEVEL_OF[x.level] ?? "info",
+      icon: x.level === "urgent" ? "alert" : "info",
+      title: x.level === "urgent" ? "From your agent: needs you" : "From your agent",
+      text,
+      agent: [],
+      go: null,
+    });
+  }
+  // one link per page on a screen, never to the page the notes are on (nor
+  // to Holdings from Today, whose "Holding now" panel is right there)
+  const linked = new Set<Go>();
+  for (const x of out) {
+    if (x.go && (x.go === here || linked.has(x.go) || (here === "today" && x.go === "holdings"))) x.go = null;
+    if (x.go) linked.add(x.go);
   }
   return out;
 }
@@ -492,7 +598,8 @@ export function statement(s: Status, l: Link): Statement {
         n && s.real_positions_managed
           ? `Your ${plural(n, "real position")} will be sold when ${their(n, "its exit signal arrives", "their exit signals arrive")}. Press Resume to allow new trades again.`
           : n
-            ? `${notSold(s)} not being sold by the agent right now. Press Resume to allow new trades again.`
+            ? // in practice the band says it already (it states what happens to real positions)
+              `${live ? `${notSold(s)} not being sold by the agent right now. ` : ""}Press Resume to allow new trades again.`
             : "No real position is open. Press Resume to allow new trades again.",
       empty: false,
     };
@@ -521,7 +628,8 @@ export function statement(s: Status, l: Link): Statement {
       n && s.real_positions_managed
         ? `It is still looking after ${plural(n, "real position")} bought while LIVE, and sells ${their(n, "it", "each one")} for real when its exit signal arrives.`
         : n
-          ? `${notSold(s)} not being sold by the agent right now. Holdings says which; look after ${their(unwatched(s).length, "it", "them")} at ${b}.`
+          ? // the band says which are not being sold; this says what to do
+            `Holdings says which real ${their(unwatched(s).length, "position is", "positions are")} not being sold; look after ${their(unwatched(s).length, "it", "them")} at ${b}.`
           : o.state === "practice_only"
             ? "It records what it would have bought and sold, so you can see how your rules behave before using real money."
             : answerWhy("opening", o, s),

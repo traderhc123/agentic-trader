@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Activity, Iso, Position, Status } from "../lib/viewModel";
 import { Band, type BandAction } from "./Band";
-import { ActionDialog, UpdateDialog, type DialogKind } from "./Dialogs";
+import { ActionDialog, LiveDialog, UpdateDialog, type Cmd, type DialogKind } from "./Dialogs";
 import { UPDATE, describe, expiryWill } from "./lib/copy";
 import { asOf, brokerLabel, isStale, linkOf, nextFor, type Link } from "./lib/derive";
 import { badgeFor, updateLine } from "./lib/update";
@@ -12,12 +12,17 @@ import { UNKNOWN, contractName, count, dayLong, etDayKey, etTime, etWhen, usd } 
 import { Drawer, ExpiresFlag, Icon, Tag, WillWont, type IconId } from "./ui";
 import { useStatus, type StatusFeed } from "./useStatus";
 import { ActivityView, EventDrawer } from "./views/Activity";
-import { HoldingsView, MoreView, RulesView, SettingsView, SignalsView } from "./views/Pages";
+import { HoldingsView, MoreView } from "./views/Pages";
+import { RulesView } from "./views/Rules";
+import { SettingsView } from "./views/Settings";
+import { SignalsView } from "./views/Signals";
+import { useSettings, type SettingsFeed } from "./useSettings";
+import { API, send } from "./lib/http";
+import { VIEWS, type View } from "./lib/screens";
 import { ResultsView } from "./views/Results";
 import { Today } from "./views/Today";
 
-export type View = "today" | "holdings" | "activity" | "results" | "rules" | "signals" | "settings" | "more";
-const VIEWS: View[] = ["today", "holdings", "activity", "results", "rules", "signals", "settings", "more"];
+export type { View };
 
 /** What every view is handed: the snapshot, how current it is, and the few
  *  things a view can ask the shell to do. */
@@ -39,6 +44,12 @@ export interface Page {
   /** the page load's update check, and the dialog that installs it */
   update: UpdateFeed;
   openUpdate: () => void;
+  /** the saved settings (GET /api/v2/settings), read again after each save */
+  settings: SettingsFeed;
+  /** the toast: what a save or a command came to */
+  say: (ok: boolean, text: string) => void;
+  /** read the status again now (after a save) */
+  refresh: () => void;
 }
 
 function viewFromHash(): View {
@@ -218,15 +229,30 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
     clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToast(null), 15000);
   }, []);
-  const send = useCallback(
-    async (command: string) => {
+  const settings = useSettings();
+  // one typed command; the toast carries the agent's own reply, and the band
+  // changes only when the next status says so
+  const run = useCallback(
+    async (cmd: Cmd) => {
       setBusy(true);
-      const r = await feed.command(command);
+      let ok: boolean;
+      let text: string;
+      if (cmd.action === "stop") {
+        const r = await feed.command("stop");
+        ok = r.ok;
+        text = r.ok ? `The agent answered: ${r.reply}` : r.reply;
+      } else {
+        const r = await send<{ reply?: string }>(API.command, cmd);
+        ok = r.ok;
+        text = r.ok ? `The agent answered: ${(r as { reply?: string }).reply ?? "done."}` : r.error;
+        feed.refresh();
+        settings.reload();
+      }
       setBusy(false);
       setDialog(null);
-      say(r.ok, r.ok ? `The agent answered: ${r.reply}` : r.reply);
+      say(ok, text);
     },
-    [feed, say],
+    [feed, say, settings],
   );
   const act = useCallback(
     (a: BandAction | "stop") => {
@@ -273,6 +299,9 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
     act,
     update: upd,
     openUpdate,
+    settings,
+    say,
+    refresh: () => void feed.refresh(),
   };
   const ev = evN != null ? feed.rows.find((e) => e.n === evN) : undefined;
   const pos = posId != null ? status.positions.find((p) => p.id === posId) : undefined;
@@ -321,21 +350,6 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
                 </button>
               ))}
             </nav>
-            <div className="side-foot">
-              <a className="side-btn" href="/dash">
-                <Icon name="back" small />
-                <span className="nl">
-                  Classic<span className="l2"> dashboard</span>
-                </span>
-              </a>
-              <button className="side-btn" onClick={theme.toggle}>
-                <Icon name={theme.dark ? "sun" : "moon"} small />
-                <span className="nl">
-                  {theme.dark ? "Light" : "Dark"}
-                  <span className="l2"> theme</span>
-                </span>
-              </button>
-            </div>
           </aside>
           <main id="main" tabIndex={-1} ref={main}>
             {feed.fetching.kind === "locked" && (
@@ -379,7 +393,19 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
       </div>
       {ev && !dialog && !updOpen && <EventDrawer e={ev} page={page} onClose={() => setEvN(null)} />}
       {pos && !dialog && !updOpen && !ev && <PositionDrawer p={pos} page={page} onClose={() => setPosId(null)} />}
-      {dialog && <ActionDialog kind={dialog} s={status} busy={busy} onConfirm={send} onClose={() => !busy && setDialog(null)} />}
+      {dialog === "to-live" && (
+        <LiveDialog
+          s={status}
+          onClose={() => setDialog(null)}
+          onDone={(reply) => {
+            setDialog(null);
+            feed.refresh();
+            settings.reload();
+            say(true, `The agent answered: ${reply}`);
+          }}
+        />
+      )}
+      {dialog && dialog !== "to-live" && <ActionDialog kind={dialog} s={status} busy={busy} onConfirm={run} onClose={() => !busy && setDialog(null)} />}
       {updOpen && !dialog && upd.check.kind === "available" && (
         <UpdateDialog
           offer={upd.check.offer}

@@ -1,14 +1,25 @@
-// The confirm dialogs. Each one sends exactly one of the commands the agent
-// already understands (the same words the classic dashboard's buttons send):
-//   Pause new trades   -> "pause"      Resume            -> "resume"
-//   Switch to practice -> "dry on"     Go LIVE           -> "dry off"
-//   Stop the agent     -> "stop"
+// The confirm dialogs. Each one sends exactly one typed command
+// (POST /api/v2/command, which runs the chat commands' own code with fixed
+// words; never text from this page):
+//   Pause new trades   -> {action: "pause"}
+//   Resume             -> {action: "resume"}
+//   Switch to practice -> {action: "set_mode", mode: "practice"}
+//   Go LIVE            -> {action: "set_mode", mode: "live"}: two steps; the
+//                         dialog shows the SERVER's preview (account, cash,
+//                         size, limits, open real positions) and needs the
+//                         tick box, checked again by the server
+//   Stop the agent     -> the fixed command "stop" (POST /api/command; the
+//                         typed route has no stop)
 // Nothing is assumed to have worked: the agent's own reply is shown, and the
 // band changes only when the next status says so.
 // UpdateDialog is the one that does not send a command: it installs the
 // version the update check reported (POST /api/update/pull, see lib/update.ts).
 import { useEffect, useState } from "react";
+import type { CommandDone, Preview } from "../lib/settingsApi";
 import type { Position, Status } from "../lib/viewModel";
+import { ReviewDialog, askPreview } from "./Forms";
+import { API } from "./lib/http";
+import { money, sizeWords, lossWords } from "./lib/settings";
 import { UPDATE, sellsHow } from "./lib/copy";
 import { brokerLabel, paidFor, practicePositions, realPositions } from "./lib/derive";
 import { UNKNOWN, contractName, count, etTime, plural, usd } from "./lib/format";
@@ -16,6 +27,9 @@ import type { Offer, Phase } from "./lib/update";
 import { Dialog, ExpiresFlag, Icon, WillWont } from "./ui";
 
 export type DialogKind = "pause" | "resume" | "to-practice" | "to-live" | "stop";
+
+/** What a dialog asks the agent to do. */
+export type Cmd = { action: "pause" } | { action: "resume" } | { action: "set_mode"; mode: "practice" } | { action: "stop" };
 
 const their = (n: number, one: string, many: string) => (n === 1 ? one : many);
 
@@ -36,56 +50,130 @@ function PosList({ list }: { list: Position[] }) {
   );
 }
 
-function Summary({ s }: { s: Status }) {
-  const L = s.limits;
-  const m = L.trade_size.main;
-  const o = L.trade_size.other;
-  const size = (t: typeof m) =>
-    t.mode === "budget" && t.usd != null
-      ? `up to ${usd(t.usd, 0)}`
-      : t.mode === "percent" && t.percent != null
-        ? `${t.percent}% of your account`
-        : t.mode === "contracts" && t.contracts != null
-          ? plural(t.contracts, "contract")
-          : UNKNOWN;
-  const perTrade = m.usd != null && o.usd != null ? Math.max(m.usd, o.usd) : null;
+/** The facts going LIVE is reviewed with, as the server's preview has them
+ *  (an unknown is said as unknown). */
+function LiveFacts({ p, s }: { p: Preview; s: Status }) {
+  const acct = p.account;
+  const name = acct?.name || brokerLabel(s);
+  const lim = p.limits;
   return (
     <dl className="facts">
       <dt>Broker account</dt>
       <dd>
-        {brokerLabel(s)}
-        {s.broker.paper_account && <small>The broker's paper-trading account.</small>}
+        {name}
+        {acct?.account_mask ? ` ····${acct.account_mask}` : ""}
+        {acct?.paper_account && <small>The broker's paper-trading account.</small>}
         {s.broker.connected === false && <small>Not connected right now, so real orders can't be sent until it is.</small>}
       </dd>
       <dt>Cash available</dt>
       <dd>
-        {s.broker.buying_power != null ? usd(s.broker.buying_power) : UNKNOWN}
-        {s.broker.buying_power_at && <small>Read at {etTime(s.broker.buying_power_at)}.</small>}
-        {L.cash.low && <small>Too little for one trade at your size, so buy orders would be rejected.</small>}
+        {p.buying_power != null ? usd(p.buying_power) : UNKNOWN}
+        {p.buying_power_at && <small>Read at {etTime(p.buying_power_at)}.</small>}
+        {p.cash_low && <small>Too little for one trade at your size, so buy orders would be rejected.</small>}
       </dd>
       <dt>Each trade</dt>
       <dd>
-        {size(m)} <small>{o.same_as_main ? "The same for the provider's other trades." : `${size(o)} for the provider's other trades.`}</small>
+        {sizeWords(p.trade_size?.main ?? null, "main")}
+        <small>{p.trade_size?.other ? `${sizeWords(p.trade_size.other, "other")} for the provider's other trades.` : "The same for the provider's other trades."}</small>
       </dd>
       <dt>New trades per day</dt>
-      <dd>
-        {count(L.cap)}
-        <small>
-          {count(L.used_today.real)} real {their(L.used_today.real, "trade", "trades")} opened today. Practice trades are counted separately.
-        </small>
-      </dd>
+      <dd>{lim?.max_entries_per_day != null ? count(lim.max_entries_per_day) : UNKNOWN}</dd>
       <dt>Daily loss limit</dt>
       <dd>
-        {L.max_daily_loss != null ? usd(L.max_daily_loss, 0) : "Off"}{" "}
-        <small>{L.max_daily_loss != null ? "Stops new trades for the day. It does not sell anything." : "Losses never stop new trades."}</small>
+        {lossWords(lim?.max_daily_loss_usd)}{" "}
+        <small>{lossWords(lim?.max_daily_loss_usd) !== "Off" ? "Stops new trades for the day. It does not sell anything." : "Losses never stop new trades."}</small>
       </dd>
-      {perTrade != null && (
+      <dt>Open positions at once</dt>
+      <dd>{lim?.max_open_positions != null ? count(lim.max_open_positions) : UNKNOWN}</dd>
+      <dt>Real positions open now</dt>
+      <dd>{p.real_positions != null ? count(p.real_positions) : UNKNOWN}</dd>
+      {p.trade_size?.main?.mode === "budget" && p.trade_size.main.value != null && lim?.max_entries_per_day != null && (
         <>
           <dt>Most in new trades in a day</dt>
-          <dd>{usd(L.cap * perTrade, 0)}</dd>
+          <dd>{money(lim.max_entries_per_day * Math.max(p.trade_size.main.value, p.trade_size.other?.mode === "budget" && p.trade_size.other.value != null ? p.trade_size.other.value : 0))}</dd>
         </>
       )}
     </dl>
+  );
+}
+
+/** Switch to LIVE: the first POST asks the server for its preview; the
+ *  dialog shows that, and only the same request with the preview's token
+ *  and the ticked box goes LIVE. */
+export function LiveDialog({ s, onClose, onDone }: { s: Status; onClose: () => void; onDone: (reply: string) => void }) {
+  const [ask, setAsk] = useState<{ kind: "asking" } | Awaited<ReturnType<typeof askPreview>>>({ kind: "asking" });
+  const payload = { action: "set_mode", mode: "live" };
+  useEffect(() => {
+    askPreview(API.command, payload).then(setAsk);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const pp = practicePositions(s);
+  if (ask.kind === "review")
+    return (
+      <ReviewDialog<CommandDone>
+        path={API.command}
+        payload={payload}
+        first={ask.preview}
+        tone="live"
+        title="Switch to LIVE: real money"
+        lead="From the next signal that passes your limits, the agent places real orders in your broker account. Check these are the numbers you expect."
+        cancel="Stay in practice"
+        confirm="Go LIVE with real money"
+        ack="I understand the agent will place real orders with my money, and I can lose it."
+        onClose={onClose}
+        onDone={(r) => onDone(typeof (r as unknown as CommandDone).reply === "string" ? (r as unknown as CommandDone).reply : "LIVE.")}
+      >
+        {(p) => (
+          <>
+            <LiveFacts p={p} s={s} />
+            <WillWont
+              will={[
+                "Buy real option contracts when a signal passes your rules and limits.",
+                s.expiry_guard_on
+                  ? "Sell them when the exit signal arrives, or at its expiry sell time on the day they expire."
+                  : "Sell them when the exit signal arrives. The expiry sell is off: sell expiring positions yourself before the close.",
+                pp.length
+                  ? `Leave your ${plural(pp.length, "practice position")} as practice. ${their(pp.length, "It closes", "They close")} as pretend ${their(pp.length, "trade", "trades")}.`
+                  : "Keep every rule and limit exactly as saved.",
+              ]}
+              wont={[
+                "Go past your trade size or your daily limits.",
+                "Protect you from losses. It has no stop-loss, and an option can lose everything paid for it, quickly.",
+                "Switch back by itself. It stays LIVE, including after a restart, until you switch to practice.",
+              ]}
+            />
+          </>
+        )}
+      </ReviewDialog>
+    );
+  return (
+    <Dialog
+      tone="live"
+      title="Switch to LIVE: real money"
+      lead={ask.kind === "asking" ? "Asking the agent for your account, cash and limits…" : undefined}
+      onClose={onClose}
+      foot={
+        <button className="btn" onClick={onClose} data-autofocus>
+          {ask.kind === "asking" ? "Cancel" : "Close"}
+        </button>
+      }
+    >
+      {ask.kind === "asking" ? (
+        <p className="wait" role="status">
+          <span className="spin" aria-hidden="true" />
+          Reading what going LIVE would use…
+        </p>
+      ) : ask.kind === "nothing" ? (
+        <p role="status">{ask.note}</p>
+      ) : (
+        <div className="callout callout-bad" role="alert">
+          <p className="err">
+            <Icon name="alert" small />
+            {ask.error}
+          </p>
+          <p className="small">Nothing was changed. You are still in practice.</p>
+        </div>
+      )}
+    </Dialog>
   );
 }
 
@@ -99,14 +187,12 @@ export function ActionDialog({
   kind: DialogKind;
   s: Status;
   busy: boolean;
-  /** the command to send, in the agent's own words */
-  onConfirm: (command: string) => void;
+  /** the command to send */
+  onConfirm: (cmd: Cmd) => void;
   onClose: () => void;
 }) {
-  const [ack, setAck] = useState(false);
   const [choice, setChoice] = useState<"entries" | "all">("entries");
   const rp = realPositions(s);
-  const pp = practicePositions(s);
   const n = rp.length;
   const b = s.broker.name || "your broker";
   const expiring = rp.find((p) => p.expires_today);
@@ -117,47 +203,6 @@ export function ActionDialog({
       {label}
     </button>
   );
-
-  if (kind === "to-live")
-    return (
-      <Dialog
-        tone="live"
-        title="Switch to LIVE: real money"
-        lead="From the next signal that passes your limits, the agent places real orders in your broker account. Check these are the numbers you expect."
-        onClose={onClose}
-        foot={
-          <>
-            <label className="check ack">
-              <input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} />
-              <span id="dlg-why">I understand the agent will place real orders with my money, and I can lose it.</span>
-            </label>
-            {cancel("Stay in practice")}
-            <button className="btn btn-golive" id="dlg-ok" disabled={!ack || busy} aria-describedby="dlg-why" onClick={() => onConfirm("dry off")}>
-              Go LIVE with real money
-            </button>
-          </>
-        }
-      >
-        <Summary s={s} />
-        <WillWont
-          will={[
-            "Buy real option contracts when a signal passes your rules and limits.",
-            s.expiry_guard_on
-              ? "Sell them when the exit signal arrives, or at its expiry sell time on the day they expire."
-              : "Sell them when the exit signal arrives. The expiry sell is off: sell expiring positions yourself before the close.",
-            pp.length
-              ? `Leave your ${plural(pp.length, "practice position")} as practice. ${their(pp.length, "It closes", "They close")} as pretend ${their(pp.length, "trade", "trades")}.`
-              : "Keep every rule and limit exactly as saved.",
-          ]}
-          wont={[
-            "Go past your trade size or your daily limits.",
-            "Protect you from losses. It has no stop-loss, and an option can lose everything paid for it, quickly.",
-            "Switch back by itself. It stays LIVE, including after a restart, until you switch to practice.",
-          ]}
-        />
-        <p className="small muted">The agent may still refuse (for example when your written rules need an AI helper that is not connected). Its answer is shown here.</p>
-      </Dialog>
-    );
 
   if (kind === "to-practice")
     return (
@@ -173,7 +218,7 @@ export function ActionDialog({
         foot={
           <>
             {cancel("Stay LIVE")}
-            <button className="btn btn-primary" id="dlg-ok" disabled={busy} onClick={() => onConfirm("dry on")}>
+            <button className="btn btn-primary" id="dlg-ok" disabled={busy} onClick={() => onConfirm({ action: "set_mode", mode: "practice" })}>
               Switch to practice
             </button>
           </>
@@ -211,7 +256,7 @@ export function ActionDialog({
         foot={
           <>
             {cancel("Keep running")}
-            <button className="btn btn-primary" id="dlg-ok" disabled={busy || choice !== "entries"} onClick={() => onConfirm("pause")}>
+            <button className="btn btn-primary" id="dlg-ok" disabled={busy || choice !== "entries"} onClick={() => onConfirm({ action: "pause" })}>
               Pause new trades
             </button>
           </>
@@ -258,7 +303,7 @@ export function ActionDialog({
         foot={
           <>
             {cancel(s.pause.kind === "state_hold" ? "Stay on hold" : "Stay paused")}
-            <button className="btn btn-primary" id="dlg-ok" disabled={busy} onClick={() => onConfirm("resume")}>
+            <button className="btn btn-primary" id="dlg-ok" disabled={busy} onClick={() => onConfirm({ action: "resume" })}>
               Resume
             </button>
           </>
@@ -287,7 +332,7 @@ export function ActionDialog({
       foot={
         <>
           {cancel("Keep it running")}
-          <button className="btn btn-primary" id="dlg-ok" disabled={busy} onClick={() => onConfirm("stop")}>
+          <button className="btn btn-primary" id="dlg-ok" disabled={busy} onClick={() => onConfirm({ action: "stop" })}>
             Stop the agent
           </button>
         </>
