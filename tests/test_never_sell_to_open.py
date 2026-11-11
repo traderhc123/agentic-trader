@@ -83,6 +83,26 @@ def test_a_sell_with_nothing_held_is_refused(held):
     assert e.value.code == "nothing_held"
 
 
+def test_nothing_held_wording_does_not_say_the_position_is_gone():
+    """A zero can be temporary (another sell working on it, a fill not
+    settled): the owner is told what the broker shows now, and that the
+    agent retries — not that the position is gone."""
+    exc = RefusedOrder("x", "nothing_held")
+    msg = order_guard.refusal_text("moomoo", "sell", 2, "SPY C", exc)
+    assert "right now" in msg and "retries" in msg
+    assert "any more" not in msg and "doesn't hold" not in msg
+
+
+@pytest.mark.parametrize("text,gone", [
+    ("insufficient qty available for order (requested: 2, available: 0)", True),
+    ("position does not exist", True),
+    ("requested: 2, available: 0 )", True),
+    ("requested: 2, available: 0.5 contracts left", False),
+    ("available: 05", False)])
+def test_alpaca_nothing_to_close_pattern(text, gone):
+    assert bool(alpaca._NOTHING_TO_CLOSE_RX.search(text)) is gone
+
+
 @pytest.mark.parametrize("held", [None, float("nan"), True, "3"])
 def test_unknown_holdings_only_pass_where_the_broker_refuses_an_opening_sell(held):
     with pytest.raises(RefusedOrder) as e:
@@ -236,7 +256,9 @@ def test_alpaca_no_position_to_close_answer_means_gone_not_unknown(monkeypatch):
     assert order_guard.get(st, KEY) is None            # not "unconfirmed"
     (rep,) = broker_events.drain()
     assert rep["reason"] == "nothing_held" and rep["kind"] == "exit_failed"
-    assert "doesn't hold" in rep["message"] and "no short position" in rep["message"]
+    assert "none of" in rep["message"] and "right now" in rep["message"]
+    assert "no short position" in rep["message"]
+    assert "any more" not in rep["message"] and "doesn't hold" not in rep["message"]
     api.pos_status = 200                               # readable now: holds none
     changed, st = _alp_sell(api, qty=2)
     assert len(api.posts) == 1 and not changed         # not sent again

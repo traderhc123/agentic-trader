@@ -249,7 +249,7 @@ _INTENT = {("buy", "open"): "buy_to_open", ("sell", "close"): "sell_to_close"}
 # e.g. 403 {"code": 40310000, "message": "insufficient qty available for
 # order (requested: 1, available: 0)"}.
 _NOTHING_TO_CLOSE_RX = re.compile(
-    r"insufficient\s+qty|available:\s*0\b|position\s+(does\s+not\s+exist|not\s+found)"
+    r"insufficient\s+qty|available:\s*0\s*\)|position\s+(does\s+not\s+exist|not\s+found)"
     r"|no\s+(such\s+)?position|not\s+enough\s+(qty|quantity|contracts?)", re.I)
 
 
@@ -346,10 +346,12 @@ def _order(cfg, occ, side, qty, limit_price=None, client_order_id=None,
             # unknown outcome, and not sold again until a read shows them.
             broker_events.report(
                 "exit_failed",
-                f"Alpaca says your account doesn't hold {contract} to sell "
-                f"(it refused the sell-to-close: {text[:200]}). Nothing was "
-                "sold and no short position was opened. The agent checks the "
-                "account again before any new sell.", reason="nothing_held")
+                f"Alpaca shows none of {contract} available to sell right now "
+                "(another sell may be working on it, a fill may not have "
+                "settled, or it is gone; Alpaca refused the sell-to-close: "
+                f"{text[:200]}). Nothing was sold and no short position was "
+                "opened. The agent checks the account again and retries.",
+                reason="nothing_held")
             return None
         broker_events.report("order_failed" if side == "buy" else "exit_failed",
                              f"Alpaca rejected the {side} order (HTTP "

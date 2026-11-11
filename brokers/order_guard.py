@@ -48,8 +48,9 @@ class RefusedOrder(Exception):
     """check_order() turned the order down; nothing was sent. `code`:
     "invalid"          not a buy-to-open or a sell-to-close of a whole
                        number of contracts above zero;
-    "nothing_held"     the account holds none of the contract to sell (or
-                       every contract it holds is being sold already);
+    "nothing_held"     the broker shows none of the contract available to
+                       sell right now (none held, or every contract held is
+                       being sold already — possibly only for a moment);
     "holdings_unknown" what the account holds can't be read, and this broker
                        has no way to refuse an opening sell itself."""
 
@@ -119,10 +120,11 @@ def refusal_text(broker_name, side, qty, contract, exc):
     """Plain words for an order check_order() turned down."""
     code = getattr(exc, "code", "invalid")
     if code == "nothing_held":
-        return (f"your {broker_name} account doesn't hold {contract} any more "
-                "(or every contract of it is already being sold), so the agent "
+        return (f"your {broker_name} account shows none of {contract} "
+                "available to sell right now (another sell may be working on "
+                "it, a fill may not have settled, or it is gone), so the agent "
                 "sent no sell order: selling it now could open a short position. "
-                "The agent checks the account again before any new sell.")
+                "The agent checks the account again and retries.")
     if code == "holdings_unknown":
         return (f"couldn't confirm what your {broker_name} account holds, so the "
                 f"sell for {contract} was held back: {broker_name} can't be told "
