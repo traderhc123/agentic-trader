@@ -380,8 +380,9 @@ def test_the_wizard_goes_back_to_the_chosen_dashboard(home, app):
 
 DASH_LINK = ('  <a class="btn btn-ghost" href="/v2" title="A redesigned dashboard. '
              'You can come back here at any time.">Try the new dashboard</a>\n')
-# sha256 of _DASH_HTML at origin/main c73dfc2
-DASH_AT_MAIN = "5df4ddc7ae3c7482db3e134e7964a6ca31c19655ad3fd1b97f3263793554957c"
+# sha256 of _DASH_HTML at origin/main 2c19c0c (#83 changed the classic
+# page's polling; c73dfc2's was 5df4ddc7…)
+DASH_AT_MAIN = "af9f3d4cfed9615e5dd09e645b95ee674deb72606efc051db3529f5524cdd9fa"
 
 
 def test_the_classic_page_only_gains_the_one_link():
