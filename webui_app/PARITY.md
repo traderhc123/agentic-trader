@@ -16,7 +16,7 @@ Stage A (groups 0-3), branch `feat/v2-parity-and-switch`:
 
 - **Group 0, server groundwork: done.** View-model readings `results.paid_days` (P-26), `limits.budget_hints` (P-33), `signals.preview` (P-48), `proposal` (P-74); conditions `budget_too_small`, `proposal_pending`, `consent_needed` (P-83). `GET /api/v2/settings` gains `expiry`, `computer.open_dashboard_at_login`, `computer.dashboard`, `signals.dry_run_preview`, `code.self_edit_enabled`, `broker.warning` (a code, `options_off`: the classic text carries the whole account number) and `consent`; `GET /api/v2/agreement`. The route-coverage test is `tests/test_v2_parity.py::test_every_route_has_a_v2_caller_or_a_classic_only_reason`. The UI for these readings belongs to groups 5, 7, 8, 9 and 10.
   - Deviation: the paid-day figures sit in `Results.paid_days {real, practice}` (with `paid_on` / `estimated_on` day lists) rather than in each `Book` / `BookDay`, so the Book shape the panels and chart read is unchanged.
-- **Group 1, the dashboard switch (P-71): done.** Lives in Settings → This dashboard (decision 7). The classic `/dash` link is a plain link to `/v2` (the smallest edit); remembering the choice is done from /v2.
+- **Group 1, the dashboard switch (P-71): done.** Lives in Settings → This dashboard (decision 7). The classic `/dash` link is a plain link to `/v2` (the smallest edit); remembering the choice is done from /v2. `/`, the setup wizard's way back and the agent's login link (`/dash?k=…`, which `agent.py link`, start and opening the dashboard at login use) all land on the chosen dashboard; `/dash` and `/v2` typed as they are always answer.
 - **Group 2, the agent (P-07 Stop, P-08 Start): done.** Settings → The agent on this computer.
 - **Group 3, this computer (P-66, P-67, P-68, P-69, P-70, P-90 link): done.** Settings → This computer → Move (one Move control).
 
@@ -24,8 +24,8 @@ Stage B (groups 4-7), same branch:
 
 - **Group 4, Settings → Help and support (P-79, P-80, P-81, P-82): done.** Connection check, support report, Tip AgentHC (dialog) and Your agreement (text from `GET /api/v2/agreement`), each one button in Settings. The classic help and tip routes are reused as they are; the tip dialog names no wallet or pass route.
 
-- **Group 5, Settings → Code changes (P-74..P-78): done.** One section: the AI code proposals switch (`POST /api/v2/settings/code`), Review (the classic `GET /api/proposal` and `POST /api/proposal/reject`), Apply and restart (`POST /api/v2/proposal/apply`, two-step, the payload is the sha256 of the diff the page shows, worked out in the browser over exactly that text), and Ask for a change (`POST /api/v2/proposal/request` → `self_edit.propose`, never `apply_command`). Today shows one `proposal_pending` note linking to Settings (fixture state `proposal-pending`).
-  - Deviation: `self_edit.apply_and_restart` gains an optional `expect_sha256`; the /v2 apply passes the reviewed sha so the check also holds where the proposal file is read (a proposal written between the confirmation and the apply is left alone). The classic route calls it as before.
+- **Group 5, Settings → Code changes (P-74..P-78): done.** One section: the AI code proposals switch (`POST /api/v2/settings/code`), Review (the classic `GET /api/proposal` and `POST /api/proposal/reject`), Apply (`POST /api/v2/proposal/apply`, two-step, the payload is the sha256 of the diff the page shows, worked out in the browser over exactly that text; the server hashes the whole diff and refuses a diff too large to show whole (GET /api/proposal says `truncated`) or one made against files that changed since (`self_edit.base_problem`)), and Ask for a change (`POST /api/v2/proposal/request` → `self_edit.propose`, never `apply_command`). Today shows one `proposal_pending` note linking to Settings (fixture state `proposal-pending`).
+  - Deviation: `self_edit.apply_and_restart` gains an optional `expect_sha256`; the /v2 apply passes the reviewed sha so the check (whole diff, not cut, made against the files as they are) also holds where the proposal file is read (a proposal written between the confirmation and the apply is left alone). The classic route calls it as before, so classic still applies a cut or out-of-date proposal.
 
 - **Group 6, Settings → Connections (P-57, P-58, P-63): done.** P-57 is PR 3's `POST /api/v2/broker/robinhood` and broker dialog (a test now checks it hands back the same address as `GET /api/rh/start`). P-58: the Broker row says when options trading is off in the Robinhood account (`broker.warning`), with the one link to Robinhood's form. P-63: `expiry_alert_et` on `POST /api/v2/settings/alerts` (direct), saved through `agent._expiry_setting`, the check the chat's `expiry alert` uses (split out of `_expiry_command`, same results); its field is in the Alerts dialog, and the Alerts row says the time.
 
@@ -33,7 +33,7 @@ Stage B (groups 4-7), same branch:
   - *Signal source*: Source (`POST /api/v2/settings/source {source, url}`, two-step), Which signals (`POST /api/v2/settings/signals {scope}`, two-step over `source_scope`), Subscription key (`{agenthc_key}` alone on the source route: direct, write-only). Both go through `_source_save`, the classic `/api/source` body split out unchanged; /v2 passes the saved scope along, so a source or key save never changes it.
   - *What it would have taken* (practice mode only): the view-model's `signals.preview` and its on/off switch (`{dry_run_preview}`, direct; the chat's `preview on|off` key).
   - *Payment wallet*: Make / Replace (`POST /api/v2/wallet/create`, two-step over `_wallet_create`), Add sats (`POST /api/v2/wallet/fund`, two-step over `_wallet_fund_invoice`, the classic fund's invoice code split out; the amount's worth from the reused `GET /api/wallet/quote`), Use my own wallet (`POST /api/v2/wallet/connect`, two-step over `_source_save`), Buys a day-pass by itself (PR 2's `/api/v2/wallet/recurring`), Open the wallet page (`POST /api/v2/wallet/page` on click, into a window the click opened; `GET /api/v2/settings` only says `page_on_file`). Balance: the reused `GET /api/wallet/balance`.
-  - Deviations: `/api/v2/wallet/fund` refuses under 1,000 sats or above a known invoice cap (the classic form raises / cuts the amount); the wallet routes' answers never carry the wallet page link (the classic create answers with it); host names only (`signals.source_site`, `signals.wallet.site`) because a feed or wallet address can carry a token. `/api/v2/wallet/create` saves with the plain save after the confirmation (it writes only the wallet's own keys and the source, and the guarded save could leave an old-wallet file for a wallet that stays), while `/api/v2/wallet/connect` keeps the guarded save (it also writes the scope).
+  - Deviations: `/api/v2/wallet/fund` refuses under 1,000 sats or above a known invoice cap (the classic form raises / cuts the amount); the wallet routes' answers never carry the wallet page link (the classic create answers with it); host names only (`signals.source_site`, `signals.wallet.site`) because a feed or wallet address can carry a token. `/api/v2/wallet/create` and `/api/v2/wallet/connect` save only while config.json is as it was when the token was redeemed (the LNbits call runs outside the settings lock); wallet create runs its whole switch, old-wallet file included, in that one lock hold (`_wallet_create(switching=…)`), so a save that lands meanwhile is never overwritten and leaves no old-wallet file. Both refuse without the agreement, as the classic routes do.
 
 Stage B's routes are all called by the committed /v2 bundle now (rows marked *v2* in the Server routes table).
 
@@ -43,7 +43,7 @@ Stage C (groups 8-11, the review findings, the closing work), same branch:
   - P-39: `expiry_sell_et` on `POST /api/v2/settings/limits`, two-step, through `agent._expiry_setting` (the chat's own check) into the chat's key `expiry_guard_et`. Equivalent to `expiry guard off|HH:MM|on` (on = 15:45). 09:30-15:59 or "off"; the preview's direction: off raises the risk, a later time raises it, an earlier one or switching it on lowers it. The row lives in a new *On expiry day* panel; the old line in *Always on* is gone (one place). The row also says the expiry-day warning time as text (its control stays in Settings → Alerts).
   - P-33 / P-34: each budget hint sits in its book's trade-size row; "Use $S" opens that row's form with $S typed in, so Review sends what typing $S sends (a test checks it saves the same config as the classic hint button's `set [other ]budget S`). Today shows the hints once, as a note (condition `budget_too_small`) linking to Rules & limits.
   - P-40: the wizard's sizing notice is said once in /v2, in the trade-size confirm dialog.
-- **Group 9, Results (P-26, P-24 caption): done.** "Result on paid signal days" in *What it has cost you* (real; practice beside it when it has any), from `results.paid_days`; "paid signal day" / "(estimated)" under the day in the by-day table; the table says each trade counts on the day it closed.
+- **Group 9, Results (P-26, P-24 caption): done.** "Result on paid signal days" in *What it has cost you* (real; practice beside it when it has any), from `results.paid_days`; "paid signal day" / "(estimated)" under the day in the by-day table; the table says each trade counts on the day it closed, and, when a mark is shown, that the paid-day result counts trades by the day they opened, so it need not add up from the marked rows. A mark is a fact about the day (signals were paid for), so an entry in a broker paper account also marks its day as an estimated paid day.
 - **Group 10, Today and Activity (P-14, P-15, P-16, P-83): done.**
   - P-15 / P-16: `POST /api/v2/ask {question}` → `_ask_llm` with the settings, status fields and trades `d_command`'s fallback hands it. It never calls `apply_command`, `self_edit` or a save: a test sends `pause`, `dry off`, `stop`, `set budget 1`, `code: x`, `go live`, `resume`, `expiry guard off`, `self-edit off` and checks nothing ran and nothing changed. Today's *Ask your agent* panel keeps this visit's questions and answers in the page only.
   - P-14: Activity → Problems shows *Problems by kind* (×count, the newest's time and contract, its Fix; it opens the newest line), over the lines loaded, and says so.
@@ -52,6 +52,8 @@ Stage C (groups 8-11, the review findings, the closing work), same branch:
 - **Review findings: fixed.**
   - *Activity showed partial days as if complete.* Each ActivityPage now carries `day_lines` (for each day it has rows of, that day's line count in the whole log). A day the page has only part of says "N of M lines loaded" and shows no counts and no P&L until it is whole. The chips say their counts are of the lines loaded so far. Today's "Today so far" uses the same check for "at least".
   - *"Today so far · Opened" used the UTC day.* `Book.opened_today` counts the Eastern day the panel describes (tested at 19:30 and 20:30 ET on a summer day, either side of midnight UTC). The daily limit keeps its UTC-day count, as the agent does.
+
+- **Second review (PR 4 itself): fixed.** Wallet create checks the agreement, takes `replace` as true/false only and never overwrites a save that landed during the LNbits call; a subscriber with only a key can switch the source back to AgentHC; code-change Apply is bound to the whole diff against the files as they are (cut or out-of-date changes are refused, and the dialog says so and offers no Apply); the login link follows the dashboard switch; the wallet page link is never kept in the page (a blocked popup asks to allow pop-ups and click again); Start in practice says "Starting…" with no Cancel and shows the agent's autostart note; the cloud move keeps the classic guidance (cloud-init log, Droplets page, `ssh -L` from the address) and its preview says DigitalOcean may use a nearby region or a bigger size; field errors sit next to their fields and are tied to them; the code-change dialog says "restart" only when the server says it restarts; the by-day table explains its paid-day marks; the two-step test harness checks that every refusal leaves all of config.json and no old-wallet file.
 
 Closing: this table now says, for every row, where it is in /v2 or why it is classic-only. The route test (`test_every_route_has_a_v2_caller_or_a_classic_only_reason`) also fails if a *pending* row is left or a *classic* route is missing from the list in *Classic-only, because…*.
 
@@ -130,7 +132,7 @@ Closing: this table now says, for every row, where it is in /v2 or why it is cla
 | P-54 | control | Use my own LNbits wallet (instance URL + admin key), replacing the agent's wallet | wizard webui.py:866-870 · SourceStep.tsx:323-331 | POST /api/source .lnbits_url, .lnbits_key | **yes** | in-v2 (PR 4 group 7) | Signals & pass → Payment wallet ('Use my own wallet') | NEW POST /api/v2/wallet/connect two-step over a helper split out of source() (:3391-3406 + _use_pasted_wallet); admin key write-only | S-22 |
 | P-55 | reading | Broker connected: name, account ····1234, cash | wizard webui.py:895, :1386-1390 · steps.tsx:388-417 · /api/status ['buying power'], ['broker connection'] | GET /api/state .broker; GET /api/status | no | in-v2 (before PR 4) | Settings → Connections → Broker row + vitals | GET /api/v2/status broker | S-27, D-50 |
 | P-56 | control | Connect a key-based broker (pick platform, fill fields, Connect); replace with confirmation | wizard webui.py:905-913 brkConnect :1588 · steps.tsx:339-356, 426-463 | GET /api/brokers; POST /api/broker/connect | **yes** | in-v2 (PR 3) | Settings → Connections → Broker | PR 2 POST /api/v2/broker/connect (two-step); reuse GET /api/brokers | S-26 |
-| P-57 | control | Connect Robinhood (OAuth sign-in in a new tab; page waits until saved) | wizard webui.py:898-903 rhStart :1599 · steps.tsx:358-375 · GET /callback webui.py:4279-4293 | GET /api/rh/start; GET /callback | **yes** | in-v2 (PR 3; checked PR 4 group 6) | Settings → Connections → Broker (same panel as P-56: one home for 'connect a broker') | NEW POST /api/v2/broker/robinhood/start two-step (preview names the broker it replaces) over rh_start; /callback unchanged, lands on the remembered dashboard (4b) | S-24 |
+| P-57 | control | Connect Robinhood (OAuth sign-in in a new tab; page waits until saved) | wizard webui.py:898-903 rhStart :1599 · steps.tsx:358-375 · GET /callback webui.py:4279-4293 | GET /api/rh/start; GET /callback | **yes** | in-v2 (PR 3; checked PR 4 group 6) | Settings → Connections → Broker (same panel as P-56: one home for 'connect a broker') | NEW POST /api/v2/broker/robinhood two-step (preview names the broker it replaces) over rh_start; /callback unchanged, lands on the remembered dashboard (4b) | S-24 |
 | P-58 | reading | Robinhood: 'Options are NOT enabled on your Agentic account' + link | wizard webui.py:1611-1612 · steps.tsx:424 | GET /api/state .rh_warning | no | in-v2 (PR 4 group 6) | Settings → Connections → Broker row | GET /api/v2/settings gains broker.warning | S-25 |
 | P-59 | control | AI helper: paste key (provider detected) or pick provider / local endpoint, find models, pick one, Connect (one test call) | wizard webui.py:705-751 llmFind :1437, doLLM :1458 · steps.tsx:117-296 | GET /api/llm/providers; POST /api/llm/models; POST /api/llm | no | in-v2 (PR 3) | Settings → Connections → AI helper | PR 2 POST /api/v2/settings/ai; reuse GET /api/llm/providers, POST /api/llm/models (read-only) | S-4, S-5 |
 | P-60 | reading | Which AI is connected (provider + model) | wizard webui.py:1376-1378 · steps.tsx:191, 236-238 | GET /api/state .llm | no | in-v2 (PR 3) | Settings → Connections → AI helper | PR 2 GET /api/v2/settings ai.* | S-6 |
@@ -175,7 +177,7 @@ Input for the 4a.5 test (`tests/test_v2_parity.py::test_every_route_has_a_v2_cal
 | Route | Method | What | After PR 4 | Kind |
 |---|---|---|---|---|
 | `/api/state` | GET | wizard state (consent, source, broker, llm, wallet incl. LNbits page URL, notes) | classic: wizard only; /v2 reads GET /api/v2/settings + /api/v2/status, and this payload carries the wallet page bearer URL (P-51, P-82) | classic |
-| `/api/rh/start` | GET | Robinhood OAuth start URL | classic: wrapped by NEW POST /api/v2/broker/robinhood/start (P-57) | classic |
+| `/api/rh/start` | GET | Robinhood OAuth start URL | classic: wrapped by NEW POST /api/v2/broker/robinhood (P-57) | classic |
 | `/api/wallet/balance` | GET | wallet balance in sats | /v2 Signals & pass → Payment wallet (P-51) | v2 |
 | `/api/deploy/status` | GET | cloud deploy progress | /v2 Settings → This computer → Move (P-70) | v2 |
 | `/api/brokers` | GET | key-based broker list + fields | /v2 Settings → Connections → Broker (P-56) | v2 |
@@ -232,7 +234,7 @@ Input for the 4a.5 test (`tests/test_v2_parity.py::test_every_route_has_a_v2_cal
 | `/api/v2/settings/computer` | POST | start at login, keep awake, open at login (P-66), dashboard switch (P-71) | /v2 Settings → This computer / This dashboard | v2 |
 | `/api/v2/settings/ai` | POST | AI helper | /v2 Settings → Connections | v2 |
 | `/api/v2/broker/connect` | POST | key-based broker (two-step) | /v2 Settings → Connections | v2 |
-| `/api/v2/broker/robinhood` | POST | Robinhood sign-in (two-step; PARITY's /api/v2/broker/robinhood/start) | /v2 Settings → Connections | v2 |
+| `/api/v2/broker/robinhood` | POST | Robinhood sign-in (two-step) | /v2 Settings → Connections | v2 |
 | `/api/v2/pass/buy` | POST | signal days invoice (two-step) | /v2 Signals & pass | v2 |
 | `/api/v2/wallet/recurring` | POST | recurring day-pass (two-step) | /v2 Signals & pass → Payment wallet (P-53) | v2 |
 | `/api/v2/command` | POST | pause, resume, practice, LIVE (two-step), stop (two-step, P-07) | /v2 band; Settings → The agent on this computer | v2 |
@@ -283,10 +285,10 @@ Every route below is registered in `W.routes_get`/`W.routes_post`, so it inherit
 | `POST /api/v2/wallet/fund` | helper split out of wallet_fund | two-step | P-52 |
 | `POST /api/v2/wallet/connect` | helper split out of source() + _use_pasted_wallet | two-step | P-54 |
 | `POST /api/v2/wallet/page` | returns the LNbits wallet page URL on click (never in a GET) | direct | P-51 |
-| `POST /api/v2/broker/robinhood/start` | rh_start | two-step | P-57 |
+| `POST /api/v2/broker/robinhood` | rh_start | two-step | P-57 |
 | `GET /api/v2/agreement` | A._disclaimer_text() | read-only | P-82 |
 | `GET /api/v2/settings +expiry, +computer.open_dashboard_at_login/dashboard, +signals.dry_run_preview, +code.self_edit_enabled, +broker.warning, +consent` | read-only, secret-free | read-only | P-39, P-58, P-66, P-71, P-77, P-82 |
-| `GET /api/v2/status (view-model) +results.real.paid_days/days[].paid, +limits.budget_hints, +signals.preview, +proposal.pending, conditions +budget_too_small/+proposal_pending/+consent_needed` | read-only, from the readers the classic /api/status and /api/pnl use | read-only | P-26, P-33, P-48, P-74, P-83 |
+| `GET /api/v2/status (view-model) +results.paid_days {real, practice}, +limits.budget_hints, +signals.preview, +proposal.pending, conditions +budget_too_small/+proposal_pending/+consent_needed` | read-only, from the readers the classic /api/status and /api/pnl use | read-only | P-26, P-33, P-48, P-74, P-83 |
 
 ## Missing: build list
 
@@ -294,7 +296,7 @@ Grouped by the /v2 page that owns each item, in build order. Server work comes f
 
 ### 0. Groundwork (server only, no UI)
 1. **View-model readings** (`view_model.py`, read-only):
-   - `results.real.paid_days {days, pnl}` + `days[].paid` (P-26)
+   - `results.paid_days {real, practice}` (pnl, closed, days, paid_on, estimated_on) (P-26)
    - `limits.budget_hints` (P-33)
    - `signals.preview` (P-48)
    - `proposal {pending, diff_sha256}` (P-74)
@@ -369,7 +371,7 @@ Grouped by the /v2 page that owns each item, in build order. Server work comes f
 
 ### 5. Settings → Code changes
 - **P-74** review panel: reuse `GET /api/proposal`. Today shows one `proposal_pending` note linking here.
-- **P-75** Apply: `POST /api/v2/proposal/apply`, two-step, token bound to sha256 of the diff.
+- **P-75** Apply: `POST /api/v2/proposal/apply`, two-step, token bound to sha256 of the whole diff; a diff cut for display, or one made against files that changed since, is refused.
 
   *Tests:*
   - No token → not applied.
@@ -384,7 +386,7 @@ Grouped by the /v2 page that owns each item, in build order. Server work comes f
   *Test:* the request text `pause` / `dry off` is proposed and never executed: `apply_command` is not called and the config is unchanged.
 
 ### 6. Settings → Connections
-- **P-57** Robinhood: `POST /api/v2/broker/robinhood/start`, two-step, over `rh_start`.
+- **P-57** Robinhood: `POST /api/v2/broker/robinhood`, two-step, over `rh_start`.
 
   *Test:* the confirmed call returns the same auth URL as `GET /api/rh/start` (stubbed OAuth). `/callback` is untouched.
 - **P-58** options warning: `GET /api/v2/settings broker.warning`, fixture render.
@@ -503,7 +505,7 @@ Every command `agent._apply_command` (agent.py:5027-5290) accepts. Statuses are 
 
 Kept short on purpose, because the owner asked for everything. Features that /v2 does **not** get:
 
-1. **The first-run wizard** (P-84 accept agreement, P-85 stepper, P-86 skip AI, P-88 Finish setup, P-89 first launch, P-90 move import, P-91 setup assistant). /v2 needs a set-up agent behind it, and on a receiving computer the import *is* the first run. /v2 links back with `?from=v2` only for: unfinished setup (Band/Today), an updated agreement (P-83) and "Bringing a setup here?" (P-90).
+1. **The first-run wizard** (P-84 accept agreement, P-85 stepper, P-86 skip AI, P-88 Finish setup, P-89 first launch, P-90 move import, P-91 setup assistant). /v2 needs a set-up agent behind it, and on a receiving computer the import *is* the first run. /v2 links back with `?from=v2` only for: unfinished setup (Settings → The agent on this computer), an updated agreement (P-83) and "Bringing a setup here?" (P-90).
 2. **Free-text commands and the quick-command chips** (P-17, P-93; `POST /api/command`). The SPEC forbids free text in /v2. Every command that changes something has a typed control in the table above, and questions go to the answer-only Ask box.
 3. **"Claude API key — only if you skipped step 2"** on the inline Safety step (P-87). It would be a second home for the AI key; the one home is Settings → Connections → AI helper. The React wizard already dropped it.
 4. **The activity sparkline** in the inline /dash header (P-20). The Results chart replaces it.
