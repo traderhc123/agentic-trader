@@ -641,36 +641,44 @@ def _check_two_step(name, home, app, monkeypatch, log=None):
     path, payload, done, reset, start = (case[k] for k in (
         "path", "payload", "done", "reset", "start"))
     write_cfg(home, start)
+    kept = {"files": _old_wallet_files(home)}
+
+    def untouched(on_file=start):
+        """A refusal wrote nothing: not done, the whole config.json as it
+        was, and no old-wallet file (wallet create / connect)."""
+        return (not done() and read_cfg(home) == on_file
+                and _old_wallet_files(home) == kept["files"])
     # no token: a preview, nothing done
     first = c.post(path, payload)
-    assert first.get("needs_confirm") is True and not done(), (name, first)
+    assert first.get("needs_confirm") is True and untouched(), (name, first)
     token = first["preview"]["token"]
     # wrong tokens
     for bad in ("nope", "", None, 7, token[:-1] + ("0" if token[-1] != "0" else "1")):
         r = c.post(path, {**payload, "confirm": bad})
-        assert r["ok"] is False and not done(), (name, bad)
+        assert r["ok"] is False and untouched(), (name, bad)
     # expired
     token = c.post(path, payload)["preview"]["token"]
     real = webui._clock()
     monkeypatch.setattr(webui, "_clock", lambda: real + 121)
     r = c.post(path, {**payload, "confirm": token})
     monkeypatch.setattr(webui, "_clock", lambda: real)
-    assert r["ok"] is False and "expired" in r["error"] and not done(), name
+    assert r["ok"] is False and "expired" in r["error"] and untouched(), name
     # another payload than the one previewed
     token = c.post(path, payload)["preview"]["token"]
     r = c.post(path, {**payload, "confirm": token, "extra": 1})
-    assert r["ok"] is False and not done(), name
+    assert r["ok"] is False and untouched(), name
     for k, v in payload.items():  # each value changed in turn
         token = c.post(path, payload)["preview"]["token"]
         other = (not v) if isinstance(v, bool) else (v + 1000 if isinstance(v, int)
                                                      else v[:-1] + ("x" if v[-1] != "x" else "y"))
         r = c.post(path, {**payload, k: other, "confirm": token})
-        assert r["ok"] is False and not done(), (name, k)
+        assert r["ok"] is False and untouched(), (name, k)
     # settings changed after the preview
     token = c.post(path, payload)["preview"]["token"]
-    write_cfg(home, {**start, "max_entries_per_day": 9})
+    moved = {**start, "max_entries_per_day": 9}
+    write_cfg(home, moved)
     r = c.post(path, {**payload, "confirm": token})
-    assert r == {"ok": False, "error": webui._REVIEW_AGAIN} and not done(), name
+    assert r == {"ok": False, "error": webui._REVIEW_AGAIN} and untouched(moved), name
     write_cfg(home, start)
     # the right one: done once; the same token again: refused
     token = c.post(path, payload)["preview"]["token"]
@@ -678,10 +686,11 @@ def _check_two_step(name, home, app, monkeypatch, log=None):
     assert r["ok"] is True and done(), (name, r)
     reset()
     write_cfg(home, start)
+    kept["files"] = _old_wallet_files(home)
     if case.get("again"):
         case["again"]()
     r = c.post(path, {**payload, "confirm": token})
-    assert r["ok"] is False and not done(), name
+    assert r["ok"] is False and untouched(), name
 
 
 @pytest.mark.parametrize("name", ["proposal-apply", "source", "scope"])
