@@ -810,3 +810,19 @@ textarea.input{min-height:120px;resize:vertical;font-size:15px;line-height:1.45}
   /* a wide value (the frame legend) goes under its label on a phone */
   .setrow .val:has(.legendrow){grid-row:auto;grid-column:1 / -1;justify-self:start;text-align:left}
 }
+
+/* Settings → This dashboard: "New | Classic" (a two-way choice, saved on the agent) */
+.seg{display:inline-flex;border:1px solid var(--line2);border-radius:var(--r1);overflow:hidden}
+.seg button{min-height:32px;padding:4px 14px;border:0;background:transparent;color:var(--ink2);font:inherit;font-weight:600;cursor:pointer}
+.seg button + button{border-left:1px solid var(--line2)}
+.seg button[aria-checked="true"]{background:var(--ink);color:var(--surface)}
+.seg button:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}
+.seg button:disabled{cursor:default}
+.seg button:disabled:not([aria-checked="true"]){color:var(--ink3)}
+/* the move dialog: numbered steps, then the cloud option */
+.steps{display:grid;gap:16px;margin:0;padding-left:20px}
+.steps li{display:grid;gap:8px}
+.steps h4,.subsec h4{margin:0;font-size:15px}
+.row-acts{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.subsec{display:grid;gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+@media (max-width:640px){.seg button{min-height:44px}.row-acts .btn{min-height:44px}}

@@ -6,15 +6,54 @@
 // field before anything is sent. What is saved, and what a change does to
 // the owner's risk in the confirm dialog, always comes from the server's own
 // preview (POST without `confirm`), never from here.
-import type { Change, Direction, Purchases, SettingsView, SignInEnd, SizeMode, SizeSpec } from "../../lib/settingsApi";
+import type { Change, Direction, Purchases, SettingsView, SignInEnd, SizeMode, SizeSpec, Unsold } from "../../lib/settingsApi";
 import { count, plural, usd } from "./format.ts";
 
-/** The first-run wizard and the move tool are the only pages /v2 sends the
- *  owner to; the wizard brings them back here (webui._RETURN_TO). */
+/** The first-run wizard is the only page /v2 sends the owner to (to finish
+ *  setup, or to bring a setup to this computer); it brings them back here
+ *  (webui._RETURN_TO). */
 export const SETUP_FROM_V2 = "/setup?from=v2";
-/** "Move to another computer" lives in the classic dashboard's move tool
- *  (the setup wizard only has the receiving end); #move opens it. */
-export const MOVE_TOOL = "/dash#move";
+/** The classic dashboard: Settings → This dashboard opens it (once). */
+export const CLASSIC = "/dash";
+
+// ── move to another computer ────────────────────────────────────────────────
+
+/** What is wrong with the move file's passphrase ("" when nothing): the
+ *  classic move tool's rules, 8 characters or more, typed twice alike. */
+export function movePassProblem(pw: string, again: string): string {
+  if (pw.length < 8) return "Pick a passphrase of at least 8 characters.";
+  if (pw !== again) return "The two passphrases don't match.";
+  return "";
+}
+
+/** The DigitalOcean regions a cloud move can use (provision.REGIONS; the
+ *  server refuses any other). */
+export const DEPLOY_REGIONS: [string, string][] = [
+  ["nyc3", "New York"],
+  ["sfo3", "San Francisco"],
+  ["tor1", "Toronto"],
+  ["lon1", "London"],
+  ["fra1", "Frankfurt"],
+  ["sgp1", "Singapore"],
+];
+
+/** One real position a stop or a move leaves unsold here, in words. */
+export function unsoldWords(u: Unsold): string {
+  const c = u.contract;
+  const name = c ? `${c.symbol} ${c.strike}${c.side} ${c.expiry}` : u.label || "A position the agent can't name";
+  const qty = typeof u.qty === "number" && Number.isFinite(u.qty) ? `, ${plural(u.qty, "contract")}` : "";
+  return `${name}${qty}${u.expires_today ? ", expires today" : ""}`;
+}
+
+/** Why Start can't be offered yet ("" when it can): the first-run steps
+ *  the wizard still has to do (the server checks again either way). */
+export function setupUnfinished(v: SettingsView | null): string {
+  if (!v) return "";
+  if (v.consent?.accepted === false) return "The agreement isn't accepted yet.";
+  if (!v.signals?.source) return "No signal source is chosen yet.";
+  if (v.broker?.ready === false) return "No broker is connected yet.";
+  return "";
+}
 
 /** "$1,150" for whole dollars, "$1,150.50" otherwise. */
 export const money = (n: number) => usd(n, Number.isInteger(n) ? 0 : 2);
@@ -146,6 +185,8 @@ export function valueWords(key: string, v: unknown): string {
   if (key === "mode") return v === "live" ? "LIVE" : v === "practice" ? "Practice" : "not known";
   if (key === "signal_days") return isNum(v) ? plural(v, "signal day") : "None";
   if (key === "robinhood") return v ? "Signed in" : "Not signed in";
+  if (key === "agent") return v === "running" ? "Running" : v === "stopped" ? "Stopped" : "not known";
+  if (key === "this_computer" && typeof v === "string" && v) return v.charAt(0).toUpperCase() + v.slice(1);
   if (typeof v === "boolean") return v ? "On" : "Off";
   if (isNum(v)) return count(v);
   if (v == null || v === "") return "not set";

@@ -6,7 +6,7 @@ import type { Status } from "../lib/viewModel";
 import { UPDATE } from "./lib/copy";
 import { bandModel, marketVital, vitals, type Link, type Vital } from "./lib/derive";
 import { addSeconds, ago } from "./lib/format";
-import { SETUP_FROM_V2 } from "./lib/settings";
+import { bandStartLink, type View } from "./lib/screens";
 import { Icon } from "./ui";
 
 export type BandAction = "pause" | "resume" | "to-practice" | "to-live" | "retry";
@@ -77,6 +77,8 @@ export function Band({
   onAction,
   update,
   onUpdate,
+  view,
+  onGo,
 }: {
   status: Status;
   link: Link;
@@ -85,6 +87,9 @@ export function Band({
   /** "Update available": shown only when lib/update.badgeFor says so */
   update?: { count: number | null } | null;
   onUpdate?: () => void;
+  /** the page on screen, and how to go to another (the band's one link) */
+  view?: View;
+  onGo?: (v: View) => void;
 }) {
   const m = bandModel(status, link);
   const ref = useRef<HTMLElement>(null);
@@ -152,10 +157,11 @@ export function Band({
               Try again
             </button>
           )}
-          {a.start && (
-            <a className="btn btn-primary" data-act="start" href={SETUP_FROM_V2}>
-              Open setup to start it
-            </a>
+          {view && onGo && bandStartLink(view, status, link) && (
+            // a pointer, not a second Start: the button is in Settings
+            <button className="btn btn-primary" data-go="settings" onClick={() => onGo("settings")}>
+              Start it in Settings
+            </button>
           )}
           {a.pause && (
             <button className="btn" data-act="pause" onClick={() => onAction("pause")} disabled={busy}>

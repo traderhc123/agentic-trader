@@ -1,11 +1,9 @@
 // Where the /v2 dashboard gets its data: GET /api/v2/status every 5 s (the
 // classic dashboard's cadence) and older Activity rows from /api/v2/activity
-// on demand. `command` is only the stop button's fixed "stop" (POST
-// /api/command); every other command goes through the typed
-// POST /api/v2/command (App.tsx).
+// on demand. Commands go through the typed POST /api/v2/command (App.tsx,
+// views/AgentDialogs.tsx); this page sends no free text.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { SCHEMA_VERSION, type Activity, type ActivityPage, type Status } from "../lib/viewModel";
-import { postJson } from "./lib/http";
 
 export const POLL_MS = 5000;
 const TIMEOUT_MS = 4000;
@@ -60,8 +58,6 @@ export interface StatusFeed {
   olderError: string;
   loadOlder: () => void;
   refresh: () => Promise<void>;
-  /** send one command; resolves to the agent's own reply */
-  command: (text: string) => Promise<{ ok: boolean; reply: string }>;
 }
 
 export function useStatus(): StatusFeed {
@@ -194,26 +190,5 @@ export function useStatus(): StatusFeed {
     }
   }, [loadingOlder]);
 
-  const command = useCallback(
-    async (text: string) => {
-      try {
-        const r = await postJson("/api/command", { text });
-        if (r.status === 401 || r.status === 403) {
-          setFetching({ kind: "locked" });
-          return { ok: false, reply: "Your dashboard login expired, so nothing was changed. Open the login link again (python agent.py link)." };
-        }
-        const j = (await r.json()) as { reply?: unknown; error?: unknown };
-        if (r.status !== 200 || typeof j.reply !== "string")
-          return { ok: false, reply: `The agent did not accept that${typeof j.error === "string" ? `: ${j.error}` : ""}. Nothing was changed as far as this page knows.` };
-        return { ok: true, reply: j.reply };
-      } catch {
-        return { ok: false, reply: "Could not reach the agent, so this page does not know whether anything changed. Check the band at the top once it reconnects." };
-      } finally {
-        refresh();
-      }
-    },
-    [refresh],
-  );
-
-  return { status, fetching, failing, rows, total, canLoadOlder, loadingOlder, olderError, loadOlder, refresh, command };
+  return { status, fetching, failing, rows, total, canLoadOlder, loadingOlder, olderError, loadOlder, refresh };
 }

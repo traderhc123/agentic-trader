@@ -55,9 +55,13 @@ import { UNKNOWN, ago, contractName, dayLong, etDayKey, etTime, etWhen, plural, 
 import { UPDATE } from "../src/v2/lib/copy.ts";
 import { API, FAILED, confirmBody, getJson, onUnknownWrite, postJson, send } from "../src/v2/lib/http.ts";
 import {
-  MOVE_TOOL,
+  CLASSIC,
+  DEPLOY_REGIONS,
   ackGiven,
   SETUP_FROM_V2,
+  movePassProblem,
+  setupUnfinished,
+  unsoldWords,
   confirmLabel,
   limitMeans,
   limitRange,
@@ -75,7 +79,7 @@ import {
   v2Words,
   valueWords,
 } from "../src/v2/lib/settings.ts";
-import { ACTION_HOME, HOME_FILE, VIEWS, screenOf, todayLimitsLink } from "../src/v2/lib/screens.ts";
+import { ACTION_HOME, HOME_FILE, VIEWS, bandStartLink, screenOf, todayLimitsLink } from "../src/v2/lib/screens.ts";
 import { returnTo } from "../src/lib/returnTo.ts";
 import { fileURLToPath } from "node:url";
 import { RANGES, addDays, axisMoney, chartModel, niceTicks, rangeStart } from "../src/v2/lib/chart.ts";
@@ -1067,8 +1071,8 @@ test("http: every /v2 write is one same-origin JSON POST; failures never claim n
   assert.equal((await getJson(API.settings, fakeReply(401, {}))).why, "locked");
   assert.equal((await getJson(API.settings, fakeReply("down", null))).why, "network");
   for (const f of Object.values(FAILED)) for (const t of Object.values(f)) clean(t, "failure words");
-  // /v2 sends no free text: the classic command route is only the fixed "stop"
-  for (const [k, p] of Object.entries(API)) if (k !== "classicCommand") assert.ok(p !== "/api/command", k);
+  // /v2 sends no free text: the classic command route is never called
+  for (const [k, p] of Object.entries(API)) assert.ok(p !== "/api/command", k);
 });
 
 test("the setup wizard goes back to /v2 only when /v2 sent the owner there", () => {
@@ -1198,21 +1202,117 @@ test("the settings never leave /v2: every remaining link to /setup or /dash is o
   }
   // each one, and why it stays:
   assert.deepEqual(found.sort(), [
-    // the constants the links use (Band's start link; Settings' move link)
-    "lib/settings.ts /dash#move",
+    // the constants the links use: the first-run wizard (finish setup; bring
+    // a setup to this computer) and Settings → This dashboard's one link
+    "lib/settings.ts /dash",
     "lib/settings.ts /setup?from=v2",
     // the Waiting screen, shown when there is no status to draw Settings from
     "App.tsx /dash",
-    // Settings → This dashboard: the one "Back to the classic dashboard"
-    "views/Settings.tsx /dash",
   ].sort());
-  assert.equal(MOVE_TOOL, "/dash#move");
-  // the start link (shown only when no agent runs) returns to /v2
-  assert.match(fs.readFileSync(path.join(SRC, "v2", "Band.tsx"), "utf8"), /href=\{SETUP_FROM_V2\}/);
+  assert.equal(CLASSIC, "/dash");
+  // where the constants are used: setup only to finish it or to bring a
+  // setup here; the classic page only from This dashboard
+  const uses = (name) =>
+    files.filter((f) => new RegExp(`\\b${name}\\b`).test(fs.readFileSync(f, "utf8").replace(/^import .*$/gm, ""))).map(rel).filter((f) => f !== "lib/settings.ts").sort();
+  assert.deepEqual(uses("SETUP_FROM_V2"), ["views/AgentDialogs.tsx", "views/Settings.tsx"]);
+  assert.deepEqual(uses("CLASSIC"), ["views/Settings.tsx"]);
+  // starting the agent never goes through setup: the band points at Settings
+  const band = fs.readFileSync(path.join(SRC, "v2", "Band.tsx"), "utf8");
+  assert.ok(!/SETUP_FROM_V2|\/setup/.test(band), "Band.tsx still sends the owner to setup");
   // the setup wizard's own links and its hop after starting honour from=v2
   for (const f of ["wizard/Wizard.tsx", "wizard/steps.tsx"]) {
     const t = fs.readFileSync(path.join(SRC, f), "utf8");
     assert.ok(!/["']\/dash["']/.test(t), `${f} still goes to /dash by itself`);
     assert.match(t, /returnTo\(\)/);
   }
+});
+
+// ── PR 4 groups 1-3: this dashboard, the agent, this computer ──────────────
+
+test("the agent: Start and Stop live in Settings; the band only points there", { skip }, () => {
+  assert.equal(ACTION_HOME.start, "settings");
+  assert.equal(ACTION_HOME.stop, "settings");
+  const get = (n) => states.find(([x]) => x === n)[1];
+  const stopped = get("stopped");
+  const l = linkOf(stopped, false);
+  assert.equal(l, "stopped");
+  // Settings has the Start button, and the band no link to itself
+  const set = screenOf("settings", stopped, l);
+  assert.ok(set.controls.includes("start") && !set.controls.includes("stop"));
+  assert.equal(bandStartLink("settings", stopped, l), false);
+  // every other page: one link to Settings, from the band or from a note
+  for (const view of VIEWS.filter((v) => v !== "settings")) {
+    const sc = screenOf(view, stopped, l);
+    assert.equal(sc.links.filter((x) => x === "settings").length, 1, view);
+    assert.ok(!sc.controls.includes("start"), view);
+  }
+  // an agent that runs: Stop, never Start, and no band link
+  const live = get("live");
+  assert.ok(screenOf("settings", live, "ok").controls.includes("stop"));
+  assert.ok(!screenOf("settings", live, "ok").controls.includes("start"));
+  for (const view of VIEWS) assert.equal(bandStartLink(view, live, "ok"), false, view);
+});
+
+test("the agent: Stop asks the server first and lists what it leaves unsold", () => {
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "AgentDialogs.tsx"), "utf8");
+  // one typed command, two steps (askPreview, then ReviewDialog with the token)
+  assert.match(src, /usePreview\(API\.command, payload\)/);
+  assert.match(src, /const payload = \{ action: "stop" \}/);
+  assert.match(src, /<UnsoldList p=\{p\} after="while it is stopped"/);
+  // Start: the typed route, never the setup wizard
+  assert.match(src, /usePreview\(API\.agentStart, \{\}\)/);
+  assert.equal(API.agentStart, "/api/v2/agent/start");
+  assert.equal(API.command, "/api/v2/command");
+  // the words for a position left unsold, never null or NaN
+  const u = { id: "x", label: "SPY 700C", contract: { symbol: "SPY", expiry: "2026-11-13", strike: 700, side: "C" }, qty: 2, expires_today: true };
+  assert.equal(unsoldWords(u), "SPY 700C 2026-11-13, 2 contracts, expires today");
+  clean(unsoldWords({ ...u, contract: null, qty: null, label: null, expires_today: false }), "unsold, unknown");
+  assert.equal(unsoldWords({ ...u, contract: null, label: null, qty: null, expires_today: false }), "A position the agent can't name");
+  // Start is held back, with the reason, while setup is unfinished
+  const v = { consent: { accepted: true }, signals: { source: "agenthc" }, broker: { ready: true } };
+  assert.equal(setupUnfinished(v), "");
+  assert.match(setupUnfinished({ ...v, consent: { accepted: false } }), /agreement/);
+  assert.match(setupUnfinished({ ...v, signals: { source: null } }), /signal source/);
+  assert.match(setupUnfinished({ ...v, broker: { ready: false } }), /broker/);
+  assert.equal(setupUnfinished(null), "");
+});
+
+test("this computer: Move is one control, made of the classic routes and two-step finishes", () => {
+  // the passphrase rules of the classic move tool: 8 or more, typed twice alike
+  assert.match(movePassProblem("short", "short"), /at least 8/);
+  assert.match(movePassProblem("long enough", "long enougj"), /don't match/);
+  assert.equal(movePassProblem("long enough", "long enough"), "");
+  // the file is made and downloaded by the classic routes as they are
+  assert.equal(API.moveExport, "/api/move/export");
+  assert.equal(API.moveDownload, "/api/move/download");
+  assert.equal(API.deployStatus, "/api/deploy/status");
+  // retiring this computer and the cloud move are typed and two-step
+  assert.equal(API.moveFinish, "/api/v2/move/finish");
+  assert.equal(API.moveDeploy, "/api/v2/move/deploy");
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "AgentDialogs.tsx"), "utf8");
+  assert.match(src, /send<MoveFile>\(API\.moveExport, \{ passphrase: pw \}\)/);
+  assert.match(src, /askPreview\(API\.moveFinish, \{\}\)/);
+  assert.match(src, /askPreview\(API\.moveDeploy, payload\)/);
+  assert.ok(!/\/api\/finish/.test(src), "the cloud move never ends the setup server's wait");
+  // the regions are the server's own list (provision.REGIONS)
+  assert.deepEqual(DEPLOY_REGIONS.map(([k]) => k), ["nyc3", "sfo3", "tor1", "lon1", "fra1", "sgp1"]);
+  // one Move control in all of /v2, in Settings
+  let moves = 0;
+  for (const f of sources(path.join(SRC, "v2"))) moves += (fs.readFileSync(f, "utf8").match(/data-act="move"/g) || []).length;
+  assert.equal(moves, 1);
+});
+
+test("this dashboard: one switch, saved on the agent; one way to the classic page", () => {
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "Settings.tsx"), "utf8");
+  // the switch saves through the computer settings route, nothing else
+  assert.match(src, /send\(API\.computer, \{ dashboard: d \}\)/);
+  assert.equal((src.match(/data-act="dashboard"/g) || []).length, 1);
+  assert.equal((src.match(/data-act="classic"/g) || []).length, 1);
+  // the theme is set here only (not in the sidebar, not under More)
+  for (const f of sources(path.join(SRC, "v2")).filter((p) => p.endsWith(".tsx"))) {
+    const t = fs.readFileSync(f, "utf8");
+    if (rel(f) !== "views/Settings.tsx") assert.ok(!/toggleTheme\}|onClick=\{page\.toggleTheme/.test(t), `${rel(f)} toggles the theme`);
+  }
+  // open at login: a switch of its own on the same route
+  assert.match(src, /k="open_dashboard_at_login" act="open-at-login"/);
 });

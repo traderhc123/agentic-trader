@@ -1,21 +1,23 @@
-// Settings: connections (broker, AI helper, alerts) and this computer
-// (start at login, keep awake, move, stop), plus this dashboard (theme, the
-// way back to the classic one). Everything is changed here, in /v2:
-// connecting or replacing a broker is confirmed against the server's
-// preview first; the rest saves straight away. After every save the page
-// reads the settings again and shows those.
+// Settings: connections (broker, AI helper, alerts), the agent on this
+// computer (start, stop), this computer (start at login, open at login, keep
+// awake, move to another computer), and this dashboard (which one "/" opens,
+// theme). Everything is changed here, in /v2: connecting or replacing a
+// broker, stopping, starting in LIVE and moving are confirmed against the
+// server's preview first; the rest saves straight away. After every save the
+// page reads the settings again and shows those.
 import { useEffect, useId, useRef, useState } from "react";
-import type { AiModels, AiProviders, BrokerForm, Preview, Secret, SettingsView, SignInDone } from "../../lib/settingsApi";
+import type { AiModels, AiProviders, BrokerForm, Dashboard, Preview, Secret, SettingsView, SignInDone } from "../../lib/settingsApi";
 import { FieldError, ReviewDialog, SettingsDoubt, Switch, askPreview } from "../Forms";
 import { brokerLabel } from "../lib/derive";
 import { API, getJson, send } from "../lib/http";
-import { MOVE_TOOL, RH_OPTIONS_URL, brokerName, signInOutcome } from "../lib/settings";
+import { CLASSIC, RH_OPTIONS_URL, SETUP_FROM_V2, brokerName, setupUnfinished, signInOutcome } from "../lib/settings";
 import { badgeFor, updateLine } from "../lib/update";
 import { UPDATE } from "../lib/copy";
 import { UNKNOWN, etDayKey, etTime, etWhen, usd } from "../lib/format";
 import { Dialog, Icon, Stamp } from "../ui";
 import type { Page } from "../App";
 import { Row } from "./Pages";
+import { MoveDialog, StartDialog, StopDialog } from "./AgentDialogs";
 
 const SOURCE_NAMES: Record<string, string> = { agenthc: "AgentHC Day Trade Ideas" };
 const sourceName = (id: string) => (Object.prototype.hasOwnProperty.call(SOURCE_NAMES, id) ? SOURCE_NAMES[id] : id);
@@ -429,11 +431,15 @@ function AlertsDialog({ page, onClose }: { page: Page; onClose: () => void }) {
 
 // ── this computer ───────────────────────────────────────────────────────────
 
-function ComputerSwitch({ page, k, act, label }: { page: Page; k: "autostart" | "keep_awake"; act: string; label: string }) {
+type ComputerKey = "autostart" | "keep_awake" | "open_dashboard_at_login";
+const computerOn = (v: SettingsView | null, k: ComputerKey): boolean | null =>
+  !v ? null : k === "autostart" ? v.computer.autostart.enabled : k === "keep_awake" ? v.computer.keep_awake : v.computer.open_dashboard_at_login;
+
+function ComputerSwitch({ page, k, act, label }: { page: Page; k: ComputerKey; act: string; label: string }) {
   const v = page.settings.view;
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-  const on = !v ? null : k === "autostart" ? v.computer.autostart.enabled : v.computer.keep_awake;
+  const on = computerOn(v, k);
   const save = async (next: boolean) => {
     setBusy(true);
     setErr("");
@@ -444,7 +450,7 @@ function ComputerSwitch({ page, k, act, label }: { page: Page; k: "autostart" | 
     }
     const nv = await page.settings.reload();
     setBusy(false);
-    const now = nv ? (k === "autostart" ? nv.computer.autostart.enabled : nv.computer.keep_awake) : null;
+    const now = nv ? computerOn(nv, k) : null;
     const note = (r as { autostart_note?: string }).autostart_note;
     page.say(true, `Saved. ${label}: ${now == null ? "not read back yet" : now ? "on" : "off"}.${note ? ` ${note}` : ""}`);
   };
@@ -452,6 +458,46 @@ function ComputerSwitch({ page, k, act, label }: { page: Page; k: "autostart" | 
     <>
       <Switch act={act} label={label} on={on} busy={busy} disabled={!!cantEdit(page)} onChange={save} />
       <FieldError id={`${k}-e`} text={err} />
+    </>
+  );
+}
+
+/** Which dashboard the address of this page ("/") opens: saved on the
+ *  agent (config "dashboard"), so every browser and the setup wizard's way
+ *  back follow it. Both dashboards stay reachable either way. */
+function DashboardSwitch({ page }: { page: Page }) {
+  const v = page.settings.view;
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const now = v ? v.computer.dashboard : null;
+  const pick = async (d: Dashboard) => {
+    if (d === now) return;
+    setBusy(true);
+    setErr("");
+    const r = await send(API.computer, { dashboard: d });
+    if (!r.ok) {
+      setBusy(false);
+      return setErr(r.error);
+    }
+    const nv = await page.settings.reload();
+    setBusy(false);
+    page.say(
+      true,
+      nv
+        ? `Saved. The dashboard's address now opens the ${nv.computer.dashboard === "v2" ? "new" : "classic"} dashboard.`
+        : "Saved. This page could not read your settings back yet.",
+    );
+  };
+  return (
+    <>
+      <div className="seg" role="radiogroup" aria-label="Dashboard the address opens" data-act="dashboard">
+        {(["v2", "classic"] as Dashboard[]).map((d) => (
+          <button key={d} type="button" role="radio" aria-checked={now === d} disabled={busy || now == null || !!cantEdit(page)} onClick={() => pick(d)}>
+            {d === "v2" ? "New" : "Classic"}
+          </button>
+        ))}
+      </div>
+      <FieldError id="dashboard-e" text={err} />
     </>
   );
 }
@@ -485,7 +531,8 @@ export function SettingsView({ page }: { page: Page }) {
   const a = s.agent;
   const v = page.settings.view;
   const why = cantEdit(page);
-  const [open, setOpen] = useState<"broker" | "ai" | "alerts" | null>(null);
+  const [open, setOpen] = useState<"broker" | "ai" | "alerts" | "stop" | "start" | "move" | null>(null);
+  const unfinished = setupUnfinished(v);
   const reload = page.settings.reload;
   useEffect(() => {
     reload();
@@ -496,7 +543,7 @@ export function SettingsView({ page }: { page: Page }) {
       <div className="view-h">
         <div>
           <h1>Settings</h1>
-          <p>Connections and this computer, changed here. Nothing on this page switches Practice or LIVE, or buys or sells anything.</p>
+          <p>Connections, the agent and this computer, changed here. Nothing on this page switches Practice or LIVE, or buys or sells anything by itself.</p>
         </div>
         {page.stale && <Stamp at={page.asOf} />}
       </div>
@@ -579,17 +626,42 @@ export function SettingsView({ page }: { page: Page }) {
       </section>
       <section className={`panel ${page.stale ? "stale" : ""}`}>
         <div className="ph">
-          <h2>This computer</h2>
+          <h2>The agent on this computer</h2>
         </div>
         <Row
           label="Agent"
           exp={
             !a.running
-              ? "No agent is running behind this page. Start it with the button at the top of the window."
-              : `${a.started_at ? `Started ${etWhen(a.started_at, today)}. ` : ""}${a.last_heartbeat ? `Last report at ${etTime(a.last_heartbeat)}.` : "No report yet."}`
+              ? unfinished
+                ? <>Not running. {unfinished} <a href={SETUP_FROM_V2}>Finish setup</a>, then start it here.</>
+                : `Not running: nothing is bought, sold or watched. Start runs it with your settings as saved${s.mode === "live" ? ", in LIVE mode" : ", in practice"}.`
+              : `${a.started_at ? `Started ${etWhen(a.started_at, today)}. ` : ""}${a.last_heartbeat ? `Last report at ${etTime(a.last_heartbeat)}.` : "No report yet."} Stopping it leaves open positions at your broker, with nobody selling them.`
           }
           val={!a.running ? <span className="tag tag-bad">Stopped</span> : a.answering ? plain("Running") : <span className="tag tag-unk">Not answering</span>}
+          act={
+            a.running ? (
+              <button className="btn btn-sm" data-act="stop" aria-haspopup="dialog" onClick={() => setOpen("stop")} disabled={page.link !== "ok"}>
+                Stop the agent…
+              </button>
+            ) : (
+              <button
+                className="btn btn-sm btn-primary"
+                data-act="start"
+                aria-haspopup="dialog"
+                onClick={() => setOpen("start")}
+                disabled={page.link === "lost" || !!unfinished || !v}
+                title={unfinished || undefined}
+              >
+                {s.mode === "live" ? "Start the agent…" : "Start the agent"}
+              </button>
+            )
+          }
         />
+      </section>
+      <section className={`panel ${page.stale ? "stale" : ""}`}>
+        <div className="ph">
+          <h2>This computer</h2>
+        </div>
         <Row
           label="Start at login"
           exp={
@@ -600,6 +672,17 @@ export function SettingsView({ page }: { page: Page }) {
                 : `Starts the agent when you log in to this computer${auto.how ? ` (${auto.how})` : ""}.`
           }
           act={auto?.supported || !v ? <ComputerSwitch page={page} k="autostart" act="autostart" label="Start at login" /> : undefined}
+        />
+        <Row
+          label="Open the dashboard at login"
+          exp={
+            !v
+              ? UNKNOWN
+              : auto?.enabled === false
+                ? "Opens this dashboard, already signed in, after the agent starts at login. Start at login is off, so nothing opens yet."
+                : "Opens this dashboard, already signed in, after the agent starts at login."
+          }
+          act={<ComputerSwitch page={page} k="open_dashboard_at_login" act="open-at-login" label="Open the dashboard at login" />}
         />
         <Row label="Keep awake" exp="Stops this computer from sleeping while the agent runs, so it doesn't miss signals." act={<ComputerSwitch page={page} k="keep_awake" act="keep-awake" label="Keep awake" />} />
         <Row
@@ -625,38 +708,29 @@ export function SettingsView({ page }: { page: Page }) {
         <UpdateRow page={page} />
         <Row
           label="Move to another computer"
-          exp="Packs this setup into one passphrase-locked file for the other computer. Opens the move tool, which is in the classic dashboard."
+          exp="Packs this setup into one passphrase-locked file for the other computer, or moves it to a new cloud server, then retires this computer so the two never both trade."
           act={
-            <a className="btn btn-sm" data-act="move" href={MOVE_TOOL}>
-              <Icon name="ext" small />
-              Open the move tool
-            </a>
+            <button className="btn btn-sm" data-act="move" aria-haspopup="dialog" disabled={page.link === "lost"} onClick={() => setOpen("move")}>
+              Move…
+            </button>
           }
         />
-        {a.running && (
-          <Row
-            label="Stop the agent completely"
-            exp="Nothing is bought, sold or watched until you start it again. Open positions stay open at your broker."
-            act={
-              <button className="btn btn-sm" data-act="stop" onClick={() => page.act("stop")} disabled={page.busy || page.link !== "ok"}>
-                Stop the agent…
-              </button>
-            }
-          />
-        )}
       </section>
       <section className="panel">
         <div className="ph">
           <h2>This dashboard</h2>
         </div>
         <Row
-          label="Classic dashboard"
-          exp="The dashboard you had before is still there, with the question box, help, tips and the wallet."
-          act={
-            <a className="btn btn-sm" data-act="classic" href="/dash">
-              Back to the classic dashboard
-            </a>
+          label="Dashboard"
+          exp={
+            <>
+              Which dashboard the agent's address opens: this new one, or the classic one you had before. Both stay available.{" "}
+              <a data-act="classic" href={CLASSIC}>
+                Open the classic dashboard
+              </a>
+            </>
           }
+          act={<DashboardSwitch page={page} />}
         />
         <Row
           label="Theme"
@@ -672,6 +746,9 @@ export function SettingsView({ page }: { page: Page }) {
       {open === "broker" && v && <BrokerDialog page={page} onClose={() => setOpen(null)} />}
       {open === "ai" && v && <AiDialog page={page} onClose={() => setOpen(null)} />}
       {open === "alerts" && v && <AlertsDialog page={page} onClose={() => setOpen(null)} />}
+      {open === "stop" && <StopDialog page={page} onClose={() => setOpen(null)} />}
+      {open === "start" && <StartDialog page={page} onClose={() => setOpen(null)} />}
+      {open === "move" && <MoveDialog page={page} onClose={() => setOpen(null)} />}
     </div>
   );
 }

@@ -2,8 +2,9 @@
 // dashboard's login cookie, with no Origin trick or token of its own (the
 // server's host/origin guard and login check apply to every request alike).
 // Every read and write of /v2 goes through here: the typed settings routes
-// (/api/v2/...), the update pull, the few classic read-only routes /v2
-// reuses, and the one fixed command the stop button still sends.
+// (/api/v2/...), the update pull, and the few classic routes /v2 reuses as
+// they are (read-only, or making a file / an invoice that changes nothing).
+// /v2 sends no free text: the classic /api/command is never called.
 // No imports that exist at run time, so the Node tests load it as it is.
 import type { Reply } from "../../lib/settingsApi";
 
@@ -128,6 +129,9 @@ export const API = {
   robinhood: "/api/v2/broker/robinhood",
   passBuy: "/api/v2/pass/buy",
   command: "/api/v2/command",
+  agentStart: "/api/v2/agent/start",
+  moveFinish: "/api/v2/move/finish",
+  moveDeploy: "/api/v2/move/deploy",
   // classic, read-only (or saving nothing), reused as they are
   brokers: "/api/brokers",
   aiProviders: "/api/llm/providers",
@@ -135,6 +139,8 @@ export const API = {
   passOptions: "/api/pass/options",
   passStatus: "/api/pass/status",
   walletBalance: "/api/wallet/balance",
-  // the one fixed command not in /api/v2/command: "stop" (see Dialogs.tsx)
-  classicCommand: "/api/command",
+  // the move file: made, then downloaded (a GET the browser saves)
+  moveExport: "/api/move/export",
+  moveDownload: "/api/move/download",
+  deployStatus: "/api/deploy/status",
 } as const;

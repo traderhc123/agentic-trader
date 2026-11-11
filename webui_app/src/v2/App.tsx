@@ -40,7 +40,7 @@ export interface Page {
   go: (v: View) => void;
   openEv: (n: number) => void;
   openPos: (id: string) => void;
-  act: (a: BandAction | "stop") => void;
+  act: (a: BandAction) => void;
   /** the page load's update check, and the dialog that installs it */
   update: UpdateFeed;
   openUpdate: () => void;
@@ -249,19 +249,11 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
   const run = useCallback(
     async (cmd: Cmd) => {
       setBusy(true);
-      let ok: boolean;
-      let text: string;
-      if (cmd.action === "stop") {
-        const r = await feed.command("stop");
-        ok = r.ok;
-        text = r.ok ? `The agent answered: ${r.reply}` : r.reply;
-      } else {
-        const r = await send<{ reply?: string }>(API.command, cmd);
-        ok = r.ok;
-        text = r.ok ? `The agent answered: ${(r as { reply?: string }).reply ?? "done."}` : r.error;
-        feed.refresh();
-        settings.reload();
-      }
+      const r = await send<{ reply?: string }>(API.command, cmd);
+      const ok = r.ok;
+      const text = r.ok ? `The agent answered: ${(r as { reply?: string }).reply ?? "done."}` : r.error;
+      feed.refresh();
+      settings.reload();
       setBusy(false);
       setDialog(null);
       say(ok, text);
@@ -269,7 +261,7 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
     [feed, say, settings],
   );
   const act = useCallback(
-    (a: BandAction | "stop") => {
+    (a: BandAction) => {
       if (a === "retry") {
         setBusy(true);
         feed.refresh().finally(() => setBusy(false));
@@ -331,7 +323,7 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
           Skip to content
         </a>
         <div className="frame" aria-hidden="true" />
-        <Band status={status} link={link} busy={busy} onAction={act} update={badge} onUpdate={openUpdate} />
+        <Band status={status} link={link} busy={busy} onAction={act} update={badge} onUpdate={openUpdate} view={view} onGo={go} />
         <div className="app">
           <aside className="side" aria-label="Sections">
             <div className="brand">

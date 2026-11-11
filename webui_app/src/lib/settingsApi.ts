@@ -60,7 +60,16 @@ export interface SettingsView {
   computer: {
     autostart: { supported: boolean; enabled: boolean | null; how: string };
     keep_awake: boolean;
+    /** open the dashboard after login (the chat's "open at login"); null: not known */
+    open_dashboard_at_login: boolean | null;
+    /** the dashboard "/" lands on */
+    dashboard: Dashboard;
   };
+  /** the expiry sell and its alert (HH:MM ET; null = off); null: not known */
+  expiry: Expiry | null;
+  code: { self_edit_enabled: boolean };
+  /** the agreement on file (its text: GET /api/v2/agreement) */
+  consent: Consent;
   ai: {
     connected: boolean;
     provider: string | null;
@@ -81,10 +90,14 @@ export interface SettingsView {
     fields: Record<string, boolean | Secret>;
     /** how the last Robinhood sign-in ended (seq 0: none since the agent started) */
     signin: SignInEnd;
+    /** the classic wizard's Robinhood warning, as a code (options not turned on) */
+    warning: "options_off" | null;
   };
   signals: {
     source: string | null;
     include_other_trades: boolean;
+    /** practice mode's "what it would have taken" preview is on */
+    dry_run_preview: boolean;
     recurring: boolean;
     wallet_connected: boolean;
     api_key: Secret;
@@ -93,6 +106,36 @@ export interface SettingsView {
      *  (an invoice that expired unpaid is in neither) */
     purchases: Purchases;
   };
+}
+
+export type Dashboard = "classic" | "v2";
+
+export interface Expiry {
+  sell_et: string | null;
+  alert_et: string | null;
+  /** today's times (an early close moves both) */
+  effective_today: { sell_et: string | null; alert_et: string | null; close_et: string | null; early_close: boolean };
+  /** the classic status line ("sells at 15:45 ET, alert at 15:50 ET") */
+  described: string;
+  allowed: [string, string];
+}
+
+export interface Consent {
+  /** the agreement on file is the current one */
+  accepted: boolean;
+  on_file: boolean;
+  accepted_at: string | null;
+  terms_version: string | null;
+  current_terms_version: string;
+}
+
+/** A real position a stop or a move leaves with nobody selling it here. */
+export interface Unsold {
+  id: string;
+  label: string | null;
+  contract: { symbol: string; expiry: string; strike: number; side: "C" | "P" } | null;
+  qty: number | null;
+  expires_today: boolean;
 }
 
 /** One line of a server preview: Saved now → New. Values are as the server
@@ -120,6 +163,12 @@ export interface Preview {
   limits?: { max_entries_per_day: number | null; max_daily_loss_usd: number | null; max_open_positions: number | null };
   real_positions?: number | null;
   cash_low?: boolean | null;
+  /** stop / move: the real positions nobody sells here afterwards; null: not known */
+  unsold?: Unsold[] | null;
+  /** move: whether an agent runs behind this page (it stops) */
+  agent_running?: boolean;
+  /** start: the saved mode it starts in */
+  mode?: "live" | "practice";
 }
 
 /** Every /v2 write answers with one of these (HTTP 200). */
@@ -145,6 +194,32 @@ export interface Invoice {
   access_until: string | null;
   /** the QR code as rows of dark (1) / light (0) modules; null when not made */
   qr?: number[][] | null;
+}
+
+/** POST /api/v2/agent/start, applied (start_local's answer). */
+export interface StartDone {
+  autostart_note?: string;
+}
+
+/** POST /api/move/export (classic, reused): the move file is ready to download. */
+export interface MoveFile {
+  filename: string;
+  kb: number;
+}
+
+/** POST /api/v2/move/finish or /api/v2/move/deploy, applied. */
+export interface MoveDone {
+  note: string;
+  here?: string;
+  retired?: boolean;
+}
+
+/** GET /api/deploy/status (classic, reused): the cloud server's progress. */
+export interface DeployStatus {
+  status: string;
+  ip: string;
+  ssh?: string;
+  error?: string;
 }
 
 /** POST /api/v2/command, applied: the agent's own reply. */
