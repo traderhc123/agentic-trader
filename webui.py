@@ -1975,6 +1975,7 @@ _DASH_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <a class="btn btn-ghost" id="upd-badge" href="/setup" style="display:none;color:var(--accent)" title="Install it from settings (top of the page)">↑ Update<span class="lbl-sm">available</span></a>
   <button class="btn-ghost" id="help-btn" onclick="toggleHelp()" title="Help" aria-expanded="false" aria-controls="help"><svg class="i"><use href="#i-help"/></svg><span class="lbl-sm">Help</span></button>
   <a class="btn btn-ghost" href="/setup" title="Settings"><svg class="i"><use href="#i-gear"/></svg><span class="lbl-sm">Settings</span></a>
+  <a class="btn btn-ghost" href="/v2" title="A redesigned dashboard. You can come back here at any time.">Try the new dashboard</a>
  </div>
  <span class="vsep hide-sm"></span>
  <div class="actions acts-b">
@@ -2350,6 +2351,11 @@ class _Handler(BaseHTTPRequestHandler):
     landing = "/setup"
     v2 = False  # serve the redesigned dashboard at /v2 (start_app turns it on)
 
+    def _remembered(self):
+        """The dashboard the owner chose to land on ("classic" | "v2");
+        start_app reads it from the settings. "v2" only while /v2 is built."""
+        return "classic"
+
     def log_message(self, *a):  # quiet
         pass
 
@@ -2431,7 +2437,22 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(None, 401, html=_LOCKED_PAGE)
         if path == "/":
             self.send_response(302)
-            self.send_header("Location", self.landing)
+            # the agent's own server lands on the dashboard the owner chose;
+            # the setup server always on the wizard
+            self.send_header("Location", "/v2" if self.landing == "/dash"
+                             and self.v2 and self._remembered() == "v2"
+                             else self.landing)
+            self.end_headers()
+            return
+        if (path == "/setup" and self.v2 and _return_to(self.path) is None
+                and "from=" not in self.path and self._remembered() == "v2"):
+            # the wizard's "Dashboard" links and its hop after "Start my
+            # agent" go to the dashboard the owner chose (?from=v2, the
+            # fixed value; anything else in the address is kept as it is)
+            sep = "&" if "?" in self.path else "?"
+            self.send_response(302)
+            self.send_header("Location", f"{self.path}{sep}from=v2")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
         if path in self.pages:
@@ -3404,6 +3425,17 @@ def _broker_direction(before, after):
     return "raises_risk"
 
 
+# The dashboard "/" lands on (config key "dashboard"): classic unless the
+# owner chose the new one in /v2 Settings → This dashboard.
+_DASHBOARDS = ("classic", "v2")
+
+
+def _dashboard_pref(cfg):
+    """The saved landing choice; "classic" when absent or not a known one."""
+    v = cfg.get("dashboard") if isinstance(cfg, dict) else None
+    return v if v in _DASHBOARDS else "classic"
+
+
 # /setup?from=<one of these>: where the wizard's "Dashboard" links and its
 # hop after "Start my agent" go. A fixed list: never an open redirect.
 _RETURN_TO = {"v2": "/v2", "dash": "/dash"}
@@ -3638,6 +3670,15 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         landing = "/dash" if get_status else "/setup"
         v2 = True
         routes_get, routes_post = {}, {}
+
+        def _remembered(self):
+            try:
+                saved = _dashboard_pref(A._read_config())
+            except Exception:
+                return "classic"  # unreadable now: the classic landing
+            # no /v2 in this build: the classic one, whatever was chosen
+            return saved if saved == "classic" or _app_v2() is not None \
+                else "classic"
 
     def state(_h):
         return {
@@ -4072,7 +4113,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"pending": False}
         return {"pending": True, "explanation": p.get("explanation", ""),
                 "warnings": p.get("warnings", []),
-                "diff": "\n".join(c["diff"] for c in p.get("changes", []))[:200000]}
+                "diff": self_edit.shown_diff(p)}
 
     def proposal_apply(_h, _data):
         import self_edit
@@ -4420,6 +4461,24 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         pending["finished"].set()
         return {"ok": True}
 
+    def _start_refused():
+        """Why the agent can't be started here now (start_local's checks),
+        or None."""
+        if not A.consent_ok():
+            return "accept the agreement first"
+        from brokers import broker_ready
+        if not (cfg.get("source") and broker_ready(cfg)):
+            return "finish the source and broker steps first"
+        import llm_policy
+        if llm_policy.entries_blocked(cfg):
+            return llm_policy.BLOCKED_MSG
+        import transfer
+        if transfer.moved_away():
+            return ("this setup was moved to another computer, so it won't start "
+                    "here — to run it here again, stop the other computer and run: "
+                    "python agent.py resume-here")
+        return None
+
     def start_local(_h, data):
         """Option A as one click: start the agent in the background (under
         keep_running's supervisor, so closing the terminal doesn't stop it
@@ -4427,21 +4486,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         it this port. The supervisor waits until the wizard's socket is
         free before running `agent.py run`, so the dashboard (same port)
         can't lose the bind race and fall back to headless."""
-        if not A.consent_ok():
-            return {"ok": False, "error": "accept the agreement first"}
-        from brokers import broker_ready
-        if not (cfg.get("source") and broker_ready(cfg)):
-            return {"ok": False,
-                    "error": "finish the source and broker steps first"}
-        import llm_policy
-        if llm_policy.entries_blocked(cfg):
-            return {"ok": False, "error": llm_policy.BLOCKED_MSG}
-        import transfer
-        if transfer.moved_away():
-            return {"ok": False, "error": (
-                "this setup was moved to another computer, so it won't start "
-                "here — to run it here again, stop the other computer and run: "
-                "python agent.py resume-here")}
+        refused = _start_refused()
+        if refused:
+            return {"ok": False, "error": refused}
         save()
         import keep_running
         auto_note = ""
@@ -4554,11 +4601,17 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         run.__name__ = fn.__name__
         return run
 
-    def _two_step(route, payload, data, changes, does_not, extra=None):
+    def _two_step(route, payload, data, changes, does_not, extra=None,
+                  bind=None):
         """Under CONFIG_LOCK, after _sync(). None: go ahead (the token in
         `data` confirms exactly this payload against these settings). Else
-        the reply: the preview (no token sent yet) or why not."""
+        the reply: the preview (no token sent yet) or why not. bind: more
+        facts the preview showed (the real positions a stop leaves unsold):
+        when they differ at the confirm, the owner reviews again."""
+        import hashlib
         fp = _fingerprint()
+        if bind is not None:
+            fp += ":" + hashlib.sha256(_canonical(bind).encode()).hexdigest()[:16]
         if "confirm" not in data:
             return {"ok": True, "needs_confirm": True, "preview": {
                 "changes": changes, "does_not": does_not, **(extra or {}),
@@ -4634,6 +4687,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         except Exception:
             auto = {"supported": False, "enabled": None, "how": ""}
         acct = str(cfg.get("robinhood_account") or "") if bid == "robinhood" else ""
+        try:
+            open_at_login = bool(A._open_at_login_wanted(cfg))
+        except Exception:
+            open_at_login = None
         return {
             "ok": True,
             "fingerprint": _fingerprint(),
@@ -4656,7 +4713,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                       "policy_blocks_entries": llm_policy.entries_blocked(cfg)},
             "alerts": {src: _secret(cfg.get(key)) for src, key in _ALERT_KEYS},
             "computer": {"autostart": auto,
-                         "keep_awake": cfg.get("keep_awake", True) is not False},
+                         "keep_awake": cfg.get("keep_awake", True) is not False,
+                         "open_dashboard_at_login": open_at_login,
+                         "dashboard": _dashboard_pref(cfg)},
+            "expiry": _expiry_view(),
+            "code": {"self_edit_enabled": bool(cfg.get("self_edit_enabled"))},
+            "consent": _consent_view(),
             "ai": {"connected": bool(ai), "provider": ai.get("provider"),
                    "name": ai.get("name"), "model": ai.get("model"),
                    "endpoint": (_site_only(cfg["llm_base_url"])
@@ -4667,9 +4729,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                        "paper": (account_tag(cfg).endswith(":paper")
                                  if bid else None),
                        "fields": fields,
-                       "signin": dict(pending["rh_signin"])},
+                       "signin": dict(pending["rh_signin"]),
+                       # the classic wizard's Robinhood warning, as a code:
+                       # its text carries the whole account number
+                       "warning": "options_off" if pending["rh_warning"] else None},
             "signals": {"source": cfg.get("source"),
                         "include_other_trades": bool(cfg.get("include_other_trades")),
+                        "dry_run_preview": cfg.get("dry_run_preview", True) is not False,
                         "recurring": bool(cfg.get("day_pass_recurring")),
                         "wallet_connected": bool(cfg.get("lnbits_url")
                                                  and cfg.get("lnbits_admin_key")),
@@ -4678,6 +4744,46 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                              or cfg.get("feed_pass_pending")),
                         "purchases": _pass_purchases()},
         }
+
+    def _expiry_view():
+        """The expiry sell and its alert, as saved and as they fall today
+        (an early close moves both): the readers the chat's "expiry guard"
+        uses. HH:MM ET; null = off."""
+        def hm(mins):
+            return None if mins is None else f"{mins // 60:02d}:{mins % 60:02d}"
+        try:
+            day = A._et_now().date().isoformat()
+            guard, alert, close = A._expiry_times(cfg, day)
+            return {
+                "sell_et": hm(A._et_hhmm(cfg, "expiry_guard_et",
+                                         A.EXPIRY_GUARD_DEFAULT)),
+                "alert_et": hm(A._et_hhmm(cfg, "expiry_alert_et",
+                                          A.EXPIRY_ALERT_DEFAULT)),
+                "effective_today": {"sell_et": hm(guard), "alert_et": hm(alert),
+                                    "close_et": hm(close),
+                                    "early_close": close != A._REGULAR_CLOSE_MIN},
+                "described": A._expiry_guard_desc(cfg),
+                "allowed": ["09:30", "15:59"],
+            }
+        except Exception:
+            return None  # not known: shown as not known
+
+    def _consent_view():
+        """The agreement on file (never its text: GET /api/v2/agreement)."""
+        rec = A._load(A.ACCEPTANCE_PATH, {}) or {}
+        rec = rec if isinstance(rec, dict) else {}
+        return {"accepted": bool(A.consent_ok()),
+                "on_file": rec.get("accepted") is True,
+                "accepted_at": (str(rec["accepted_at"])[:40]
+                                if rec.get("accepted_at") else None),
+                "terms_version": (str(rec["terms_version"])[:80]
+                                  if rec.get("terms_version") else None),
+                "current_terms_version": A.TERMS_VERSION}
+
+    def v2_agreement(_h):
+        """GET /api/v2/agreement: the agreement's text, to read again."""
+        return {"ok": True, "text": A._disclaimer_text(),
+                "terms_version": A.TERMS_VERSION}
 
     def v2_settings(_h):
         """GET /api/v2/settings: the settings as they are on disk now, typed,
@@ -4865,12 +4971,20 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     @_v2
     def v2_computer(data):
         """POST /api/v2/settings/computer: start at login (the classic
-        /api/autostart route) and keep awake (as the Safety step)."""
-        p = _v2_payload(data, ("autostart", "keep_awake"))
+        /api/autostart route), keep awake (as the Safety step), open the
+        dashboard at login (the chat's "open at login on|off" key) and the
+        dashboard "/" lands on ("classic" | "v2"). None of them is money."""
+        p = _v2_payload(data, ("autostart", "keep_awake",
+                               "open_dashboard_at_login", "dashboard"))
         if not p:
-            raise _Invalid("Send autostart and/or keep_awake. Nothing was changed.")
+            raise _Invalid("Send autostart, keep_awake, open_dashboard_at_login "
+                           "and/or dashboard. Nothing was changed.")
         for k, v in p.items():
-            if not isinstance(v, bool):
+            if k == "dashboard":
+                if v not in _DASHBOARDS:
+                    raise _Invalid('dashboard must be "classic" or "v2". '
+                                   "Nothing was changed.")
+            elif not isinstance(v, bool):
                 raise _Invalid(f"{k} must be true or false. Nothing was changed.")
         out = {"ok": True, "saved": True}
         if "autostart" in p:
@@ -4879,10 +4993,15 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             if not res.get("ok"):
                 return {"ok": False, "error": res.get("note")
                         or "could not change start-at-login"}
-        if "keep_awake" in p:
+        if {"keep_awake", "open_dashboard_at_login", "dashboard"} & set(p):
             with A.CONFIG_LOCK:
                 _sync()
-                _apply_keep_awake(cfg, p)
+                if "keep_awake" in p:
+                    _apply_keep_awake(cfg, p)
+                if "open_dashboard_at_login" in p:
+                    cfg["open_dashboard_at_login"] = p["open_dashboard_at_login"]
+                if "dashboard" in p:
+                    cfg["dashboard"] = p["dashboard"]
                 save()
         with A.CONFIG_LOCK:
             out["settings"] = _settings_view()
@@ -5097,7 +5216,37 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
 
     # the fixed command each action runs (never text from the request)
     commands = {"pause": "pause", "resume": "resume",
-                "practice": "dry on", "live": "go live"}
+                "practice": "dry on", "live": "go live", "stop": "stop"}
+
+    def _real_left():
+        """The real positions the agent holds, as the dashboard lists them
+        (what a stop leaves with nobody selling them)."""
+        try:
+            s = d_status_v2(None)
+        except Exception:
+            return None  # not known
+        out = []
+        for x in s.get("positions") or ():
+            if isinstance(x, dict) and x.get("real"):
+                out.append({"id": x.get("id"), "label": x.get("label"),
+                            "contract": x.get("contract"), "qty": x.get("qty"),
+                            "expires_today": bool(x.get("expires_today"))})
+        return out
+
+    def _stop_preview(p, data):
+        """Stop: two steps. The preview lists the real positions nobody
+        sells while the agent is stopped; the token is bound to that list."""
+        left = _real_left()
+        return _two_step("command", p, data, [_change(
+            "agent", "Agent on this computer", "running", "stopped",
+            "raises_risk" if left else "neutral")], [
+            "It does not sell anything on the way out: open positions stay "
+            "open at your broker.",
+            "It does not switch between Practice and LIVE.",
+            "It does not change any setting."],
+            extra={"unsold": left, "real_positions": (None if left is None
+                                                      else len(left))},
+            bind={"unsold": [x["id"] for x in left or ()]})
 
     @_v2
     def v2_command(data):
@@ -5111,13 +5260,26 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         elif (action == "set_mode" and set(p) == {"action", "mode"}
               and p.get("mode") in ("practice", "live")):
             which = p["mode"]
+        elif action == "stop" and set(p) == {"action"}:
+            which = "stop"
         else:
-            raise _Invalid('Send {"action": "pause"}, {"action": "resume"} or '
-                           '{"action": "set_mode", "mode": "practice" | '
-                           '"live"}. Nothing was changed.')
+            raise _Invalid('Send {"action": "pause"}, {"action": "resume"}, '
+                           '{"action": "stop"} or {"action": "set_mode", '
+                           '"mode": "practice" | "live"}. Nothing was changed.')
         if apply_command is None:
             return {"ok": False, "error": "The agent isn't running, so this "
                     "can't change now. Start it first."}
+        if which == "stop":
+            # a stop changes no setting and must work even when config.json
+            # can't be read (as the chat's "stop"): no _sync()
+            with A.CONFIG_LOCK:
+                wait = _stop_preview(p, data)
+            if wait:
+                return wait
+            handled, reply = apply_command(commands["stop"])
+            if not (handled and CONTROLS["stop"]):
+                return {"ok": False, "error": reply or "The agent did not stop."}
+            return {"ok": True, "reply": reply}
         with A.CONFIG_LOCK:
             _sync()
             if which == "live":
@@ -5151,6 +5313,93 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 return {"ok": False, "error": reply or "Nothing was changed."}
             return {"ok": True, "reply": reply}
 
+    @_v2
+    def v2_agent_start(data):
+        """POST /api/v2/agent/start: the setup wizard's "Start my agent now"
+        (start_local, its refusals included). Two steps when the saved mode
+        is LIVE: the agent then places real orders from its first signal."""
+        p = _v2_payload(data, ())
+        if get_status is not None:
+            return {"ok": False, "error": "The agent is already running. "
+                    "Nothing was changed."}
+        with A.CONFIG_LOCK:
+            _sync()
+            refused = _start_refused()
+            if refused:
+                return {"ok": False, "error": refused}
+            if A._mode(cfg) == "live":
+                wait = _two_step("agent_start", p, data, [_change(
+                    "agent", "Agent on this computer", "stopped", "running",
+                    "raises_risk")], [
+                    "It does not change a setting: it runs with them as saved.",
+                    "It does not switch to Practice: it starts in LIVE, and the "
+                    "next signal that passes your limits becomes a real order.",
+                    "It does not sell anything by itself when it starts."],
+                    extra={**_live_preview(), "mode": "live"})
+                if wait:
+                    return wait
+        return start_local(None, {})
+
+    def _moving_preview_facts():
+        left = _real_left()
+        return {"unsold": left,
+                "real_positions": None if left is None else len(left),
+                "agent_running": get_status is not None}
+
+    @_v2
+    def v2_move_finish(data):
+        """POST /api/v2/move/finish: "I saved the file": retire this
+        computer and stop the agent here (the classic /api/move/finish),
+        applied by the second (confirmed) POST only."""
+        p = _v2_payload(data, ())
+        if not pending.get("move_blob"):
+            raise _Invalid("Create and download your move file first: this "
+                           "computer is retired only after that. Nothing was "
+                           "changed.")
+        with A.CONFIG_LOCK:
+            wait = _two_step("move_finish", p, data, [_change(
+                "this_computer", "This computer", "runs the agent",
+                "retired: it never runs this setup again", "neutral")], [
+                "It does not sell anything: open positions stay open at your "
+                "broker, and the agent on the new computer sells them on "
+                "their exit signals once you start it there.",
+                "It does not delete anything on this computer.",
+                "It does not undo by itself: to run this setup here again, "
+                "stop the other computer first, then run: python agent.py "
+                "resume-here"],
+                extra=_moving_preview_facts())
+        if wait:
+            return wait
+        return move_finish(None, {})
+
+    @_v2
+    def v2_move_deploy(data):
+        """POST /api/v2/move/deploy: move to a new DigitalOcean server (the
+        classic /api/deploy, its lock and refusals unchanged), by the second
+        (confirmed) POST only. The token is never sent back."""
+        import provision
+        p = _v2_payload(data, ("token", "region"))
+        token = _v2_text(p.get("token"), "token", longest=500)
+        region = p.get("region", "nyc3")
+        if region not in provision.REGIONS:
+            raise _Invalid("region must be one of: " + ", ".join(provision.REGIONS)
+                           + ". Nothing was changed.")
+        p = {"token": token, "region": region}
+        with A.CONFIG_LOCK:
+            wait = _two_step("move_deploy", p, data, [_change(
+                "this_computer", "Where the agent runs", "this computer",
+                f"a new DigitalOcean server ({region})", "neutral")], [
+                "DigitalOcean bills your own account for the server.",
+                "It does not sell anything: open positions stay open at your "
+                "broker; the server sells them on their exit signals.",
+                "It does not leave this computer trading: once the server is "
+                "made, this computer is retired and the agent here stops.",
+                "It does not switch between Practice and LIVE."],
+                extra=_moving_preview_facts())
+        if wait:
+            return wait
+        return deploy(None, p)
+
     W.routes_get = {"/api/state": state, "/api/rh/start": rh_start,
                     "/api/wallet/balance": wallet_balance,
                     "/api/deploy/status": deploy_status,
@@ -5169,6 +5418,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/v2/status": d_status_v2,
                     "/api/v2/activity": d_activity_v2,
                     "/api/v2/settings": v2_settings,
+                    "/api/v2/agreement": v2_agreement,
                     "/api/proposal": proposal_get,
                     "/api/autostart": autostart_get,
                     "/api/move/download": move_download}
@@ -5218,7 +5468,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/v2/broker/robinhood": v2_robinhood,
                      "/api/v2/pass/buy": v2_pass_buy,
                      "/api/v2/wallet/recurring": v2_recurring,
-                     "/api/v2/command": v2_command}
+                     "/api/v2/command": v2_command,
+                     "/api/v2/agent/start": v2_agent_start,
+                     "/api/v2/move/finish": v2_move_finish,
+                     "/api/v2/move/deploy": v2_move_deploy}
 
     W.routes_get = {p: _fresh(fn) for p, fn in W.routes_get.items()}
     W.routes_post = {p: _fresh(fn) for p, fn in W.routes_post.items()}

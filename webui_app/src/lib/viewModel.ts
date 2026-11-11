@@ -78,12 +78,15 @@ export const CONDITIONS = [
   "paused",
   "settings_unreadable",
   "ai_needed",
+  "consent_needed",
+  "proposal_pending",
   "broker_down",
   "positions_unmanaged",
   "low_cash",
   "daily_cap_reached",
   "daily_loss_reached",
   "position_cap_reached",
+  "budget_too_small",
   "signal_pass",
   "feed_unreachable",
   "records_unwritten",
@@ -125,6 +128,14 @@ export interface Status {
   notices: Notice[];
   /** every owner-facing condition true now, each once, most urgent first: one note per code on a screen */
   conditions: ConditionNote[];
+  proposal: Proposal;
+}
+
+export interface Proposal {
+  /** an AI-proposed code change is waiting for review */
+  pending: boolean;
+  /** sha256 of the diff GET /api/proposal shows */
+  diff_sha256: string | null;
 }
 
 export interface Agent {
@@ -179,6 +190,34 @@ export interface Signals {
   /** feed = the feed's own time; activity_log = when the agent last logged handling a signal */
   last_signal_from: "feed" | "activity_log" | null;
   pass: Pass;
+  /** practice mode with the AgentHC feed: what the owner's rules would have taken from the feed's closed trades of the past days (dry_run_preview); null when it is off or does not apply */
+  preview: WouldHave | null;
+}
+
+export interface WouldHave {
+  days: number;
+  would_take: number;
+  wins: number;
+  breakeven: number;
+  losses: number;
+  avg_paper_pnl_pct: number | null;
+  updated_at: Iso | null;
+  /** why the last refresh failed; null when it did not */
+  error: string | null;
+  unavailable: boolean;
+  rows: WouldHaveRow[];
+}
+
+export interface WouldHaveRow {
+  date: string;
+  contract: string;
+  entry_time: string | null;
+  exit_time: string | null;
+  hold_minutes: number | null;
+  paper_pnl_pct: number | null;
+  exit_kind: string | null;
+  would_take: boolean;
+  skip_reason: string | null;
 }
 
 export interface Pass {
@@ -240,6 +279,19 @@ export interface Limits {
     other: TradeSize;
   };
   cash: Cash;
+  /** today's (UTC) signals skipped because one contract cost more than the dollar trade size, and a size that would have taken about half of them (agent._budget_hints) */
+  budget_hints: BudgetHint[];
+}
+
+export interface BudgetHint {
+  book: "main" | "other";
+  budget: number;
+  skipped: number;
+  min_cost: number;
+  max_cost: number;
+  /** a dollar trade size (rounded up to $50) */
+  suggest: number;
+  would_take: number;
 }
 
 export interface TradeSize {
@@ -354,6 +406,11 @@ export interface Results {
   /** orders filled in a broker's paper-trading account (recorded on each line since this version): not real money */
   paper_account: Book;
   signal_cost: SignalCost;
+  /** per book, trades OPENED on a paid signal day (agent.pnl_summary's pass figures, credited to the day the position was opened); null: the source has no per-day charge, or the book has no such figure */
+  paid_days: {
+    real: PaidDays | null;
+    practice: PaidDays | null;
+  };
 }
 
 export interface Book {
@@ -376,6 +433,17 @@ export interface BookDay {
   day: string;
   pnl: number;
   closed: number;
+}
+
+export interface PaidDays {
+  pnl: number;
+  closed: number;
+  /** paid signal days those trades were opened on */
+  days: number;
+  /** the book's `days` that were paid signal days */
+  paid_on: string[];
+  /** the book's `days` from before paid days were recorded on which the agent took an entry (a feed entry needs a paid day) */
+  estimated_on: string[];
 }
 
 export interface SignalCost {

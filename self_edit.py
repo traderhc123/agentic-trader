@@ -195,6 +195,17 @@ def current():
         return None
 
 
+def shown_diff(p):
+    """The diff of a proposal as the dashboard shows it for review (GET
+    /api/proposal); /v2 binds its Apply confirmation to its sha256."""
+    return "\n".join(c["diff"] for c in p.get("changes", []))[:200000]
+
+
+def diff_sha256(p):
+    import hashlib
+    return hashlib.sha256(shown_diff(p).encode("utf-8")).hexdigest()
+
+
 def reject():
     try:
         os.unlink(_proposal_path())

@@ -87,7 +87,9 @@ def test_fixture_states_carry_the_conditions_their_screens_show():
               "feed-down": "feed_unreachable"}
     for name, code in expect.items():
         assert code in codes(gs.status(name)), (name, codes(gs.status(name)))
-    assert codes(gs.status("live")) == []
+    # the live fixture's log has signals skipped today for costing more
+    # than the dollar trade size: the budget hint, and nothing else
+    assert codes(gs.status("live")) == ["budget_too_small"]
 
 
 def test_the_operators_example_is_one_condition_not_two():
