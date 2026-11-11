@@ -19,7 +19,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import type { CommandDone, DeployStatus, MoveDone, MoveFile, Preview, StartDone, Unsold } from "../../lib/settingsApi";
 import { FieldError, ReviewDialog, askPreview, type Asked } from "../Forms";
 import { API, getJson, send } from "../lib/http";
-import { DEPLOY_REGIONS, SETUP_FROM_V2, movePassProblem, sizeWords, lossWords, unsoldWords } from "../lib/settings";
+import { DEPLOY_REGIONS, SETUP_FROM_V2, deploySsh, movePassProblem, sizeWords, lossWords, unsoldWords } from "../lib/settings";
 import { UNKNOWN, count } from "../lib/format";
 import { Dialog, Icon, WillWont } from "../ui";
 import type { Page } from "../App";
@@ -139,19 +139,50 @@ function started(page: Page, r: StartDone) {
   page.refresh();
 }
 
-/** Start in practice: straight away (the server starts it on this POST).
- *  The saved mode is LIVE: the server's preview first. */
+/** Start in practice: straight away (the server starts it on this POST),
+ *  so the dialog says "Starting" and has no Cancel. The saved mode is LIVE:
+ *  the server's preview first (nothing happens until it is confirmed).
+ *  Whatever the first POST did is said, even if the dialog was closed. */
 export function StartDialog({ page, onClose }: { page: Page; onClose: () => void }) {
-  const ask = usePreview(API.agentStart, {});
-  // practice: the first POST already started it (no preview to show)
+  const live = page.s.mode === "live";
+  const [ask, setAsk] = useState<{ kind: "asking" } | Asked>({ kind: "asking" });
   const once = useRef(false);
+  const shown = useRef(true);
+  useEffect(
+    () => () => {
+      shown.current = false;
+    },
+    [],
+  );
   useEffect(() => {
-    if (ask.kind === "nothing" && !once.current) {
+    send<StartDone>(API.agentStart, {}).then((r) => {
+      if (r.ok && "needs_confirm" in r && r.needs_confirm) return setAsk({ kind: "review", preview: r.preview });
+      if (!r.ok) return setAsk({ kind: "error", error: r.error });
+      // started on this POST (practice): the reply, its autostart note too
+      if (once.current) return;
       once.current = true;
-      started(page, {});
-      onClose();
-    }
-  }, [ask]); // eslint-disable-line react-hooks/exhaustive-deps
+      started(page, r as unknown as StartDone);
+      if (shown.current) onClose();
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  if (ask.kind === "asking" && !live)
+    return (
+      <Dialog
+        title="Start the agent"
+        lead="Starting the agent in practice mode, with your settings as saved."
+        onClose={() => {}}
+        foot={
+          <button className="btn" aria-disabled="true" data-autofocus>
+            Starting…
+          </button>
+        }
+      >
+        <p className="wait" role="status">
+          <span className="spin" aria-hidden="true" />
+          Starting the agent…
+        </p>
+      </Dialog>
+    );
   if (ask.kind !== "review") return <Asking title="Start the agent" ask={ask} onClose={onClose} />;
   return (
     <ReviewDialog<StartDone>
@@ -193,27 +224,33 @@ type MoveStep =
   | { kind: "cloud"; payload: { token: string; region: string }; preview: Preview }
   | { kind: "cloud-watch"; note: string };
 
-/** The cloud server's progress (the classic poll, every 5 s). */
+/** The cloud server's progress (the classic poll, every 5 s). When the
+ *  agent here stops answering (it retires once the server is made), the
+ *  classic page's words: where to find the server's address. */
 function CloudWatch({ note, onClose }: { note: string; onClose: () => void }) {
   const [st, setSt] = useState<DeployStatus | null>(null);
-  const [err, setErr] = useState("");
+  const [gone, setGone] = useState(false);
   useEffect(() => {
     let live = true;
+    let id = 0;
     const poll = async () => {
       const r = await getJson<DeployStatus>(API.deployStatus);
       if (!live) return;
-      if (r.ok) {
-        setSt(r.body);
-        setErr("");
-      } else setErr(r.error);
+      if (r.ok) setSt(r.body);
+      else {
+        // as the classic poll: the agent here has stopped, so stop asking
+        setGone(true);
+        window.clearInterval(id);
+      }
     };
     poll();
-    const id = setInterval(poll, 5000);
+    id = window.setInterval(poll, 5000);
     return () => {
       live = false;
-      clearInterval(id);
+      window.clearInterval(id);
     };
   }, []);
+  const ssh = deploySsh(st);
   return (
     <Dialog
       title="Your cloud server is being made"
@@ -229,20 +266,26 @@ function CloudWatch({ note, onClose }: { note: string; onClose: () => void }) {
       <dl className="facts">
         <dt>Server</dt>
         <dd role="status" aria-live="polite">
-          {st ? st.status : err || "Asking DigitalOcean…"}
+          {gone ? "Made. The agent on this computer has stopped, so this page can't follow it any more." : st ? st.status : "Asking DigitalOcean…"}
         </dd>
         <dt>Address</dt>
-        <dd>{st?.ip || "Not given yet"}</dd>
-        {st?.ssh && (
+        <dd>{st?.ip || (gone ? "Find it under Droplets at cloud.digitalocean.com." : "Not given yet")}</dd>
+        {ssh && (
           <>
             <dt>Open its dashboard</dt>
             <dd>
-              <code>{st.ssh}</code>
-              <small>Run this on your computer, then open http://127.0.0.1:8721/ there.</small>
+              <code>{ssh}</code>
+              <small>Run this on your computer, then open http://127.0.0.1:8721/dash there.</small>
             </dd>
           </>
         )}
       </dl>
+      {st?.ip && (
+        <p className="small">
+          It is installing the agent now (about 5 minutes). No notification after 15 minutes? Log in with the command above and run{" "}
+          <code>sudo tail -50 /var/log/cloud-init-output.log</code> to see how far it got.
+        </p>
+      )}
     </Dialog>
   );
 }
@@ -251,7 +294,8 @@ export function MoveDialog({ page, onClose }: { page: Page; onClose: () => void 
   const [pw, setPw] = useState("");
   const [pw2, setPw2] = useState("");
   const [file, setFile] = useState<MoveFile | null>(null);
-  const [err, setErr] = useState("");
+  const [pwErr, setPwErr] = useState(""); // step 1: next to the passphrase
+  const [err, setErr] = useState(""); // step 3: next to Retire
   const [busy, setBusy] = useState(false);
   const [token, setToken] = useState("");
   const [region, setRegion] = useState(DEPLOY_REGIONS[0][0]);
@@ -262,12 +306,12 @@ export function MoveDialog({ page, onClose }: { page: Page; onClose: () => void 
 
   const create = async () => {
     const bad = movePassProblem(pw, pw2);
-    if (bad) return setErr(bad);
-    setErr("");
+    if (bad) return setPwErr(bad);
+    setPwErr("");
     setBusy(true);
     const r = await send<MoveFile>(API.moveExport, { passphrase: pw });
     setBusy(false);
-    if (!r.ok) return setErr(r.error);
+    if (!r.ok) return setPwErr(r.error);
     const f = r as unknown as MoveFile;
     setFile({ filename: f.filename, kb: f.kb });
     // the browser saves it: the classic download, as it is
@@ -350,7 +394,16 @@ export function MoveDialog({ page, onClose }: { page: Page; onClose: () => void 
           <h4>Create your move file</h4>
           <div className="field">
             <label htmlFor={`${id}-p1`}>Passphrase (8 characters or more; you need it on the new computer)</label>
-            <input id={`${id}-p1`} className="input" type="password" autoComplete="new-password" value={pw} onChange={(e) => setPw(e.target.value)} />
+            <input
+              id={`${id}-p1`}
+              className="input"
+              type="password"
+              autoComplete="new-password"
+              value={pw}
+              onChange={(e) => setPw(e.target.value)}
+              aria-invalid={!!pwErr || undefined}
+              aria-describedby={pwErr ? `${id}-pe` : undefined}
+            />
           </div>
           <div className="field">
             <label htmlFor={`${id}-p2`}>Type it again</label>
@@ -362,8 +415,11 @@ export function MoveDialog({ page, onClose }: { page: Page; onClose: () => void 
               value={pw2}
               onChange={(e) => setPw2(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && create()}
+              aria-invalid={!!pwErr || undefined}
+              aria-describedby={pwErr ? `${id}-pe` : undefined}
             />
           </div>
+          <FieldError id={`${id}-pe`} text={pwErr} />
           <div className="row-acts">
             <button className="btn btn-primary" onClick={create} disabled={busy}>
               {busy && !file ? "Packing…" : "Create the move file"}
@@ -392,13 +448,13 @@ export function MoveDialog({ page, onClose }: { page: Page; onClose: () => void 
           <h4>Retire this computer</h4>
           <p className="small">After you saved the file. {running ? "The agent here stops." : ""}</p>
           <div className="row-acts">
-            <button className="btn" onClick={finish} disabled={busy || !file}>
+            <button className="btn" onClick={finish} disabled={busy || !file} aria-describedby={err ? `${id}-e` : undefined}>
               I saved the file: retire this computer…
             </button>
           </div>
+          <FieldError id={`${id}-e`} text={err} />
         </li>
       </ol>
-      <FieldError id={`${id}-e`} text={err} />
       <section className="subsec">
         <h4>Or move to a new cloud server</h4>
         <p className="small">
@@ -407,7 +463,17 @@ export function MoveDialog({ page, onClose }: { page: Page; onClose: () => void 
         </p>
         <div className="field">
           <label htmlFor={`${id}-t`}>DigitalOcean API token (read and write)</label>
-          <input id={`${id}-t`} className="input" type="password" autoComplete="off" spellCheck={false} value={token} onChange={(e) => setToken(e.target.value)} />
+          <input
+            id={`${id}-t`}
+            className="input"
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            aria-invalid={!!cloudErr || undefined}
+            aria-describedby={cloudErr ? `${id}-ce` : undefined}
+          />
         </div>
         <div className="field">
           <label htmlFor={`${id}-r`}>Region</label>

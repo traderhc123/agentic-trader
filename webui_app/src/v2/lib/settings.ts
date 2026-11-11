@@ -6,7 +6,7 @@
 // field before anything is sent. What is saved, and what a change does to
 // the owner's risk in the confirm dialog, always comes from the server's own
 // preview (POST without `confirm`), never from here.
-import type { Change, Direction, Purchases, SettingsView, SignInEnd, SizeMode, SizeSpec, Unsold } from "../../lib/settingsApi";
+import type { Change, DeployStatus, Direction, Purchases, SettingsView, SignInEnd, SizeMode, SizeSpec, Unsold } from "../../lib/settingsApi";
 import type { BudgetHint } from "../../lib/viewModel";
 import { count, plural, usd } from "./format.ts";
 
@@ -37,6 +37,16 @@ export const DEPLOY_REGIONS: [string, string][] = [
   ["fra1", "Frankfurt"],
   ["sgp1", "Singapore"],
 ];
+
+/** The command that opens a new cloud server's dashboard from this
+ *  computer: the server's own (deploy status "ssh"), or the classic page's
+ *  fallback built from its address. null until there is an address. */
+export function deploySsh(st: DeployStatus | null): string | null {
+  if (!st) return null;
+  if (typeof st.ssh === "string" && st.ssh.trim()) return st.ssh.trim();
+  const ip = typeof st.ip === "string" ? st.ip.trim() : "";
+  return /^[0-9A-Fa-f:.]{2,45}$/.test(ip) ? `ssh -L 8721:127.0.0.1:8721 trader@${ip}` : null;
+}
 
 /** One real position a stop or a move leaves unsold here, in words. */
 export function unsoldWords(u: Unsold): string {

@@ -381,7 +381,9 @@ function WalletPanel({ page, open }: { page: Page; open: (o: Open) => void }) {
   const on = v?.signals.wallet_connected;
   const w = v?.signals.wallet;
   const [bal, setBal] = useState<string>("");
-  const [link, setLink] = useState<{ err?: string; url?: string } | null>(null);
+  // only ever why the page did not open: the link itself is never kept in
+  // the page (a bearer link: whoever has it can spend from the wallet)
+  const [link, setLink] = useState<{ err: string } | null>(null);
   const lost = page.link === "lost" || !v;
   useEffect(() => {
     if (!on) return;
@@ -401,16 +403,17 @@ function WalletPanel({ page, open }: { page: Page; open: (o: Open) => void }) {
   const openPage = async () => {
     setLink(null);
     const win = window.open("", "_blank");
+    // blocked: the link is not even asked for (it would have nowhere to go
+    // but this page)
+    if (!win) return setLink({ err: "Your browser blocked the new window. Allow pop-ups for this page, then click Open the wallet page again." });
     const r = await send<WalletPage>(API.walletPage, {});
     const url = r.ok ? (r as unknown as WalletPage).url : "";
     if (!r.ok || typeof url !== "string" || !/^https?:\/\//.test(url)) {
-      win?.close();
+      win.close();
       return setLink({ err: r.ok ? "The agent did not hand back a wallet page." : r.error });
     }
-    if (win) {
-      win.opener = null;
-      win.location.href = url;
-    } else setLink({ url });
+    win.opener = null;
+    win.location.href = url;
   };
   return (
     <section className="panel">
@@ -448,16 +451,8 @@ function WalletPanel({ page, open }: { page: Page; open: (o: Open) => void }) {
         <Row
           label="Wallet page"
           exp={
-            link?.err ? (
+            link ? (
               <span className="err">{link.err}</span>
-            ) : link?.url ? (
-              <>
-                Your browser blocked the new window:{" "}
-                <a href={link.url} target="_blank" rel="noopener noreferrer">
-                  open the wallet page
-                </a>
-                .
-              </>
             ) : (
               "Opens the wallet in LNbits. Whoever has this link can spend from the wallet, so this page never shows it."
             )

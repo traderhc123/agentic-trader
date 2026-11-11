@@ -203,10 +203,20 @@ export function KeyDialog({ page, onClose }: { page: Page; onClose: () => void }
     >
       <div className="field">
         <label htmlFor={`${id}-k`}>Key</label>
-        <input id={`${id}-k`} className="input" type="password" autoComplete="off" spellCheck={false} value={key} onChange={(e) => (setKey(e.target.value), setErr(""))} />
+        <input
+          id={`${id}-k`}
+          className="input"
+          type="password"
+          autoComplete="off"
+          spellCheck={false}
+          value={key}
+          onChange={(e) => (setKey(e.target.value), setErr(""))}
+          aria-invalid={!!err || undefined}
+          aria-describedby={err ? `${id}-e` : undefined}
+        />
         {v.signals.api_key.set && <span className="help">Saved now: set{v.signals.api_key.last4 ? `, ending ${v.signals.api_key.last4}` : ""}. A new key replaces it.</span>}
+        <FieldError id={`${id}-e`} text={err} />
       </div>
-      <FieldError id={`${id}-e`} text={err} />
     </Dialog>
   );
 }

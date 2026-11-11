@@ -67,6 +67,7 @@ import {
   hintWords,
   agreementWords,
   brokerWarning,
+  deploySsh,
   readAddress,
   readSats,
   scopeWords,
@@ -1284,7 +1285,7 @@ test("the agent: Stop asks the server first and lists what it leaves unsold", ()
   assert.match(src, /const payload = \{ action: "stop" \}/);
   assert.match(src, /<UnsoldList p=\{p\} after="while it is stopped"/);
   // Start: the typed route, never the setup wizard
-  assert.match(src, /usePreview\(API\.agentStart, \{\}\)/);
+  assert.match(src, /send<StartDone>\(API\.agentStart, \{\}\)/);
   assert.equal(API.agentStart, "/api/v2/agent/start");
   assert.equal(API.command, "/api/v2/command");
   // the words for a position left unsold, never null or NaN
@@ -1757,3 +1758,77 @@ test("no redundancy: the theme, the classic page and Move each have one place", 
   }
 });
 
+
+// ── PR 4 review fixes ──────────────────────────────────────────────────────
+
+const v2src = (f) => fs.readFileSync(path.join(SRC, "v2", ...f.split("/")), "utf8");
+
+test("review: a code change too large to show whole is never offered for Apply", () => {
+  const src = v2src("views/CodeDialogs.tsx");
+  // the server says the diff is cut; then there is no Apply button at all
+  assert.match(src, /const cut = shown\.kind === "shown" && shown\.p\.truncated !== false;/);
+  assert.match(src, /\{!cut && \(\s*<button className="btn btn-primary" id="dlg-ok" onClick=\{apply\}/);
+  assert.match(src, /too large to show here in full/);
+  assert.match(src, /if \(shown\.kind !== "shown" \|\| !shown\.sha \|\| cut\) return;/);
+});
+
+test("review: the code-change dialog says it restarts only when the server says so", () => {
+  const src = v2src("views/CodeDialogs.tsx");
+  assert.match(src, /title=\{review\.restarts \? "Apply this code change and restart the agent\?" : "Apply this code change\?"\}/);
+  assert.match(src, /confirm=\{review\.restarts \? "Apply and restart the agent" : "Apply the change"\}/);
+  // before the server has said, the button names no restart
+  assert.ok(!/"Apply and restart…"/.test(src));
+  assert.match(src, /"Review and apply…"/);
+});
+
+test("review: the wallet page link is never kept in the page", () => {
+  const src = v2src("views/Signals.tsx");
+  assert.match(src, /useState<\{ err: string \} \| null>\(null\)/);
+  assert.ok(!/setLink\(\{ url/.test(src) && !/link\??\.url/.test(src), "the link is kept in state or the DOM");
+  // a blocked window: the link is not even asked for
+  const blocked = src.indexOf("if (!win) return setLink(");
+  const asked = src.indexOf("send<WalletPage>(API.walletPage, {})");
+  assert.ok(blocked > 0 && asked > blocked, "the link is fetched before the window is known to be open");
+});
+
+test("review: Start in practice says it is starting, with no Cancel, and keeps the agent's note", () => {
+  const src = v2src("views/AgentDialogs.tsx");
+  const start = src.slice(src.indexOf("export function StartDialog"), src.indexOf("// ── move to another computer"));
+  // its own POST, not askPreview (which dropped the reply's autostart note)
+  assert.match(start, /send<StartDone>\(API\.agentStart, \{\}\)/);
+  assert.ok(!/usePreview\(API\.agentStart/.test(start));
+  assert.match(start, /started\(page, r as unknown as StartDone\)/);
+  // practice: "Starting…", nothing that claims to cancel
+  assert.match(start, /if \(ask\.kind === "asking" && !live\)/);
+  const practice = start.slice(start.indexOf('if (ask.kind === "asking" && !live)'), start.indexOf('if (ask.kind !== "review")'));
+  assert.match(practice, /Starting the agent…/);
+  assert.ok(!/Cancel|Asking the agent what this would change/.test(practice));
+  assert.match(src, /\$\{r\.autostart_note \? ` \$\{r\.autostart_note\}` : ""\}/);
+});
+
+test("review: the cloud move keeps the classic page's guidance", () => {
+  const src = v2src("views/AgentDialogs.tsx");
+  assert.match(src, /sudo tail -50 \/var\/log\/cloud-init-output\.log/);
+  assert.match(src, /Droplets at cloud\.digitalocean\.com/);
+  assert.match(src, /setGone\(true\)/);
+  // the dashboard command: the server's own, or built from the address
+  assert.equal(deploySsh(null), null);
+  assert.equal(deploySsh({ status: "new", ip: "" }), null);
+  assert.equal(deploySsh({ status: "active", ip: "203.0.113.7" }), "ssh -L 8721:127.0.0.1:8721 trader@203.0.113.7");
+  assert.equal(deploySsh({ status: "active", ip: "203.0.113.7", ssh: "ssh -L 8721:127.0.0.1:8721 trader@203.0.113.7 -i k" }), "ssh -L 8721:127.0.0.1:8721 trader@203.0.113.7 -i k");
+  assert.equal(deploySsh({ status: "active", ip: "1.2.3.4; rm -rf ~" }), null);
+});
+
+test("review: field errors sit next to their field and are tied to it", () => {
+  const mv = v2src("views/AgentDialogs.tsx");
+  const move = mv.slice(mv.indexOf("export function MoveDialog"));
+  // the passphrase error: right under the two fields, which point at it
+  assert.equal((move.match(/aria-describedby=\{pwErr \? `\$\{id\}-pe` : undefined\}/g) || []).length, 2);
+  assert.ok(move.indexOf('<FieldError id={`${id}-pe`} text={pwErr} />') < move.indexOf("<h4>On the new computer</h4>"));
+  // the retire error: next to the Retire button, after the passphrase step
+  const retire = move.indexOf("I saved the file: retire this computer…");
+  const finishErr = move.indexOf('<FieldError id={`${id}-e`} text={err} />');
+  assert.ok(finishErr > retire && finishErr < move.indexOf("</ol>"));
+  assert.match(v2src("views/CodeDialogs.tsx"), /aria-describedby=\{`\$\{id\}-h\$\{err \? ` \$\{id\}-e` : ""\}`\}/);
+  assert.match(v2src("views/SignalsDialogs.tsx"), /aria-invalid=\{!!err \|\| undefined\}\s+aria-describedby=\{err \? `\$\{id\}-e` : undefined\}/);
+});

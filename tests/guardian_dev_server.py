@@ -486,7 +486,8 @@ class Handler(BaseHTTPRequestHandler):
                  "/api/proposal": lambda: (
                      {"pending": True, "explanation": "(fixture) Adds a connector for another broker.",
                       "warnings": [], "diff": "--- a/brokers/example.py\n+++ b/brokers/example.py\n"
-                                              "@@ -0,0 +1 @@\n+x = 1\n"}
+                                              "@@ -0,0 +1 @@\n+x = 1\n",
+                      "truncated": False}
                      if tab.get("proposal") or name == "proposal-pending" else {"pending": False}),
                  "/api/help/netcheck": lambda: {"ok": True, "text": "AgentHC: OK (fixture)\nGitHub (updates): OK (fixture)"},
                  "/api/help/report": lambda: {"ok": True, "text": "agentic-trader support report\n(fixture)"},

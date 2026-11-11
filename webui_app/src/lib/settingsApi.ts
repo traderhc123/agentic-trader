@@ -340,7 +340,9 @@ export type TipCheck = { ok: true; status: "pending" | "paid" | "expired" } | { 
 // ── Settings → Code changes ─────────────────────────────────────────────────
 
 /** GET /api/proposal (classic, reused): the code change waiting for review. */
-export type ProposalView = { pending: false } | { pending: true; explanation: string; warnings: string[]; diff: string };
+/** GET /api/proposal (classic). truncated: the diff is cut (too large to
+ *  show whole), so it was never all shown and /v2 never applies it. */
+export type ProposalView = { pending: false } | { pending: true; explanation: string; warnings: string[]; diff: string; truncated?: boolean };
 
 /** POST /api/v2/proposal/apply, applied: the agent's own words. */
 export interface ApplyDone {

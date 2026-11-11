@@ -4,9 +4,11 @@
 //   Review   GET /api/proposal (the classic read, as it is): the AI helper's
 //            explanation, its warnings and the diff. Reject is the classic
 //            POST /api/proposal/reject (it only throws the proposal away).
-//            Apply and restart is POST /api/v2/proposal/apply, two steps,
-//            bound to the sha256 of the diff shown here: the server applies
-//            only the proposal whose diff is exactly this one.
+//            Apply is POST /api/v2/proposal/apply, two steps, bound to the
+//            sha256 of the diff shown here: the server applies only the
+//            proposal whose whole diff is exactly this one, made against the
+//            files as they are now. A diff too large to show whole (the
+//            server says truncated) is never offered for Apply.
 //   Ask      POST /api/v2/proposal/request: the AI helper writes a change and
 //            leaves it waiting here. The words are never run as a command.
 import { useEffect, useId, useState } from "react";
@@ -35,8 +37,9 @@ export function ProposalDialog({ page, onClose }: { page: Page; onClose: () => v
     })();
   }, []);
 
+  const cut = shown.kind === "shown" && shown.p.truncated !== false;
   const apply = async () => {
-    if (shown.kind !== "shown" || !shown.sha) return;
+    if (shown.kind !== "shown" || !shown.sha || cut) return;
     setErr("");
     setBusy(true);
     const a = await askPreview(API.proposalApply, { diff_sha256: shown.sha });
@@ -61,7 +64,7 @@ export function ProposalDialog({ page, onClose }: { page: Page; onClose: () => v
         path={API.proposalApply}
         payload={{ diff_sha256: shown.sha }}
         first={review}
-        title="Apply this code change and restart the agent?"
+        title={review.restarts ? "Apply this code change and restart the agent?" : "Apply this code change?"}
         lead="The agent's own code is changed by what its AI helper wrote. Apply it only if you have read the change and want it."
         cancel="Not now"
         confirm={review.restarts ? "Apply and restart the agent" : "Apply the change"}
@@ -116,9 +119,11 @@ export function ProposalDialog({ page, onClose }: { page: Page; onClose: () => v
               <button className="btn" onClick={reject} disabled={busy}>
                 Reject it
               </button>
-              <button className="btn btn-primary" id="dlg-ok" onClick={apply} disabled={busy || !shown.sha}>
-                {busy ? "Asking the agent…" : "Apply and restart…"}
-              </button>
+              {!cut && (
+                <button className="btn btn-primary" id="dlg-ok" onClick={apply} disabled={busy || !shown.sha}>
+                  {busy ? "Asking the agent…" : "Review and apply…"}
+                </button>
+              )}
             </>
           )}
         </>
@@ -152,10 +157,20 @@ export function ProposalDialog({ page, onClose }: { page: Page; onClose: () => v
               ))}
             </div>
           )}
+          {cut && (
+            <div className="callout callout-warn" role="alert">
+              <p>
+                <Icon name="alert" small />
+                {shown.p.truncated
+                  ? "This change is too large to show here in full: the diff below stops part way. Part of it can't be read here, so it can't be applied from this page. Reject it and ask for a smaller change."
+                  : "This agent did not say whether the diff below is the whole change, so it can't be applied from this page. Update the agent, or reject the change."}
+              </p>
+            </div>
+          )}
           <pre className="helptext helptext-long diff" tabIndex={0} aria-label="The change, as a diff">
             {shown.p.diff}
           </pre>
-          {!shown.sha && (
+          {!shown.sha && !cut && (
             <p className="small">This browser can't fingerprint the change, so it can't be applied from here. Use a current browser on this computer.</p>
           )}
         </>
@@ -202,8 +217,21 @@ export function RequestDialog({ page, onClose }: { page: Page; onClose: () => vo
     >
       <div className="field">
         <label htmlFor={`${id}-t`}>The change you want</label>
-        <textarea id={`${id}-t`} className="input" rows={5} maxLength={4000} value={text} disabled={busy} onChange={(e) => setText(e.target.value)} />
-        <span className="help">It is a request to the AI helper only: words like “pause” or “go live” here are never run as commands.</span>
+        <textarea
+          id={`${id}-t`}
+          className="input"
+          rows={5}
+          maxLength={4000}
+          value={text}
+          disabled={busy}
+          onChange={(e) => setText(e.target.value)}
+          aria-invalid={!!err || undefined}
+          aria-describedby={`${id}-h${err ? ` ${id}-e` : ""}`}
+        />
+        <span className="help" id={`${id}-h`}>
+          It is a request to the AI helper only: words like “pause” or “go live” here are never run as commands.
+        </span>
+        <FieldError id={`${id}-e`} text={err} />
       </div>
       {busy && (
         <p className="wait" role="status" aria-live="polite">
@@ -211,7 +239,6 @@ export function RequestDialog({ page, onClose }: { page: Page; onClose: () => vo
           Your AI helper is writing the change. This can take several minutes; keep this open.
         </p>
       )}
-      <FieldError id={`${id}-e`} text={err} />
     </Dialog>
   );
 }
