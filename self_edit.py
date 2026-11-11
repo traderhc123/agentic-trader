@@ -162,6 +162,28 @@ def enabled(cfg):
     return bool(cfg.get("self_edit_enabled"))
 
 
+def corpus_mode(cfg):
+    """config self_edit_corpus: "full" (default) sends every source file;
+    "lean" leaves tests/ out (about 64% of the tree), so the model can't
+    update the tests in the same proposal."""
+    return "lean" if str((cfg or {}).get("self_edit_corpus", "")).strip().lower() \
+        == "lean" else "full"
+
+
+LEAN_NOTE = ("(The tests/ folder was left out of this tree to save tokens: "
+             "you can't see or update the tests.)")
+
+
+def prompt_text(corpus, request, lean=False):
+    """The proposal's user message: the source tree FIRST (sorted, the same
+    bytes for every request on an unchanged tree, so a provider's automatic
+    prefix cache can reuse it on the next request), the owner's request
+    LAST."""
+    return (f"CURRENT SOURCE TREE:\n{corpus}\n\n"
+            + (LEAN_NOTE + "\n\n" if lean else "")
+            + f"OWNER'S REQUEST:\n{request}")
+
+
 def current():
     try:
         with open(_proposal_path(), encoding="utf-8") as f:
@@ -187,7 +209,10 @@ def propose(cfg, request):
         return False, "Connect an AI model first (Setup → Connect your AI)."
 
     files = _repo_files()
-    corpus = "\n\n".join(f"===== {p} =====\n{c}" for p, c in sorted(files.items()))
+    lean = corpus_mode(cfg) == "lean"
+    shown = {p: c for p, c in files.items()
+             if not (lean and p.split("/")[0] == "tests")}
+    corpus = "\n\n".join(f"===== {p} =====\n{c}" for p, c in sorted(shown.items()))
     schema = {
         "type": "object",
         "properties": {
@@ -224,7 +249,7 @@ def propose(cfg, request):
     try:
         result = llm_client.complete_json(
             cfg, system,
-            f"OWNER'S REQUEST:\n{request}\n\nCURRENT SOURCE TREE:\n{corpus}",
+            prompt_text(corpus, request, lean),
             schema, max_tokens=64000, long=True, timeout=900)
     except llm_client.LLMError as exc:
         if exc.reason == "refused":
