@@ -194,6 +194,15 @@ def test_alpaca_no_second_sell_while_one_works_on_the_whole_holding(monkeypatch)
     assert _reasons() == ["nothing_held"]
 
 
+def test_alpaca_working_sell_for_part_of_the_holding_leaves_the_rest(monkeypatch):
+    """Holding 5 with a 2-lot sell working: Alpaca's qty_available is 3
+    (holding less what open orders hold) — the exit sells 3."""
+    api = AlpacaAPI(monkeypatch, held=5, avail=3)
+    changed, st = _alp_sell(api, qty=5)
+    (body,) = api.posts
+    assert body["qty"] == "3" and changed and st["positions"][KEY]["qty"] == 2
+
+
 def test_alpaca_short_position_is_never_traded(monkeypatch):
     api = AlpacaAPI(monkeypatch, held=-2, side="short")
     changed, _st = _alp_sell(api)
@@ -331,6 +340,15 @@ def test_robinhood_no_second_sell_while_one_works_on_the_whole_holding():
     rh = RH(held=2, pending=2)
     changed, _st = _rh_sell(rh, qty=2)
     assert rh.placed() == [] and not changed
+
+
+def test_robinhood_working_sell_for_part_of_the_holding_leaves_the_rest():
+    """Holding 5 with a 2-lot sell working (pending_sell_quantity 2): the
+    exit sells 3."""
+    rh = RH(held=5, pending=2)
+    changed, _st = _rh_sell(rh, qty=5)
+    (args,) = rh.placed()
+    assert args["quantity"] == "3" and changed
 
 
 def test_robinhood_short_position_is_never_traded():
@@ -943,15 +961,33 @@ CONTRACTS = [("SPY", 752.0, "C"), ("QQQ", 500.0, "P")]
 
 class Account:
     """A broker account that — unlike a real one — lets any sell through,
-    so a sell of more than is held shows up as a negative position."""
+    so a sell of more than is held shows up as a negative position.
+
+    The owner's sells may also rest unfilled (`resting`): like a real
+    broker, the contracts they will sell are frozen — not available to
+    another sell — until they fill or are cancelled."""
 
     def __init__(self):
         self.held, self.bad, self.orders = {}, [], []
+        self.resting = {}       # sym -> contracts the owner's working sells hold
+        self.last_check = None  # held_long the adapter's order check last saw
+        self.misread, self.full_sells = [], 0
 
-    def order(self, sym, side, qty):
+    def sellable(self, sym):
+        return self.held.get(sym, 0) - self.resting.get(sym, 0)
+
+    def order(self, sym, side, qty, owner=False):
         qty = int(qty)
-        if side == "sell" and qty > self.held.get(sym, 0):
-            self.bad.append((sym, side, qty, self.held.get(sym, 0)))
+        if side == "sell" and qty > self.sellable(sym) and not owner:
+            self.bad.append((sym, side, qty, self.sellable(sym)))
+        if side == "sell" and not owner:
+            # the adapter capped this sell at what it read the account held:
+            # that read must be the broker's truth (held less working sells,
+            # subtracted once), or a held position is under-sold
+            if self.last_check is not None and self.last_check != self.sellable(sym):
+                self.misread.append((sym, self.last_check, self.sellable(sym)))
+            if qty == self.sellable(sym):
+                self.full_sells += 1
         self.held[sym] = self.held.get(sym, 0) + (qty if side == "buy" else -qty)
         oid = f"ord-{len(self.orders) + 1}"
         self.orders.append({"id": oid, "sym": sym, "side": side, "qty": qty,
@@ -960,11 +996,24 @@ class Account:
         return oid
 
     def owner_sells(self, rng):
-        held = [s for s, q in self.held.items() if q > 0]
+        held = [s for s, q in self.held.items() if self.sellable(s) > 0]
         if held:
             sym = rng.choice(held)
-            self.order(sym, "sell", rng.randint(1, self.held[sym]))
+            n = rng.randint(1, self.sellable(sym))
+            if rng.random() < 0.5:   # a limit sell that rests for a while
+                self.resting[sym] = self.resting.get(sym, 0) + n
+                return
+            self.order(sym, "sell", n, owner=True)
             self.orders[-1]["owner"] = True
+
+    def owner_order_settles(self, rng):
+        """A resting owner sell fills or is cancelled."""
+        if self.resting:
+            sym = rng.choice(sorted(self.resting))
+            n = self.resting.pop(sym)
+            if rng.random() < 0.6:
+                self.order(sym, "sell", n, owner=True)
+                self.orders[-1]["owner"] = True
 
 
 class AlpacaFront:
@@ -997,7 +1046,8 @@ class AlpacaFront:
 
     def get(self, url, **kw):
         if url.endswith("/v2/positions"):
-            return _Resp(200, [{"symbol": s, "qty": str(q), "qty_available": str(q),
+            return _Resp(200, [{"symbol": s, "qty": str(q),
+                                "qty_available": str(self.acct.sellable(s)),
                                 "side": "long" if q > 0 else "short",
                                 "asset_class": "us_option"}
                                for s, q in self.acct.held.items() if q])
@@ -1029,8 +1079,10 @@ class MoomooFront(MM):
 
         class Ctx:
             def position_list_query(self, **kw):
+                # can_sell_qty: "holding quantity - frozen quantity"
                 return sdk.RET_OK, _DF([
-                    {"code": s, "qty": float(abs(q)), "can_sell_qty": float(max(q, 0)),
+                    {"code": s, "qty": float(abs(q)),
+                     "can_sell_qty": float(max(sdk.acct.sellable(s), 0)),
                      "position_side": "LONG" if q > 0 else "SHORT"}
                     for s, q in sdk.acct.held.items() if q])
 
@@ -1042,7 +1094,10 @@ class MoomooFront(MM):
                                                   "order_status": "FILLED_ALL",
                                                   "dealt_qty": o["qty"]}]
                     return sdk.RET_OK, _DF(rows)
-                return sdk.RET_OK, _DF([])
+                return sdk.RET_OK, _DF([
+                    {"code": s, "order_id": f"owner-{s}", "order_status": "SUBMITTED",
+                     "trd_side": "TrdSide.SELL", "qty": float(n), "dealt_qty": 0.0}
+                    for s, n in sdk.acct.resting.items() if n])
 
             def place_order(self, **kw):
                 oid = sdk.acct.order(kw["code"], "buy" if kw["trd_side"] == "BUY"
@@ -1086,7 +1141,7 @@ class RobinhoodFront:
         if name == "get_option_positions":
             return _mcp({"data": {"positions": [
                 {"option_id": s, "quantity": f"{abs(q)}.0000",
-                 "pending_sell_quantity": "0.0000",
+                 "pending_sell_quantity": f"{self.acct.resting.get(s, 0)}.0000",
                  "type": "long" if q > 0 else "short"}
                 for s, q in self.acct.held.items() if q]}})
         if name == "place_option_order":
@@ -1131,6 +1186,13 @@ def test_random_life_never_opens_a_short(home, no_policy, monkeypatch, name, see
     monkeypatch.setattr(agent, "_problems_logged", set())
     rng = random.Random(seed)
     acct = Account()
+    real_check = order_guard.check_order
+
+    def check_order(side, effect, qty, held_long, **kw):
+        acct.last_check = held_long if side == "sell" else None
+        return real_check(side, effect, qty, held_long, **kw)
+    monkeypatch.setattr(order_guard, "check_order", check_order)
+    unexpected = []
     front_cls, mod, cfg = _FRONTS[name]
     cfg.update(position_sync=False, max_entries_per_day=1000, max_open_positions=50)
     front = front_cls(acct, monkeypatch, rng)
@@ -1144,8 +1206,10 @@ def test_random_life_never_opens_a_short(home, no_policy, monkeypatch, name, see
         n += 1
         if roll < 0.08:                                   # restart from disk
             state = json.loads(json.dumps(state))
-        elif roll < 0.18:                                 # the owner sells
+        elif roll < 0.14:                                 # the owner sells
             acct.owner_sells(rng)
+        elif roll < 0.18:                                 # ...and it fills
+            acct.owner_order_settles(rng)
         elif roll < 0.26:                                 # the ledger says more
             row = state["positions"].get(f"{c[0]}|{EXPIRY}|{c[1]}|{c[2]}")
             if row and not row.get("pending"):
@@ -1163,17 +1227,23 @@ def test_random_life_never_opens_a_short(home, no_policy, monkeypatch, name, see
             if hasattr(mod, "reconcile"):
                 try:
                     mod.reconcile(client, cfg, state, lambda s: None)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    unexpected.append(("reconcile", repr(exc)))
                 agent._log_adopted_buys(cfg, state, lambda s: None, mod, client)
             try:
                 agent.handle_event(dict(ev), cfg, state, mod, client, lambda s: None)
-            except Exception:
+            except (agent.ExitNotDone, RuntimeError):
                 pass                                       # retried, like the loop
+            except Exception as exc:
+                unexpected.append(("handle_event", repr(exc)))
         assert acct.bad == [], acct.bad
         assert all(q >= 0 for q in acct.held.values()), acct.held
+        assert all(q >= 0 for q in acct.resting.values()), acct.resting
+    assert unexpected == []
+    assert acct.misread == [], acct.misread
     assert any(o["side"] == "sell" and not o.get("owner") for o in acct.orders), \
         "the scenario never sold: it tested nothing"
+    assert acct.full_sells, "no exit ever sold all the account could sell"
 
 
 # ── self-edit: a broker file the agent writes can't go around the check ────
