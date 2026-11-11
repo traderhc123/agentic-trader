@@ -6,6 +6,8 @@ Zero network."""
 
 from datetime import timedelta
 
+import pytest
+
 import agent
 from test_exit_remainder import TAG, U1, U2, Client, FakeBroker, _loop, et
 from test_exit_remainder import notes  # noqa: F401  (fixture reuse)
@@ -97,3 +99,32 @@ def test_deferred_upkeep_is_not_starved(monkeypatch):
     assert calls == [] and agent._POS_SYNC.get("deferred")
     up({}, {}, lambda s: None, b, c, now=130.0, defer_to_ledger=True)
     assert calls == [False] and not agent._POS_SYNC.get("deferred")
+
+
+def _blind_since_13(state):
+    """No exit signals since 13:00, the owner warned at 15:00 (today)."""
+    state["positions"][LATER]["live"] = True
+    state["signal_loss"] = {"since": et(13, 0).timestamp(), "cause": "pass_ended",
+                            "warned_at": et(15, 0).timestamp(),
+                            "warned_day": et(15, 0).date().isoformat()}
+    return state
+
+
+@pytest.mark.parametrize("held, sold", [(0, False), (6, True)])
+def test_no_signal_sell_reads_the_broker_not_the_memo(monkeypatch, notes, held, sold):
+    """The no-signal sell at 15:30 with a fresh remembered list that says
+    the contracts are held: its exit check still asks the broker, and only
+    what that read says decides the sale."""
+    now = et(15, 30)
+    monkeypatch.setattr(agent, "_now", lambda: now.timestamp())
+    monkeypatch.setattr(agent, "_et_now", lambda: now)
+    b = FakeBroker(held={U1: held})
+    b.exit_bid = lambda client, cfg, event, option_id: 1.0
+    c = Client()
+    st = _blind_since_13(held_state())
+    agent._remember_holdings(c, [U1], {U1: 6})
+    agent.signal_loss_tick({"broker": "fake"}, st, lambda s: None, b, c,
+                           now_et=now)
+    assert b.asked and b.asked[0] == [U1]       # a fresh read before any sell
+    assert not agent._HOLDINGS_MEMO.get("used")
+    assert bool(b.sells) is sold

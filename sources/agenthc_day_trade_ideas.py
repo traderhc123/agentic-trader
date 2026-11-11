@@ -1400,6 +1400,9 @@ def _note_feed_answer(resp):
     if key is None:
         _REFUSAL.clear()
         return
+    # no exit signal from this read either: the same cause as the back-off
+    # that follows (the no-signal sell, agent._note_exit_source)
+    _LAST_POLL["why"] = "feed_refused"
     now = _now_s()
     if _REFUSAL.get("key") != key:
         _REFUSAL.clear()

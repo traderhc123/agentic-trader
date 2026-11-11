@@ -6789,6 +6789,16 @@ def cmd_run(app_window=False):
                     _WATCH_SINCE.clear()
                 elif not due:
                     events, feed_read = [], False
+                    # The no-signal sell: a read skipped because the feed
+                    # keeps refusing the agent is still no exit signal (the
+                    # loss clock runs on, inside the session only). One
+                    # skipped by the hourly schedule outside the feed window
+                    # neither starts nor extends a loss.
+                    if _why == "refused":
+                        _note_exit_source(cfg, state, save_state, "lost",
+                                          "feed_refused")
+                    else:
+                        _note_exit_source(cfg, state, save_state, "skip")
                 else:
                     FEED_GATE["now"] = False
                     try:

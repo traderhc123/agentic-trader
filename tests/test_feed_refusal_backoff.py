@@ -188,3 +188,98 @@ def test_status_shows_refusal_and_times(wire):
     assert agent._feed_schedule_note(
         {}, agenthc, datetime(2026, 10, 31, 10, 0, tzinfo=ET)).startswith(
         "Signal feed refused")
+
+
+# ── the no-signal sell: reads the back-off or the schedule skips ─────────────
+
+def _backing_off(since, next_at):
+    """The source's state after three identical 403s (refusal_wait_until)."""
+    agenthc._REFUSAL.clear()
+    agenthc._REFUSAL.update(key=agenthc._refusal_key(Resp(403, REFUSED)),
+                            count=3, since=since, next_at=next_at)
+
+
+def test_reads_the_backoff_skips_keep_the_no_signal_clock_running(
+        home, monkeypatch, sent, clock):
+    """The feed has refused the agent since before the open. 09:29:30: one
+    refused read (no loss before the session), then the back-off skips the
+    reads at 09:30 and after. Those skipped reads are no exit signal either:
+    the loss starts at 09:30, as feed_refused, and the owner is warned five
+    minutes later, before the next refused read could have started it."""
+    clock.t = OPEN.replace(minute=29, second=30).astimezone(timezone.utc)
+    monkeypatch.setattr(agent, "_now", lambda: clock.t.timestamp())
+    monkeypatch.setattr(agenthc, "_now_s", lambda: clock.t.timestamp())
+    tr = Transport([Resp(403, REFUSED)])
+    monkeypatch.setattr(agenthc.requests, "get", tr.get)
+    start = clock.t.timestamp()
+    _backing_off(start - 600, start - 1)     # 4th refusal now: wait 240 s
+    state = {"seen": [], "positions": {KEY: {"option_id": "stub", "qty": 1,
+                                             "live": True}}}
+    _b, saved = run_loop(home, monkeypatch, state, [[]] * 12, clock=clock,
+                         steps=(30,) * 12, source=agenthc,
+                         config={"source": "stub", "agenthc_api_key": "k"})
+    assert tr.n == 2                         # 09:29:30 and 09:33:30 only
+    loss = saved["signal_loss"]
+    assert loss["cause"] == "feed_refused"
+    assert loss["since"] == start + 30       # 09:30:00, a skipped read
+    (w,) = [m for m in sent if "no exit signals have reached" in m]
+    assert "since 9:30 ET (the signal feed is refusing the agent)" in w
+
+
+def test_a_refusal_backoff_outside_the_session_records_nothing(
+        home, monkeypatch, sent, clock):
+    """The same back-off at 19:00 ET: no signal is published then, so no
+    loss starts."""
+    clock.t = OPEN.replace(hour=19).astimezone(timezone.utc)
+    monkeypatch.setattr(agent, "_now", lambda: clock.t.timestamp())
+    monkeypatch.setattr(agenthc, "_now_s", lambda: clock.t.timestamp())
+    tr = Transport([Resp(403, REFUSED)])
+    monkeypatch.setattr(agenthc.requests, "get", tr.get)
+    start = clock.t.timestamp()
+    _backing_off(start - 600, start - 1)
+    state = {"seen": [], "positions": {KEY: {"option_id": "stub", "qty": 1,
+                                             "live": True}}}
+    _b, saved = run_loop(home, monkeypatch, state, [[]] * 6, clock=clock,
+                         source=agenthc,
+                         config={"source": "stub", "agenthc_api_key": "k"})
+    assert tr.n == 1
+    assert "signal_loss" not in saved
+    assert not [m for m in sent if "no exit signals" in m]
+
+
+class OffHours:
+    """A source read on the hourly schedule outside the feed window. Its one
+    read (the loop's first, "asked") answers without exit signals."""
+    IDLE_READS = True
+    reads = 0
+
+    @classmethod
+    def poll(cls, cfg, st, save_state):
+        cls.reads += 1
+        return []
+
+    had_access = staticmethod(lambda: False)
+    had_exit_access = staticmethod(lambda: False)
+    exit_loss_reason = staticmethod(lambda: "feed_not_live")
+
+
+@pytest.mark.parametrize("before", [None, {"since": 1.0, "cause": "pass_ended",
+                                           "warned_at": 2.0,
+                                           "warned_day": "2026-10-28"}])
+def test_reads_the_off_hours_schedule_skips_never_start_or_extend_a_loss(
+        home, monkeypatch, sent, clock, before):
+    """20:00 ET: the first loop reads, the next ones are skipped by the
+    hourly schedule. With no loss on record none starts; one on record from
+    the session is kept exactly as it was (same start, same cause)."""
+    clock.t = OPEN.replace(hour=20).astimezone(timezone.utc)
+    monkeypatch.setattr(agent, "_now", lambda: clock.t.timestamp())
+    OffHours.reads = 0
+    state = {"seen": [], "positions": {KEY: {"option_id": "stub", "qty": 1,
+                                             "live": True}}}
+    if before is not None:
+        state["signal_loss"] = dict(before)
+    _b, saved = run_loop(home, monkeypatch, state, [[]] * 6, clock=clock,
+                         source=OffHours)
+    assert OffHours.reads == 1
+    assert saved.get("signal_loss") == before
+    assert not [m for m in sent if "no exit signals" in m]
