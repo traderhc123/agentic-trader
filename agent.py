@@ -1274,13 +1274,165 @@ def _et_now():
     return datetime.now(MARKET_TZ)
 
 
-def _market_open_now():
-    """US equity market hours-ish (9:25–16:15 ET, Mon–Fri). Poll slow outside."""
-    now = datetime.now(MARKET_TZ)
-    if now.weekday() >= 5:
+FEED_WINDOW_OPEN_MIN = 9 * 60 + 25   # the feed window: 09:25 ET ...
+FEED_WINDOW_AFTER_CLOSE_MIN = 15     # ... to 15 min after today's close
+FEED_IDLE_READ_S = 3600   # feed_idle_read_seconds default (0 = every loop)
+CASH_REFRESH_S = 600      # buying power inside the feed window
+CASH_REFRESH_IDLE_S = 3600  # cash_refresh_idle_seconds default (outside it)
+# The settings the running loop uses, for _market_open_now() (which takes no
+# arguments: the owner's market_holidays / early_close_days still count).
+_RUN_CFG = {"cfg": None}
+# The signal feed's read schedule (cmd_run): when it was last read with
+# success (epoch seconds), and "now": read on the next loop whatever the
+# schedule says (first loop after a start, Resume, "check now").
+FEED_GATE = {"read_at": None, "now": True}
+
+
+def _feed_window_now(cfg=None, now_et=None):
+    """True from 09:25 ET to 15 minutes after today's close on a trading day
+    (NYSE holidays, the owner's market_holidays and early closes count).
+    Every signal the feed has ever published fell inside this window."""
+    now_et = now_et or _et_now()
+    day = now_et.date()
+    if not is_trading_day(cfg, day):
         return False
-    minutes = now.hour * 60 + now.minute
-    return (9 * 60 + 25) <= minutes <= (16 * 60 + 15)
+    m = now_et.hour * 60 + now_et.minute
+    return (FEED_WINDOW_OPEN_MIN <= m
+            <= close_minute(cfg, day) + FEED_WINDOW_AFTER_CLOSE_MIN)
+
+
+def _market_open_now():
+    """The feed window right now (_feed_window_now): fast polling inside it,
+    slow outside — also on market holidays and after an early close."""
+    return _feed_window_now(_RUN_CFG["cfg"], _et_now())
+
+
+def _cfg_seconds(cfg, key, default):
+    """A whole number of seconds from config, >= 0; default when unset or
+    unreadable."""
+    try:
+        v = int((cfg or {}).get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return v if v >= 0 else default
+
+
+def request_feed_read():
+    """Read the signal feed (and buying power) on the next loop, whatever
+    the schedule or a refusal back-off says: Resume and "check now"."""
+    FEED_GATE["now"] = True
+    _CASH_NOW["on"] = True
+
+
+_CASH_NOW = {"on": False}
+
+
+def _feed_read_due(cfg, state, source, now=None, now_et=None):
+    """(read?, why) for this loop's read of the signal feed.
+
+    Inside the feed window the feed is read on every loop, as always, so an
+    exit signal is never delayed. Outside it (nights, weekends, holidays,
+    after an early close) no signal has ever been published: a source that
+    says IDLE_READS is read once every feed_idle_read_seconds (default
+    3600; 0 = every loop), and at once after a start, Resume or "check
+    now", while a pass or day-pass payment is waiting, and while the expiry
+    guard has work. A source that is backing off after the same refusal
+    (refusal_wait_until) is not read until then, except on Resume / "check
+    now". Skipping a read is the feed_read=False path: exits owed still
+    retry and nothing is forgotten from the seen list."""
+    now = _now() if now is None else now
+    if FEED_GATE["now"]:
+        return True, "asked"
+    wait = getattr(source, "refusal_wait_until", None)
+    if callable(wait):
+        try:
+            until = wait()
+        except Exception:
+            until = None
+        if until and now < until:
+            return False, "refused"
+    if not getattr(source, "IDLE_READS", False):
+        return True, "always"
+    now_et = now_et or _et_now()
+    if _feed_window_now(cfg, now_et):
+        return True, "window"
+    idle = _cfg_seconds(cfg, "feed_idle_read_seconds", FEED_IDLE_READ_S)
+    if idle <= 0:
+        return True, "idle_off"
+    pending = getattr(source, "payment_pending", None)
+    try:
+        if callable(pending) and pending(cfg, state):
+            return True, "payment"
+    except Exception:
+        return True, "payment"
+    try:
+        if expiry_guard_busy(cfg, state, now_et):
+            return True, "expiry"
+    except Exception:
+        pass
+    last = FEED_GATE["read_at"]
+    if last is None or now - last >= idle:
+        return True, "idle"
+    return False, "idle"
+
+
+def _next_window_open(cfg, now_et=None):
+    """The next start of the feed window (an aware ET datetime)."""
+    from datetime import timedelta
+    now_et = now_et or _et_now()
+    day = now_et.date()
+    m = now_et.hour * 60 + now_et.minute
+    if not (is_trading_day(cfg, day) and m < FEED_WINDOW_OPEN_MIN):
+        for _ in range(15):  # the longest closure is a few days
+            day = day + timedelta(days=1)
+            if is_trading_day(cfg, day):
+                break
+    return datetime(day.year, day.month, day.day, FEED_WINDOW_OPEN_MIN // 60,
+                    FEED_WINDOW_OPEN_MIN % 60, tzinfo=MARKET_TZ)
+
+
+def _feed_schedule_note(cfg, source, now_et=None):
+    """The dashboard's line about when the signal feed is read, when that
+    is not "every loop" (outside the feed window, or backing off after a
+    refusal): the last read and the next one, in ET. "" otherwise."""
+    try:
+        now_et = now_et or _et_now()
+        info = getattr(source, "refusal_info", None)
+        info = info() if callable(info) else None
+        if info:
+            since = datetime.fromtimestamp(info["since"], MARKET_TZ)
+            nxt = datetime.fromtimestamp(info["next_at"], MARKET_TZ)
+            what = f"{info['status']}" + (f" {info['code']}" if info.get("code") else "")
+            return (f"Signal feed refused ({what}) since {since:%H:%M} ET; "
+                    f"next try {nxt:%H:%M} ET (say 'check now' to try at once)")
+        if (not getattr(source, "IDLE_READS", False) or _feed_window_now(cfg, now_et)
+                or _cfg_seconds(cfg, "feed_idle_read_seconds", FEED_IDLE_READ_S) <= 0):
+            return ""
+        last = FEED_GATE["read_at"]
+        last_txt = (f"{datetime.fromtimestamp(last, MARKET_TZ):%H:%M} ET"
+                    if last else "not yet")
+        opens = _next_window_open(cfg, now_et)
+        when = (f"{opens:%H:%M} ET" if opens.date() == now_et.date()
+                else f"{opens:%a} {opens:%H:%M} ET")
+        return (f"Signal feed: last read {last_txt} (market closed, next "
+                f"regular read {when})")
+    except Exception:
+        return ""
+
+
+def _feed_notice(cfg, source, now_et=None):
+    """_feed_schedule_note as a dashboard notice, or None. `condition`
+    (view_model.CONDITIONS): a feed that keeps refusing is the feed that
+    can't be read (feed_unreachable, one note with the failed read); the
+    hourly reads while the market is closed are feed_off_hours."""
+    note = _feed_schedule_note(cfg, source, now_et)
+    if not note:
+        return None
+    if note.startswith("Signal feed refused"):
+        return {"level": "warn", "code": "feed_refused",
+                "condition": "feed_unreachable", "text": note}
+    return {"level": "info", "code": "feed_schedule",
+            "condition": "feed_off_hours", "text": note}
 
 
 def _prune_expired_positions(cfg, state, save_state):
@@ -1869,10 +2021,26 @@ def _alert_if_broker_down(cfg, state, save_state, client, why=None):
                 "in Settings → Broker.")
 
 
+def _cash_refresh_due(cfg, cash, now=None, now_et=None):
+    """True when the loop should re-read buying power: every CASH_REFRESH_S
+    inside the feed window, every cash_refresh_idle_seconds outside it
+    (default 3600 — only a deposit changes it then), at once when the owner
+    goes live or practice, and on Resume / "check now"."""
+    now = _now() if now is None else now
+    if _CASH_NOW["on"] or bool(cfg.get("dry_run")) != cash.get("dry"):
+        return True
+    every = CASH_REFRESH_S
+    if not _feed_window_now(cfg, now_et):
+        every = max(CASH_REFRESH_S, _cfg_seconds(
+            cfg, "cash_refresh_idle_seconds", CASH_REFRESH_IDLE_S))
+    return now - float(cash.get("at") or 0.0) >= every
+
+
 def _refresh_cash(cfg, state, save_state, broker, client, cash):
-    """Re-read buying power (every ~10 min) for the dashboard, and warn once
-    a day in LIVE mode when it can't cover trades."""
-    cash["at"] = time.time()
+    """Re-read buying power (_cash_refresh_due) for the dashboard, and warn
+    once a day in LIVE mode when it can't cover trades."""
+    _CASH_NOW["on"] = False
+    cash["at"] = _now()
     cash["dry"] = bool(cfg.get("dry_run"))
     cash["bp"] = _buying_power(broker, client, cfg)
     _alert_if_broker_down(cfg, state, save_state, client)
@@ -2009,6 +2177,14 @@ _FILL_IDS_KEPT = 20
 _FILLS_USED_KEPT = 100
 _BROKER_NAMES = {"robinhood": "Robinhood", "alpaca": "Alpaca", "moomoo": "moomoo"}
 _POS_SYNC = {"next_at": 0.0}
+# The ledger check's last holdings read, for the periodic position upkeep
+# only (_position_upkeep): when the upkeep is due in a loop where the ledger
+# check reads too, it runs right after that read and uses it instead of a
+# second read of the same contracts. Never used by anything that decides or
+# confirms an exit (_check_before_exit, the remainder re-sell, the expiry
+# guard always read the broker), and each read is used at most once.
+HOLDINGS_MEMO_S = 20
+_HOLDINGS_MEMO = {}
 
 
 def _float0(v):
@@ -2160,8 +2336,29 @@ def _sync_candidates(state, tag, now, cfg=None):
     return cand, changed
 
 
+def _remember_holdings(client, ids, held):
+    """Keep the ledger check's fresh holdings read (see HOLDINGS_MEMO_S)."""
+    _HOLDINGS_MEMO.clear()
+    _HOLDINGS_MEMO.update(at=time.monotonic(), ids=frozenset(ids),
+                          held=dict(held), client=id(client))
+
+
+def _remembered_holdings(client, ids):
+    """The ledger check's read when it is younger than HOLDINGS_MEMO_S, was
+    made with this client, covers every one of `ids` and was not used
+    before; else None (read the broker)."""
+    memo = _HOLDINGS_MEMO
+    if (not memo or memo.get("used") or memo.get("client") != id(client)
+            or time.monotonic() - memo["at"] >= HOLDINGS_MEMO_S
+            or not set(ids) <= memo["ids"]):
+        return None
+    memo["used"] = True
+    return dict(memo["held"])
+
+
 def _sync_positions(cfg, state, save_state, broker, client, keys=None,
-                    confirm_s=POS_CONFIRM_S, event_id=None, detected_by="sync"):
+                    confirm_s=POS_CONFIRM_S, event_id=None, detected_by="sync",
+                    memo_ok=False):
     """Compare the ledger with what the broker account holds and stop
     tracking contracts confirmed gone. Read-only toward the broker.
 
@@ -2175,7 +2372,7 @@ def _sync_positions(cfg, state, save_state, broker, client, keys=None,
     broker_events.begin()
     try:
         return _sync_read(cfg, state, save_state, broker, client, fn, keys,
-                          confirm_s, event_id, detected_by)
+                          confirm_s, event_id, detected_by, memo_ok)
     finally:
         _read_problems(cfg, state, save_state, client, broker_events.drain())
 
@@ -2195,16 +2392,20 @@ def _read_problems(cfg, state, save_state, client, events):
 
 
 def _sync_read(cfg, state, save_state, broker, client, fn, keys, confirm_s,
-               event_id, detected_by):
+               event_id, detected_by, memo_ok=False):
     now = _now()
     tag = _account_tag(cfg, broker, client)
     cand, changed = _sync_candidates(state, tag, now, cfg)
     held = None
     if cand:
-        try:
-            held = fn(client, cfg, sorted(set(cand.values())))
-        except Exception:
-            held = None
+        ids = sorted(set(cand.values()))
+        # memo_ok: the periodic upkeep only — never an exit's own check
+        held = _remembered_holdings(client, ids) if memo_ok else None
+        if held is None:
+            try:
+                held = fn(client, cfg, ids)
+            except Exception:
+                held = None
     if not isinstance(held, dict) or getattr(client, "last_error", None):
         if changed:
             save_state(state)
@@ -2527,10 +2728,19 @@ def _outside_message(cause, name, contract, k, target, unlogged, px, est):
     return msg + "The agent stopped tracking those — check your account. " + keeps
 
 
-def _position_upkeep(cfg, state, save_state, broker, client, now=None):
+def _position_upkeep(cfg, state, save_state, broker, client, now=None,
+                     defer_to_ledger=False, memo_ok=False):
     """Once per heartbeat: check holdings every position_sync_seconds while
     the market is open (default 120 s), every 30 min otherwise, sooner while
-    a shortfall waits for confirmation. Never raises."""
+    a shortfall waits for confirmation. Never raises.
+
+    defer_to_ledger (the main loop): when the ledger check reads holdings
+    later in this same loop, wait for it — exit_remainder_tick then runs
+    this check right after that read, with memo_ok=True (one read for
+    both; HOLDINGS_MEMO_S)."""
+    # still set: the last deferral was never run (that loop broke off) —
+    # don't wait for the ledger check again
+    starved = _POS_SYNC.pop("deferred", None)
     if not _gate_on(cfg, broker, client):
         return
     now = _now() if now is None else now
@@ -2545,9 +2755,13 @@ def _position_upkeep(cfg, state, save_state, broker, client, now=None):
             every = 120
     else:
         every = POS_SYNC_CLOSED_S
+    if (defer_to_ledger and not starved
+            and _ledger_check_due(cfg, state, broker, client, now)):
+        _POS_SYNC["deferred"] = True  # run by exit_remainder_tick, this loop
+        return
     _POS_SYNC["next_at"] = now + every
     try:
-        _sync_positions(cfg, state, save_state, broker, client)
+        _sync_positions(cfg, state, save_state, broker, client, memo_ok=memo_ok)
     except Exception as exc:
         print(f"position check error (non-fatal): {str(exc)[:150]}")
     try:
@@ -4279,6 +4493,10 @@ def _exit_remainder_tick(cfg, state, save_state, broker, client, paused, now_et)
                 _ledger_check(cfg, state, save_state, broker, client, now_et, now, tag)
             except Exception as exc:
                 print(f"ledger check error (non-fatal): {str(exc)[:150]}")
+    if _POS_SYNC.get("deferred") and not paused:
+        # the position upkeep that waited for the ledger check's read (it
+        # uses that read when it covers its contracts, else reads itself)
+        _position_upkeep(cfg, state, save_state, broker, client, memo_ok=True)
     return _exit_remainders(cfg, state, save_state, broker, client, paused,
                             now_et, now, tag, trading)
 
@@ -4292,6 +4510,21 @@ def _ledger_near_guard(cfg, key, now_et):
     guard, _alert, close = _expiry_times(cfg, day)
     m = now_et.hour * 60 + now_et.minute
     return guard is not None and guard - LEDGER_CHECK_NEAR_MIN <= m < close
+
+
+def _ledger_check_due(cfg, state, broker, client, now, now_et=None):
+    """True when exit_remainder_tick (paused=False) will run the ledger
+    check in this loop and it can read holdings — the same conditions."""
+    try:
+        now_et = now_et or _et_now()
+        if (not _trading_now(cfg, now_et) or now < _LEDGER_CHECK["next_at"]
+                or not _gate_on(cfg, broker, client)
+                or _dry_run_holds_real_sells(cfg)
+                or getattr(client, "last_error", None)):
+            return False
+        return not (_ledger_check_every(cfg, state, now_et) and _in_open_rush())
+    except Exception:
+        return False
 
 
 def _ledger_check_every(cfg, state, now_et):
@@ -4625,6 +4858,7 @@ def _ledger_check(cfg, state, save_state, broker, client, now_et, now, tag):
         except Exception:
             held = None
     if isinstance(held, dict) and not getattr(client, "last_error", None):
+        _remember_holdings(client, cand, held)  # for _position_upkeep only
         for oid, key in sorted(cand.items()):
             h = held.get(oid)
             row = positions.get(key)
@@ -5240,6 +5474,12 @@ def _apply_command(text):
         if t.rstrip("? ") not in _SHOW_COMMANDS or "?" in t.rstrip("? "):
             return False, ""
         t = t.rstrip("? ")
+    if t in ("check now", "check feed", "read feed now"):
+        # changes no setting: the next loop reads the signal feed and buying
+        # power whatever the schedule (or a refusal back-off) says
+        request_feed_read()
+        return True, ("Checking now: the agent reads the signal feed and your "
+                      "buying power on its next loop (within a few minutes).")
     if t == "stop":
         # changes no setting, so it needs none: Stop must work even when
         # config.json can't be read
@@ -5296,6 +5536,7 @@ def _command(t, cfg, text):
                 "python agent.py resume-here")
         cfg.pop("paused", None)
         _save(CONFIG_PATH, cfg, private=True)
+        request_feed_read()  # the feed and buying power at once, not on schedule
         was_held = _state_held()
         hold = _end_state_hold()  # on hold since startup over a damaged state.json
         if hold is not None:
@@ -5748,6 +5989,7 @@ def cmd_run(app_window=False):
         c = _load(CONFIG_PATH, None)
         c = c if c and isinstance(c, dict) else cfg
         st = _load(STATE_PATH, {"positions": {}})
+        feed_note = _feed_schedule_note(c, source)
         return {
             "mode": "DRY-RUN" if c.get("dry_run") else "LIVE",
             # also on a full hold: a damaged state.json (the dashboard then
@@ -5774,6 +6016,8 @@ def cmd_run(app_window=False):
                                  else "on" if llm_policy.enabled(c) else "off"),
                 "rules": __import__("rules").describe(c) or "none",
                 "market": "open" if _market_open_now() else "closed (slow polling)",
+                **({"signal feed": feed_note.split(": ", 1)[-1]}
+                   if feed_note else {}),
                 "expiry guard": _expiry_guard_desc(c),
                 "open positions": ", ".join(st.get("positions", {})) or "none",
                 "start at login": ("on" if keep_running.autostart_enabled()
@@ -5832,6 +6076,9 @@ def cmd_run(app_window=False):
                 out.append({"level": "warn", "code": "second_copy",
                             "condition": "second_copy",
                             "text": "Check for a second copy: " + deploy_warn})
+            feed = _feed_notice(c, source)
+            if feed:
+                out.append(feed)
             return out
 
         return view_snapshot({
@@ -5921,6 +6168,9 @@ def cmd_run(app_window=False):
     # "at" = when the previous loop STARTED, so a loop that hangs (not only
     # a sleep) shows up as a gap at the next start
     beat = {"at": _now(), "wait": 0.0, "saved": 0.0}
+    # the first loop reads the feed whatever the time (then the schedule)
+    FEED_GATE.update(read_at=None, now=True)
+    _RUN_CFG["cfg"] = cfg
     _loop_note(started_at=beat["at"], beat_at=None, wait_s=None, poll_at=None,
                poll_ok=None, feed_access=None, signal_at=None)
     while True:
@@ -5940,6 +6190,7 @@ def cmd_run(app_window=False):
             beat["saved"] = now_beat
             _save_heartbeat(state, save_state, now_beat)
         cfg = _load(CONFIG_PATH, cfg) or cfg  # dashboard edits apply live
+        _RUN_CFG["cfg"] = cfg
         awake.apply(cfg)  # same thread every time (Windows needs that)
         if time.time() - dash["at"] > DASH_CHECK_EVERY_S:
             dash["at"] = time.time()
@@ -6016,26 +6267,35 @@ def cmd_run(app_window=False):
                     # buys found at the broker after all: logged as entries
                     _log_adopted_buys(cfg, state, save_state, broker, client)
                 # positions the owner closed in the broker app (throttled)
-                _position_upkeep(cfg, state, save_state, broker, client)
+                _position_upkeep(cfg, state, save_state, broker, client,
+                                 defer_to_ledger=True)
                 # contracts an exit left held (re-sold), and ones the agent
                 # bought that its ledger lost (re-added) — before the feed,
                 # so a remainder from this loop's exits is re-sold next loop
                 exit_remainder_tick(cfg, state, save_state, broker, client)
-                # every 10 min, and right away when the owner goes live
-                if (time.time() - cash["at"] > 600
-                        or bool(cfg.get("dry_run")) != cash.get("dry")):
+                # every 10 min in the feed window, hourly outside it, and
+                # right away when the owner goes live (_cash_refresh_due)
+                if _cash_refresh_due(cfg, cash):
                     _refresh_cash(cfg, state, save_state, broker, client, cash)
                 poll_error = None
                 # paused, nothing real to sell, on the pay-per-day feed:
                 # the feed is deliberately not read
                 feed_read = not _pause_skips_feed(cfg, state)
+                # outside the feed window (or backing off after the same
+                # refusal): not read this loop — the same "feed not read"
+                # path below, so exits owed still retry
+                due, _why = (_feed_read_due(cfg, state, source, now_beat)
+                             if feed_read else (False, "paused"))
                 if not feed_read:
                     events = []
                     # signals that fire meanwhile happened while the agent
                     # wasn't watching: after Resume they are old news, not
                     # a delay worth an alert
                     _WATCH_SINCE.clear()
+                elif not due:
+                    events, feed_read = [], False
                 else:
+                    FEED_GATE["now"] = False
                     try:
                         events = source.poll(cfg, state, save_state)
                     except Exception as exc:
@@ -6046,6 +6306,7 @@ def cmd_run(app_window=False):
                         # still owes don't need it
                         poll_error, events = exc, []
                     if poll_error is None:
+                        FEED_GATE["read_at"] = now_beat
                         note_watching(cfg, access=_poll_had_access(source))
                         _loop_note_poll(source, events, None)  # (dashboard)
                     else:

@@ -95,6 +95,7 @@ export const CONDITIONS = [
   "position_expired",
   "position_expiring_unsold",
   "position_expiring",
+  "feed_off_hours",
 ] as const;
 export type Condition = (typeof CONDITIONS)[number];
 

@@ -461,6 +461,22 @@ def test_robinhood_sell_with_nothing_held_sends_no_order():
     assert _reasons() == ["nothing_held"]
 
 
+def test_a_remembered_holdings_read_never_stands_in_for_the_sell_check(
+        monkeypatch):
+    """The agent's holdings memo (agent._remember_holdings: the ledger
+    check's read, kept HOLDINGS_MEMO_S for the periodic position upkeep)
+    says 6 are held; the account now holds none. The sell still reads the
+    broker itself and sends nothing, and the memo is left unused."""
+    monkeypatch.setattr(agent, "_HOLDINGS_MEMO", {})
+    rh = RH(held=0)
+    agent._remember_holdings(rh, [RH_ID], {RH_ID: 6})
+    changed, st = _rh_sell(rh)
+    assert rh.placed() == [] and not changed and st["positions"][KEY]["qty"] == 3
+    assert _reasons() == ["nothing_held"]
+    assert [n for n, _ in rh.calls].count("get_option_positions") >= 1
+    assert not agent._HOLDINGS_MEMO.get("used")
+
+
 def test_robinhood_sells_only_what_the_account_holds():
     rh = RH(held=1)
     changed, st = _rh_sell(rh, qty=3)

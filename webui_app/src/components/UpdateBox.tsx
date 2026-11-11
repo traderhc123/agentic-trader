@@ -34,7 +34,8 @@ export function UpdateBox({ className, compact }: { className?: string; compact?
     setCanPull(false);
     setRes(null);
     start("Checking");
-    const r = await apiTimed("/api/update/check", undefined, 150000);
+    // the owner pressed Check: a fresh check, not the remembered answer
+    const r = await apiTimed("/api/update/check?force=1", undefined, 150000);
     stop();
     if (!r.ok) return setRes({ kind: "err", text: r.error || "update check failed" });
     if (!r.behind) return setRes({ kind: "ok", text: "Up to date" });

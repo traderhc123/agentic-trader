@@ -331,6 +331,7 @@ export const CONDITION_GO: Record<NoteCode, Go | null> = {
   position_expired: "holdings",
   position_expiring_unsold: "holdings",
   position_expiring: "holdings",
+  feed_off_hours: null,
 };
 
 const LEVEL_OF: Record<Notice["level"], Note["level"]> = { urgent: "crit", warn: "warn", info: "info" };

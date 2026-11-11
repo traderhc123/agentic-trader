@@ -35,6 +35,22 @@ def _no_state_hold_left_over(monkeypatch):
     monkeypatch.setitem(webui.CONTROLS, "replaced", False)
 
 
+@pytest.fixture(autouse=True)
+def _no_read_schedule_left_over(monkeypatch):
+    """The feed's read schedule, a refusal back-off, a pending "read buying
+    power now", the ledger check's remembered holdings and the update
+    check's last answer are kept in memory for the run: one test's must not
+    change what the next test reads."""
+    from sources import agenthc_day_trade_ideas as hc
+    monkeypatch.setattr(hc, "_REFUSAL", {})
+    monkeypatch.setattr(agent, "FEED_GATE", {"read_at": None, "now": True})
+    monkeypatch.setattr(agent, "_CASH_NOW", {"on": False})
+    monkeypatch.setattr(agent, "_HOLDINGS_MEMO", {})
+    monkeypatch.setitem(agent._RUN_CFG, "cfg", None)
+    import webui
+    monkeypatch.setattr(webui, "_UPDATE_MEMO", {})  # the update check's answer
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """Isolated AGENT_HOME; yields its path."""
