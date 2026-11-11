@@ -33,6 +33,8 @@ Stage B (groups 4-7), same branch:
   - *Payment wallet*: Make / Replace (`POST /api/v2/wallet/create`, two-step over `_wallet_create`), Add sats (`POST /api/v2/wallet/fund`, two-step over `_wallet_fund_invoice`, the classic fund's invoice code split out; the amount's worth from the reused `GET /api/wallet/quote`), Use my own wallet (`POST /api/v2/wallet/connect`, two-step over `_source_save`), Buys a day-pass by itself (PR 2's `/api/v2/wallet/recurring`), Open the wallet page (`POST /api/v2/wallet/page` on click, into a window the click opened; `GET /api/v2/settings` only says `page_on_file`). Balance: the reused `GET /api/wallet/balance`.
   - Deviations: `/api/v2/wallet/fund` refuses under 1,000 sats or above a known invoice cap (the classic form raises / cuts the amount); the wallet routes' answers never carry the wallet page link (the classic create answers with it); host names only (`signals.source_site`, `signals.wallet.site`) because a feed or wallet address can carry a token. `/api/v2/wallet/create` saves with the plain save after the confirmation (it writes only the wallet's own keys and the source, and the guarded save could leave an old-wallet file for a wallet that stays), while `/api/v2/wallet/connect` keeps the guarded save (it also writes the scope).
 
+Stage B's routes are all called by the committed /v2 bundle now (rows marked *v2* in the Server routes table).
+
 Still to build: groups 8-11. Rows marked *pending: group N* in the Server routes table must all be *v2* when PR 4 is finished.
 
 ## Changes to the input inventories after checking the code
@@ -161,21 +163,21 @@ Input for the 4a.5 test (`tests/test_v2_parity.py::test_every_route_has_a_v2_cal
 | `/api/brokers` | GET | key-based broker list + fields | /v2 Settings → Connections → Broker (P-56) | v2 |
 | `/api/broker/cash` | GET | broker buying power + warning | classic: the view-model already carries limits.cash + broker.buying_power (P-13) | classic |
 | `/api/update/check` | GET | update check | /v2 lib/update.ts:36 (P-72) | v2 |
-| `/api/help/netcheck` | GET | connection check | /v2 Settings → Help and support (P-79) | pending: group 4 |
-| `/api/help/report` | GET | scrubbed support report | /v2 Settings → Help and support (P-80) | pending: group 4 |
-| `/api/wallet/quote` | GET | sats ↔ $ quote | /v2 Signals & pass → Payment wallet (P-52) | pending: group 7 |
+| `/api/help/netcheck` | GET | connection check | /v2 Settings → Help and support (P-79) | v2 |
+| `/api/help/report` | GET | scrubbed support report | /v2 Settings → Help and support (P-80) | v2 |
+| `/api/wallet/quote` | GET | sats ↔ $ quote | /v2 Signals & pass → Payment wallet (P-52) | v2 |
 | `/api/llm/providers` | GET | AI provider list | /v2 Settings → Connections → AI helper (P-59) | v2 |
 | `/api/pass/status` | GET | pass / invoice status | /v2 Buy signal days dialog (P-47) | v2 |
 | `/api/pass/options` | GET | pass sizes on sale | /v2 Buy signal days dialog (P-46) | v2 |
-| `/api/tip/options` | GET | tip tiers | /v2 Settings → Help and support → Tip (P-81) | pending: group 4 |
+| `/api/tip/options` | GET | tip tiers | /v2 Settings → Help and support → Tip (P-81) | v2 |
 | `/api/status` | GET | classic status payload | classic: classic page payload; every reading it has that /v2 lacks moves into /api/v2/status (P-26, P-33, P-39, P-48) | classic |
 | `/api/trades` | GET | trade log page | classic: /v2 uses /api/v2/activity (P-18, P-19) | classic |
 | `/api/pnl` | GET | all-time P&L | classic: /v2 uses view-model results.* (P-21..P-26) | classic |
 | `/api/v2/status` | GET | view-model | /v2 useStatus.ts:124, useUpdate.ts:36 | v2 |
 | `/api/v2/activity` | GET | older activity | /v2 useStatus.ts:179 | v2 |
 | `/api/v2/settings` | GET | typed settings, secret-free (PR 2; PR 4 adds expiry, open at login, dashboard, preview switch, self-edit, broker warning, consent) | /v2 useSettings.ts | v2 |
-| `/api/v2/agreement` | GET | the agreement's text (P-82) | /v2 Settings → Help and support | pending: group 4 |
-| `/api/proposal` | GET | pending code proposal | /v2 Settings → Code changes (P-74) | pending: group 5 |
+| `/api/v2/agreement` | GET | the agreement's text (P-82) | /v2 Settings → Help and support | v2 |
+| `/api/proposal` | GET | pending code proposal | /v2 Settings → Code changes (P-74) | v2 |
 | `/api/autostart` | GET | start-at-login state | classic: no page caller even at origin/main; /v2 reads GET /api/v2/settings computer.autostart (P-64) | classic |
 | `/api/move/download` | GET | download the .atmove file | /v2 Settings → This computer → Move (P-67) | v2 |
 | `/api/consent` | POST | accept the agreement | classic: first-run wizard (P-84); /v2 links /setup?from=v2 when terms change (P-83) | classic |
@@ -194,8 +196,8 @@ Input for the 4a.5 test (`tests/test_v2_parity.py::test_every_route_has_a_v2_cal
 | `/api/autostart` | POST | start at login on/off | classic: no page caller; PR 2 /api/v2/settings/computer calls the same autostart_set (P-64) | classic |
 | `/api/wallet/create` | POST | create / replace hosted wallet | classic: wrapped by NEW /api/v2/wallet/create two-step (P-50) | classic |
 | `/api/pass/buy` | POST | pass invoice | classic: wrapped by PR 2 /api/v2/pass/buy (P-46) | classic |
-| `/api/tip/create` | POST | tip invoice | /v2 Settings → Help and support → Tip (P-81) | pending: group 4 |
-| `/api/tip/status` | POST | tip paid? | /v2 Tip dialog (P-81) | pending: group 4 |
+| `/api/tip/create` | POST | tip invoice | /v2 Settings → Help and support → Tip (P-81) | v2 |
+| `/api/tip/status` | POST | tip paid? | /v2 Tip dialog (P-81) | v2 |
 | `/api/wallet/fund` | POST | wallet funding invoice | classic: wrapped by NEW /api/v2/wallet/fund two-step (P-52) | classic |
 | `/api/llm` | POST | connect AI helper | classic: wrapped by PR 2 /api/v2/settings/ai (P-59) | classic |
 | `/api/llm/models` | POST | list models for a key | /v2 Settings → Connections → AI helper (P-59) | v2 |
@@ -204,7 +206,7 @@ Input for the 4a.5 test (`tests/test_v2_parity.py::test_every_route_has_a_v2_cal
 | `/api/wallet/recurring` | POST | recurring day-pass | classic: wrapped by PR 2 /api/v2/wallet/recurring (P-53) | classic |
 | `/api/broker/connect` | POST | connect key broker | classic: wrapped by PR 2 /api/v2/broker/connect (P-56) | classic |
 | `/api/proposal/apply` | POST | apply code change + restart | classic: wrapped by NEW /api/v2/proposal/apply two-step (P-75) | classic |
-| `/api/proposal/reject` | POST | reject code change | /v2 Settings → Code changes (P-76) | pending: group 5 |
+| `/api/proposal/reject` | POST | reject code change | /v2 Settings → Code changes (P-76) | v2 |
 | `/api/command` | POST | free-text command / question | classic: after PR 3 step 6 + {action:'stop'} (P-07) and /api/v2/ask (P-15), /v2 sends no free text | classic |
 | `/api/v2/settings/limits` | POST | trade size, cap, loss limit, positions (two-step) | /v2 Rules & limits | v2 |
 | `/api/v2/settings/rules` | POST | built-in filters, written rules | /v2 Rules & limits | v2 |
@@ -214,20 +216,20 @@ Input for the 4a.5 test (`tests/test_v2_parity.py::test_every_route_has_a_v2_cal
 | `/api/v2/broker/connect` | POST | key-based broker (two-step) | /v2 Settings → Connections | v2 |
 | `/api/v2/broker/robinhood` | POST | Robinhood sign-in (two-step; PARITY's /api/v2/broker/robinhood/start) | /v2 Settings → Connections | v2 |
 | `/api/v2/pass/buy` | POST | signal days invoice (two-step) | /v2 Signals & pass | v2 |
-| `/api/v2/wallet/recurring` | POST | recurring day-pass (two-step) | /v2 Signals & pass → Payment wallet (P-53) | pending: group 7 |
+| `/api/v2/wallet/recurring` | POST | recurring day-pass (two-step) | /v2 Signals & pass → Payment wallet (P-53) | v2 |
 | `/api/v2/command` | POST | pause, resume, practice, LIVE (two-step), stop (two-step, P-07) | /v2 band; Settings → The agent on this computer | v2 |
 | `/api/v2/agent/start` | POST | start the agent (start_local; two-step when the saved mode is LIVE, P-08) | /v2 Settings → The agent on this computer | v2 |
 | `/api/v2/move/finish` | POST | retire this computer after the move file is saved (two-step, P-68) | /v2 Settings → This computer → Move | v2 |
 | `/api/v2/move/deploy` | POST | move to a new cloud server (two-step, P-69) | /v2 Settings → This computer → Move | v2 |
-| `/api/v2/settings/code` | POST | let the AI helper propose code changes (self_edit_enabled, P-77) | /v2 Settings → Code changes | pending: group 5 |
-| `/api/v2/proposal/request` | POST | ask the AI helper for a code change: self_edit.propose, never apply_command (P-78) | /v2 Settings → Code changes | pending: group 5 |
-| `/api/v2/proposal/apply` | POST | apply the reviewed code change and restart (two-step, bound to the sha256 of the diff shown, P-75) | /v2 Settings → Code changes | pending: group 5 |
-| `/api/v2/settings/source` | POST | signal source (two-step) or, alone, the subscription key (direct, write-only), through the classic source save (P-42, P-44) | /v2 Signals & pass → Signal source | pending: group 7 |
-| `/api/v2/settings/signals` | POST | which AgentHC signals (two-step, over source_scope) and the practice preview switch (direct) (P-43, P-49) | /v2 Signals & pass | pending: group 7 |
-| `/api/v2/wallet/create` | POST | make or replace the agent's wallet (two-step, over _wallet_create; no page link in the answer) (P-50) | /v2 Signals & pass → Payment wallet | pending: group 7 |
-| `/api/v2/wallet/fund` | POST | invoice to add sats to the agent's wallet (two-step, over the classic fund's invoice) (P-52) | /v2 Signals & pass → Payment wallet | pending: group 7 |
-| `/api/v2/wallet/connect` | POST | use your own LNbits wallet (two-step, over the classic source save; key write-only) (P-54) | /v2 Signals & pass → Payment wallet | pending: group 7 |
-| `/api/v2/wallet/page` | POST | the wallet page link, on click only (never in a GET) (P-51) | /v2 Signals & pass → Payment wallet | pending: group 7 |
+| `/api/v2/settings/code` | POST | let the AI helper propose code changes (self_edit_enabled, P-77) | /v2 Settings → Code changes | v2 |
+| `/api/v2/proposal/request` | POST | ask the AI helper for a code change: self_edit.propose, never apply_command (P-78) | /v2 Settings → Code changes | v2 |
+| `/api/v2/proposal/apply` | POST | apply the reviewed code change and restart (two-step, bound to the sha256 of the diff shown, P-75) | /v2 Settings → Code changes | v2 |
+| `/api/v2/settings/source` | POST | signal source (two-step) or, alone, the subscription key (direct, write-only), through the classic source save (P-42, P-44) | /v2 Signals & pass → Signal source | v2 |
+| `/api/v2/settings/signals` | POST | which AgentHC signals (two-step, over source_scope) and the practice preview switch (direct) (P-43, P-49) | /v2 Signals & pass | v2 |
+| `/api/v2/wallet/create` | POST | make or replace the agent's wallet (two-step, over _wallet_create; no page link in the answer) (P-50) | /v2 Signals & pass → Payment wallet | v2 |
+| `/api/v2/wallet/fund` | POST | invoice to add sats to the agent's wallet (two-step, over the classic fund's invoice) (P-52) | /v2 Signals & pass → Payment wallet | v2 |
+| `/api/v2/wallet/connect` | POST | use your own LNbits wallet (two-step, over the classic source save; key write-only) (P-54) | /v2 Signals & pass → Payment wallet | v2 |
+| `/api/v2/wallet/page` | POST | the wallet page link, on click only (never in a GET) (P-51) | /v2 Signals & pass → Payment wallet | v2 |
 
 Page paths (not in the route tables):
 
