@@ -400,6 +400,9 @@ STATES.update({
                               "path": "brokers/example.py", "content": "x = 1\n",
                               "diff": "--- a/brokers/example.py\n+++ b/brokers/"
                                       "example.py\n@@ -0,0 +1 @@\n+x = 1\n"}]})),
+    # AgentHC changed the agreement since the owner accepted it
+    "agreement-changed": (LIVE, _state(True), _history(True),
+                          runtime(consent_ok=False)),
     # LIVE on a broker's paper-trading account
     "paper-account": (
         {**LIVE, "broker": "alpaca", "alpaca_paper": True},

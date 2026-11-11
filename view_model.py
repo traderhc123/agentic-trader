@@ -360,7 +360,9 @@ def _types():
             "total": "int",
             "next": Opt("int"),
             "oldest": Opt("int"),
+            "day_lines": List(Ref("DayLines")),
         },
+        "DayLines": {"day": "str", "lines": "int"},
         "Activity": {
             "n": "int",
             "at": Opt("iso"),
@@ -402,6 +404,7 @@ def _types():
             "lost": "int",
             "unmeasured": "int",
             "unmeasured_today": "int",
+            "opened_today": "int",
             "days": List(Ref("BookDay")),
         },
         "BookDay": {"day": "str", "pnl": "num", "closed": "int"},
@@ -491,6 +494,12 @@ _DOC = {
     "NextAction.expiry_guard_at": "when the expiry guard would sell it on its "
                                   "expiry day, if it is still open then",
     "ActivityPage.next": "pass as ?before= for the page after this one",
+    "ActivityPage.day_lines": "for each market (ET) day this page has rows "
+                              "of, newest first: how many lines that day "
+                              "has in the whole log, so a page can tell a "
+                              "day it has only part of (\"\" = rows whose "
+                              "time could not be read)",
+    "DayLines.lines": "the day's lines in the whole log, of every kind",
     "Activity.n": "line number in the trade log: a stable row id",
     "Activity.known": "false: a kind this version can't describe",
     "Activity.real": "which book the row belongs to; null = not recorded",
@@ -505,6 +514,9 @@ _DOC = {
     "Book.last_7_days": "the last 7 calendar days (ET), today included",
     "Book.unmeasured_today": "sales today (ET) with no estimate: not in "
                              "`today`, and not in `days`",
+    "Book.opened_today": "entries today (the ET day `today` describes) in "
+                         "this book; the daily limit counts by UTC day "
+                         "instead (Limits.used_today)",
     "Results.real": "orders the agent sent to a real-money account (or one "
                     "not recorded as a paper-trading account)",
     "Results.paper_account": "orders filled in a broker's paper-trading "
@@ -992,15 +1004,28 @@ def activity_page(rows, before=None, limit=ACTIVITY_LIMIT, _checked=False):
     limit = max(1, min(_int(limit, ACTIVITY_LIMIT) or ACTIVITY_LIMIT,
                        ACTIVITY_LIMIT_MAX))
     rows = rows if _checked else _clean_rows(rows)
+    rows_all = rows
     oldest = rows[0]["n"] if rows else None
     cut = _int(before)
     if cut is not None:
         rows = [r for r in rows if r["n"] < cut]
     page = rows[-limit:]
+    days = []
+    for r in reversed(page):
+        d = _row_day(r)
+        if d not in days:
+            days.append(d)
+    want = set(days)
+    lines = dict.fromkeys(days, 0)
+    for r in rows_all:
+        d = _row_day(r)
+        if d in want:
+            lines[d] += 1
     return {"rows": [activity_row(r) for r in reversed(page)],
             "total": len(rows),
             "next": page[0]["n"] if page and len(rows) > len(page) else None,
-            "oldest": oldest}
+            "oldest": oldest,
+            "day_lines": [{"day": d, "lines": lines[d]} for d in days]}
 
 
 # ── results ──────────────────────────────────────────────────────────────────
@@ -1047,9 +1072,13 @@ def _results(rows, now):
                  - timedelta(days=6)).isoformat()
     books = {k: {"today": 0.0, "last_7_days": 0.0, "total": 0.0,
                  "closed": 0, "won": 0, "lost": 0, "unmeasured": 0,
-                 "unmeasured_today": 0, "days": {}}
+                 "unmeasured_today": 0, "opened_today": 0, "days": {}}
              for k in ("real", "practice", "paper_account")}
     for t in rows:
+        if t.get("action") == "entry":
+            # "Today so far · Opened": the ET day this panel describes
+            books[_book_key(t)]["opened_today"] += _row_day(t) == today
+            continue
         if t.get("action") != "exit":
             continue
         b = books[_book_key(t)]

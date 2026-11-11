@@ -364,6 +364,14 @@ export interface ActivityPage {
   /** pass as ?before= for the page after this one */
   next: number | null;
   oldest: number | null;
+  /** for each market (ET) day this page has rows of, newest first: how many lines that day has in the whole log, so a page can tell a day it has only part of ("" = rows whose time could not be read) */
+  day_lines: DayLines[];
+}
+
+export interface DayLines {
+  day: string;
+  /** the day's lines in the whole log, of every kind */
+  lines: number;
 }
 
 export interface Activity {
@@ -425,6 +433,8 @@ export interface Book {
   unmeasured: number;
   /** sales today (ET) with no estimate: not in `today`, and not in `days` */
   unmeasured_today: number;
+  /** entries today (the ET day `today` describes) in this book; the daily limit counts by UTC day instead (Limits.used_today) */
+  opened_today: number;
   days: BookDay[];
 }
 

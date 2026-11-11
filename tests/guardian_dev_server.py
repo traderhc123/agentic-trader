@@ -95,6 +95,11 @@ def _size(cfg, prefix):
     return {"mode": mode, "value": cfg.get(prefix + key)} if key else None
 
 
+def _sell(cfg):
+    v = cfg.get("expiry_guard_et", "15:45")
+    return None if v == "off" else v
+
+
 def _settings(tab):
     """A made-up GET /api/v2/settings for the tab's state (same shape)."""
     cfg = tab["cfg"]
@@ -124,8 +129,8 @@ def _settings(tab):
                      "keep_awake": cfg.get("keep_awake", True) is not False,
                      "open_dashboard_at_login": cfg.get("open_dashboard_at_login", True) is not False,
                      "dashboard": cfg.get("dashboard", "classic")},
-        "expiry": {"sell_et": "15:45", "alert_et": "15:50",
-                   "effective_today": {"sell_et": "15:45", "alert_et": "15:50",
+        "expiry": {"sell_et": _sell(cfg), "alert_et": "15:50",
+                   "effective_today": {"sell_et": _sell(cfg), "alert_et": "15:50",
                                        "close_et": "16:00", "early_close": False},
                    "described": "sells at 15:45 ET, alert at 15:50 ET",
                    "allowed": ["09:30", "15:59"]},
@@ -239,6 +244,13 @@ def _v2_post(tab, path, data):
                 new[k] = data[k]
                 changes.append({"key": k, "label": label, "saved_now": cfg.get(k),
                                 "new": data[k], "direction": _risk(cfg.get(k), data[k], unl)})
+        if "expiry_sell_et" in data and data["expiry_sell_et"] != (cfg.get("expiry_guard_et") or "15:45"):
+            new["expiry_guard_et"] = data["expiry_sell_et"]
+            before, after = _sell(cfg), _sell(new)
+            changes.append({"key": "expiry_sell_et", "label": "Expiry-day sell time",
+                            "saved_now": before, "new": after,
+                            "direction": "raises_risk" if after is None or (before and after > before)
+                            else "lowers_risk"})
         for book, prefix in (("main", ""), ("other", "other_")):
             spec = (data.get("trade_size") or {}).get(book)
             if spec is None:
@@ -331,6 +343,13 @@ def _v2_post(tab, path, data):
                 "amount_sats": 10200 * data["days"],
                 "amount_usd": 10 * data["days"], "extends": False, "carried": 0,
                 "access_until": None, "qr": [[int(v) for v in r] for r in qr]}
+    if path == "/api/v2/ask":
+        # answer-only, as the agent's own route: never a command
+        q = str(data.get("question") or "").strip()
+        if not q:
+            return {"ok": False, "error": "Type a question first."}
+        return {"ok": True, "answer": "(fixture server) The agent would answer here from "
+                f"its status and recent trades. You asked: {q[:200]}"}
     if path == "/api/v2/settings/code":
         cfg["self_edit_enabled"] = bool(data.get("self_edit_enabled"))
         return {"ok": True, "saved": True}

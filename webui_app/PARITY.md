@@ -230,6 +230,7 @@ Input for the 4a.5 test (`tests/test_v2_parity.py::test_every_route_has_a_v2_cal
 | `/api/v2/wallet/fund` | POST | invoice to add sats to the agent's wallet (two-step, over the classic fund's invoice) (P-52) | /v2 Signals & pass → Payment wallet | v2 |
 | `/api/v2/wallet/connect` | POST | use your own LNbits wallet (two-step, over the classic source save; key write-only) (P-54) | /v2 Signals & pass → Payment wallet | v2 |
 | `/api/v2/wallet/page` | POST | the wallet page link, on click only (never in a GET) (P-51) | /v2 Signals & pass → Payment wallet | v2 |
+| `/api/v2/ask` | POST | "Ask your agent": answer-only, the classic chat's fallback answer function (_ask_llm with the same status fields and trades), never apply_command (P-15, P-16) | pending: group 10 | pending: group 10 |
 
 Page paths (not in the route tables):
 

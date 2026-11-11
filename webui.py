@@ -3408,6 +3408,25 @@ def _book_size(cfg, prefix):
     return {"mode": mode, "value": cfg.get(f"{prefix}{_SZ_VALUE_KEY[mode]}")}
 
 
+def _hhmm(mins):
+    """Minutes after midnight as "HH:MM"; None (off) stays None."""
+    return None if mins is None else f"{mins // 60:02d}:{mins % 60:02d}"
+
+
+def _expiry_direction(old, new):
+    """The expiry-day sell time ("HH:MM" or None = off): switching it off
+    raises the risk (an expiring contract is then sold only by an exit
+    signal, else exercised or left to expire), switching it on lowers it;
+    a later time holds the contract longer into its last day."""
+    if old == new:
+        return "neutral"
+    if new is None:
+        return "raises_risk"
+    if old is None:
+        return "lowers_risk"
+    return "raises_risk" if new > old else "lowers_risk"
+
+
 def _size_direction(old, new):
     if old and new and old["mode"] == new["mode"]:
         return _risk_direction(old.get("value"), new.get("value"))
@@ -4889,6 +4908,25 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             A.set_position_cap(new, _v2_number(
                 p["max_open_positions"], "max_open_positions",
                 *_V2_LIMIT_RANGES["max_open_positions"], whole=True))
+        if "expiry_sell_et" in p:
+            # the chat's "expiry guard off|HH:MM", by the same check and
+            # into the same key (agent._expiry_setting)
+            v = p["expiry_sell_et"]
+            sell = (A._expiry_setting(v, A.EXPIRY_GUARD_DEFAULT)
+                    if isinstance(v, str) and v != "on" else None)
+            if sell is None:
+                raise _Invalid('expiry_sell_et must be "off" or a time from '
+                               "09:30 to 15:59 (HH:MM, Eastern). Nothing was "
+                               "changed.")
+            new["expiry_guard_et"] = sell
+            before = _hhmm(A._et_hhmm(cfg, "expiry_guard_et",
+                                      A.EXPIRY_GUARD_DEFAULT))
+            after = _hhmm(A._et_hhmm(new, "expiry_guard_et",
+                                     A.EXPIRY_GUARD_DEFAULT))
+            if before != after:
+                changes.append(_change("expiry_sell_et", "Expiry-day sell time",
+                                       before, after,
+                                       _expiry_direction(before, after)))
         for key, label, default, unlimited in (
                 ("max_entries_per_day", "New trades per day", 5, False),
                 ("max_daily_loss_usd", "Daily loss limit", None, True),
@@ -4903,10 +4941,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     @_v2
     def v2_limits(data):
         """POST /api/v2/settings/limits: trade size per book, new trades per
-        day, daily loss limit, positions open at once. Partial: only the
-        keys sent change. Never touches Practice/LIVE or the pause."""
+        day, daily loss limit, positions open at once, and the expiry-day
+        sell time (the chat's "expiry guard"). Partial: only the keys sent
+        change. Never touches Practice/LIVE or the pause."""
         p = _v2_payload(data, ("trade_size", "max_entries_per_day",
-                               "max_daily_loss_usd", "max_open_positions"))
+                               "max_daily_loss_usd", "max_open_positions",
+                               "expiry_sell_et"))
         if not p:
             raise _Invalid("Send at least one limit. Nothing was changed.")
         with A.CONFIG_LOCK:
@@ -5827,6 +5867,38 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "address this page can open."}
         return {"ok": True, "url": page}
 
+    @_v2
+    def v2_ask(data):
+        """POST /api/v2/ask {question}: "Ask your agent" on Today. Answer
+        only: the answer function the classic chat falls back to (_ask_llm,
+        with the same settings, status fields and recent trades d_command
+        hands it), and never the chat's commands: no apply_command, no
+        "code:", nothing saved. What reads like a command is a question."""
+        import llm_client
+        if not isinstance(data, dict) or set(data) != {"question"}:
+            raise _Invalid("Send {question}: the question only.")
+        q = data["question"]
+        if not isinstance(q, str) or not q.strip():
+            raise _Invalid("Type a question first.")
+        if len(q) > 2000 or any(ord(ch) < 32 and ch not in "\n\t" for ch in q):
+            raise _Invalid("The question must be plain text of at most 2,000 "
+                           "characters.")
+        if apply_command is None:
+            # as d_command: with no agent behind this server there is no
+            # status or trade log to answer from
+            return {"ok": False, "error": "The agent isn't running, so it can't "
+                    "answer yet. Start it in Settings, under The agent on this "
+                    "computer."}
+        now = cfg_getter() if cfg_getter else cfg
+        if not llm_client.configured(now):
+            return {"ok": False, "error": "No AI helper is connected, so there is "
+                    "nobody to answer. Connect one in Settings, under "
+                    "Connections."}
+        answer = _ask_llm(now, q.strip(), d_status(None).get("fields", {}),
+                          get_trades() if get_trades else [],
+                          system=_V2_ASK_SYSTEM)
+        return {"ok": True, "answer": str(answer)}
+
     W.routes_get = {"/api/state": state, "/api/rh/start": rh_start,
                     "/api/wallet/balance": wallet_balance,
                     "/api/deploy/status": deploy_status,
@@ -5907,7 +5979,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/v2/wallet/create": v2_wallet_create,
                      "/api/v2/wallet/fund": v2_wallet_fund,
                      "/api/v2/wallet/connect": v2_wallet_connect,
-                     "/api/v2/wallet/page": v2_wallet_page}
+                     "/api/v2/wallet/page": v2_wallet_page,
+                     "/api/v2/ask": v2_ask}
 
     W.routes_get = {p: _fresh(fn) for p, fn in W.routes_get.items()}
     W.routes_post = {p: _fresh(fn) for p, fn in W.routes_post.items()}
@@ -6352,6 +6425,23 @@ def _llm_safe_state(st):
     out["notes"] = {k: link.sub(lambda m: _site_only(m.group(0)), str(v))
                     for k, v in (st.get("notes") or {}).items()}
     return out
+
+
+# "Ask your agent" in /v2 (POST /api/v2/ask): _ask_llm's own instructions,
+# except that /v2 takes no typed commands, so for control the answer points
+# at the page that has the control instead of at a chat command.
+_V2_ASK_SYSTEM = (
+    "You are the status assistant embedded in the user's own agentic-trader "
+    "instance. Answer questions using ONLY the status and trade-log data "
+    "provided. You cannot place, modify, or size trades, and you cannot "
+    "change any setting: this box only answers. For control, tell the user "
+    "where it is on their dashboard: Pause / Resume and Practice / LIVE in "
+    "the bar at the top; trade size, daily limits, the expiry-day sell time "
+    "and which signals to take in Rules & limits; the signal source, signal "
+    "days and the payment wallet in Signals & pass; the broker, AI helper, "
+    "alerts, start at login, stopping or starting the agent and code changes "
+    "in Settings. Never give investment advice; you may explain what the "
+    "agent did and why (per its logs). Be concise and plain-spoken.")
 
 
 def _ask_llm(cfg, question, status_fields, trades, system=None):
