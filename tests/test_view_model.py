@@ -373,7 +373,9 @@ def test_empty_first_run():
     assert s["signals"]["last_poll"] is None
     assert s["signals"]["last_signal"] is None
     assert s["signals"]["pass"] == {"kind": "none", "status": "none",
-                                    "days_left": None, "auto_pay": False}
+                                    "days_left": None, "auto_pay": False,
+                                    "last_day": False, "exits_until": None}
+    assert s["signals"]["exit_loss"] is None
     assert s["broker"]["connected"] is None
     assert s["limits"]["cap"] == 5 and s["limits"]["max_positions"] == 10
     assert s["entry_checks"] == [c for c, _k in agent.ENTRY_CHECKS]
@@ -935,7 +937,8 @@ def test_signal_pass_states():
     prepaid = {**base, "feed_pass": {"token": "tok"}}
     s = p(prepaid, {"pass_status": {tid: {"status": "active", "days_left": 13}}})
     assert s["signals"]["pass"] == {"kind": "prepaid", "status": "active",
-                                    "days_left": 13, "auto_pay": False}
+                                    "days_left": 13, "auto_pay": False,
+                                    "last_day": False, "exits_until": None}
     used = p(prepaid, {"pass_status": {tid: {"status": "exits_only"}}},
              feed_access=False)
     assert used["signals"]["pass"]["status"] == "exits_only"
@@ -956,7 +959,7 @@ def test_signal_pass_states():
     wallet = {**base, "lnbits_url": "https://wallet.example", "day_pass_recurring": True}
     assert p(wallet, feed_access=None)["signals"]["pass"] == {
         "kind": "day_pass", "status": "waiting", "days_left": None,
-        "auto_pay": True}
+        "auto_pay": True, "last_day": False, "exits_until": None}
     # not read yet, auto-pay on: nothing says it can't
     assert p(wallet, feed_access=None)["capabilities"]["opening"]["state"] \
         == "practice_only"
@@ -965,7 +968,7 @@ def test_signal_pass_states():
     assert p(base, feed_access=None)["signals"]["pass"]["kind"] == "none"
     assert p({**CFG, "source": "manual"})["signals"]["pass"] == {
         "kind": "not_needed", "status": "active", "days_left": None,
-        "auto_pay": False}
+        "auto_pay": False, "last_day": False, "exits_until": None}
     assert p(base, poll_ok=False, feed_access=True)["capabilities"][
         "listening"] == {"state": "cant", "reason_code": "feed_unreachable"}
 
@@ -1203,3 +1206,66 @@ def test_reason_codes_cover_the_rule_codes_and_every_logged_kind():
     for check, logged in agent.ENTRY_CHECKS:
         assert check in vm.check_ids()
     assert set(vm._ENTRY_ONLY_KINDS) <= kinds
+
+
+# ── one note per condition; the pass's last day; no exit signals ────────────
+
+def _tid(token):
+    from sources import agenthc_day_trade_ideas as hc
+    return hc._token_id(token)
+
+
+LIVE_PASS = {**CFG, "dry_run": False, "agenthc_api_key": "",
+             "feed_pass": {"token": "tok"}}
+
+
+def test_a_lapsed_prepaid_pass_is_one_condition():
+    """The agent's saved lapse notice and the dashboard's own pass note are
+    one condition (signal_pass), said once."""
+    st = {**state(**{SPY: real_pos()}),
+          "pass_status": {_tid("tok"): {"status": "used_up"}},
+          "pass_notice": "Your signal pass has run out: no new trades until "
+                         "you buy more signal days."}
+    s = build(cfg=LIVE_PASS, st=st, rt=runtime(feed_access=False))
+    (c,) = [c for c in s["conditions"] if c["code"] == "signal_pass"]
+    assert [s["notices"][i]["code"] for i in c["notices"]] == ["pass"]
+
+
+def test_pass_last_day_and_exits_until():
+    base = {"pass_status": {_tid("tok"): {"status": "active", "days_left": 0}}}
+    s = build(cfg=LIVE_PASS, st={**state(), **base, "pass_charged_day": TODAY})
+    assert s["signals"]["pass"]["last_day"] is True
+    s = build(cfg=LIVE_PASS, st={**state(), **base, "pass_charged_day": "2026-11-06"})
+    assert s["signals"]["pass"]["last_day"] is False
+    used = {"pass_status": {_tid("tok"): {
+        "status": "exits_only", "days_left": 0,
+        "exits_until": datetime(2026, 11, 12, 1, 0, tzinfo=timezone.utc).timestamp()}}}
+    p = build(cfg=LIVE_PASS, st={**state(), **used},
+              rt=runtime(feed_access=False))["signals"]["pass"]
+    assert p["exits_until"] == "2026-11-12T01:00:00Z" and p["last_day"] is False
+
+
+def test_exit_loss_says_since_when_why_and_when_it_sells():
+    since = datetime(2026, 11, 9, 19, 0, tzinfo=timezone.utc)      # 14:00 ET
+    warned = datetime(2026, 11, 9, 19, 5, tzinfo=timezone.utc)
+    st = {**state(**{SPY: real_pos()}),
+          "signal_loss": {"since": since.timestamp(), "cause": "pass_ended",
+                          "warned_at": warned.timestamp(),
+                          "warned_day": TODAY}}
+    s = build(cfg=LIVE_PASS, st=st, rt=runtime(feed_access=False))
+    assert s["signals"]["exit_loss"] == {
+        "since": "2026-11-09T19:00:00Z", "cause": "pass_ended",
+        "sell_at": "2026-11-09T20:30:00Z", "armed": True}
+    off = build(cfg={**LIVE_PASS, "signal_loss_sell_et": "off"}, st=st,
+                rt=runtime(feed_access=False))["signals"]["exit_loss"]
+    assert off["armed"] is False and off["sell_at"] is None
+    # not warned yet: the sale comes 15 minutes after the warning can go out
+    late = {**st, "signal_loss": {"since": since.timestamp(), "cause": "odd"}}
+    x = build(cfg={**LIVE_PASS, "signal_loss_sell_et": "14:30"}, st=late,
+              rt=runtime(feed_access=False))["signals"]["exit_loss"]
+    assert x["cause"] == "feed_error"
+    assert x["sell_at"] == "2026-11-09T19:56:07Z" and x["armed"] is True
+    # nothing held: nothing to sell
+    none = build(cfg=LIVE_PASS, st={**st, "positions": {}},
+                 rt=runtime(feed_access=False))["signals"]["exit_loss"]
+    assert none["armed"] is False and none["since"] == "2026-11-09T19:00:00Z"

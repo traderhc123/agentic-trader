@@ -95,6 +95,11 @@ PASS_KINDS = ("prepaid", "day_pass", "subscription", "not_needed", "none")
 # unknown: a prepaid pass the agent could not check with AgentHC (the check
 # failed, or it has not run yet); it reads no signals until it can
 PASS_STATES = ("active", "exits_only", "waiting", "none", "unknown")
+# why no exit signal reaches the agent (agent._note_exit_source: the source's
+# exit_loss_reason(), or feed_error when its read failed)
+EXIT_LOSS_CAUSES = ("pass_ended", "pass_unpaid", "pass_unchecked", "no_day_pass",
+                    "day_pass_refused", "feed_error", "feed_not_live",
+                    "feed_refused")
 
 # trade-log kinds ("action") -> the reason code a row of that kind gets when
 # the row itself doesn't carry a more exact one. Anything else is "unknown".
@@ -232,12 +237,21 @@ def _types():
             "last_signal": Opt("iso"),
             "last_signal_from": Opt(Enum("feed", "activity_log")),
             "pass": Ref("Pass"),
+            "exit_loss": Opt(Ref("ExitLoss")),
         },
         "Pass": {
             "kind": Enum(*PASS_KINDS),
             "status": Enum(*PASS_STATES),
             "days_left": Opt("int"),
             "auto_pay": "bool",
+            "last_day": "bool",
+            "exits_until": Opt("iso"),
+        },
+        "ExitLoss": {
+            "since": "iso",
+            "cause": Enum(*EXIT_LOSS_CAUSES),
+            "sell_at": Opt("iso"),
+            "armed": "bool",
         },
         "Market": {
             "open": "bool",
@@ -415,6 +429,16 @@ _DOC = {
                             "signals (false: no pass or day-pass, or it "
                             "ran out); null = not read yet",
     "Signals.last_signal": "when the newest signal the agent has seen happened",
+    "Pass.last_day": "today is the last day the prepaid pass covers new "
+                     "trades (its last signal day was charged today)",
+    "Pass.exits_until": "when a used-up pass stops getting exit signals, if "
+                        "AgentHC said",
+    "Signals.exit_loss": "null while exit signals can reach the agent; else "
+                         "since when they can't and why",
+    "ExitLoss.sell_at": "when the agent sells what it holds today because of "
+                        "it (the no-signal sell); null = it won't today",
+    "ExitLoss.armed": "true: the agent will sell its positions itself at "
+                      "sell_at unless exit signals come back",
     "Pass.status": "unknown: a prepaid pass the agent could not check with "
                    "AgentHC yet (it reads no signals until it can); a wallet "
                    "day-pass that is running counts as active",
@@ -1344,7 +1368,7 @@ def _pass(cfg, state, now):
     """What signal access the agent has, as data — the cases of
     sources.agenthc_day_trade_ideas.pass_summary."""
     none = {"kind": "none", "status": "none", "days_left": None,
-            "auto_pay": False}
+            "auto_pay": False, "last_day": False, "exits_until": None}
     if cfg.get("source", "agenthc") != "agenthc":
         return {**none, "kind": "not_needed", "status": "active"}
     if cfg.get("agenthc_api_key"):
@@ -1375,27 +1399,52 @@ def _pass(cfg, state, now):
     live = bool(l402.get("token")) and until is not None \
         and until > now.timestamp()
     if live and not (best and best.get("status") == "active"):
-        return {"kind": "day_pass", "status": "active", "days_left": None,
-                "auto_pay": auto}
+        return {**none, "kind": "day_pass", "status": "active", "auto_pay": auto}
     if best:
         left = _int(best.get("days_left"))
-        return {"kind": "prepaid", "status": best["status"],
+        import agent as A
+        today = now.astimezone(A.MARKET_TZ).date().isoformat()
+        exits_until = _num(best.get("exits_until"))
+        return {**none, "kind": "prepaid", "status": best["status"],
                 "days_left": left if left is not None and left >= 0 else None,
-                "auto_pay": auto}
+                "auto_pay": auto,
+                # its last signal day was charged today (hc._poll_with_pass)
+                "last_day": (best["status"] == "active" and left == 0
+                             and state.get("pass_charged_day") == today),
+                "exits_until": (_iso(exits_until) if exits_until
+                                and best["status"] == "exits_only" else None)}
     if tokens:
         # no record for a pass: its check with AgentHC failed (or has not
         # run yet), and hc.poll reads nothing until it knows — never "used
         # up" on a guess
-        return {"kind": "prepaid",
+        return {**none, "kind": "prepaid",
                 "status": "unknown" if None in statuses else "waiting",
-                "days_left": None, "auto_pay": auto}
+                "auto_pay": auto}
     if cfg.get("lnbits_url"):
         # no day-pass in hand: with auto-pay on, the agent buys one on its
         # next read of the feed on a market day
-        return {"kind": "day_pass",
-                "status": "waiting" if auto else "none",
-                "days_left": None, "auto_pay": auto}
+        return {**none, "kind": "day_pass",
+                "status": "waiting" if auto else "none", "auto_pay": auto}
     return none
+
+
+def _exit_loss(cfg, state, now):
+    """Since when no exit signal can reach the agent and why, and when it
+    sells what it holds because of that (agent.signal_loss_tick) — None
+    while exit signals arrive."""
+    import agent as A
+    rec = state.get("signal_loss")
+    if not isinstance(rec, dict) or _num(rec.get("since")) is None:
+        return None
+    try:
+        at = A.signal_loss_sell_at(cfg, state, now.astimezone(A.MARKET_TZ))
+    except Exception:
+        at = None   # can't tell: never promise a sale
+    cause = rec.get("cause")
+    return {"since": _iso(rec["since"]),
+            "cause": cause if cause in EXIT_LOSS_CAUSES else "feed_error",
+            "sell_at": _iso(at) if at else None,
+            "armed": at is not None}
 
 
 # event ids the agent makes up itself (the expiry guard, a close it found in
@@ -1760,6 +1809,7 @@ def build_status(cfg, state, rows, runtime=None, now=None,
         "last_signal": last_signal,
         "last_signal_from": signal_from,
         "pass": _pass(cfg, state, now),
+        "exit_loss": _exit_loss(cfg, state, now),
     }
     market = _market(cfg, now)
     c["past_close"] = (c["now_et"].hour * 60 + c["now_et"].minute

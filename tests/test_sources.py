@@ -568,7 +568,7 @@ def test_exits_only_pass_keeps_reading_exits_and_warns(monkeypatch):
     state = {}
     events = agenthc.poll(_pass_cfg(), state, lambda s: None)
     assert [e["event"] for e in events] == ["EXITED"]
-    assert len(sent) == 1 and "EXIT signals" in sent[0]
+    assert sent == [agenthc.PASS_USED_UP_TEXT]
     assert "used up" in agenthc.pass_summary(_pass_cfg(), state)
 
 
@@ -821,3 +821,112 @@ def test_feed_not_live_has_no_exit_access(monkeypatch):
     state = {"pass_status": {tid: {"status": "active", "until_ts": 9e12}}}
     assert agenthc.poll(_pass_cfg(), state, lambda s: None) == []
     assert _exit_flag() == (False, "feed_not_live")
+
+
+# ── pass notices: new trades only, one note per condition ───────────────────
+
+def test_pass_notices_speak_only_about_new_trades():
+    texts = (agenthc.PASS_LOW_TEXT.format(n=2), agenthc.PASS_LAST_DAY_TEXT,
+             agenthc.PASS_USED_UP_TEXT, agenthc.PASS_RUN_OUT_TEXT)
+    assert texts == (
+        "Your signal pass has 2 signal day(s) left. Buy more in the dashboard "
+        "(Settings → Signal source); unused days carry over.",
+        "Today is the last day your signal pass covers new trades. Buy more "
+        "signal days (dashboard → Settings → Signal source) to keep getting new "
+        "trades. Exit signals for trades already open keep arriving.",
+        "Your signal pass is used up: no new trades until you buy more signal "
+        "days (dashboard → Settings → Signal source). Exit signals for the "
+        "trades your agent already opened still arrive.",
+        "Your signal pass has run out: no new trades until you buy more signal "
+        "days (dashboard → Settings → Signal source).")
+    for t in texts:
+        assert "position" not in t and "watch" not in t
+
+
+def _feed_body(srv, **body):
+    orig = srv.get
+
+    def get(url, params=None, headers=None, timeout=None):
+        r = orig(url, params, headers, timeout)
+        if not url.endswith("/pass"):
+            r._payload = {"events": [], **body}
+        return r
+    return get
+
+
+def test_run_out_notice_is_the_new_text(monkeypatch):
+    monkeypatch.setattr(agenthc.requests, "get", _PassServer(status="expired").get)
+    sent = []
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: sent.append(text))
+    state = {}
+    agenthc.poll(_pass_cfg(), state, lambda s: None)
+    assert sent == [agenthc.PASS_RUN_OUT_TEXT]
+    assert state["pass_notice"] == agenthc.PASS_RUN_OUT_TEXT
+
+
+def test_last_day_notice_once_per_day(monkeypatch):
+    srv = _PassServer(days_left=0)
+    monkeypatch.setattr(agenthc.requests, "get", _feed_body(
+        srv, pass_days_left=0, pass_charged_today=True))
+    sent = []
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: sent.append(text))
+    state = {}
+    for _ in range(3):
+        agenthc.poll(_pass_cfg(), state, lambda s: None)
+    assert sent == [agenthc.PASS_LAST_DAY_TEXT]
+    assert state["pass_last_day_notified"] == time.strftime("%Y-%m-%d")
+    # not charged today with 0 left: the "days left" notice, as before
+    sent.clear()
+    monkeypatch.setattr(agenthc.requests, "get", _feed_body(srv, pass_days_left=0))
+    agenthc.poll(_pass_cfg(), {}, lambda s: None)
+    assert sent == [agenthc.PASS_LOW_TEXT.format(n=0)]
+
+
+def test_pass_notice_is_cleared_after_a_read_with_entry_access(monkeypatch):
+    srv = _PassServer()
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    state = {"pass_notice": agenthc.PASS_RUN_OUT_TEXT}
+    agenthc.poll(_pass_cfg(), state, lambda s: None)
+    assert "pass_notice" not in state
+    # with an API key or a wallet day-pass too
+    monkeypatch.setattr(agenthc.requests, "get",
+                        lambda *a, **kw: FakeResp({"events": []}))
+    state = {"pass_notice": agenthc.PASS_RUN_OUT_TEXT}
+    agenthc.poll({"agenthc_api_key": "k"}, state, lambda s: None)
+    assert "pass_notice" not in state
+    # a wallet day-pass alert stays until that problem ends
+    state = {"pass_notice": "AgentHC refused the day-pass…",
+             "daypass_alert": "daypass_refused_notified"}
+    agenthc.poll({"agenthc_api_key": "k"}, state, lambda s: None)
+    assert state["pass_notice"] == "AgentHC refused the day-pass…"
+
+
+def test_exits_only_read_keeps_the_notice_and_the_exits_end(monkeypatch):
+    srv = _PassServer(status="exits_only", days_left=0)
+    monkeypatch.setattr(agenthc.requests, "get", _feed_body(
+        srv, pass_days_left=0, pass_exits_only=True,
+        pass_exits_until="2026-07-17T00:00:00+00:00"))
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: None)
+    state = {}
+    agenthc.poll(_pass_cfg(), state, lambda s: None)
+    assert state["pass_notice"] == agenthc.PASS_USED_UP_TEXT
+    rec = state["pass_status"][agenthc._token_id(PASS_TOK)]
+    assert rec["exits_until"] == agenthc._iso_ts("2026-07-17T00:00:00+00:00")
+
+
+def test_day_pass_alerts_end_at_no_new_trades(monkeypatch):
+    resp = FakeResp({"detail": "payment required"}, status=402)
+    monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
+    sent = []
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: sent.append(text))
+    state = {"l402": {"token": "L402 m:p", "expires_at": time.time() + 3600,
+                      "paid_day": "2026-07-15"}}
+    agenthc.poll({}, state, lambda s: None)
+    (text,) = sent
+    assert "the agent gets no new trades" in text
+    assert "position" not in text and "watch" not in text
+    assert not hasattr(agenthc, "_NO_SIGNALS")

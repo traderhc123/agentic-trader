@@ -59,6 +59,24 @@ _PENDING_ALERT_S = 600          # undecided this long: tell the owner
 _PENDING_MAX_AGE_S = 24 * 3600  # undecided this long: stop waiting for it
 
 
+# The pass notices (Discord/ntfy/Telegram + dashboard) say what the pass
+# means for NEW trades only. What happens to positions the agent already
+# holds is said once, by the agent's no-signal warning (agent.py,
+# signal_loss_tick) and the dashboard's positions note.
+_SETTINGS = "dashboard → Settings → Signal source"
+PASS_LOW_TEXT = ("Your signal pass has {n} signal day(s) left. Buy more in the "
+                 "dashboard (Settings → Signal source); unused days carry over.")
+PASS_LAST_DAY_TEXT = ("Today is the last day your signal pass covers new "
+                      f"trades. Buy more signal days ({_SETTINGS}) to keep "
+                      "getting new trades. Exit signals for trades already "
+                      "open keep arriving.")
+PASS_USED_UP_TEXT = ("Your signal pass is used up: no new trades until you buy "
+                     f"more signal days ({_SETTINGS}). Exit signals for the "
+                     "trades your agent already opened still arrive.")
+PASS_RUN_OUT_TEXT = ("Your signal pass has run out: no new trades until you "
+                     f"buy more signal days ({_SETTINGS}).")
+
+
 class PassUnavailable(RuntimeError):
     """The feed server isn't selling prepaid passes (yet)."""
 
@@ -496,6 +514,8 @@ def _refresh_pass(cfg, state, save_state, force=False):
                 rec = {"status": fresh.get("status"), "until_ts": until_ts,
                        "days_left": fresh.get("days_left", fresh.get("trading_days_left")),
                        "checked": now, "first_seen": rec.get("first_seen", now)}
+                if fresh.get("exits_until"):
+                    rec["exits_until"] = _iso_ts(fresh["exits_until"]) or None
                 cache[tid] = rec
                 save_state(state)
         if rec.get("status") in _USABLE:
@@ -542,16 +562,21 @@ def _daypass_alert(cfg, state, save_state, key, text):
         save_state(state)
 
 
+def _entry_read(state, save_state):
+    """The feed was just read with entry access: a saved pass notice (a
+    lapse, a used-up pass) is no longer true, so it goes. A current wallet
+    day-pass alert stays: it is cleared when that problem ends."""
+    if state.get("pass_notice") and not state.get("daypass_alert"):
+        state.pop("pass_notice", None)
+        save_state(state)
+
+
 def _daypass_alert_clear(state):
     """Take a day-pass alert off the dashboard. Returns True when it did."""
     if not state.pop("daypass_alert", None):
         return False
     state.pop("pass_notice", None)
     return True
-
-
-_NO_SIGNALS = ("no new entries, and no exit signals for positions it holds, so "
-               "watch those yourself")
 
 
 def _retry_text():
@@ -702,7 +727,7 @@ def _no_receipt_text(sats):
             "receipt (the \"preimage\") that AgentHC needs to open the feed, "
             "so that pass could not be used. To stop this from costing you "
             "every day, your agent will NOT buy another day-pass with this "
-            f"wallet. It gets no signals — {_NO_SIGNALS}. To start again: "
+            "wallet. The agent gets no new trades. To start again: "
             "connect a different Lightning wallet, or buy signal days with a "
             "prepaid pass (dashboard → Settings → Signal source). If you "
             "know the wallet is fixed, switch 'Recurring day-pass' off and "
@@ -942,7 +967,7 @@ def _settle_daypass(cfg, state, save_state, wallet=None):
                 "undecided. The agent can't ask the previous wallet about it "
                 "any more, so it will not pay again from the new wallet for "
                 "now — it might pay twice for the same day. Until this is "
-                f"sorted out it gets no signals — {_NO_SIGNALS}. It buys "
+                "sorted out the agent gets no new trades. It buys "
                 "again once a day has passed since that payment. If you "
                 "switch back to the previous wallet, the agent asks it again "
                 "and uses the pass if it was paid. (When a wallet is "
@@ -953,8 +978,8 @@ def _settle_daypass(cfg, state, save_state, wallet=None):
                 f"Your agent asked its wallet to pay {amount:,} sats for "
                 "today's day-pass, and the wallet has not said yet whether the "
                 "payment went through. The agent will not pay again while this "
-                "payment is undecided, so it gets no signals for now — "
-                f"{_NO_SIGNALS}. It keeps asking the wallet and uses the pass "
+                "payment is undecided, so for now the agent gets no new "
+                "trades. It keeps asking the wallet and uses the pass "
                 "as soon as the payment is confirmed. If the payment failed — "
                 "or the wallet still has no record of it once the invoice has "
                 "expired, about an hour after it was issued — the sats are "
@@ -980,7 +1005,7 @@ def _buy_day_pass(cfg, state, body, save_state):
             _daypass_alert(
                 cfg, state, save_state, "daypass_invoice_notified",
                 f"Your agent did not buy today's day-pass. {exc} Until a "
-                f"day-pass is paid the agent gets no signals — {_NO_SIGNALS}. "
+                "day-pass is paid the agent gets no new trades. "
                 f"{_retry_text()} If this keeps happening, update the agent "
                 "or contact AgentHC.")
         raise
@@ -1076,7 +1101,7 @@ def _pay_day_pass(cfg, state, body, save_state):
                 cfg, state, save_state, "daypass_failed_notified",
                 "Your agent's wallet could not pay for today's day-pass "
                 f"({amount:,} sats): {why}. Nothing was paid. Until a pass is "
-                f"paid the agent gets no signals — {_NO_SIGNALS}. "
+                "paid the agent gets no new trades. "
                 f"{_retry_text()}")
             raise RuntimeError(f"Day-pass payment failed — nothing was paid: {reason}")
         if outcome != "paid":
@@ -1167,9 +1192,7 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             if "pending" in statuses:
                 return _no_read("pass_unpaid")  # invoice shown, not paid yet
             _pass_notice(cfg, state, save_state, "pass_expired_notified",
-                         "Your AgentHC feed pass has run out — the agent gets no "
-                         "signals until you buy more signal days (dashboard → "
-                         "Settings → Signal source).")
+                         PASS_RUN_OUT_TEXT)
             return _no_read("pass_ended")
         # else: fall through to the wallet's daily auto-pay
     # Skip the request entirely when access is impossible: no API key, no
@@ -1215,9 +1238,8 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             "AgentHC refused the day-pass your agent's wallet paid for "
             "today. The agent will NOT buy another one today. It keeps "
             f"offering the paid pass every {_REFUSED_RETRY_S // 60} minutes; "
-            "until AgentHC accepts it the agent gets no signals — no new "
-            "entries, and no exit signals for positions it holds, so watch "
-            "those yourself. If this doesn't clear up, contact AgentHC with "
+            "until AgentHC accepts it the agent gets no new trades. If this "
+            "doesn't clear up, contact AgentHC with "
             "the time of the payment from your wallet's payment list.")
         return _no_read("day_pass_refused")
     if resp.status_code == 402 and not _retried:
@@ -1254,6 +1276,7 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
                 and _record_paid_day(state, now.strftime("%Y-%m-%d"))):
             save_state(state)
     _LAST_POLL.update(access=True, exits=True)
+    _entry_read(state, save_state)
     return _parse_events(resp.json())
 
 
@@ -1288,21 +1311,27 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
     rec = state.setdefault("pass_status", {}).get(_token_id(token))
     if rec is not None:
         new_status = "exits_only" if exits_only else "active"
-        if rec.get("days_left") != left or rec.get("status") != new_status:
+        until = (_iso_ts(body.get("pass_exits_until")) or None) if exits_only else None
+        if (rec.get("days_left") != left or rec.get("status") != new_status
+                or rec.get("exits_until") != until):
             rec["days_left"] = left
             rec["status"] = new_status
+            if until:
+                rec["exits_until"] = until
+            else:
+                rec.pop("exits_until", None)
             save_state(state)
     if exits_only:
         _pass_notice(cfg, state, save_state, "pass_used_up_notified",
-                     "Your AgentHC feed pass is used up — for a few more days "
-                     "the agent still gets EXIT signals (so open positions can "
-                     "close), but no new entries. Buy more signal days in the "
-                     "dashboard (Settings → Signal source).")
-    elif isinstance(left, int) and left <= PASS_LOW_DAYS:
-        _pass_notice(cfg, state, save_state, "pass_low_notified",
-                     f"Your AgentHC feed pass has {left} signal day(s) left — "
-                     "buy more in the dashboard (Settings → Signal source); "
-                     "unused days carry over.")
+                     PASS_USED_UP_TEXT)
+    else:
+        _entry_read(state, save_state)
+        if left == 0 and body.get("pass_charged_today"):
+            _pass_notice(cfg, state, save_state, "pass_last_day_notified",
+                         PASS_LAST_DAY_TEXT)
+        elif isinstance(left, int) and left <= PASS_LOW_DAYS:
+            _pass_notice(cfg, state, save_state, "pass_low_notified",
+                         PASS_LOW_TEXT.format(n=left))
     return _parse_events(body)
 
 
@@ -1318,7 +1347,7 @@ def pass_summary(cfg, state):
                                  and best.get("status") != "active")):
             best = rec
     if best and best.get("status") == "exits_only":
-        return "prepaid pass used up — exit signals only for a few days; buy more"
+        return "prepaid pass used up — exit signals only; buy more"
     if best:
         left = best.get("days_left")
         return (f"prepaid pass · {left} signal day(s) left" if left is not None

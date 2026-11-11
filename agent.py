@@ -4259,6 +4259,44 @@ def _signal_loss_tick(cfg, state, save_state, broker, client, paused, now_et):
     return done
 
 
+def signal_loss_sell_at(cfg, state, now_et=None):
+    """When today's no-signal sell will act (epoch seconds) while the agent
+    has lost its exit source and holds a position: the sell time, or 15
+    minutes after the warning when that is later (a warning still to come
+    counts from when it can go out). None when nothing is lost or held, the
+    sell is off, it is not a trading day, or the close comes first. Never
+    raises."""
+    try:
+        now_et = now_et or _et_now()
+        rec = state.get("signal_loss")
+        if not isinstance(rec, dict) or not isinstance(rec.get("since"), (int, float)):
+            return None
+        rows = _signal_loss_rows(state)
+        if not rows or not is_trading_day(cfg, now_et.date()):
+            return None
+        day = now_et.date().isoformat()
+        sell_m = _signal_loss_time(cfg, day)
+        if sell_m is None:
+            return None
+        d = now_et.date()
+        sell_ts = datetime(d.year, d.month, d.day, sell_m // 60, sell_m % 60,
+                           tzinfo=MARKET_TZ).timestamp()
+        open_ts = datetime(d.year, d.month, d.day, _OPEN_MIN // 60, _OPEN_MIN % 60,
+                           tzinfo=MARKET_TZ).timestamp()
+        if any(_opened_live(r) for _k, r in rows):
+            told = (float(rec["warned_at"]) if rec.get("warned_day") == day
+                    and isinstance(rec.get("warned_at"), (int, float))
+                    else max(now_et.timestamp(), open_ts,
+                             float(rec["since"]) + SIGNAL_LOSS_WARN_S))
+        else:
+            told = float(rec["since"]) + SIGNAL_LOSS_WARN_S
+        at = max(sell_ts, told + SIGNAL_LOSS_LEAD_S)
+        close_ts = _close_epoch(cfg, day)
+        return at if at < close_ts and now_et.timestamp() < close_ts else None
+    except Exception:
+        return None
+
+
 def signal_loss_banner(cfg, state, now_et=None):
     """The classic dashboard's line while the owner has been warned today
     that the agent sells what it holds for lack of exit signals:
@@ -4273,24 +4311,21 @@ def signal_loss_banner(cfg, state, now_et=None):
         real = [k for k, r in _signal_loss_rows(state) if _opened_live(r)]
         if not real:
             return []
-        sell_m = _signal_loss_time(cfg, day)
-        told = float(rec["warned_at"])
-        at = datetime.fromtimestamp(told + SIGNAL_LOSS_LEAD_S, MARKET_TZ)
-        at_m = at.hour * 60 + at.minute + (1 if at.second else 0)
-        close_m = _close_min(cfg, day)
         why = _signal_loss_why(rec.get("cause"))
-        one = len(real) == 1
-        what = f"{len(real)} real position{'' if one else 's'}"
-        if sell_m is None:
+        what = f"{len(real)} real position{'' if len(real) == 1 else 's'}"
+        at = signal_loss_sell_at(cfg, state, now_et)
+        if _signal_loss_time(cfg, day) is None:
             text = (f"No exit signals reach the agent ({why}). The no-signal "
                     f"sell is off: sell your {what} yourself.")
-        elif max(sell_m, at_m) >= close_m:
+        elif at is None:
             text = (f"No exit signals reach the agent ({why}). It is too late "
                     f"today for the agent to sell your {what} itself.")
         else:
+            t = datetime.fromtimestamp(at, MARKET_TZ)
             text = (f"No exit signals reach the agent ({why}). It sells your "
-                    f"{what} itself at {_hm(max(sell_m, at_m))} ET unless they "
-                    "are back.")
+                    f"{what} itself at "
+                    f"{_hm(t.hour * 60 + t.minute + (1 if t.second else 0))} ET "
+                    "unless they are back.")
         return [{"level": "urgent", "text": text}]
     except Exception:
         return []
@@ -6825,7 +6860,8 @@ def _feed_access_check(cfg, state, check):
         if best:
             if best.get("status") == "exits_only":
                 check("feed_access", False, "Feed access",
-                      "signal days used up — exit signals only for a few days",
+                      "signal days used up — exit signals only, for trades "
+                      "already open",
                       "the OWNER buys more signal days in the wizard (Signal source)",
                       who="owner")
                 return

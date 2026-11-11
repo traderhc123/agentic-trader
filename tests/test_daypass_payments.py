@@ -460,7 +460,8 @@ def test_wallet_with_no_record_after_a_lost_answer_waits_for_the_invoice_to_expi
         assert _poll(CFG, state) == [] and "daypass_pending" in state
     assert wallet.paid == [] and feed.minted == 1
     assert len(alerts) == 1 and "once the invoice has expired" in alerts[0]
-    assert "no exit signals" in alerts[0]
+    assert "the agent gets no new trades" in alerts[0]
+    assert "position" not in alerts[0]
     clock.tick(minutes=6)                      # 66 minutes: the invoice is dead
     assert len(_poll(CFG, state)) == 1         # released, bought for real
     assert len(wallet.paid) == 1 and feed.minted == 2
@@ -551,7 +552,8 @@ def test_wallet_changed_while_a_payment_is_undecided_never_pays_twice(
     assert wallet_b.paid == [] and asked_b == [] and feed.minted == 1
     assert state["daypass_pending"]["macaroon"] == "MAC1"   # A's pass is kept
     assert len(alerts) == 1 and "wallet was changed" in alerts[0]
-    assert "no exit signals" in alerts[0]
+    assert "the agent gets no new trades" in alerts[0]
+    assert "position" not in alerts[0]
     wallet_a.settle()                          # A's payment went through after all
     cfg = dict(CFG, **WALLET_A)                # …and the owner switched back
     assert len(agenthc.poll(cfg, state, lambda s: None)) == 1
@@ -588,7 +590,8 @@ def test_wallet_that_pays_without_a_receipt_is_not_used_again(
     assert len(alerts) == 3                    # Wed, then a reminder Thu and Fri
     for text in alerts:
         assert "sats left the wallet" in text and "NOT buy another" in text
-        assert "10,000 sats" in text and "no exit signals" in text
+        assert "10,000 sats" in text and "agent gets no new trades" in text
+        assert "position" not in text
         assert "has not said yet" not in text
     assert state["pass_notice"] == alerts[0]   # and it stays on the dashboard
 
@@ -674,7 +677,8 @@ def test_invoice_the_agent_refuses_is_reported_to_the_owner_once_a_day(
     text = alerts[0]
     assert text.startswith("Your agent did not buy today's day-pass.")
     assert words in text and "Nothing was paid" in text
-    assert "no exit signals for positions it holds" in text
+    assert "the agent gets no new trades" in text
+    assert "position" not in text and "watch" not in text
     assert "8:30 AM ET on the next market day" in text
     assert "{" not in text                     # no raw server text
     assert state["pass_notice"] == text        # on the dashboard too
@@ -706,7 +710,8 @@ def test_failed_payment_alert_says_what_happens_next_in_plain_words(
     assert "HTTP" not in text and "{" not in text and "detail" not in text
     assert "every 5 minutes until today's market close" in text
     assert "from 8:30 AM ET on the next market day" in text
-    assert "no exit signals for positions it holds" in text
+    assert "the agent gets no new trades" in text
+    assert "position" not in text and "watch" not in text
     # and that is what it does: funded at 4:10 PM, nothing is bought tonight
     wallet.pay_invoice = lambda invoice: Wallet.pay_invoice(wallet, invoice)
     clock.now = datetime(2026, 7, 15, 16, 10, tzinfo=agenthc.MARKET_TZ)
