@@ -1561,7 +1561,12 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
         elif isinstance(left, int) and left <= PASS_LOW_DAYS:
             _pass_notice(cfg, state, save_state, "pass_low_notified",
                          PASS_LOW_TEXT.format(n=left))
-    return _parse_events(body)
+    events = _parse_events(body)
+    if exits_only:
+        # a used-up pass gets no entries: should the reply carry one anyway
+        # (a server bug, a malformed answer), it never reaches the agent
+        events = [e for e in events if e["event"] == "EXITED"]
+    return events
 
 
 def pass_summary(cfg, state):

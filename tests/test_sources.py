@@ -572,6 +572,39 @@ def test_exits_only_pass_keeps_reading_exits_and_warns(monkeypatch):
     assert "used up" in agenthc.pass_summary(_pass_cfg(), state)
 
 
+def test_an_exits_only_reply_never_opens_a_position(monkeypatch, home, no_policy):
+    """A used-up pass reads exits only. Should that reply carry an ENTERED
+    anyway (a server bug, a malformed or hostile answer), the agent must not
+    buy: only its EXITED events reach the agent."""
+    import agent
+    from conftest import StubBroker
+    srv = _PassServer(status="exits_only", days_left=0)
+    orig = srv.get
+    leg = {"ticker": "SPY", "expiry": "2026-07-17", "type": "C", "occurred_at": "x"}
+
+    def get(url, params=None, headers=None, timeout=None):
+        r = orig(url, params, headers, timeout)
+        if not url.endswith("/pass"):
+            r._payload = {"events": [{"event": "ENTERED", "strike": 601, **leg},
+                                     {"event": "EXITED", "strike": 600, **leg}],
+                          "pass_days_left": 0, "pass_exits_only": True}
+        return r
+    monkeypatch.setattr(agenthc.requests, "get", get)
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: None)
+    monkeypatch.setattr(agent, "notify", lambda *a, **k: None)
+    events = agenthc.poll(_pass_cfg(), {}, lambda s: None)
+    assert [(e["event"], e["strike"]) for e in events] == [("EXITED", 600.0)]
+    assert agenthc.had_access() is False and _exit_flag() == (True, "")
+    b = StubBroker()
+    st = {"positions": {}}
+    for ev in events:
+        agent.handle_event(ev, {"source": "agenthc"}, st, b, object(),
+                           lambda s: None)
+    assert [c["event"] for c in b.calls if c["event"] != "EXITED"] == []
+    assert st["positions"] == {}
+
+
 def test_active_pass_preferred_over_exits_only_one(monkeypatch):
     srv = _PassServer()
     monkeypatch.setattr(agenthc.requests, "get", srv.get)
