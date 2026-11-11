@@ -1269,3 +1269,18 @@ def test_exit_loss_says_since_when_why_and_when_it_sells():
     none = build(cfg=LIVE_PASS, st={**st, "positions": {}},
                  rt=runtime(feed_access=False))["signals"]["exit_loss"]
     assert none["armed"] is False and none["since"] == "2026-11-09T19:00:00Z"
+
+
+def test_the_no_signal_warning_is_part_of_the_positions_condition():
+    rt = runtime(feed_access=False, notices=[
+        {"level": "urgent", "code": "signal_loss",
+         "condition": "positions_unmanaged",
+         "text": "No exit signals reach the agent (your signal pass has run "
+                 "out). It sells your 1 real position itself at 15:30 ET "
+                 "unless they are back."}])
+    st = {**state(**{SPY: real_pos()}),
+          "pass_status": {_tid("tok"): {"status": "used_up"}}}
+    s = build(cfg=LIVE_PASS, st=st, rt=rt)
+    (c,) = [c for c in s["conditions"] if c["code"] == "positions_unmanaged"]
+    assert [s["notices"][i]["code"] for i in c["notices"]] == ["signal_loss"]
+    assert c["level"] == "urgent"

@@ -6260,6 +6260,11 @@ def cmd_run(app_window=False):
             out += [{**w, "code": "expiry"} for w in expiry_banner(
                 c, st, paused=bool(_full_hold_note()), acct=_status_acct(c),
                 conditions=True)]
+            # no exit signals: when the agent sells what it holds (the
+            # dashboard's own positions note says the same condition)
+            out += [{**w, "code": "signal_loss",
+                     "condition": "positions_unmanaged"}
+                    for w in signal_loss_banner(c, st)]
             if cash.get("warning"):
                 out.append({"level": "warn", "code": "low_cash",
                             "condition": "low_cash", "text": cash["warning"]})
