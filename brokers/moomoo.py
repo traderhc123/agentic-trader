@@ -25,6 +25,7 @@ already selling — and is NOT sent at all while the holdings can't be read
 """
 
 import math
+import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -364,7 +365,31 @@ def _fail_kind(side):
     return "order_failed" if side == "buy" else "exit_failed"
 
 
-def _sell_holding(cfg, sdk, code):
+# OpenD's refresh_cache position and order queries are limited to 10 per 30 s
+# per account (moomoo API docs, "Interface Limitations"); over the limit the
+# query just fails. Its wording isn't documented, so this matches the words
+# such an answer can use. A sell whose holdings read hit the limit waits the
+# window out (_LIMIT_WAITS_S, 30 s in all) instead of being held back to the
+# next loop — on expiry day that loop may come too late.
+_LIMIT_RX = re.compile(r"freq|too\s+(many|often|fast)|rate[\s_-]*limit|频|頻", re.I)
+_LIMIT_WAITS_S = (2.0, 4.0, 8.0, 16.0)
+
+
+def _fresh_query(sdk, query, **kw):
+    """query(**kw) -> (ret, data); a frequency-limit failure is retried
+    after _LIMIT_WAITS_S, any other failure is returned at once."""
+    waits = list(_LIMIT_WAITS_S)
+    while True:
+        ret, data = query(**kw)
+        if ret == sdk.RET_OK or not waits or not _LIMIT_RX.search(str(data)):
+            return ret, data
+        wait = waits.pop(0)
+        print(f"  OpenD: query limit reached ({str(data)[:80]}) — retrying in "
+              f"{wait:g}s")
+        time.sleep(wait)
+
+
+def _sell_holding(cfg, sdk, code, ctx=None):
     """(long contracts of `code` the account can sell right now, short
     contracts of it), fresh from OpenD: the smaller of its can_sell_qty and
     its qty less what working sell orders on it still have to sell.
@@ -376,12 +401,17 @@ def _sell_holding(cfg, sdk, code):
     leave the working sells out. Subtracting them from it again would sell
     too little (holding 5, a 2-lot sell working: can_sell_qty 3, and 3 - 2
     = 1) and leave the rest unsellable. min(can_sell, qty - working) is
-    right either way."""
-    ctx = None
+    right either way.
+
+    ctx: the trade context the order goes out through (read right before
+    sending it); without one a context is opened and closed here."""
+    own = ctx is None
     try:
-        ctx = _trade_ctx(cfg, sdk)
+        if own:
+            ctx = _trade_ctx(cfg, sdk)
         env = _trd_env(cfg, sdk)
-        ret, data = ctx.position_list_query(trd_env=env, refresh_cache=True)
+        ret, data = _fresh_query(sdk, ctx.position_list_query, trd_env=env,
+                                 refresh_cache=True)
         if ret != sdk.RET_OK or data is None:
             return None, None
         held, can_sell, short = 0.0, 0.0, 0
@@ -405,7 +435,8 @@ def _sell_holding(cfg, sdk, code):
             can_sell += max(0.0, can)
         if short:
             return 0, short
-        ret, orders = ctx.order_list_query(trd_env=env, refresh_cache=True)
+        ret, orders = _fresh_query(sdk, ctx.order_list_query, trd_env=env,
+                                   refresh_cache=True)
         if ret != sdk.RET_OK or orders is None:
             return None, None
         working = 0
@@ -425,7 +456,7 @@ def _sell_holding(cfg, sdk, code):
     except Exception:
         return None, None
     finally:
-        if ctx is not None:
+        if own and ctx is not None:
             try:
                 ctx.close()
             except Exception:
@@ -449,20 +480,17 @@ def _order(cfg, sdk, code, side, qty, price, effect=None, contract=None,
     only for what OpenD says the account holds, less what working sells
     are already selling. moomoo can't be told to only close a position,
     so while the holdings can't be read NO sell is sent: the owner is told,
-    and the agent tries again on the next loop."""
+    and the agent tries again on the next loop.
+
+    The holdings are read through the same trade context as the order,
+    right before it is sent (after the trade unlock). Nothing at moomoo
+    ties the two together: a sale the owner makes in the app between the
+    read and the order can still leave this sell short. That window is a
+    few hundred milliseconds; no OpenD setting closes it."""
     contract = contract or code
-    held = None
-    if side == "sell":
-        held, short = _sell_holding(cfg, sdk, code)
-        if short:
-            msg = order_guard.short_text("moomoo", contract, short)
-            print(f"  ORDER NOT SENT: {msg}")
-            broker_events.report("exit_failed", msg, reason="short_seen",
-                                 short=short, option_id=code)
-            return None
-    try:
-        qty = order_guard.check_order(side, effect, qty, held,
-                                      broker_refuses_open=False)
+    try:  # side, effect and quantity first: nothing is opened for a bad one
+        qty = order_guard.check_order(side, effect, qty, None,
+                                      broker_refuses_open=True)
     except order_guard.RefusedOrder as exc:
         order_guard.report_refusal("moomoo", side, qty, contract, exc,
                                    expires_today=_expires_today(expiry))
@@ -484,6 +512,21 @@ def _order(cfg, sdk, code, side, qty, price, effect=None, contract=None,
                 print(f"  ORDER FAILED: trade unlock rejected: {data}")
                 broker_events.report(_fail_kind(side),
                                      f"moomoo rejected the trade unlock: {data}")
+                return None
+        if side == "sell":
+            held, short = _sell_holding(cfg, sdk, code, ctx)
+            if short:
+                msg = order_guard.short_text("moomoo", contract, short)
+                print(f"  ORDER NOT SENT: {msg}")
+                broker_events.report("exit_failed", msg, reason="short_seen",
+                                     short=short, option_id=code)
+                return None
+            try:
+                qty = order_guard.check_order(side, effect, qty, held,
+                                              broker_refuses_open=False)
+            except order_guard.RefusedOrder as exc:
+                order_guard.report_refusal("moomoo", side, qty, contract, exc,
+                                           expires_today=_expires_today(expiry))
                 return None
         trd_side = sdk.TrdSide.BUY if side == "buy" else sdk.TrdSide.SELL
         ret, data = ctx.place_order(

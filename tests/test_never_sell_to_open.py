@@ -551,6 +551,78 @@ def test_moomoo_holdings_unreadable_holds_the_sell_back_until_readable(
     assert [o["qty"] for o in sdk.placed] == [2] and st["positions"] == {}
 
 
+class LimitedMM(MM):
+    """OpenD answering the refresh_cache queries with a frequency-limit
+    error the first `limited` times (10 per 30 s per account)."""
+
+    def __init__(self, limited, said="request too frequent, please try again later",
+                 **kw):
+        super().__init__(**kw)
+        self.limited, self.said, self.asked, self.ctxs = limited, said, [], []
+
+    def OpenSecTradeContext(self, **kw):
+        ctx, sdk = super().OpenSecTradeContext(**kw), self
+        self.ctxs.append(ctx)
+        real_pos, real_ord, real_place = (ctx.position_list_query,
+                                          ctx.order_list_query, ctx.place_order)
+
+        def limited(name, real):
+            def call(**q):
+                sdk.asked.append((name, ctx))
+                if sdk.limited > 0 and not q.get("order_id"):
+                    sdk.limited -= 1
+                    return -1, sdk.said
+                return real(**q)
+            return call
+        ctx.position_list_query = limited("pos", real_pos)
+        ctx.order_list_query = limited("ord", real_ord)
+        ctx.place_order = limited("place", real_place)
+        return ctx
+
+
+@pytest.mark.parametrize("said", ["request too frequent, please try again later",
+                                  "Frequency limit exceeded",
+                                  "请求频率太高，请稍后再试"])
+def test_moomoo_frequency_limit_waits_and_sells_instead_of_holding_back(
+        monkeypatch, said):
+    """A frequency-limit answer to the holdings read is not "unknown": the
+    sell waits for the limit's window and goes out in the same loop."""
+    slept = []
+    monkeypatch.setattr(moomoo.time, "sleep", slept.append)
+    sdk = LimitedMM(limited=2, said=said, held=3)
+    changed, st = _mm_sell(monkeypatch, sdk, qty=3)
+    assert [o["qty"] for o in sdk.placed] == [3] and changed
+    assert len(slept) >= 2 and _reasons() == []
+
+
+def test_moomoo_frequency_limit_that_never_lifts_holds_the_sell_back(monkeypatch):
+    slept = []
+    monkeypatch.setattr(moomoo.time, "sleep", slept.append)
+    sdk = LimitedMM(limited=10 ** 6, held=3)
+    changed, _st = _mm_sell(monkeypatch, sdk, qty=3)
+    assert sdk.placed == [] and not changed
+    assert _reasons() == ["holdings_unknown"]
+    assert 30 <= sum(slept) <= 60  # waited out one 30 s window, no longer
+
+
+def test_moomoo_other_read_errors_hold_back_at_once(monkeypatch):
+    slept = []
+    monkeypatch.setattr(moomoo.time, "sleep", slept.append)
+    sdk = LimitedMM(limited=1, said="disconnected", held=3)
+    changed, _st = _mm_sell(monkeypatch, sdk, qty=3)
+    assert sdk.placed == [] and slept == [] and _reasons() == ["holdings_unknown"]
+
+
+def test_moomoo_holdings_are_read_in_the_order_s_own_context(monkeypatch):
+    """The read and the order go through one trade context, back to back:
+    the window in which the owner could sell first is as short as it gets."""
+    sdk = LimitedMM(limited=0, held=3)
+    _mm_sell(monkeypatch, sdk, qty=3)
+    sell = [(n, c) for n, c in sdk.asked][:3]
+    assert [n for n, _c in sell] == ["pos", "ord", "place"]
+    assert len({id(c) for _n, c in sell}) == 1
+
+
 def test_moomoo_held_back_sell_says_so_louder_on_expiry_day(monkeypatch):
     today = datetime.now(robinhood.MARKET_TZ).date().isoformat()
     key = f"SPY|{today}|752.0|C"
