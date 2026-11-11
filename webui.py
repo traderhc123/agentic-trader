@@ -3283,7 +3283,10 @@ def _v2_number(v, name, low, high, whole=False, low_open=False):
     import numbers
     kind = "a whole number" if whole else "a number"
     if (isinstance(v, bool) or not isinstance(v, numbers.Real)
-            or not math.isfinite(v) or (whole and v != int(v))):
+            # a JSON whole number is finite however long (math.isfinite
+            # would raise OverflowError past a float's range)
+            or not (isinstance(v, int) or math.isfinite(v))
+            or (whole and v != int(v))):
         raise _Invalid(f"{name} must be {kind}. Nothing was changed.")
     if (v <= low if low_open else v < low) or v > high:
         rng = (f"more than {low:g} and at most {high:,g}" if low_open

@@ -548,7 +548,14 @@ def test_bad_payloads_are_refused_and_change_nothing(home, app, monkeypatch, pat
 @pytest.mark.parametrize("raw", ['{"max_daily_loss_usd": NaN}',
                                  '{"max_daily_loss_usd": Infinity}',
                                  '{"max_entries_per_day": -Infinity}',
-                                 '{"trade_size": {"main": {"mode": "budget", "value": NaN}}}'])
+                                 '{"trade_size": {"main": {"mode": "budget", "value": NaN}}}',
+                                 # whole numbers too big for a float: a range
+                                 # refusal, not an OverflowError (HTTP 500)
+                                 '{"max_daily_loss_usd": 1' + '0' * 400 + '}',
+                                 '{"max_entries_per_day": -1' + '0' * 400 + '}',
+                                 '{"trade_size": {"main": {"mode": "budget", "value": 1' + '0' * 400 + '}}}'],
+                         ids=["loss-nan", "loss-inf", "cap-neg-inf", "size-nan",
+                              "loss-huge-int", "cap-huge-neg-int", "size-huge-int"])
 def test_nan_and_infinity_are_refused(home, app, raw):
     write_cfg(home, BASE)
     c = app()
