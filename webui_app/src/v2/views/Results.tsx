@@ -234,6 +234,12 @@ export function ResultsView({ page }: { page: Page }) {
               </tbody>
             </table>
           </div>
+          {days.slice(0, showN).some((d) => paidMark(s, d.day)) && (
+            <p className="pb small muted" data-paid="days-note">
+              “Paid signal day” marks a day the signals were paid for. Result on paid signal days, below, counts the trades opened on those days,
+              so it need not add up from the rows marked here.
+            </p>
+          )}
           {days.length > showN && (
             <div className="pfoot">
               <button className="btn btn-sm" onClick={() => setAllDays(true)}>

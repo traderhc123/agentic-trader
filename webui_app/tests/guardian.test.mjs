@@ -1832,3 +1832,12 @@ test("review: field errors sit next to their field and are tied to it", () => {
   assert.match(v2src("views/CodeDialogs.tsx"), /aria-describedby=\{`\$\{id\}-h\$\{err \? ` \$\{id\}-e` : ""\}`\}/);
   assert.match(v2src("views/SignalsDialogs.tsx"), /aria-invalid=\{!!err \|\| undefined\}\s+aria-describedby=\{err \? `\$\{id\}-e` : undefined\}/);
 });
+
+test("review: the paid-day marks say how they relate to the result on paid signal days", () => {
+  const src = v2src("views/Results.tsx");
+  // the table counts a trade on the day it closed, the paid-day result on the day it opened: said where the marks are
+  assert.match(src, /Each trade counts on the day it closed \(ET\)/);
+  assert.match(src, /\{days\.slice\(0, showN\)\.some\(\(d\) => paidMark\(s, d\.day\)\) && \(/);
+  assert.match(src, /counts the trades opened on those days,\s+so it need not add up from the rows marked here/);
+  assert.match(src, /opened on \{plural\(pd\.real\.days, "paid signal day"\)\}, counted on the day each was\s+opened/);
+});
