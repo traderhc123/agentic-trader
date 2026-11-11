@@ -366,10 +366,17 @@ def _fail_kind(side):
 
 def _sell_holding(cfg, sdk, code):
     """(long contracts of `code` the account can sell right now, short
-    contracts of it), fresh from OpenD: the position's qty, capped by its
-    can_sell_qty, less what working sell orders on it still have to sell.
+    contracts of it), fresh from OpenD: the smaller of its can_sell_qty and
+    its qty less what working sell orders on it still have to sell.
     (None, None) when either list can't be read; a code not listed is
-    held 0."""
+    held 0.
+
+    moomoo documents can_sell_qty as "holding quantity - frozen quantity",
+    and a working sell freezes what it sells, so can_sell_qty may already
+    leave the working sells out. Subtracting them from it again would sell
+    too little (holding 5, a 2-lot sell working: can_sell_qty 3, and 3 - 2
+    = 1) and leave the rest unsellable. min(can_sell, qty - working) is
+    right either way."""
     ctx = None
     try:
         ctx = _trade_ctx(cfg, sdk)
@@ -377,7 +384,7 @@ def _sell_holding(cfg, sdk, code):
         ret, data = ctx.position_list_query(trd_env=env, refresh_cache=True)
         if ret != sdk.RET_OK or data is None:
             return None, None
-        held, short = 0, 0
+        held, can_sell, short = 0.0, 0.0, 0
         for i in range(len(data)):
             row = data.iloc[i]
             if not row.get("code"):
@@ -394,7 +401,8 @@ def _sell_holding(cfg, sdk, code):
             can = q if can is None else float(can)
             if not math.isfinite(can):
                 return None, None
-            held += max(0, math.floor(min(q, can)))
+            held += max(0.0, q)
+            can_sell += max(0.0, can)
         if short:
             return 0, short
         ret, orders = ctx.order_list_query(trd_env=env, refresh_cache=True)
@@ -413,7 +421,7 @@ def _sell_holding(cfg, sdk, code):
             if not math.isfinite(left):
                 return None, None
             working += max(0, math.ceil(left))
-        return max(0, held - working), 0
+        return max(0, min(math.floor(can_sell), math.floor(held) - working)), 0
     except Exception:
         return None, None
     finally:

@@ -514,6 +514,19 @@ def test_moomoo_no_second_sell_while_one_works_on_the_whole_holding(monkeypatch,
     assert sdk.placed == [] and not changed
 
 
+@pytest.mark.parametrize("can_sell", [3, 5, None])
+def test_moomoo_working_sell_is_subtracted_once(monkeypatch, can_sell):
+    """moomoo documents can_sell_qty as "holding quantity - frozen
+    quantity", and a working sell freezes what it sells. Holding 5 with the
+    owner's 2-lot sell working leaves 3 to sell — whether can_sell_qty
+    already excludes the working sell (3), doesn't (5), or is missing."""
+    sdk = MM(held=5, can_sell=can_sell, working=2)
+    changed, st = _mm_sell(monkeypatch, sdk, qty=5)
+    (order,) = sdk.placed
+    assert order["qty"] == 3
+    assert changed and st["positions"][KEY]["qty"] == 2
+
+
 def test_moomoo_short_position_is_never_traded(monkeypatch):
     sdk = MM(held=2, short=True)
     changed, _st = _mm_sell(monkeypatch, sdk)
