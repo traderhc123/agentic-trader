@@ -355,6 +355,57 @@ def test_robinhood_replaced_sell_is_capped_at_what_is_held(monkeypatch):
     assert st["positions"][KEY]["pending"]["requested"] == 1
 
 
+@pytest.mark.parametrize("odd", [
+    {"quantity": "2.0000", "pending_sell_quantity": "0.0000", "type": "long"},
+    {"option_id": "0b6e1c1e-1111-4222-8333-444455556666", "type": "long"}])
+def test_robinhood_position_row_it_cannot_identify_reads_as_unknown(odd):
+    """A row with no contract id or no quantity could be this contract: the
+    holdings are unknown, not "none" — the sell goes out as a close-only
+    sell (Robinhood refuses it if nothing is held), not refused as gone."""
+    class OddRH(RH):
+        def call_tool(self, name, args):
+            if name == "get_option_positions":
+                self.calls.append((name, args))
+                return _mcp({"data": {"positions": [odd]}})
+            return super().call_tool(name, args)
+    rh = OddRH()
+    assert robinhood._sell_holding(rh, RH_CFG, RH_ID) == (None, None)
+    changed, _st = _rh_sell(rh, qty=2)
+    (args,) = rh.placed()
+    assert args["quantity"] == "2" and args["legs"][0]["position_effect"] == "close"
+    assert "nothing_held" not in _reasons()
+
+
+class LostAnswerRH(RH):
+    """The sell goes in, its answer is lost; the order list shows it."""
+
+    def call_tool(self, name, args):
+        if name == "place_option_order":
+            self.calls.append((name, args))
+            self.sent = dict(args, at=datetime.now(timezone.utc).isoformat())
+            raise requests.ReadTimeout("answer lost")
+        if name == "get_option_orders" and getattr(self, "sent", None):
+            self.calls.append((name, args))
+            s = self.sent
+            return _mcp({"data": {"orders": [{
+                "id": "o-lost", "ref_id": s["ref_id"], "state": "confirmed",
+                "quantity": s["quantity"], "processed_quantity": "0",
+                "created_at": s["at"], "type": s["type"], "legs": s["legs"]}]}})
+        return super().call_tool(name, args)
+
+
+def test_robinhood_adopted_sell_is_booked_at_the_capped_quantity(monkeypatch):
+    """Ledger 3, account 1: the sell goes out for 1. Its answer is lost and
+    the order is found — the pending sell is for 1, not the ledger's 3."""
+    monkeypatch.setattr(robinhood, "_settle_fast", lambda *a, **kw: None)
+    rh = LostAnswerRH(held=1)
+    changed, st = _rh_sell(rh, qty=3)
+    (args,) = rh.placed()
+    assert args["quantity"] == "1" and changed
+    pend = st["positions"][KEY]["pending"]
+    assert pend["order_id"] == "o-lost" and pend["requested"] == 1
+
+
 @pytest.mark.parametrize("args,ok", [
     ({"legs": [{"option_id": RH_ID, "side": "buy", "position_effect": "open"}],
       "quantity": "1"}, True),

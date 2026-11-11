@@ -665,6 +665,10 @@ def _as_placed(order, unc):
     kind = str(order.get("type") or "").lower()
     placed = {"order_id": str(order["id"]),
               "was_limit": kind == "limit" if kind else bool(unc.get("was_limit"))}
+    if order_guard.contracts(unc.get("qty")):
+        # what the order was for: a sell is capped at what the account
+        # held, which can be fewer than the ledger quantity the caller had
+        placed["qty"] = int(unc["qty"])
     if unc.get("reprice"):
         placed["reprice"] = True
     return placed
@@ -1299,9 +1303,14 @@ def _sell_holding(rh, cfg, option_id):
     for row in rows:
         if not isinstance(row, dict):
             return None, None
-        if _row_option_id(row) != str(option_id):
-            continue
+        # a row that names no contract or no quantity could be this one:
+        # unknown, like _count_position (never "holds none")
+        rid = _row_option_id(row)
         qkey = "quantity" if "quantity" in row else "qty" if "qty" in row else None
+        if not rid or qkey is None:
+            return None, None
+        if rid != str(option_id):
+            continue
         try:
             q = _dec(row[qkey]) if qkey else None
             pend = (_dec(row["pending_sell_quantity"])
