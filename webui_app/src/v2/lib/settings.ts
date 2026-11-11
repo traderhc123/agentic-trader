@@ -6,7 +6,7 @@
 // field before anything is sent. What is saved, and what a change does to
 // the owner's risk in the confirm dialog, always comes from the server's own
 // preview (POST without `confirm`), never from here.
-import type { Change, Direction, SettingsView, SizeMode, SizeSpec } from "../../lib/settingsApi";
+import type { Change, Direction, SettingsView, SignInEnd, SizeMode, SizeSpec } from "../../lib/settingsApi";
 import { count, plural, usd } from "./format.ts";
 
 /** The first-run wizard and the move tool are the only pages /v2 sends the
@@ -236,4 +236,35 @@ export function v2Words(text: string): string {
     .replace(new RegExp(String.raw`\bSettings${to}Signal\s+source`, "gi"), "Signals & pass")
     .replace(new RegExp(String.raw`\bin Settings${to}Broker`, "gi"), "in Settings, under Connections")
     .replace(new RegExp(String.raw`\s*\(dashboard${to}[^)]*\)`, "gi"), " (Settings)");
+}
+
+// ── the Robinhood sign-in, as the agent saw it end ──────────────────────────
+
+/** Where Robinhood takes applications for options trading (the classic
+ *  wizard's warning links here with the full account number; /v2 never
+ *  has that number, only its last 4). */
+export const RH_OPTIONS_URL = "https://applink.robinhood.com/upgrade_options";
+
+export type SignInSay = { kind: "wait" } | { kind: "done" | "warn" | "failed"; text: string };
+
+/** What to tell the owner about the sign-in started at `since` (the
+ *  confirmed POST's signin_seq), from GET /api/v2/settings' broker.signin.
+ *  Watching the seq, not the settings: signing in again to the same
+ *  account, or with no account allowed, changes no setting at all. */
+export function signInOutcome(since: number, end: SignInEnd | null | undefined): SignInSay {
+  if (!end || typeof end.seq !== "number" || end.seq <= since) return { kind: "wait" };
+  const acct = end.account_mask ? ` ····${end.account_mask}` : "";
+  if (end.connected !== true)
+    return {
+      kind: "failed",
+      text: end.error
+        ? `The Robinhood sign-in did not finish (${end.error}). Nothing was changed. Try again.`
+        : "You signed in, but Robinhood has no active account that allows agentic trading, so nothing was changed. Turn on agentic trading for an account at Robinhood, then connect again.",
+    };
+  if (end.options_off)
+    return {
+      kind: "warn",
+      text: `Connected. Broker: Robinhood${acct}. Options trading is not turned on in this account, so Robinhood rejects the agent's orders until you apply for it at Robinhood.`,
+    };
+  return { kind: "done", text: `Connected. Broker: Robinhood${acct}.` };
 }

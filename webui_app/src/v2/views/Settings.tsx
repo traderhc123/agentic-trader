@@ -9,7 +9,7 @@ import type { AiModels, AiProviders, BrokerForm, Preview, Secret, SettingsView, 
 import { FieldError, ReviewDialog, Switch, askPreview } from "../Forms";
 import { brokerLabel } from "../lib/derive";
 import { API, getJson, send } from "../lib/http";
-import { MOVE_TOOL, brokerName } from "../lib/settings";
+import { MOVE_TOOL, RH_OPTIONS_URL, brokerName, signInOutcome } from "../lib/settings";
 import { badgeFor, updateLine } from "../lib/update";
 import { UPDATE } from "../lib/copy";
 import { UNKNOWN, etDayKey, etTime, etWhen, usd } from "../lib/format";
@@ -38,7 +38,8 @@ function cantEdit(page: Page): string {
 type BrokerStep =
   | { kind: "pick" }
   | { kind: "review"; payload: Record<string, unknown>; preview: Preview; rh: boolean; name: string }
-  | { kind: "signin"; url: string; before: string };
+  | { kind: "signin"; url: string; since: number }
+  | { kind: "ended"; text: string; warn: boolean };
 
 function BrokerDialog({ page, onClose }: { page: Page; onClose: () => void }) {
   const v = page.settings.view as SettingsView;
@@ -93,22 +94,26 @@ function BrokerDialog({ page, onClose }: { page: Page; onClose: () => void }) {
         onClose={onClose}
         onDone={async (r) => {
           if (step.rh) {
-            const url = (r as unknown as SignInDone).url;
-            if (typeof url !== "string" || !/^https:\/\//.test(url)) {
+            const { url, signin_seq: since } = r as unknown as SignInDone;
+            if (typeof url !== "string" || !/^https:\/\//.test(url) || typeof since !== "number") {
               setStep({ kind: "pick" });
               setErr("The agent did not hand back a Robinhood sign-in address. Nothing was changed. Try again.");
               return;
             }
-            setStep({ kind: "signin", url, before: v.fingerprint });
+            setStep({ kind: "signin", url, since });
             clearInterval(timer.current);
             timer.current = setInterval(async () => {
               const nv = await page.settings.reload();
-              if (nv && nv.fingerprint !== v.fingerprint && nv.broker.id === "robinhood") {
-                clearInterval(timer.current);
-                page.refresh();
-                page.say(true, `Connected. Broker: Robinhood${nv.broker.account_mask ? ` ····${nv.broker.account_mask}` : ""}.`);
-                onClose();
-              } else setWaitWords("Waiting for you to finish signing in at Robinhood…");
+              const out = signInOutcome(since, nv?.broker.signin);
+              if (out.kind === "wait") return setWaitWords(nv ? "Waiting for you to finish signing in at Robinhood…" : "Waiting for you to finish signing in at Robinhood… (this page can't reach the agent right now; it keeps trying)");
+              clearInterval(timer.current);
+              page.refresh();
+              if (out.kind === "done") {
+                page.say(true, out.text);
+                return onClose();
+              }
+              // a warning or a failure stays on screen until the owner has read it
+              setStep({ kind: "ended", text: out.text, warn: out.kind === "warn" });
             }, 3000);
             return;
           }
@@ -119,6 +124,34 @@ function BrokerDialog({ page, onClose }: { page: Page; onClose: () => void }) {
           onClose();
         }}
       />
+    );
+
+  if (step.kind === "ended")
+    return (
+      <Dialog
+        title={step.warn ? "Connected, but options are off" : "Robinhood was not connected"}
+        onClose={onClose}
+        foot={
+          <>
+            <button className="btn" onClick={onClose} data-autofocus>
+              Close
+            </button>
+            {step.warn && (
+              <a className="btn btn-primary" href={RH_OPTIONS_URL} target="_blank" rel="noopener noreferrer">
+                <Icon name="ext" small />
+                Apply for options at Robinhood
+              </a>
+            )}
+          </>
+        }
+      >
+        <div className={`callout ${step.warn ? "callout-warn" : "callout-bad"}`} role="alert">
+          <p className={step.warn ? undefined : "err"}>
+            <Icon name="alert" small />
+            {step.text}
+          </p>
+        </div>
+      </Dialog>
     );
 
   if (step.kind === "signin")

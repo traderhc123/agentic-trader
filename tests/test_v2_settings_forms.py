@@ -19,6 +19,8 @@ class FakeRobinhood:
     """Stands in for the Robinhood MCP client: no network."""
     started = []
     finished = []
+    accounts = []
+    fail = None
 
     def __init__(self, _token_path):
         pass
@@ -28,18 +30,24 @@ class FakeRobinhood:
         return "https://robinhood.example/oauth?state=abc", {"verifier": "v"}
 
     def auth_finish(self, p, redirect):
+        if FakeRobinhood.fail:
+            raise RuntimeError(FakeRobinhood.fail)
         FakeRobinhood.finished.append(redirect)
 
     def call_tool(self, name, args):
         assert name == "get_accounts"
-        return {"content": [{"type": "text", "text": json.dumps({"data": {"accounts": [
-            {"account_number": "5QR74821", "agentic_allowed": True,
-             "state": "active", "option_level": "option_level_2"}]}})}]}
+        return {"content": [{"type": "text", "text": json.dumps({"data": {
+            "accounts": FakeRobinhood.accounts}})}]}
+
+
+ACCOUNT = {"account_number": "5QR74821", "agentic_allowed": True,
+           "state": "active", "option_level": "option_level_2"}
 
 
 @pytest.fixture
 def rh(monkeypatch):
     FakeRobinhood.started, FakeRobinhood.finished = [], []
+    FakeRobinhood.accounts, FakeRobinhood.fail = [dict(ACCOUNT)], None
     monkeypatch.setattr(robinhood, "RobinhoodMCP", FakeRobinhood)
     return FakeRobinhood
 
@@ -78,7 +86,8 @@ def test_robinhood_sign_in_needs_the_confirmation(home, app, rh):  # noqa: F811
     r = c.post("/api/v2/broker/robinhood", {"broker": "robinhood"})
     assert r["ok"] is False and "Unknown setting" in r["error"]
     r = c.confirmed("/api/v2/broker/robinhood", {})
-    assert r == {"ok": True, "url": "https://robinhood.example/oauth?state=abc"}
+    assert r == {"ok": True, "url": "https://robinhood.example/oauth?state=abc",
+                 "signin_seq": 0}
     assert rh.started == [True]
     # still nothing saved: only the sign-in at Robinhood changes the broker
     assert read_cfg(home) == start
@@ -101,6 +110,52 @@ def test_a_sign_in_from_v2_lands_on_v2_and_a_classic_one_where_it_did(home, app,
     c.confirmed("/api/v2/broker/robinhood", {})
     c.get("/api/rh/start")
     assert _callback(c)[1] == "/"
+
+
+def test_v2_sees_how_each_sign_in_ended(home, app, rh):  # noqa: F811
+    """/v2 can't watch the settings for a change to know the sign-in ended:
+    signing in again to the same account changes nothing, and so does a
+    sign-in with no account allowed for agentic trading. Each finished
+    sign-in moves `signin.seq` and says how it ended."""
+    write_cfg(home, BASE)
+    c = app()
+    signin = lambda: c.get("/api/v2/settings")["broker"]["signin"]  # noqa: E731
+    assert signin() == {"seq": 0, "connected": None, "account_mask": None,
+                        "options_off": False, "error": None}
+    before = c.confirmed("/api/v2/broker/robinhood", {})["signin_seq"]
+    assert before == 0
+    _callback(c)
+    assert signin() == {"seq": 1, "connected": True, "account_mask": "4821",
+                        "options_off": False, "error": None}
+    # the same account again: nothing in the settings changes, the seq does
+    fp = c.get("/api/v2/settings")["fingerprint"]
+    assert c.confirmed("/api/v2/broker/robinhood", {})["signin_seq"] == 1
+    _callback(c)
+    assert c.get("/api/v2/settings")["fingerprint"] == fp
+    assert signin()["seq"] == 2 and signin()["connected"] is True
+    # options not enabled: said (the classic wizard's warning), and the GET
+    # still carries only the last 4 of the account number
+    rh.accounts = [{**ACCOUNT, "option_level": "option_level_0"}]
+    c.confirmed("/api/v2/broker/robinhood", {})
+    _callback(c)
+    assert signin() == {"seq": 3, "connected": True, "account_mask": "4821",
+                        "options_off": True, "error": None}
+    assert "5QR74821" not in json.dumps(c.get("/api/v2/settings"))
+    # no account allowed for agentic trading: nothing saved, and said
+    write_cfg(home, BASE)
+    rh.accounts = [{**ACCOUNT, "agentic_allowed": False}]
+    c.confirmed("/api/v2/broker/robinhood", {})
+    _callback(c)
+    assert signin() == {"seq": 4, "connected": False, "account_mask": None,
+                        "options_off": False, "error": None}
+    assert read_cfg(home) == BASE
+    # the sign-in itself failed
+    rh.fail = "state mismatch"
+    c.confirmed("/api/v2/broker/robinhood", {})
+    _callback(c)
+    s = signin()
+    assert s["seq"] == 5 and s["connected"] is False and "state mismatch" in s["error"]
+    assert read_cfg(home) == BASE
 
 
 def test_replacing_a_paper_broker_with_robinhood_says_so(home, app, rh):  # noqa: F811

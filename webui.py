@@ -3191,6 +3191,9 @@ def _write_policy_file(policy):
 
 _V2_CONFIRM_S = 120
 _V2_RESERVED = ("confirm", "acknowledge")
+# how the last Robinhood sign-in ended: none yet (GET /api/v2/settings)
+_RH_SIGNIN_NONE = {"seq": 0, "connected": None, "account_mask": None,
+                   "options_off": False, "error": None}
 _REVIEW_AGAIN = "Your settings changed since you reviewed this. Review again."
 _TOKEN_SPENT = ("That confirmation has expired or was already used. Nothing "
                 "was changed. Review again.")
@@ -3455,7 +3458,17 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                "finished": threading.Event(),
                # where the browser lands after the Robinhood sign-in: "/"
                # (classic), or "/v2" for a sign-in started from /v2
-               "oauth_return": None}
+               "oauth_return": None,
+               # how the last Robinhood sign-in ended, for /v2 to watch
+               # (seq moves with every finished sign-in, even one that
+               # changed nothing: the same account again, or none allowed)
+               "rh_signin": dict(_RH_SIGNIN_NONE)}
+
+    def _rh_signin_done(connected, account="", options_off=False, error=None):
+        pending["rh_signin"] = {
+            "seq": pending["rh_signin"]["seq"] + 1, "connected": connected,
+            "account_mask": account[-4:] or None, "options_off": options_off,
+            "error": error}
 
     # config.json is shared with the chat commands and the dashboard buttons,
     # which write it too (agent._apply_command). `cfg` is only this server's
@@ -4180,9 +4193,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         rh.auth_finish(p, redirect)
         payload = content_json(rh.call_tool("get_accounts", {})) or {}
         warning = ""
+        found = {}  # the account this sign-in saved, if any (for /v2)
         for acct in ((payload.get("data") or {}).get("accounts") or []):
             if acct.get("agentic_allowed") and acct.get("state") == "active":
                 cfg["robinhood_account"] = str(acct["account_number"])
+                found["robinhood_account"] = cfg["robinhood_account"]
                 cfg["broker"] = "robinhood"
                 pending["broker_last4"] = cfg["robinhood_account"][-4:]
                 if not acct.get("option_level") or acct.get("option_level") == "option_level_0":
@@ -4192,6 +4207,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                f"?account_number={cfg['robinhood_account']}")
         pending["rh_warning"] = warning
         save()
+        _rh_signin_done("robinhood_account" in found, found.get("robinhood_account", ""),
+                        bool(warning))
         # human-friendly landing: bounce back to the wizard tab
         raise _Redirect()
 
@@ -4631,7 +4648,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                        "account_mask": acct[-4:] or None,
                        "paper": (account_tag(cfg).endswith(":paper")
                                  if bid else None),
-                       "fields": fields},
+                       "fields": fields,
+                       "signin": dict(pending["rh_signin"])},
             "signals": {"source": cfg.get("source"),
                         "include_other_trades": bool(cfg.get("include_other_trades")),
                         "recurring": bool(cfg.get("day_pass_recurring")),
@@ -4961,7 +4979,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"ok": False, "error": "Couldn't start the Robinhood "
                     f"sign-in ({_net_error_text(exc)}). Nothing was changed."}
         pending["oauth_return"] = "/v2"
-        return {"ok": True, "url": res["url"]}
+        # the sign-in this starts is the next one to finish after this seq
+        return {"ok": True, "url": res["url"],
+                "signin_seq": pending["rh_signin"]["seq"]}
 
     @_v2
     def v2_pass_buy(data):
@@ -5187,6 +5207,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             except _Redirect:
                 pass
             except Exception as exc:
+                if pending["oauth"]:
+                    _rh_signin_done(False, error=str(exc)[:200]
+                                    or type(exc).__name__)
                 return self._send(None, html=f"<h3>OAuth failed: {exc}</h3>"
                                              f"<p><a href='/'>back to setup</a></p>")
             self.send_response(302)

@@ -79,6 +79,8 @@ export interface SettingsView {
     paper: boolean | null;
     /** the connected broker's own fields: switches as true/false, keys as Secret */
     fields: Record<string, boolean | Secret>;
+    /** how the last Robinhood sign-in ended (seq 0: none since the agent started) */
+    signin: SignInEnd;
   };
   signals: {
     source: string | null;
@@ -140,9 +142,23 @@ export interface CommandDone {
   reply: string;
 }
 
-/** POST /api/v2/broker/robinhood, confirmed: where to sign in. */
+/** POST /api/v2/broker/robinhood, confirmed: where to sign in, and the
+ *  sign-in count it starts from (the next finished sign-in is seq + 1). */
 export interface SignInDone {
   url: string;
+  signin_seq: number;
+}
+
+/** How the last Robinhood sign-in ended. seq moves with every finished
+ *  sign-in, even one that changed nothing in the settings. */
+export interface SignInEnd {
+  seq: number;
+  /** true: an account was saved; false: none (error says why when it failed); null: none yet */
+  connected: boolean | null;
+  account_mask: string | null;
+  /** options trading is not turned on in that account: Robinhood rejects the orders */
+  options_off: boolean;
+  error: string | null;
 }
 
 /** GET /api/brokers: the key-based brokers' own field lists. */

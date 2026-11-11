@@ -785,6 +785,8 @@ textarea.input{min-height:120px;resize:vertical;font-size:15px;line-height:1.45}
 .doesnot{display:grid;gap:4px;list-style:disc;padding-left:20px}
 .callout-bad{border-color:var(--bad-line);background:var(--bad-tint)}
 .callout-bad p{color:var(--ink)}
+.callout-warn{border-color:var(--warn-line);background:var(--warn-tint)}
+.callout-warn p{color:var(--ink)} .callout-warn .ic{color:var(--warn-ink)}
 .rule-text{grid-column:1 / -1;margin-top:8px;white-space:pre-wrap;font-size:14px;color:var(--ink2);border-left:3px solid var(--line2);padding-left:12px;overflow-wrap:anywhere}
 .bolt{display:block;font:13px/1.4 ui-monospace,Consolas,Menlo,monospace;background:var(--well);border:1px solid var(--line);border-radius:6px;padding:8px 12px;word-break:break-all;max-height:6.5em;overflow:auto;user-select:all}
 .note .agent-said{grid-column:2;margin-top:4px}

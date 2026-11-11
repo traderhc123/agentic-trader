@@ -66,6 +66,7 @@ import {
   readTickers,
   riskOf,
   savedTickers,
+  signInOutcome,
   sizeMeans,
   sizeWords,
   v2Words,
@@ -911,6 +912,30 @@ test("settings: a limits save sends only what changed, and never the mode", () =
   assert.deepEqual(limitsPayload(saved, { other: null }), { trade_size: { other: { mode: "same" } } });
   for (const p of [limitsPayload(saved, { max_open_positions: 9 }), limitsPayload(saved, {})])
     for (const k of Object.keys(p)) assert.ok(!/dry|mode|paused/.test(k), k);
+});
+
+test("settings: a Robinhood sign-in is over when the agent says so, however it ended", () => {
+  const end = (over) => ({ seq: 4, connected: true, account_mask: "4821", options_off: false, error: null, ...over });
+  // still waiting: no sign-in finished since this one started (or no answer)
+  assert.equal(signInOutcome(4, end()).kind, "wait");
+  assert.equal(signInOutcome(4, null).kind, "wait");
+  assert.equal(signInOutcome(0, { seq: 0, connected: null, account_mask: null, options_off: false, error: null }).kind, "wait");
+  // the same account again changes no setting, but the sign-in is over
+  const done = signInOutcome(3, end());
+  assert.equal(done.kind, "done");
+  assert.match(done.text, /Robinhood ····4821/);
+  // options off: the classic wizard's warning, never a plain "Connected."
+  const warn = signInOutcome(3, end({ options_off: true }));
+  assert.equal(warn.kind, "warn");
+  assert.match(warn.text, /rejects the agent's orders/);
+  // no account allowed for agentic trading, or the sign-in failed: said, never a wait
+  const none = signInOutcome(3, end({ connected: false, account_mask: null }));
+  assert.equal(none.kind, "failed");
+  assert.match(none.text, /no active account that allows agentic trading/);
+  const failed = signInOutcome(3, end({ connected: false, account_mask: null, error: "state mismatch" }));
+  assert.equal(failed.kind, "failed");
+  assert.match(failed.text, /state mismatch/);
+  for (const o of [done, warn, none, failed]) clean(o.text, o.kind);
 });
 
 test("settings: the agent's words for the classic page say where it is in /v2", () => {
