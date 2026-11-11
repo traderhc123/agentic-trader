@@ -53,7 +53,7 @@ from zoneinfo import ZoneInfo
 MARKET_TZ = ZoneInfo("America/New_York")
 
 import llm_policy
-from brokers import BROKERS, account_tag
+from brokers import BROKERS, account_tag, order_guard
 from brokers.market_hours import REGULAR_CLOSE_MIN, close_minute, is_trading_day
 from lightning_wallet import WalletError, print_funding_invoice, wallet_from_cfg
 from notifications import notify
@@ -1605,12 +1605,26 @@ def _execute_dry(cfg, event, state, broker=None, client=None, on_skip=None):
                         "skip_no_quote" if "no quote" in note else
                         "skip_sizing", note)
             return None
+        try:  # practice obeys the live rule: buy to open whole contracts
+            qty = order_guard.check_order("buy", "open", qty, None)
+        except order_guard.RefusedOrder as exc:
+            print(f"[DRY-RUN] would NOT buy {contract}: {exc.reason}")
+            return None
         state["positions"][pos_key] = {"option_id": "dry", "qty": qty, "dry": True}
         print(f"[DRY-RUN] would buy {qty}x {contract} ({note})")
         return "entry"
     if event["event"] == "EXITED" and pos_key in state["positions"]:
-        pos = state["positions"].pop(pos_key)
-        print(f"[DRY-RUN] would sell {pos['qty']}x {contract}")
+        pos = state["positions"][pos_key]
+        held = pos.get("qty") if isinstance(pos, dict) else None
+        try:  # practice obeys the live rule: never sell what isn't held
+            qty = order_guard.check_order("sell", "close", held, held)
+        except order_guard.RefusedOrder as exc:
+            state["positions"].pop(pos_key)
+            print(f"[DRY-RUN] would NOT sell {contract}: the practice position "
+                  f"holds {held!r} contracts ({exc.reason}) — dropped")
+            return None
+        state["positions"].pop(pos_key)
+        print(f"[DRY-RUN] would sell {qty}x {contract}")
         return "exit"
     return None
 
@@ -2522,6 +2536,10 @@ def _position_upkeep(cfg, state, save_state, broker, client, now=None):
         _sync_positions(cfg, state, save_state, broker, client)
     except Exception as exc:
         print(f"position check error (non-fatal): {str(exc)[:150]}")
+    try:
+        _check_shorts(cfg, state, save_state, broker, client)
+    except Exception as exc:
+        print(f"short-position check error (non-fatal): {str(exc)[:150]}")
     # sooner only while a shortfall is still being confirmed — not for one
     # already noted as unprovable, which may never clear
     if any(isinstance(p, dict) and isinstance(p.get("miss"), dict)
@@ -2675,6 +2693,138 @@ def _warn_if_reheld(cfg, state, save_state, broker, client, pos_key, contract):
                 "sells what it bought) — check your account.")
     tomb["warned"] = True
     save_state(state)
+
+
+# ── never short ─────────────────────────────────────────────────────────────
+# The agent only buys to open and sells to close what the account holds
+# (brokers/order_guard.py). A SHORT position in a contract the agent has
+# traded means something went wrong somewhere (or the owner wrote it): the
+# owner is told at once, new entries are paused (the owner's own Pause, so
+# only Resume lifts it), and the agent does NOT trade the short — buying it
+# back would be a new kind of order, and that is the owner's decision.
+
+def _short_ids(state):
+    """{option_id: ledger key} of every contract the agent has traded that
+    it still remembers: open rows, its bought-contracts record, and rows
+    closed outside it."""
+    out = {}
+    for key, row in (state.get("positions") or {}).items():
+        if isinstance(row, dict) and not row.get("dry"):
+            oid = row.get("option_id")
+            if isinstance(oid, str) and oid and oid != "dry":
+                out.setdefault(oid, key)
+    for oid, rec in _agent_bought(state).items():
+        if isinstance(rec, dict) and isinstance(rec.get("key"), str):
+            out.setdefault(oid, rec["key"])
+    for key, tomb in _tombstones(state).items():
+        oid = tomb.get("option_id") if isinstance(tomb, dict) else None
+        if isinstance(oid, str) and oid and oid != "dry":
+            out.setdefault(oid, key)
+    return out
+
+
+def _pause_entries():
+    """The owner's Pause, set by the agent: saved in config.json, so it
+    lasts until the owner says resume. True when it was saved."""
+    try:
+        update_config(lambda c: c.__setitem__("paused", True))
+        return True
+    except Exception as exc:
+        print(f"couldn't save the pause (non-fatal): {str(exc)[:150]}")
+        return False
+
+
+def _short_fault(cfg, state, save_state, broker, key, option_id, n):
+    """A short position of n contracts in a contract the agent traded: tell
+    the owner and pause new entries — once per short (its size changing
+    tells again). The agent never trades it."""
+    faults = state.get("short_faults")
+    if not isinstance(faults, dict):
+        faults = state["short_faults"] = {}
+    rec = faults.get(str(option_id))
+    if isinstance(rec, dict) and rec.get("qty") == n:
+        return False
+    faults[str(option_id)] = {"key": key, "qty": n, "at": _iso_at(_now())}
+    if isinstance(cfg, dict):
+        cfg["paused"] = True  # this loop too, not only from the next
+    saved = _pause_entries()
+    try:
+        save_state(state)
+    except Exception:
+        pass
+    from brokers import order_guard
+    name = _BROKER_NAMES.get(_broker_name(cfg, broker), "broker")
+    contract = _contract_of(key) if isinstance(key, str) and key.count("|") == 3 \
+        else str(option_id)
+    msg = order_guard.short_text(name, contract, n)
+    if not saved:
+        msg += " (The pause couldn't be saved: say 'pause' in the dashboard.)"
+    print("SHORT POSITION: " + msg)
+    notify(cfg, "⚠️ agentic-trader: " + msg, priority="high")
+    return True
+
+
+def _check_shorts(cfg, state, save_state, broker, client):
+    """With the holdings check (_position_upkeep): is the account short any
+    contract the agent has traded? Read-only toward the broker."""
+    fn = getattr(broker, "short_option_qty", None)
+    if fn is None or not _gate_on(cfg, broker, client) or getattr(
+            client, "last_error", None):
+        return
+    ids = _short_ids(state)
+    faults = state.get("short_faults")
+    faults = faults if isinstance(faults, dict) else {}
+    for oid, rec in faults.items():
+        if isinstance(rec, dict):
+            ids.setdefault(oid, rec.get("key"))
+    if not ids:
+        return
+    import broker_events
+    broker_events.begin()
+    try:
+        got = fn(client, cfg, sorted(ids))
+    except Exception:
+        got = None
+    _read_problems(cfg, state, save_state, client, broker_events.drain())
+    if not isinstance(got, dict) or getattr(client, "last_error", None):
+        return
+    changed = False
+    for oid, n in got.items():
+        if not _is_count(n):
+            continue
+        if n >= 1:
+            _short_fault(cfg, state, save_state, broker, ids.get(oid), oid, n)
+        elif str(oid) in faults:
+            faults.pop(str(oid))  # gone (the owner closed it): Resume is theirs
+            changed = True
+            print(f"position check: the short position in "
+                  f"{_contract_of(ids[oid]) if str(ids.get(oid)).count('|') == 3 else oid}"
+                  " is gone")
+    if changed:
+        if not faults:
+            state.pop("short_faults", None)
+        save_state(state)
+
+
+def _act_on_refusals(cfg, state, save_state, broker, pos_key, contract, ev,
+                     reported):
+    """What an adapter reported about an order it did NOT send
+    (order_guard): a short position it saw is a fault for the owner; a
+    moomoo sell held back on the contract's expiry day is urgent."""
+    for r in reported:
+        why = r.get("reason")
+        if why == "short_seen":
+            n = r.get("short")
+            if _is_count(n) and n >= 1:
+                _short_fault(cfg, state, save_state, broker, pos_key,
+                             r.get("option_id") or pos_key, n)
+        elif (why == "holdings_unknown" and ev.get("event") == "EXITED"
+              and str(ev.get("expiry")) == _et_now().date().isoformat()):
+            row = state["positions"].get(pos_key)
+            if isinstance(row, dict) and _note_once(
+                    state, save_state, row, "held_back_alerted", ev["expiry"]):
+                notify(cfg, f"⚠️ agentic-trader: {contract} EXPIRES TODAY and its "
+                            "sell is held back: " + r["message"], priority="high")
 
 
 def _contracts_sold(state, pos_key, prior_pos):
@@ -3158,6 +3308,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 # stops the retries; elsewhere it's logged as before.
                 action = None
                 _note_unfilled_exit(after, prior_pos)
+        _act_on_refusals(cfg, state, save_state, broker, pos_key, contract,
+                         ev, reported)
         for r in reported:
             msg = r["message"]
             if r["kind"] == "order_failed" and broker_events.is_cash_problem(msg):
