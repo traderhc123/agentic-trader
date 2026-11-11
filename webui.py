@@ -5066,10 +5066,15 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             if not changes:
                 return {"ok": True, "saved": False,
                         "note": "Nothing to change: those are your settings already."}
+            # a sell time decides whether the agent sells what it already
+            # holds before the close: never "does not change" those
+            sells = any(ch["key"] in ("expiry_sell_et", "no_signal_sell_et")
+                        for ch in changes)
             wait = _two_step("limits", p, data, changes, [
                 "It does not switch between Practice and LIVE.",
-                does_not_trade,
-                "It does not change positions you already hold."])
+                does_not_trade]
+                + ([] if sells
+                   else ["It does not change positions you already hold."]))
             if wait:
                 return wait
             _adopt(new)

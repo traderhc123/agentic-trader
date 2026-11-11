@@ -62,6 +62,28 @@ def test_off_or_later_raises_the_risk_and_the_preview_says_so(home, app):
                  "note": "Nothing to change: those are your settings already."}
 
 
+HELD = "It does not change positions you already hold."
+
+
+def test_a_sell_time_change_never_says_it_leaves_held_positions_alone(home, app):
+    """The no-signal sell time and the expiry-day sell time decide whether
+    the agent sells what it already holds before the close: the confirm
+    dialog never says the change does not touch those positions."""
+    write_cfg(home, {**BASE, "signal_loss_sell_et": "15:30"})
+    c = _running(app)
+    for payload in ({"no_signal_sell_et": "off"},
+                    {"no_signal_sell_et": "14:00"},
+                    {"expiry_sell_et": "15:20"},
+                    {"expiry_sell_et": "15:20", "max_open_positions": 3}):
+        p = c.post("/api/v2/settings/limits", payload)
+        assert p["needs_confirm"] is True, payload
+        assert HELD not in p["preview"]["does_not"], payload
+        assert "It does not switch between Practice and LIVE." in p["preview"]["does_not"]
+    # the other limits still say it
+    p = c.post("/api/v2/settings/limits", {"max_open_positions": 3})
+    assert HELD in p["preview"]["does_not"]
+
+
 def test_only_the_chats_range(home, app):
     write_cfg(home, {**BASE, "signal_loss_sell_et": "15:30"})
     c = _running(app)
