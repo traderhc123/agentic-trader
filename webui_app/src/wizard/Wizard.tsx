@@ -12,6 +12,7 @@ import { pluralFix } from "../lib/format";
 import { MoveImport } from "./MoveImport";
 import { SourceStep } from "./SourceStep";
 import { BrokerStep, ConsentStep, LaunchStep, LlmStep, SafetyStep, SizingStep } from "./steps";
+import { returnTo } from "../lib/returnTo";
 
 // "Your AI" is optional and sits near the end: trading never needs it (the
 // built-in rules in Safety are plain settings). It adds chat, Q&A and
@@ -135,12 +136,12 @@ export function Wizard() {
 
   return (
     <WizCtx.Provider value={ctx}>
-      <AppBar page="Setup" rail="none">
+      <AppBar page="Setup" rail="none" home={returnTo()}>
         <span className="flex-1" />
         <Pill dot tone="up" className="max-sm:hidden" title="This page is served by your agent on this computer only">
           127.0.0.1 · local only
         </Pill>
-        <LinkButton href="/dash" size="sm">
+        <LinkButton href={returnTo()} size="sm">
           Dashboard
           <ArrowRight className="h-3.5 w-3.5" />
         </LinkButton>

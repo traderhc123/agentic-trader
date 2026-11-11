@@ -76,7 +76,11 @@ export function Dashboard() {
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [updateAvail, setUpdateAvail] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
-  const [moveOpen, setMoveOpen] = useState(false);
+  // /dash#move (the /v2 Settings link) opens the move tool; nothing else does
+  const [moveOpen, setMoveOpen] = useState(() => typeof location !== "undefined" && location.hash === "#move");
+  useEffect(() => {
+    if (location.hash === "#move") requestAnimationFrame(() => document.getElementById("move")?.scrollIntoView({ block: "start" }));
+  }, []);
   const [tipOpen, setTipOpen] = useState(false);
   const [confirmLive, setConfirmLive] = useState(false);
   const [confirmDry, setConfirmDry] = useState(false);
