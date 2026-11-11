@@ -2437,7 +2437,10 @@ class _Handler(BaseHTTPRequestHandler):
         if path in self.pages:
             app = None if "ui=classic" in self.path else _app_index()
             if app is None:
-                return self._send(None, html=self.pages[path])
+                page = self.pages[path]
+                if path == "/setup":
+                    page = _wizard_page(page, self.path)
+                return self._send(None, html=page)
             return self._send_raw(app.encode(), "text/html; charset=utf-8",
                                   extra={"Content-Security-Policy": _APP_CSP,
                                          "X-Frame-Options": "DENY",
@@ -3115,6 +3118,298 @@ def _policy_save_error(cfg, policy, key):
             "every entry would be skipped and the agent would never trade. "
             "Connect your AI in the AI step first, or clear the rules box. "
             "(The built-in rules in Safety need no AI.)")
+
+
+# ── one implementation per setting ───────────────────────────────────────────
+# The Safety step's pieces, shared by the classic /api/safety route and the
+# /v2 settings routes, so the same values always make the same config.json.
+
+def _apply_entry_cap(cfg, raw_cap, seeded):
+    """The daily entry cap from a form value. Not a number: keep what is
+    set. Only a form filled in from the current settings (`seeded`) may
+    RAISE the cap: a Safety page still open from before an update sends its
+    own default (5), not your cap. Never set before: 5."""
+    raw_cap = str(raw_cap or "").strip()
+    try:
+        cap = max(1, int(float(raw_cap))) if raw_cap else None
+    except (TypeError, ValueError, OverflowError):
+        cap = None  # not a number: keep what is set
+    old_cap = cfg.get("max_entries_per_day")
+    if (cap is not None and seeded is not True
+            and isinstance(old_cap, int) and cap > old_cap):
+        cap = None
+    if cap is not None:
+        cfg["max_entries_per_day"] = cap
+    elif old_cap is None:
+        cfg["max_entries_per_day"] = 5
+
+
+def _apply_daily_loss(cfg, raw_loss):
+    """The daily loss limit from a form value; blank keeps any existing
+    limit (re-running the wizard), 0 = off."""
+    raw_loss = str(raw_loss or "").strip()
+    if raw_loss:
+        try:
+            cfg["max_daily_loss_usd"] = max(
+                0.0, float(raw_loss.lstrip("$").replace(",", "")))
+        except ValueError:
+            pass
+
+
+# (form field, config.json key) of each alert target
+_ALERT_KEYS = (("discord", "discord_webhook_url"), ("ntfy", "ntfy_topic"),
+               ("tg_token", "telegram_bot_token"), ("tg_chat", "telegram_chat_id"))
+
+
+def _apply_alert_targets(cfg, data):
+    """Alert targets from a form: a blank field keeps what is set."""
+    for src_key, cfg_key in _ALERT_KEYS:
+        v = str(data.get(src_key, "")).strip()
+        if v:
+            cfg[cfg_key] = v
+
+
+def _apply_keep_awake(cfg, data):
+    if "keep_awake" in data:
+        cfg["keep_awake"] = bool(data.get("keep_awake"))
+
+
+def _write_policy_file(policy):
+    """The owner's written trading policy (plain English), as the policy
+    brain reads it."""
+    import llm_policy
+    path = llm_policy.policy_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(policy + "\n")
+
+
+# ── /v2 settings API: typed payloads and the two-step confirmation ──────────
+# A money-affecting /v2 write is never applied by its first POST: that one
+# answers with a preview and a token. Only the same payload sent again with
+# that token (and nothing changed in the settings meanwhile) is applied.
+
+_V2_CONFIRM_S = 120
+_V2_RESERVED = ("confirm", "acknowledge")
+_REVIEW_AGAIN = "Your settings changed since you reviewed this. Review again."
+_TOKEN_SPENT = ("That confirmation has expired or was already used. Nothing "
+                "was changed. Review again.")
+_TOKEN_OTHER = ("That confirmation is for a different change than this one. "
+                "Nothing was changed. Review again.")
+
+
+def _clock():
+    import time
+    return time.time()
+
+
+def _canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, default=str)
+
+
+class _Confirmations:
+    """Single-use confirmation tokens. A token is
+    "<expiry>.<nonce>.<HMAC(key, route + payload + fingerprint + expiry +
+    nonce)>" under a random key made when the server starts; the server
+    keeps each open nonce with the settings fingerprint it was issued
+    against, and any attempt to use one spends it."""
+
+    MAX_OPEN = 500
+
+    def __init__(self):
+        import secrets
+        self.key = secrets.token_bytes(32)
+        self._open = {}  # nonce -> (expiry, fingerprint)
+        self._lock = threading.Lock()
+
+    def _mac(self, route, payload, fingerprint, expiry, nonce):
+        import hashlib
+        import hmac
+        msg = _canonical([route, payload, fingerprint, expiry, nonce])
+        return hmac.new(self.key, msg.encode(), hashlib.sha256).hexdigest()
+
+    def issue(self, route, payload, fingerprint):
+        import secrets
+        now = _clock()
+        expiry = int(now) + _V2_CONFIRM_S
+        nonce = secrets.token_hex(12)
+        with self._lock:
+            for n in [n for n, (exp, _fp) in self._open.items() if exp < now]:
+                del self._open[n]
+            while len(self._open) >= self.MAX_OPEN:
+                del self._open[next(iter(self._open))]
+            self._open[nonce] = (expiry, fingerprint)
+        return f"{expiry}.{nonce}.{self._mac(route, payload, fingerprint, expiry, nonce)}"
+
+    def redeem(self, token, route, payload, fingerprint_now):
+        """None when the token confirms exactly this change (it is spent
+        now), else what to tell the owner. Nothing may be saved then."""
+        import hmac
+        parts = token.split(".") if isinstance(token, str) else []
+        if len(parts) != 3 or not parts[0].isdigit():
+            return _TOKEN_SPENT
+        expiry, nonce, mac = int(parts[0]), parts[1], parts[2]
+        with self._lock:
+            rec = self._open.pop(nonce, None)  # single use: any try spends it
+        if rec is None or rec[0] != expiry or _clock() > expiry:
+            return _TOKEN_SPENT
+        if not hmac.compare_digest(
+                mac, self._mac(route, payload, rec[1], expiry, nonce)):
+            return _TOKEN_OTHER
+        if not hmac.compare_digest(rec[1], fingerprint_now):
+            return _REVIEW_AGAIN
+        return None
+
+
+class _Invalid(Exception):
+    """A /v2 payload that is refused as a whole (nothing is saved)."""
+
+
+def _v2_payload(data, allowed):
+    """The payload without the confirmation fields; refuses unknown keys."""
+    if not isinstance(data, dict):
+        raise _Invalid("Send the settings as a JSON object.")
+    extra = sorted(k for k in data if k not in allowed and k not in _V2_RESERVED)
+    if extra:
+        raise _Invalid(f"Unknown setting: {', '.join(map(str, extra))[:120]}. "
+                       "Nothing was changed.")
+    return {k: v for k, v in data.items() if k not in _V2_RESERVED}
+
+
+def _v2_number(v, name, low, high, whole=False, low_open=False):
+    """A finite JSON number in [low, high] ((low, high] with low_open)."""
+    import math
+    import numbers
+    kind = "a whole number" if whole else "a number"
+    if (isinstance(v, bool) or not isinstance(v, numbers.Real)
+            or not math.isfinite(v) or (whole and v != int(v))):
+        raise _Invalid(f"{name} must be {kind}. Nothing was changed.")
+    if (v <= low if low_open else v < low) or v > high:
+        rng = (f"more than {low:g} and at most {high:,g}" if low_open
+               else f"from {low:g} to {high:,g}")
+        raise _Invalid(f"{name} must be {rng}. Nothing was changed.")
+    return int(v) if whole else float(v)
+
+
+def _v2_text(v, name, longest=500):
+    if not isinstance(v, str) or not v.strip():
+        raise _Invalid(f"{name} must be filled in (send null to clear it). "
+                       "Nothing was changed.")
+    if len(v) > longest or any(ord(ch) < 32 for ch in v):
+        raise _Invalid(f"{name} is not a valid value. Nothing was changed.")
+    return v.strip()
+
+
+# What a /v2 limits save accepts (low, high) — the classic form clamps or
+# ignores what is outside; /v2 refuses it and says the range.
+_V2_LIMIT_RANGES = {"max_entries_per_day": (1, 1000),
+                    "max_daily_loss_usd": (0, 1_000_000_000),  # 0 = no limit
+                    "max_open_positions": (1, 1000)}
+# trade size: mode -> (low, high, whole number, name); budget and percent
+# must be more than `low`, contracts at least `low`
+_V2_SIZE_RANGES = {"budget": (0, 10_000_000, False, "dollars per trade"),
+                   "contracts": (1, 100_000, True, "contracts per trade"),
+                   "percent": (0, 100, False, "percent of the account")}
+
+
+def _secret(value, show_last4=True):
+    """How a secret appears in a GET: whether it is set, and at most its
+    last four characters (none for a short one or a password)."""
+    s = str(value or "")
+    return {"set": bool(s),
+            "last4": s[-4:] if show_last4 and len(s) >= 12 else None}
+
+
+# The settings a /v2 preview depends on: the fingerprint changes whenever
+# one of them does. Raw values, secrets included — the fingerprint is an
+# HMAC under the server's own random key, so it gives none of them away.
+_FP_KEYS = (
+    "sizing_mode", "budget_per_trade_usd", "contracts_per_trade",
+    "percent_per_trade", "max_contracts_per_trade", "other_sizing_mode",
+    "other_budget_per_trade_usd", "other_contracts_per_trade",
+    "other_percent_per_trade", "other_max_contracts_per_trade",
+    "max_entries_per_day", "max_daily_loss_usd", "max_open_positions",
+    "dry_run", "paused", "rule_tickers", "rule_skip_tickers", "rule_sides",
+    "rule_min_strike", "rule_skip_0dte", "rule_loss_streak",
+    "discord_webhook_url", "ntfy_topic", "telegram_bot_token",
+    "telegram_chat_id", "keep_awake", "llm_provider", "llm_api_key",
+    "llm_model", "llm_base_url", "anthropic_api_key", "llm_fallback",
+    "broker", "robinhood_account", "source", "include_other_trades",
+    "day_pass_recurring", "lnbits_url", "lnbits_admin_key",
+    "agenthc_api_key", "max_autopay_sats")
+
+
+def _broker_field_keys():
+    try:
+        from brokers import key_brokers
+        return [f["id"] for w in key_brokers() for f in w.get("fields", [])
+                if isinstance(f, dict) and f.get("id")]
+    except Exception:
+        return []
+
+
+def _settings_fingerprint(cfg, key):
+    import hashlib
+    import hmac
+    import llm_policy
+    keys = sorted(set(_FP_KEYS) | set(_broker_field_keys()))
+    picked = {k: cfg[k] for k in keys if k in cfg}
+    msg = _canonical({"cfg": picked, "policy": llm_policy.policy_text()})
+    return hmac.new(key, msg.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def _risk_direction(old, new, none_is_unlimited=False):
+    """raises_risk / lowers_risk / neutral for a bigger-is-riskier number.
+    none_is_unlimited: None or 0 means no limit at all (the loss limit)."""
+    def eff(v):
+        if none_is_unlimited and not v:
+            return float("inf")
+        return v
+    a, b = eff(old), eff(new)
+    if a is None or b is None or a == b:
+        return "neutral"
+    return "raises_risk" if b > a else "lowers_risk"
+
+
+def _book_size(cfg, prefix):
+    """One book's saved trade size as {mode, value}; None when not set (for
+    the other-trades book: it sizes the same as the main pick)."""
+    mode = cfg.get(f"{prefix}sizing_mode")
+    if mode not in _SZ_VALUE_KEY:
+        return None
+    return {"mode": mode, "value": cfg.get(f"{prefix}{_SZ_VALUE_KEY[mode]}")}
+
+
+def _size_direction(old, new):
+    if old and new and old["mode"] == new["mode"]:
+        return _risk_direction(old.get("value"), new.get("value"))
+    return "neutral"  # a different kind of size can't be compared
+
+
+# /setup?from=<one of these>: where the wizard's "Dashboard" links and its
+# hop after "Start my agent" go. A fixed list: never an open redirect.
+_RETURN_TO = {"v2": "/v2", "dash": "/dash"}
+
+
+def _return_to(raw_path):
+    """The allowed return page a /setup address asks for, or None."""
+    from urllib.parse import parse_qs, urlparse
+    try:
+        vals = parse_qs(urlparse(raw_path).query).get("from") or []
+    except ValueError:
+        return None
+    return _RETURN_TO.get(vals[0]) if len(vals) == 1 else None
+
+
+def _wizard_page(html, raw_path):
+    """The built-in setup wizard, with its way back to the dashboard the
+    owner came from (?from=v2): unchanged without it."""
+    to = _return_to(raw_path)
+    if to is None or to == "/dash":
+        return html
+    return (html.replace('href="/dash"', f'href="{to}"')
+            .replace("location='/dash'", f"location='{to}'"))
 
 
 def _broker_display(cfg, last4=""):
@@ -3887,12 +4182,17 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                     other.get("value"))
         if not ok:
             return {"ok": False, "error": f"shadow book: {err}"}
+        _adopt(new)
+        save()
+        return {"ok": True}
+
+    def _adopt(new):
+        """Make the working copy `new` (a changed copy of it), touching only
+        the keys that differ."""
         for k in [k for k in list(cfg) if k not in new]:
             cfg.pop(k, None)  # (never clear(): another request may be reading)
         cfg.update({k: v for k, v in new.items()
                     if k not in cfg or cfg[k] != v})  # only what sizing changed
-        save()
-        return {"ok": True}
 
     def source_scope(_h, data):
         """Just the "which signals" choice (main / main + other trades), so the
@@ -3918,49 +4218,16 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             cfg["dry_run"] = data["dry"]
         elif cfg.get("dry_run") is None:
             cfg["dry_run"] = True
-        raw_cap = str(data.get("cap") or "").strip()
-        try:
-            cap = max(1, int(float(raw_cap))) if raw_cap else None
-        except (TypeError, ValueError, OverflowError):
-            cap = None  # not a number: keep what is set
-        old_cap = cfg.get("max_entries_per_day")
-        if (cap is not None and data.get("seeded") is not True
-                and isinstance(old_cap, int) and cap > old_cap):
-            # A Safety page still open from before an update sends its own
-            # default (5), not your cap. Only a page that was filled in
-            # from the current settings ("seeded") may RAISE the cap.
-            cap = None
-        if cap is not None:
-            cfg["max_entries_per_day"] = cap
-        elif old_cap is None:
-            cfg["max_entries_per_day"] = 5
-        raw_loss = str(data.get("max_loss") or "").strip()
-        if raw_loss:  # blank keeps any existing limit (re-running the wizard)
-            try:
-                cfg["max_daily_loss_usd"] = max(
-                    0.0, float(raw_loss.lstrip("$").replace(",", "")))
-            except ValueError:
-                pass
+        _apply_entry_cap(cfg, data.get("cap"), data.get("seeded"))
+        _apply_daily_loss(cfg, data.get("max_loss"))
         cfg.setdefault("max_event_age_s", 300)
         import rules
         rules.apply_settings(cfg, data)
-        if "keep_awake" in data:
-            cfg["keep_awake"] = bool(data.get("keep_awake"))
-        for src_key, cfg_key in (("discord", "discord_webhook_url"),
-                                 ("ntfy", "ntfy_topic"),
-                                 ("tg_token", "telegram_bot_token"),
-                                 ("tg_chat", "telegram_chat_id")):
-            v = str(data.get(src_key, "")).strip()
-            if v:
-                cfg[cfg_key] = v
+        _apply_keep_awake(cfg, data)
+        _apply_alert_targets(cfg, data)
         policy = str(data.get("policy", "")).strip()
         if policy:
-            import llm_policy
-            path = llm_policy.policy_path()
-            import os as _os
-            _os.makedirs(_os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(policy + "\n")
+            _write_policy_file(policy)
             key = str(data.get("anthropic_key", "")).strip()
             import llm_client
             if key and not llm_client.configured(cfg):
@@ -3989,15 +4256,15 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         perr = _policy_save_error(cfg, policy, "")
         if perr:
             return {"ok": False, "error": perr}
-        import os as _os
-        import llm_policy
-        path = llm_policy.policy_path()
-        _os.makedirs(_os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(policy + "\n")
-        cfg.setdefault("llm_fallback", "skip")
+        _store_policy(policy)
         save()
         return {"ok": True, "note": "plain-English rules saved"}
+
+    def _store_policy(policy):
+        """A checked, non-empty policy: on file, and the AI's fallback set
+        (not saved: the caller saves)."""
+        _write_policy_file(policy)
+        cfg.setdefault("llm_fallback", "skip")
 
     # ── move to another computer ──
     def move_export(_h, data):
@@ -4209,6 +4476,541 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                   s.get("fields", {}),
                                   get_trades() if get_trades else [])}
 
+    # ── /v2 settings API ─────────────────────────────────────────────────────
+    # Typed payloads in; underneath, the code the classic pages and the chat
+    # commands run (one implementation per setting). A money-affecting write
+    # is applied only by its second POST, carrying the token its preview
+    # gave (_Confirmations).
+    confirms = _Confirmations()
+    rule_keys = ("rule_tickers", "rule_skip_tickers", "rule_sides",
+                 "rule_min_strike", "rule_skip_0dte", "rule_loss_streak")
+    does_not_trade = "It does not buy or sell anything."
+
+    def _fingerprint():
+        """Of config.json as it is on disk now (not of the working copy,
+        which may hold another request's unsaved changes)."""
+        with A.CONFIG_LOCK:
+            try:
+                disk = A._read_config()
+            except OSError:
+                disk = dict(cfg)
+        return _settings_fingerprint(disk, confirms.key)
+
+    def _sync():
+        """The working copy brought up to config.json as it is now (under
+        CONFIG_LOCK). Raises ConfigUnreadable: nothing may be saved then."""
+        _pull(A._read_config())
+
+    def _v2(fn):
+        def run(_h, data):
+            try:
+                return fn(data)
+            except _Invalid as exc:
+                return {"ok": False, "error": str(exc)}
+        run.__name__ = fn.__name__
+        return run
+
+    def _two_step(route, payload, data, changes, does_not, extra=None):
+        """Under CONFIG_LOCK, after _sync(). None: go ahead (the token in
+        `data` confirms exactly this payload against these settings). Else
+        the reply: the preview (no token sent yet) or why not."""
+        fp = _fingerprint()
+        if "confirm" not in data:
+            return {"ok": True, "needs_confirm": True, "preview": {
+                "changes": changes, "does_not": does_not, **(extra or {}),
+                "token": confirms.issue(route, payload, fp),
+                "expires_in_s": _V2_CONFIRM_S}}
+        problem = confirms.redeem(data.get("confirm"), route, payload, fp)
+        return None if problem is None else {"ok": False, "error": problem}
+
+    def _change(key, label, saved_now, new, direction):
+        return {"key": key, "label": label, "saved_now": saved_now,
+                "new": new, "direction": direction}
+
+    def _settings_view():
+        import keep_running
+        import llm_client
+        import llm_policy
+        import rules
+        from brokers import account_tag, broker_ready, key_brokers
+        ai = llm_client.resolve(cfg) or {}
+        bid = str(cfg.get("broker") or "")
+        wiz = next((w for w in key_brokers() if w.get("id") == bid), None)
+        fields = {}
+        for f in (wiz or {}).get("fields", []):
+            if f.get("type") == "checkbox":
+                fields[f["id"]] = bool(cfg.get(f["id"], f.get("default", False)))
+            else:  # keys, passwords, gateway address: never sent back
+                fields[f["id"]] = _secret(cfg.get(f["id"]),
+                                          f.get("type") != "password")
+        try:
+            ready = bool(broker_ready(cfg))
+        except Exception:
+            ready = None
+        try:
+            auto = keep_running.autostart_status()
+            auto = {"supported": bool(auto.get("supported")),
+                    "enabled": bool(auto.get("enabled")),
+                    "how": str(auto.get("how") or "")}
+        except Exception:
+            auto = {"supported": False, "enabled": None, "how": ""}
+        acct = str(cfg.get("robinhood_account") or "") if bid == "robinhood" else ""
+        return {
+            "ok": True,
+            "fingerprint": _fingerprint(),
+            "agent_running": get_status is not None,
+            "mode": {"mode": A._mode(cfg),
+                     "explicit": isinstance(cfg.get("dry_run"), bool)},
+            "paused": A._paused(cfg),
+            "limits": {
+                "trade_size": {"main": _book_size(cfg, ""),
+                               "other": _book_size(cfg, "other_")},
+                "max_entries_per_day": cfg.get("max_entries_per_day"),
+                "max_daily_loss_usd": cfg.get("max_daily_loss_usd"),
+                "max_open_positions": cfg.get("max_open_positions"),
+                "defaults": {"max_entries_per_day": 5, "max_open_positions": 10},
+                "allowed": _V2_LIMIT_RANGES,
+            },
+            "rules": {**{k: cfg.get(k) for k in rule_keys},
+                      "summary": rules.describe(cfg) or "",
+                      "policy": llm_policy.policy_text(),
+                      "policy_blocks_entries": llm_policy.entries_blocked(cfg)},
+            "alerts": {src: _secret(cfg.get(key)) for src, key in _ALERT_KEYS},
+            "computer": {"autostart": auto,
+                         "keep_awake": cfg.get("keep_awake", True) is not False},
+            "ai": {"connected": bool(ai), "provider": ai.get("provider"),
+                   "name": ai.get("name"), "model": ai.get("model"),
+                   "endpoint": (_site_only(cfg["llm_base_url"])
+                                if cfg.get("llm_base_url") else None),
+                   "key": _secret(ai.get("key"))},
+            "broker": {"id": bid or None, "ready": ready,
+                       "account_mask": acct[-4:] or None,
+                       "paper": (account_tag(cfg).endswith(":paper")
+                                 if bid else None),
+                       "fields": fields},
+            "signals": {"source": cfg.get("source"),
+                        "include_other_trades": bool(cfg.get("include_other_trades")),
+                        "recurring": bool(cfg.get("day_pass_recurring")),
+                        "wallet_connected": bool(cfg.get("lnbits_url")
+                                                 and cfg.get("lnbits_admin_key")),
+                        "api_key": _secret(cfg.get("agenthc_api_key")),
+                        "pass_on_file": bool(cfg.get("feed_pass")
+                                             or cfg.get("feed_pass_pending"))},
+        }
+
+    def v2_settings(_h):
+        """GET /api/v2/settings: the settings as they are on disk now, typed,
+        with the fingerprint a preview is bound to. Secrets: set + last4."""
+        with A.CONFIG_LOCK:
+            try:
+                _sync()
+                readable = True
+            except OSError:
+                readable = False  # answered from the last good read
+            return {**_settings_view(), "settings_readable": readable}
+
+    def _limits_new(p):
+        """The validated limits payload applied to a copy of the settings,
+        by the classic code: (copy, changes)."""
+        new = dict(cfg)
+        changes = []
+        size = p.get("trade_size")
+        if "trade_size" in p:
+            if not isinstance(size, dict) or not size or any(
+                    b not in ("main", "other") for b in size):
+                raise _Invalid("trade_size takes main and/or other. Nothing "
+                               "was changed.")
+            for book in ("main", "other"):
+                if book not in size:
+                    continue
+                spec = size[book]
+                if not isinstance(spec, dict) or set(spec) - {"mode", "value"}:
+                    raise _Invalid(f"trade_size.{book} takes mode and value. "
+                                   "Nothing was changed.")
+                mode = spec.get("mode")
+                if book == "other" and mode == "same":
+                    if "value" in spec:
+                        raise _Invalid("trade_size.other: 'same' takes no "
+                                       "value. Nothing was changed.")
+                    value = None
+                elif mode in _V2_SIZE_RANGES:
+                    low, high, whole, label = _V2_SIZE_RANGES[mode]
+                    value = _v2_number(spec.get("value"),
+                                       f"trade_size.{book} ({label})", low,
+                                       high, whole=whole, low_open=not whole)
+                else:
+                    raise _Invalid(f"trade_size.{book}.mode must be budget, "
+                                   "contracts or percent"
+                                   + (" (or same)" if book == "other" else "")
+                                   + ". Nothing was changed.")
+                ok, err = A.set_book_sizing(new, book, mode, value)
+                if not ok:
+                    raise _Invalid(f"trade_size.{book}: {err}. Nothing was changed.")
+                prefix = "" if book == "main" else "other_"
+                before, after = _book_size(cfg, prefix), _book_size(new, prefix)
+                if before != after:
+                    changes.append(_change(
+                        f"trade_size.{book}",
+                        "Trade size" + (" (main pick)" if book == "main"
+                                        else " (other trades)"),
+                        before, after, _size_direction(before, after)))
+        if "max_entries_per_day" in p:
+            n = _v2_number(p["max_entries_per_day"], "max_entries_per_day",
+                           *_V2_LIMIT_RANGES["max_entries_per_day"], whole=True)
+            _apply_entry_cap(new, str(n), True)
+        if "max_daily_loss_usd" in p:
+            usd = _v2_number(p["max_daily_loss_usd"], "max_daily_loss_usd",
+                             *_V2_LIMIT_RANGES["max_daily_loss_usd"])
+            _apply_daily_loss(new, repr(usd))
+        if "max_open_positions" in p:
+            A.set_position_cap(new, _v2_number(
+                p["max_open_positions"], "max_open_positions",
+                *_V2_LIMIT_RANGES["max_open_positions"], whole=True))
+        for key, label, default, unlimited in (
+                ("max_entries_per_day", "New trades per day", 5, False),
+                ("max_daily_loss_usd", "Daily loss limit", None, True),
+                ("max_open_positions", "Positions open at once", 10, False)):
+            if key in p and cfg.get(key, default) != new.get(key, default):
+                changes.append(_change(
+                    key, label, cfg.get(key, default), new.get(key, default),
+                    _risk_direction(cfg.get(key, default), new.get(key, default),
+                                    none_is_unlimited=unlimited)))
+        return new, changes
+
+    @_v2
+    def v2_limits(data):
+        """POST /api/v2/settings/limits: trade size per book, new trades per
+        day, daily loss limit, positions open at once. Partial: only the
+        keys sent change. Never touches Practice/LIVE or the pause."""
+        p = _v2_payload(data, ("trade_size", "max_entries_per_day",
+                               "max_daily_loss_usd", "max_open_positions"))
+        if not p:
+            raise _Invalid("Send at least one limit. Nothing was changed.")
+        with A.CONFIG_LOCK:
+            _sync()
+            new, changes = _limits_new(p)
+            if not changes:
+                return {"ok": True, "saved": False,
+                        "note": "Nothing to change: those are your settings already."}
+            wait = _two_step("limits", p, data, changes, [
+                "It does not switch between Practice and LIVE.",
+                does_not_trade,
+                "It does not change positions you already hold."])
+            if wait:
+                return wait
+            _adopt(new)
+            save()
+            return {"ok": True, "saved": True, "settings": _settings_view()}
+
+    @_v2
+    def v2_rules(data):
+        """POST /api/v2/settings/rules: the built-in rules (rules.apply_settings,
+        as the classic Safety step) and the written policy (as the classic
+        policy save; null turns it off, as /api/policy/disable)."""
+        import rules
+        p = _v2_payload(data, rule_keys + ("policy",))
+        if not p:
+            raise _Invalid("Send at least one rule. Nothing was changed.")
+        for k in ("rule_tickers", "rule_skip_tickers"):
+            if k in p:
+                v = p[k]
+                if (not isinstance(v, list) or len(v) > 200
+                        or not all(isinstance(t, str) for t in v)):
+                    raise _Invalid(f"{k} must be a list of tickers. Nothing "
+                                   "was changed.")
+                bad = [t for t in v if rules.parse_tickers([t]) == []]
+                if bad:
+                    raise _Invalid(f"{k}: not a ticker: {', '.join(bad)[:80]}. "
+                                   "Nothing was changed.")
+        if "rule_sides" in p and p["rule_sides"] not in rules.SIDES:
+            raise _Invalid("rule_sides must be one of: "
+                           + ", ".join(rules.SIDES) + ". Nothing was changed.")
+        if "rule_min_strike" in p:
+            _v2_number(p["rule_min_strike"], "rule_min_strike", 0, 100_000)
+        if "rule_skip_0dte" in p and not isinstance(p["rule_skip_0dte"], bool):
+            raise _Invalid("rule_skip_0dte must be true or false. Nothing was "
+                           "changed.")
+        if "rule_loss_streak" in p:
+            _v2_number(p["rule_loss_streak"], "rule_loss_streak", 0, 100,
+                       whole=True)
+        policy = p.get("policy", "")
+        if "policy" in p and policy is not None:
+            if not isinstance(policy, str) or not policy.strip():
+                raise _Invalid("policy must be your written rules (send null "
+                               "to turn them off). Nothing was changed.")
+            if len(policy) > 20_000:
+                raise _Invalid("policy is too long (20,000 characters at "
+                               "most). Nothing was changed.")
+        with A.CONFIG_LOCK:
+            _sync()
+            if "policy" in p and policy is not None:
+                perr = _policy_save_error(cfg, policy.strip(), "")
+                if perr:
+                    return {"ok": False, "error": perr}
+            rules.apply_settings(cfg, {k: v for k, v in p.items() if k in rule_keys})
+            if "policy" in p:
+                if policy is None:
+                    import llm_policy
+                    llm_policy.disable_policy()
+                else:
+                    _store_policy(policy.strip())
+            save()
+            return {"ok": True, "saved": True, "settings": _settings_view()}
+
+    @_v2
+    def v2_alerts(data):
+        """POST /api/v2/settings/alerts: Discord / ntfy / Telegram targets, as
+        the classic Safety step saves them. null clears one (the classic form
+        can't: a blank field there keeps what is set)."""
+        p = _v2_payload(data, tuple(src for src, _key in _ALERT_KEYS))
+        if not p:
+            raise _Invalid("Send at least one alert target. Nothing was changed.")
+        keep = {}
+        for src, _key in _ALERT_KEYS:
+            if src in p and p[src] is not None:
+                keep[src] = _v2_text(p[src], src)
+        if "discord" in keep and not keep["discord"].startswith("https://"):
+            raise _Invalid("discord must be the webhook address (https://…). "
+                           "Nothing was changed.")
+        with A.CONFIG_LOCK:
+            _sync()
+            _apply_alert_targets(cfg, keep)
+            for src, key in _ALERT_KEYS:
+                if src in p and p[src] is None:
+                    cfg.pop(key, None)
+            save()
+            return {"ok": True, "saved": True, "settings": _settings_view()}
+
+    @_v2
+    def v2_computer(data):
+        """POST /api/v2/settings/computer: start at login (the classic
+        /api/autostart route) and keep awake (as the Safety step)."""
+        p = _v2_payload(data, ("autostart", "keep_awake"))
+        if not p:
+            raise _Invalid("Send autostart and/or keep_awake. Nothing was changed.")
+        for k, v in p.items():
+            if not isinstance(v, bool):
+                raise _Invalid(f"{k} must be true or false. Nothing was changed.")
+        out = {"ok": True, "saved": True}
+        if "autostart" in p:
+            res = autostart_set(None, {"enabled": p["autostart"]})
+            out["autostart_note"] = res.get("note", "")
+            if not res.get("ok"):
+                return {"ok": False, "error": res.get("note")
+                        or "could not change start-at-login"}
+        if "keep_awake" in p:
+            with A.CONFIG_LOCK:
+                _sync()
+                _apply_keep_awake(cfg, p)
+                save()
+        with A.CONFIG_LOCK:
+            out["settings"] = _settings_view()
+        return out
+
+    @_v2
+    def v2_ai(data):
+        """POST /api/v2/settings/ai: the classic /api/llm handler (it tries
+        the model once before saving)."""
+        p = _v2_payload(data, ("provider", "key", "model", "base_url"))
+        for k, v in p.items():
+            if not isinstance(v, str) or len(v) > 2000:
+                raise _Invalid(f"{k} must be text. Nothing was changed.")
+        res = llm(None, p)
+        if res.get("ok"):
+            res = {**res, "saved": True, "settings": _settings_view()}
+        return res
+
+    @_v2
+    def v2_broker_connect(data):
+        """POST /api/v2/broker/connect: the classic /api/broker/connect,
+        applied by the second (confirmed) POST only."""
+        from brokers import account_tag, key_brokers
+        p = _v2_payload(data, ("broker", "values"))
+        wiz = next((w for w in key_brokers()
+                    if w.get("id") == p.get("broker")), None)
+        if wiz is None:
+            raise _Invalid("unknown broker. Nothing was changed.")
+        kinds = {f["id"]: f.get("type") for f in wiz.get("fields", [])}
+        values = p.get("values", {})
+        if not isinstance(values, dict) or set(values) - set(kinds):
+            raise _Invalid("values must be the broker's own fields: "
+                           + ", ".join(kinds) + ". Nothing was changed.")
+        for k, v in values.items():
+            if kinds[k] == "checkbox":
+                if not isinstance(v, bool):
+                    raise _Invalid(f"{k} must be true or false. Nothing was "
+                                   "changed.")
+            elif not isinstance(v, str) or len(v) > 2000:
+                raise _Invalid(f"{k} must be text. Nothing was changed.")
+        p = {"broker": p["broker"], "values": values}
+        # the account it would be: the broker's paper/live switch (a
+        # "<broker>_paper" field; the adapter's own default when not sent)
+        switch = {f["id"]: values.get(f["id"], bool(f.get("default", False)))
+                  for f in wiz.get("fields", [])
+                  if f.get("type") == "checkbox" and f["id"].endswith("_paper")}
+        with A.CONFIG_LOCK:
+            _sync()
+            before = {"id": cfg.get("broker") or None,
+                      "paper": (account_tag(cfg).endswith(":paper")
+                                if cfg.get("broker") else None)}
+            trial = {**cfg, "broker": p["broker"], **switch}
+            after = {"id": p["broker"],
+                     "paper": (all(switch.values()) if switch else None)}
+            if after["paper"] is None or before["paper"] == after["paper"]:
+                direction = "neutral"
+            elif after["paper"]:
+                direction = "lowers_risk" if before["id"] else "neutral"
+            else:
+                direction = "raises_risk"
+            notes = [f"It does not switch between Practice and LIVE: "
+                     f"{'Practice' if A._mode(cfg) == 'practice' else 'LIVE'} "
+                     "stays.", does_not_trade]
+            if before["id"] and account_tag(cfg) != account_tag(trial):
+                notes.append("Positions the agent opened in the account it "
+                             "uses now are not sold from the new one: look "
+                             "after those at your current broker.")
+            wait = _two_step("broker_connect", p, data, [_change(
+                "broker", "Broker account", before, after, direction)], notes)
+        if wait:
+            return wait
+        res = broker_connect(None, p)
+        if res.get("ok"):
+            res = {**res, "saved": True, "settings": _settings_view()}
+        return res
+
+    @_v2
+    def v2_pass_buy(data):
+        """POST /api/v2/pass/buy: the classic /api/pass/buy (an invoice for
+        N signal days), made by the second (confirmed) POST only."""
+        p = _v2_payload(data, ("days",))
+        days = _v2_number(p.get("days"), "days", 1, 366, whole=True)
+        p = {"days": days}
+        with A.CONFIG_LOCK:
+            _sync()
+            wait = _two_step("pass_buy", p, data, [_change(
+                "signal_days", "Signal days to buy", None, days, "neutral")], [
+                "Nothing is paid yet: the next step shows a Lightning invoice "
+                "with its price, and nothing is paid until you pay it from "
+                "your wallet.",
+                "It does not switch between Practice and LIVE.",
+                does_not_trade])
+        if wait:
+            return wait
+        return pass_buy(None, p)
+
+    @_v2
+    def v2_recurring(data):
+        """POST /api/v2/wallet/recurring: the classic recurring day-pass
+        switch, by the second (confirmed) POST only."""
+        p = _v2_payload(data, ("on",))
+        if not isinstance(p.get("on"), bool):
+            raise _Invalid("on must be true or false. Nothing was changed.")
+        with A.CONFIG_LOCK:
+            _sync()
+            if p["on"] and not (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")):
+                raise _Invalid("Connect a wallet first: without one there is "
+                               "nothing to pay the day-pass from. Nothing was "
+                               "changed.")
+            was = bool(cfg.get("day_pass_recurring"))
+            if was == p["on"]:
+                return {"ok": True, "saved": False,
+                        "note": "Nothing to change: that is your setting already."}
+            cap = cfg.get("max_autopay_sats")
+            wait = _two_step("recurring", p, data, [_change(
+                "day_pass_recurring", "Buy a day-pass automatically", was,
+                p["on"], "raises_risk" if p["on"] else "lowers_risk")], [
+                ("Each payment is capped at "
+                 f"{int(cap):,} sats." if isinstance(cap, (int, float))
+                 and not isinstance(cap, bool) else
+                 "Each payment is capped by your wallet's auto-pay limit.")
+                if p["on"] else "Signal days you already bought are kept.",
+                "It does not switch between Practice and LIVE.",
+                does_not_trade])
+            if wait:
+                return wait
+            res = wallet_recurring(None, p)
+            return {**res, "saved": True, "settings": _settings_view()}
+
+    def _live_preview():
+        """What the owner reviews before LIVE: the view the dashboard shows
+        (account, buying power, limits, real positions open)."""
+        try:
+            s = d_status_v2(None)
+        except Exception:
+            s = {}
+        b = s.get("broker") or {}
+        lim = s.get("limits") or {}
+        return {
+            "account": {"broker": b.get("id"), "name": b.get("name"),
+                        "account_mask": b.get("account_mask"),
+                        "paper_account": b.get("paper_account")},
+            "buying_power": b.get("buying_power"),
+            "buying_power_at": b.get("buying_power_at"),
+            "trade_size": {"main": _book_size(cfg, ""),
+                           "other": _book_size(cfg, "other_")},
+            "limits": {"max_entries_per_day": cfg.get("max_entries_per_day", 5),
+                       "max_daily_loss_usd": cfg.get("max_daily_loss_usd"),
+                       "max_open_positions": cfg.get("max_open_positions", 10)},
+            "real_positions": s.get("real_positions"),
+            "cash_low": (lim.get("cash") or {}).get("low"),
+        }
+
+    # the fixed command each action runs (never text from the request)
+    commands = {"pause": "pause", "resume": "resume",
+                "practice": "dry on", "live": "go live"}
+
+    @_v2
+    def v2_command(data):
+        """POST /api/v2/command: pause / resume / set_mode, through the chat
+        commands' own code (apply_command) with fixed command strings."""
+        import llm_policy
+        p = _v2_payload(data, ("action", "mode"))
+        action = p.get("action")
+        if action in ("pause", "resume") and set(p) == {"action"}:
+            which = action
+        elif (action == "set_mode" and set(p) == {"action", "mode"}
+              and p.get("mode") in ("practice", "live")):
+            which = p["mode"]
+        else:
+            raise _Invalid('Send {"action": "pause"}, {"action": "resume"} or '
+                           '{"action": "set_mode", "mode": "practice" | '
+                           '"live"}. Nothing was changed.')
+        if apply_command is None:
+            return {"ok": False, "error": "The agent isn't running, so this "
+                    "can't change now. Start it first."}
+        with A.CONFIG_LOCK:
+            _sync()
+            if which == "live":
+                if llm_policy.entries_blocked(cfg):
+                    return {"ok": False, "error": llm_policy.BLOCKED_MSG}
+                if cfg.get("dry_run") is False:
+                    return {"ok": True, "saved": False, "note": "Already LIVE."}
+                if "confirm" in data and data.get("acknowledge") is not True:
+                    return {"ok": False, "needs_acknowledge": True, "error": (
+                        "Tick the box to confirm you want real orders. "
+                        "Nothing was changed.")}
+                wait = _two_step("command", p, data, [_change(
+                    "mode", "Mode", A._mode(cfg), "live", "raises_risk")], [
+                    "It does not buy or sell anything by itself: the next "
+                    "signal that passes your limits becomes a real order.",
+                    "It does not change your limits or trade size."],
+                    extra={**_live_preview(), "needs_acknowledge": True})
+                if wait:
+                    return wait
+            handled, reply = apply_command(commands[which])
+            try:
+                now = A._read_config()
+            except OSError:
+                now = None
+            done = isinstance(now, dict) and {
+                "pause": now.get("paused") is True,
+                "resume": not now.get("paused"),
+                "practice": now.get("dry_run") is True,
+                "live": now.get("dry_run") is False}[which]
+            if not (handled and done):
+                return {"ok": False, "error": reply or "Nothing was changed."}
+            return {"ok": True, "reply": reply}
+
     W.routes_get = {"/api/state": state, "/api/rh/start": rh_start,
                     "/api/wallet/balance": wallet_balance,
                     "/api/deploy/status": deploy_status,
@@ -4226,6 +5028,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "/api/pnl": d_pnl,
                     "/api/v2/status": d_status_v2,
                     "/api/v2/activity": d_activity_v2,
+                    "/api/v2/settings": v2_settings,
                     "/api/proposal": proposal_get,
                     "/api/autostart": autostart_get,
                     "/api/move/download": move_download}
@@ -4265,7 +5068,16 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/broker/connect": broker_connect,
                      "/api/proposal/apply": proposal_apply,
                      "/api/proposal/reject": proposal_reject,
-                     "/api/command": d_command}
+                     "/api/command": d_command,
+                     "/api/v2/settings/limits": v2_limits,
+                     "/api/v2/settings/rules": v2_rules,
+                     "/api/v2/settings/alerts": v2_alerts,
+                     "/api/v2/settings/computer": v2_computer,
+                     "/api/v2/settings/ai": v2_ai,
+                     "/api/v2/broker/connect": v2_broker_connect,
+                     "/api/v2/pass/buy": v2_pass_buy,
+                     "/api/v2/wallet/recurring": v2_recurring,
+                     "/api/v2/command": v2_command}
 
     W.routes_get = {p: _fresh(fn) for p, fn in W.routes_get.items()}
     W.routes_post = {p: _fresh(fn) for p, fn in W.routes_post.items()}

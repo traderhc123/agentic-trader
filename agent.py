@@ -4851,6 +4851,13 @@ def set_book_sizing(cfg, book, mode, value):
     return True, ""
 
 
+def set_position_cap(cfg, val):
+    """Most positions open at once, both books together (not saved): one
+    whole number of 1 or more, checked by the caller. Shared by the chat
+    command 'set positions N' and the dashboard's settings page."""
+    cfg["max_open_positions"] = val
+
+
 # A chat command must match its whole grammar. A question, extra words, or
 # words that can't be tickers or numbers mean it is NOT a command: nothing
 # is changed, and the owner gets the usage line (or, for a question, an
@@ -5255,7 +5262,7 @@ def _command(t, cfg, text):
         val = _command_whole(t, "set positions")
         if val is None or val < 1:
             return True, _NOTHING_CHANGED + "Usage: set positions 5"
-        cfg["max_open_positions"] = val
+        set_position_cap(cfg, val)
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Max concurrent open positions set to {val}."
     if t.startswith("set max loss"):
