@@ -303,6 +303,9 @@ def test_every_route_has_a_v2_caller_or_a_classic_only_reason(home, app):
         quoted = re.search(r"[\"'`]" + re.escape(path) + r"(?:[\"'`?])", bundle)
         if kind == "v2":
             assert quoted, f"{method} {path}: PARITY.md says /v2 calls it; the bundle doesn't"
+        elif kind == "classic":
+            # classic-only: /v2 never calls it (no free text, no wizard state)
+            assert not quoted, f"{method} {path}: classic-only in PARITY.md, but /v2 calls it"
         elif kind.startswith("pending"):
             # a row a later step of PR 4 builds: listed, and not yet called
             assert not quoted, f"{method} {path}: called now; mark it v2 in PARITY.md"
