@@ -116,8 +116,13 @@ def poll(cfg, state, save_state=lambda s: None):
             _SIGHT.update(read_at=read_at, first=seen_first)
     last_read, first = _SIGHT["read_at"], {}
     events = []
+    from sources import log_ignored, never_short_reason
     for ev in resp.json().get("events", []):
-        if ev.get("event") not in ("ENTERED", "EXITED"):
+        if not isinstance(ev, dict):
+            continue
+        why = never_short_reason(ev, ev.get("event"))
+        if why:
+            log_ignored("feed", ev, why)
             continue
         try:
             norm = {

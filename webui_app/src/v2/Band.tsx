@@ -6,6 +6,7 @@ import type { Status } from "../lib/viewModel";
 import { UPDATE } from "./lib/copy";
 import { bandModel, marketVital, vitals, type Link, type Vital } from "./lib/derive";
 import { addSeconds, ago } from "./lib/format";
+import { SETUP_FROM_V2 } from "./lib/settings";
 import { Icon } from "./ui";
 
 export type BandAction = "pause" | "resume" | "to-practice" | "to-live" | "retry";
@@ -152,7 +153,7 @@ export function Band({
             </button>
           )}
           {a.start && (
-            <a className="btn btn-primary" href="/setup">
+            <a className="btn btn-primary" data-act="start" href={SETUP_FROM_V2}>
               Open setup to start it
             </a>
           )}

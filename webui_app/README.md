@@ -45,15 +45,24 @@ each other and share no code at run time.
 - It reads `GET /api/v2/status` every 5 seconds and renders only what that
   says. `null` is shown as "not known yet", never as a number. Older Activity
   rows come from `/api/v2/activity`.
-- It changes nothing by itself. Its buttons send the commands the classic
-  buttons send (`pause`, `resume`, `dry on`, `dry off`, `stop`) to
-  `POST /api/command` and show the agent's own reply; everything else links
-  to the settings pages (`/setup`).
+- Settings are changed in /v2 itself, through the typed settings API
+  (`GET /api/v2/settings`, `POST /api/v2/settings/...`, `/api/v2/broker/...`,
+  `/api/v2/pass/buy`, `/api/v2/command`; client in `src/v2/lib/http.ts`,
+  answer types in `src/lib/settingsApi.ts`). A money-affecting change is
+  confirmed in a dialog that shows the server's own preview and is applied
+  only with its token; after every save the page reads the settings back.
+  Only the first-run wizard (`/setup?from=v2`, which comes back to /v2) and
+  the move tool (`/dash#move`) are outside /v2.
+- One fact, one place; one action, one home: `src/v2/lib/screens.ts` says
+  which page owns each control, and `notes()` in `src/v2/lib/derive.ts`
+  states each condition once (the agent's own message about it is folded
+  into the dashboard's note by condition code). The Node tests check both
+  over every fixture state and scan the sources for `data-act` / `data-go`.
 - Every code the status can carry is turned into words in one file,
   `src/v2/lib/copy.ts`. What the band, the vitals and the headline say is
   worked out in `src/v2/lib/derive.ts`. Both are plain functions with tests.
 - Styles are plain CSS (`src/v2/guardian.css`), not Tailwind. The colours
-  have one meaning each: solid orange = real money / LIVE, dashed periwinkle
+  have one meaning each: solid blue = real money / LIVE, dashed violet
   = practice, grey = unknown, red = a fault or a loss, green = a gain.
 
 `npm run build` builds both: the classic app first (`vite.config.ts`), then

@@ -1395,9 +1395,14 @@ def pass_summary(cfg, state):
 
 
 def _parse_events(body):
+    from sources import log_ignored, never_short_reason
     events = []
     for ev in body.get("events", []):
-        if ev.get("event") not in ("ENTERED", "EXITED"):
+        if not isinstance(ev, dict):
+            continue
+        why = never_short_reason(ev, ev.get("event"))
+        if why:
+            log_ignored("AgentHC feed", ev, why)
             continue
         try:
             # Normalize to the contract types (see sources/__init__.py) — a

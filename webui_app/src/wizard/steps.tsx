@@ -7,6 +7,7 @@ import { Msg, err, info, ok, type MsgT } from "../components/ui/tag";
 import { api, type WizardState } from "../lib/api";
 import { mdLite } from "../lib/md";
 import { Block, Notice, StepCard, useWiz } from "./Wizard";
+import { returnTo } from "../lib/returnTo";
 
 export function BackBtn() {
   const { goBack } = useWiz();
@@ -848,7 +849,7 @@ export function LaunchStep() {
         const s = await fetch("/api/status");
         if (s.ok) {
           const j = await s.json();
-          if (j.mode && j.mode !== "OFFLINE") return void (location.href = "/dash");
+          if (j.mode && j.mode !== "OFFLINE") return void (location.href = returnTo());
         }
       } catch {
         /* still switching over */

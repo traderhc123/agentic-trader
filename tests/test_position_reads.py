@@ -571,8 +571,8 @@ class _MMCtx:
     def order_list_query(self, **kw):
         self.queries.append(("orders", kw))
         if kw.get("order_id"):  # the exit's fill check: the agent's own order
-            if self.sdk.ord_ret != self.sdk.RET_OK:
-                return self.sdk.ord_ret, None
+            if self.sdk.fill_ret != self.sdk.RET_OK:
+                return self.sdk.fill_ret, None
             n = int(str(kw["order_id"]).rsplit("-", 1)[-1])
             placed = self.sdk.placed[n - 1]
             return self.sdk.RET_OK, _FakeDF([{
@@ -629,11 +629,14 @@ class _MMSDK:
         CANCEL = "CANCEL"
 
     def __init__(self, positions=(), orders=(), pos_ret=0, ord_ret=0, history=(),
-                 sell_status="FILLED_ALL", sell_dealt=0):
+                 sell_status="FILLED_ALL", sell_dealt=0, fill_ret=None):
         self.positions = None if positions is None else list(positions)
         self.orders = None if orders is None else list(orders)
         self.history = None if history is None else list(history)
         self.pos_ret, self.ord_ret = pos_ret, ord_ret
+        # the exit's fill check (order_list_query by order_id): as the order
+        # list, unless a test scripts it apart
+        self.fill_ret = ord_ret if fill_ret is None else fill_ret
         self.sell_status, self.sell_dealt = sell_status, sell_dealt
         self.ctxs, self.placed, self.cancelled = [], [], []
 
@@ -854,6 +857,9 @@ def test_moomoo_execute_stamps_order_ids(monkeypatch):
     pos = st["positions"]["SPY|2099-12-18|752.0|C"]
     assert pos["order_ids"] == ["mm-1"] and pos["qty"] == 1
     assert pos["last_order_at"] == pytest.approx(time.time(), abs=5)
+    # the buy filled: the account holds it (a sell is only sent for that)
+    sdk.positions = [{"code": "US.SPY991218C752000", "qty": 1,
+                      "position_side": "LONG"}]
     assert moomoo.execute(None, MOOMOO, make_event(event="EXITED", expiry="2099-12-18"),
                           st)
     assert st["positions"] == {} and st["agent_order_ids"] == ["mm-1", "mm-2"]

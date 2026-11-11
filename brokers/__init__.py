@@ -5,6 +5,17 @@ or live, via their local OpenD gateway). Other platforms: copy alpaca.py's
 shape (setup/client/execute + a WIZARD descriptor) — PRs welcome, or let the
 agent build one via self-edit.
 
+THE RULE every adapter obeys: the agent only buys to open and sells to
+close what the account holds — never sells to open. The ONE function that
+sends an order to the broker must call order_guard.check_order(side,
+effect, qty, held_long, broker_refuses_open) before it sends anything, and
+send the quantity it returns; for a sell, held_long is what the broker
+itself says the account holds of that exact contract, minus what working
+sell orders are already selling (None only when that can't be read: the
+sell then goes out only where the broker itself refuses an opening sell).
+tests/test_never_sell_to_open.py checks it for every adapter here, and
+self-edit refuses broker code that looks able to send orders without it.
+
 A broker module exposes:
     setup(cfg) -> cfg               interactive wizard (auth + account pick)
     client(cfg)                     authenticated client or None
@@ -29,6 +40,11 @@ reported as "not held":
         0 means "positively not held"; an id missing from the dict means
         unknown; None means the whole read is unknown. Ids that aren't in
         this broker's id format are left out.
+
+    short_option_qty(client, cfg, option_ids) -> {option_id: int} | None
+        SHORT contracts held, for the ids asked about (0 = none), or None
+        when unknown. A short in a contract the agent traded is a fault:
+        the owner is told and new entries pause; the agent never trades it.
 
     closed_fills(client, cfg, option_id, since_iso, own_order_ids,
                  exclude_agentic=False) -> [fill] | None

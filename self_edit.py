@@ -72,6 +72,31 @@ FOUNDATION_DIRS = ("webui_app", "webui_dist")
 LOCKED_DIRS = ("brokers", "sources")
 _REGISTRY = "__init__.py"
 
+# The agent never sells to open (brokers/order_guard.py): every order it
+# sends goes through order_guard.check_order, inside the function that
+# sends it. A broker file the agent writes (a new adapter, the registry)
+# that looks able to send an order but never calls the check is refused.
+_ORDER_MARKERS = ("place_order", "submit_order", "create_order", "/orders",
+                  "place_option_order", "call_tool(", "requests.post", ".post(")
+
+
+def _order_path_problem(rel, content):
+    """Why a proposed file must not be applied because it could send broker
+    orders around the never-sell-to-open check ("" = fine)."""
+    rel = str(rel).replace(os.sep, "/").lower()
+    if not (rel.startswith("brokers/") and rel.endswith(".py")):
+        return ""
+    text = str(content or "")
+    if "order_guard.check_order(" in text:
+        return ""
+    hit = next((m for m in _ORDER_MARKERS if m in text), None)
+    if hit is None:
+        return ""
+    return (f"{rel} looks able to send broker orders ({hit!r}) but never calls "
+            "order_guard.check_order() — every order must go through that "
+            "check, inside the function that sends it, so the agent can never "
+            "sell to open")
+
 
 def _is_foundation(rel):
     """True if `rel` names a FOUNDATION file on THIS filesystem. Windows and
@@ -282,6 +307,9 @@ def propose(cfg, request):
                            "the agent cannot rewrite its own consent gate, "
                            "safety rails, terms, or this self-edit governor. "
                            "(You can still edit it manually.)")
+        problem = _order_path_problem(rel, new)
+        if problem:
+            return False, f"proposal rejected: {problem}"
         diff = "".join(difflib.unified_diff(
             old.splitlines(keepends=True), new.splitlines(keepends=True),
             fromfile=f"a/{rel}", tofile=f"b/{rel}"))
@@ -485,6 +513,10 @@ def apply_and_restart(restart=True):
             reject()
             return False, (f"apply refused: {rel} is an existing broker/source "
                            "module (proposal discarded)")
+        problem = _order_path_problem(rel, ch.get("content"))
+        if problem:
+            reject()
+            return False, f"apply refused: {problem} (proposal discarded)"
 
     backup_dir = os.path.join(_home(), "backups",
                               time.strftime("%Y%m%d-%H%M%S", time.gmtime()))

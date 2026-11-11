@@ -89,10 +89,12 @@ class FakeAlpaca:
     "ok", "timeout" (the order is taken, the answer never arrives), "cut"
     (the same, and Alpaca can't be reached from then on), "lost" (the
     request never reaches Alpaca), or an HTTP status that is answered AFTER
-    the order is taken (a gateway error). `down` fails every read."""
+    the order is taken (a gateway error). `down` fails every read. `start`:
+    {symbol: contracts} the account held before the first order."""
 
-    def __init__(self, monkeypatch, plan=()):
+    def __init__(self, monkeypatch, plan=(), start=None):
         self.plan, self.orders, self.posts, self.down = list(plan), [], [], False
+        self.start = dict(start or {})
         self.fills = None  # None = orders fill completely
         monkeypatch.setattr(alpaca.requests, "post", self.post)
         monkeypatch.setattr(alpaca.requests, "get", self.get)
@@ -141,15 +143,27 @@ class FakeAlpaca:
         if "quotes/latest" in url:
             return _Resp(200, {"quotes": {kw["params"]["symbols"]:
                                           {"ap": 2.50, "bp": 2.40}}})
+        if url.endswith("/v2/positions"):
+            # what the account holds (a sell is never sent without it)
+            rows = []
+            for sym in sorted({o["symbol"] for o in self.orders} | set(self.start)):
+                n = self.start.get(sym, 0) + self.held(sym)
+                if n:
+                    rows.append({"symbol": sym, "qty": str(n),
+                                 "qty_available": str(n),
+                                 "side": "long" if n > 0 else "short",
+                                 "asset_class": "us_option"})
+            return _Resp(200, rows)
         return _Resp(404, {})
 
     def delete(self, url, **kw):
         return _Resp(204, {})
 
-    def held(self):
-        """Net contracts the account holds (buys minus sells that filled)."""
+    def held(self, symbol=None):
+        """Net contracts the agent's orders added (buys minus sells that
+        filled), on top of `start`."""
         return sum(int(o["filled_qty"]) * (1 if o["side"] == "buy" else -1)
-                   for o in self.orders)
+                   for o in self.orders if symbol in (None, o["symbol"]))
 
 
 ALP_CFG = {"broker": "alpaca", "alpaca_key_id": "k", "alpaca_secret": "s",
@@ -294,7 +308,8 @@ def _held_alpaca_state():
 
 def test_alpaca_sell_timeout_never_sells_twice(home, no_policy, notes, monkeypatch):
     """A second plain sell after the first one filled opens a SHORT."""
-    api = FakeAlpaca(monkeypatch, plan=["cut"])          # and can't ask Alpaca yet
+    api = FakeAlpaca(monkeypatch, plan=["cut"],          # and can't ask Alpaca yet
+                     start={OCC: 2})
     feed, state = _alpaca_feed(_held_alpaca_state())
     ev = make_event(event="EXITED", event_id="x-1")
     for _ in range(3):
@@ -316,7 +331,7 @@ def test_alpaca_sell_that_never_arrived_is_sent_again_under_the_same_id(
     """An exit is never dropped: once Alpaca says the sell isn't there, it
     goes out again — under the SAME id, so if the first one shows up after
     all Alpaca refuses the repeat."""
-    api = FakeAlpaca(monkeypatch, plan=["lost"])
+    api = FakeAlpaca(monkeypatch, plan=["lost"], start={OCC: 2})
     feed, state = _alpaca_feed(_held_alpaca_state())
     ev = make_event(event="EXITED", event_id="x-1")
     feed.poll(ev)
@@ -330,7 +345,7 @@ def test_alpaca_a_later_sell_for_the_same_signal_is_a_new_order(
         home, no_policy, notes, monkeypatch):
     """A sell that got a clear answer but didn't sell everything is over;
     selling the rest must not be refused as a repeat of it."""
-    api = FakeAlpaca(monkeypatch)
+    api = FakeAlpaca(monkeypatch, start={OCC: 2})
     api.fills = 1                                        # each sell fills 1
     state = _held_alpaca_state()
     ev = make_event(event="EXITED", event_id="x-1")
@@ -860,7 +875,7 @@ def test_state_from_the_current_release_needs_no_migration(home, no_policy, note
     """An upgraded install: rows written before this change have no
     sell_seq and the state has no unconfirmed_orders. Nothing is re-traded,
     and the open position still exits normally."""
-    api = FakeAlpaca(monkeypatch)
+    api = FakeAlpaca(monkeypatch, start={OCC: 2})
     state = {"positions": {KEY: {"option_id": OCC, "qty": 2, "order_ids": ["old-1"],
                                  "opened_event": "test-1", "last_order_at": 1.0}},
              "seen": ["test-1"], "agent_order_ids": ["old-1"]}

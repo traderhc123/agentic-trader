@@ -6,10 +6,13 @@ import { Logo } from "./ui/logo";
 export function AppBar({
   page,
   rail,
+  home = "/dash",
   children,
 }: {
   page: string;
   rail?: "dry" | "live" | "paused" | "off" | "none";
+  /** where the name links to: the dashboard (the setup wizard's return page) */
+  home?: string;
   children?: ReactNode;
 }) {
   const railCls =
@@ -26,7 +29,7 @@ export function AppBar({
     <header className="sticky top-0 z-30 border-b border-line bg-bg/90 backdrop-blur-md max-sm:static">
       <div className={`h-[3px] w-full ${railCls}`} aria-hidden="true" />
       <div className="mx-auto flex min-h-12 max-w-[1440px] flex-wrap items-center gap-x-3 gap-y-2 px-6 py-1.5 max-sm:px-4 max-sm:py-2.5">
-        <a href="/dash" className="flex min-w-0 items-center gap-2.5 text-fg no-underline">
+        <a href={home} className="flex min-w-0 items-center gap-2.5 text-fg no-underline">
           <Logo />
           <span className="whitespace-nowrap text-[15px] font-semibold tracking-[-0.01em]">Agentic Trader</span>
           <span className="text-faint max-md:hidden">/</span>

@@ -538,7 +538,8 @@ def test_robinhood_guard_sell_is_a_bid_based_limit(monkeypatch):
                  "place_option_order": _mcp({"data": {"id": "o1"}})})
     placed = robinhood.place(rh, {"robinhood_account": "1"}, "opt-1", "sell",
                              "close", 2, marketable=True)
-    assert placed == {"order_id": "o1", "was_limit": True, "reprice": True}
+    assert placed == {"order_id": "o1", "was_limit": True, "reprice": True,
+                      "qty": 2}
     args = [a for n, a in rh.calls if n == "place_option_order"][-1]
     assert args["type"] == "limit" and args["price"] == "0.95"
     assert args["legs"][0]["position_effect"] == "close"
@@ -615,6 +616,8 @@ def test_alpaca_guard_sell_is_a_limit(monkeypatch):
     monkeypatch.setattr(alpaca.requests, "post",
                         lambda url, **kw: posted.append(kw["json"]) or Resp())
     monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": qty)
+    # the account holds the contract (no sell goes out without knowing that)
+    monkeypatch.setattr(alpaca, "_sell_holding", lambda cfg, occ: (1, 0))
     occ = "RIVN261106C00013500"
     state = {"positions": {KEY: {"option_id": occ, "qty": 1}}}
     assert alpaca.execute(None, {"alpaca_key_id": "k"}, agent._guard_event(KEY, DAY), state)
@@ -633,6 +636,8 @@ def test_alpaca_plain_exit_stays_market(monkeypatch):
     monkeypatch.setattr(alpaca.requests, "post",
                         lambda url, **kw: posted.append(kw["json"]) or Resp())
     monkeypatch.setattr(alpaca, "_confirm_fill", lambda cfg, oid, qty, side="buy": qty)
+    # the account holds the contract (no sell goes out without knowing that)
+    monkeypatch.setattr(alpaca, "_sell_holding", lambda cfg, occ: (1, 0))
     state = {"positions": {KEY: {"option_id": "RIVN261106C00013500", "qty": 1}}}
     ev = dict(agent._guard_event(KEY, DAY))
     ev.pop("exit_limit")

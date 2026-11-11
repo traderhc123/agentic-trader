@@ -15,7 +15,7 @@ import { clip, contractName, etTime, etWhen, plural, usd } from "./format.ts";
 
 export type Cat = "trade" | "limit" | "problem" | "other";
 export type TagKind = "real" | "prac" | "paper" | "none" | "nobuy" | "unk";
-export type Go = "rules" | "settings" | "signals";
+export type Go = "rules" | "settings" | "signals" | "holdings";
 export type IconName =
   | "in" | "out" | "skip" | "clock" | "alert" | "plug" | "note" | "q" | "check" | "dash" | "pause" | "info";
 
@@ -863,7 +863,7 @@ export const UNMANAGED_WHY: Record<NonNullable<Status["unmanaged_reason"]>, stri
   no_bid:
     "A position that expires today had no bid when the expiry sell looked, so it was not sold then. It looks again each loop. If it is in the money it can be exercised.",
   pass_unchecked:
-    "The agent could not check your signal pass with AgentHC, and it reads no signals until it can, so an exit signal can't reach it right now. It checks again on each read.",
+    "The agent could not check your signal pass with AgentHC, and it reads no signals until it can, so an exit signal can't reach it right now.",
 };
 export const UNMANAGED_FALLBACK = "Not being watched.";
 

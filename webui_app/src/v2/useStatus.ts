@@ -1,8 +1,9 @@
 // Where the /v2 dashboard gets its data: GET /api/v2/status every 5 s (the
 // classic dashboard's cadence) while the page is visible — paused while it
-// is hidden, asked at once when it is shown again — older Activity rows from
-// /api/v2/activity on demand, and commands through the same POST
-// /api/command the classic dashboard and the chat box use.
+// is hidden, asked at once when it is shown again — and older Activity rows
+// from /api/v2/activity on demand. `command` is only the stop button's fixed
+// "stop" (POST /api/command); every other command goes through the typed
+// POST /api/v2/command (App.tsx).
 import { useCallback, useEffect, useRef, useState } from "react";
 import { startPolling } from "../lib/polling";
 import { SCHEMA_VERSION, type Activity, type ActivityPage, type Status } from "../lib/viewModel";

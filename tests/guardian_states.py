@@ -375,6 +375,23 @@ STATES.update({
     # the agent could not check the prepaid pass with AgentHC
     "pass-unchecked": (LIVE, {**_state(True), "pass_status": {}},
                        _history(True), runtime(feed_access=False)),
+    # the broker is down and the agent says so too, in its classic words:
+    # one note on the screen (the dashboard's), the agent's folded into it
+    "broker-down-agent-says-so": (
+        LIVE, _state(True), _history(True),
+        runtime(broker={**_BROKER, "connected": False,
+                        "down_since": NOW.timestamp() - 2587,
+                        "last_ok_at": NOW.timestamp() - 2590,
+                        "last_error": "login expired",
+                        "buying_power_at": NOW.timestamp() - 2590},
+                notices=[{"level": "urgent", "code": "broker",
+                          "condition": "broker_down",
+                          "text": "Robinhood connection is DOWN since 1:58 "
+                                  "PM ET. Fix: reconnect it in Settings → "
+                                  "Broker."},
+                         {"level": "warn", "code": "note",
+                          "text": "Records could not be written to disk.",
+                          "condition": "records_unwritten"}])),
     # LIVE on a broker's paper-trading account
     "paper-account": (
         {**LIVE, "broker": "alpaca", "alpaca_paper": True},

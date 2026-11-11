@@ -6,12 +6,20 @@ from a free alpaca.markets account; flip to live keys later).
 
 Orders use Alpaca's /v2/orders with the raw OCC option symbol
 (e.g. SPY260710C00752000), market, day — long single-leg only, matching the
-agent's contract: buy-to-open on ENTERED, sell on EXITED for positions this
-agent opened. Requires options approval on the Alpaca account.
+agent's contract: buy-to-open on ENTERED, sell-to-close on EXITED for
+positions this agent opened. A sell is never sent for more than the
+account holds, and while what the account holds can't be read no sell is
+sent at all (_order, order_guard.check_order). Every order also carries
+Alpaca's position_intent ("buy_to_open" / "sell_to_close"): a second layer,
+in case Alpaca enforces it (see BROKER_REFUSES_OPENING_SELL). Requires
+options approval on the Alpaca account.
 """
 
+import math
 import re
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -224,18 +232,147 @@ _CONFIRM_WAIT_S = 5.0
 class _Unconfirmed(Exception):
     """The order request got no clear answer from Alpaca (a timeout, a
     dropped connection, a server error): it may or may not have gone
-    through. Never answered by simply sending it again (order_guard)."""
+    through. Never answered by simply sending it again (order_guard).
+    `.qty`: the contracts the request was for."""
+
+    def __init__(self, why, qty=None):
+        super().__init__(why)
+        self.qty = qty
 
 
-def _order(cfg, occ, side, qty, limit_price=None, client_order_id=None):
-    """Submit one order. Returns its id, or None when Alpaca refused it;
+_OrderId = order_guard.OrderId  # an order id with .qty: what it was for
+
+
+# Does Alpaca itself refuse a sell_to_close of an option the account doesn't
+# hold (instead of opening a short: cash-secured puts and covered calls are
+# allowed from options level 1)? Its docs list position_intent on the order
+# body but don't say single-leg option orders enforce it, and it hasn't been
+# tried on an account. So it is not counted on: while the holdings can't be
+# read, a sell is held back (order_guard.check_order), exactly as at moomoo.
+# Flip to True only after a paper-account test shows a sell_to_close with
+# nothing held is rejected.
+BROKER_REFUSES_OPENING_SELL = False
+
+# Position intent per side, sent with every order all the same: if Alpaca
+# does enforce it, it is a second layer behind the holdings check.
+_INTENT = {("buy", "open"): "buy_to_open", ("sell", "close"): "sell_to_close"}
+
+# Alpaca's answer to a sell_to_close with nothing (or too little) to close,
+# e.g. 403 {"code": 40310000, "message": "insufficient qty available for
+# order (requested: 1, available: 0)"}.
+_NOTHING_TO_CLOSE_RX = re.compile(
+    r"insufficient\s+qty|available:\s*0\s*\)|position\s+(does\s+not\s+exist|not\s+found)"
+    r"|no\s+(such\s+)?position|not\s+enough\s+(qty|quantity|contracts?)", re.I)
+
+
+# A failed holdings read before a sell is tried again this many times, this
+# far apart, each retry with this time limit: a passing hiccup doesn't hold a
+# sell back for a whole loop, and the worst case (every retry timing out)
+# adds 2 x (1 + 1.5) = 5 s.
+_HOLDINGS_RETRIES = 2
+_HOLDINGS_RETRY_WAIT_S = 1.0
+_HOLDINGS_RETRY_TIMEOUT_S = 1.5
+
+
+def _positions_rows(cfg):
+    """GET /v2/positions: the list of rows, or None when it can't be read.
+    A dropped connection, a timeout, a 5xx or 429 or a body that isn't a
+    list is tried again (_HOLDINGS_RETRIES); any other answer (a 401/403)
+    won't be different a second later."""
+    timeout = _TIMEOUT
+    for attempt in range(_HOLDINGS_RETRIES + 1):
+        if attempt:
+            time.sleep(_HOLDINGS_RETRY_WAIT_S)
+            timeout = _HOLDINGS_RETRY_TIMEOUT_S
+        try:
+            resp = requests.get(f"{_base(cfg)}/v2/positions",
+                                headers=_headers(cfg), timeout=timeout)
+            status = int(resp.status_code)
+            if status == 200:
+                rows = resp.json()
+                if isinstance(rows, list):
+                    return rows
+            elif status != 429 and status < 500:
+                return None
+        except Exception:
+            pass
+    return None
+
+
+def _sell_holding(cfg, occ):
+    """(long contracts of occ the account can sell right now, short
+    contracts of occ) from GET /v2/positions — qty_available is the holding
+    minus what open sell orders are already selling. (None, None) when the
+    account can't be read; a symbol not listed is held 0."""
+    rows = _positions_rows(cfg)
+    if rows is None:
+        return None, None
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("symbol"):
+            return None, None
+        if str(row["symbol"]) != str(occ):
+            continue
+        try:
+            q = float(row.get("qty"))
+            avail = row.get("qty_available")
+            a = q if avail is None else float(avail)
+        except (TypeError, ValueError):
+            return None, None
+        if not (math.isfinite(q) and math.isfinite(a)):
+            return None, None
+        if str(row.get("side") or "").lower() == "short" or q < 0:
+            return 0, int(round(abs(q)))
+        if avail is None:
+            return None, 0  # working sells can't be told apart
+        return max(0, math.floor(min(q, a))), 0
+    return 0, 0
+
+
+def _expires_today(expiry):
+    try:
+        return str(expiry) == datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:
+        return False
+
+
+def _order(cfg, occ, side, qty, limit_price=None, client_order_id=None,
+           effect=None, contract=None, expiry=None):
+    """Submit one order. Returns its id (an _OrderId: .qty is how many
+    contracts it was for), or None when it wasn't sent or Alpaca refused it;
     raises _Unconfirmed when there is no clear answer.
+
+    THE ONLY place an Alpaca order is sent. It sends nothing but a
+    buy-to-open or a sell-to-close (order_guard.check_order), and a sell
+    never for more than Alpaca says the account holds, less what its open
+    sells are already selling. While the holdings can't be read NO sell is
+    sent (BROKER_REFUSES_OPENING_SELL): the owner is told, louder on the
+    contract's expiry day (`expiry`), and the agent tries again on the
+    next loop.
 
     client_order_id: Alpaca accepts each one once per account, so a repeat
     of the same order is refused instead of buying or selling twice (that
     refusal is raised as _Unconfirmed too: the order is there already)."""
-    body = {"symbol": occ, "qty": str(int(qty)), "side": side,
-            "type": "market", "time_in_force": "day"}
+    contract = contract or occ
+    held = None
+    if side == "sell":
+        held, short = _sell_holding(cfg, occ)
+        if short:
+            msg = order_guard.short_text("Alpaca", contract, short)
+            print(f"  ORDER NOT SENT: {msg}")
+            broker_events.report("exit_failed", msg, reason="short_seen",
+                                 short=short, option_id=occ)
+            return None
+    try:
+        qty = order_guard.check_order(
+            side, effect, qty, held,
+            broker_refuses_open=BROKER_REFUSES_OPENING_SELL)
+    except order_guard.RefusedOrder as exc:
+        order_guard.report_refusal("Alpaca", side, qty, contract, exc,
+                                   expires_today=_expires_today(expiry))
+        return None
+    body = {"symbol": occ, "qty": str(qty), "side": side,
+            "type": "market", "time_in_force": "day",
+            "position_intent": _INTENT[(side, effect)]}
     if limit_price is not None:
         body.update(type="limit", limit_price=f"{limit_price:.2f}")
     if client_order_id:
@@ -245,25 +382,38 @@ def _order(cfg, occ, side, qty, limit_price=None, client_order_id=None):
                              json=body, timeout=_TIMEOUT)
         status = int(resp.status_code)
     except Exception as exc:
-        raise _Unconfirmed(type(exc).__name__) from exc
+        raise _Unconfirmed(type(exc).__name__, qty) from exc
     if status >= 500:
-        raise _Unconfirmed(f"HTTP {status}")
+        raise _Unconfirmed(f"HTTP {status}", qty)
     if status not in (200, 201):
-        if client_order_id and "client_order_id" in str(resp.text):
+        text = str(getattr(resp, "text", "") or "")
+        if client_order_id and "client_order_id" in text:
             # "client_order_id must be unique": an order under this id is
             # already there — which one is for the caller to look up
-            raise _Unconfirmed("Alpaca already has an order under this id")
-        print(f"  ORDER FAILED HTTP {resp.status_code}: {resp.text[:200]}")
+            raise _Unconfirmed("Alpaca already has an order under this id", qty)
+        print(f"  ORDER FAILED HTTP {resp.status_code}: {text[:200]}")
+        if side == "sell" and _NOTHING_TO_CLOSE_RX.search(text):
+            # a clear answer: the contracts aren't there to close. Not an
+            # unknown outcome, and not sold again until a read shows them.
+            broker_events.report(
+                "exit_failed",
+                f"Alpaca shows none of {contract} available to sell right now "
+                "(another sell may be working on it, a fill may not have "
+                "settled, or it is gone; Alpaca refused the sell-to-close: "
+                f"{text[:200]}). Nothing was sold and no short position was "
+                "opened. The agent checks the account again and retries.",
+                reason="nothing_held")
+            return None
         broker_events.report("order_failed" if side == "buy" else "exit_failed",
                              f"Alpaca rejected the {side} order (HTTP "
-                             f"{resp.status_code}): {resp.text[:300]}")
+                             f"{resp.status_code}): {text[:300]}")
         return None
     try:
         oid = resp.json().get("id", "submitted")
     except Exception as exc:  # accepted, but the answer can't be read
-        raise _Unconfirmed(type(exc).__name__) from exc
+        raise _Unconfirmed(type(exc).__name__, qty) from exc
     print(f"  alpaca order {side} x{qty} -> {oid}")
-    return oid
+    return _OrderId(oid, qty)
 
 
 def _order_by_key(cfg, key):
@@ -299,8 +449,11 @@ def _send(cfg, state, pos_key, event, contract, occ, side, qty, limit=None):
     kw = {"limit_price": limit} if limit is not None else {}
     sent_at = time.time()
     try:
-        oid = _order(cfg, occ, side, qty, client_order_id=key, **kw)
+        oid = _order(cfg, occ, side, qty, client_order_id=key,
+                     effect="open" if side == "buy" else "close",
+                     contract=contract, expiry=event.get("expiry"), **kw)
     except _Unconfirmed as exc:
+        qty = exc.qty if isinstance(exc.qty, int) else qty
         found = _order_by_key(cfg, key)
         if not found:
             order_guard.note(state, pos_key, side, key, qty, occ,
@@ -317,7 +470,7 @@ def _send(cfg, state, pos_key, event, contract, occ, side, qty, limit=None):
             else:
                 broker_events.report("exit_failed", lost + _SELL_WAITS, placed=True)
             return None
-        oid = str(found["id"])
+        oid = _OrderId(found["id"], qty)
         if _ours_now(found, state, sent_at):
             print(f"  no clear answer from Alpaca to the {side} order ({exc}), "
                   f"but the order is there ({oid}) — using it")
@@ -541,7 +694,7 @@ def execute(cl, cfg, event, state):
         oid = _send(cfg, state, pos_key, event, contract, occ, "buy", qty)
         if oid:
             _remember_order(state, oid)
-            filled = _confirm_fill(cfg, oid, qty)
+            filled = _confirm_fill(cfg, oid, getattr(oid, "qty", qty))
             if filled < 1:
                 print(f"  entry never filled — no position recorded ({contract})")
                 broker_events.report("entry_unfilled",
@@ -587,6 +740,9 @@ def execute(cl, cfg, event, state):
         oid = _send(cfg, state, pos_key, event, contract,
                     pos.get("option_id", occ), "sell", qty, limit)
         if oid:
+            # a sell is never for more than the account holds: it may be
+            # for fewer than the ledger (the rest is settled the usual way)
+            qty = getattr(oid, "qty", qty)
             _remember_order(state, oid)
             sold = _confirm_fill(cfg, oid, qty, side="sell")
             _book_sale(state, pos_key, pos, oid, sold, qty, contract)
@@ -641,6 +797,39 @@ def held_option_qty(cl, cfg, option_ids):
         return {i: held.get(i, 0) for i in ids if i not in busy}
     except Exception:
         return None
+
+
+def short_option_qty(cl, cfg, option_ids):
+    """{OCC symbol: SHORT contracts held (0 = none)} for the ids asked
+    about, or None when the account can't be read (brokers/__init__.py)."""
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    ids = sorted({str(i) for i in option_ids or () if _OCC_RE.match(str(i))})
+    if not ids:
+        return {}
+    try:
+        resp = requests.get(f"{_base(cfg)}/v2/positions", headers=_headers(cfg),
+                            timeout=_TIMEOUT)
+        rows = resp.json() if resp.status_code == 200 else None
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    out = {i: 0 for i in ids}
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        sym = str(row.get("symbol") or "")
+        if sym not in out:
+            continue
+        try:
+            q = float(row.get("qty"))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(q):
+            return None
+        if str(row.get("side") or "").lower() == "short" or q < 0:
+            out[sym] += int(round(abs(q)))
+    return out
 
 
 def _count_position(row, want, held, busy):
