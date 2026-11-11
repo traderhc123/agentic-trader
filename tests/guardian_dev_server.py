@@ -129,7 +129,7 @@ def _settings(tab):
                                        "close_et": "16:00", "early_close": False},
                    "described": "sells at 15:45 ET, alert at 15:50 ET",
                    "allowed": ["09:30", "15:59"]},
-        "code": {"self_edit_enabled": False},
+        "code": {"self_edit_enabled": bool(cfg.get("self_edit_enabled"))},
         "consent": {"accepted": True, "on_file": True,
                     "accepted_at": "2026-10-01T12:00:00+00:00",
                     "terms_version": "fixture", "current_terms_version": "fixture"},
@@ -144,10 +144,16 @@ def _settings(tab):
                    "signin": {"seq": 0, "connected": None, "account_mask": None,
                               "options_off": False, "error": None},
                    "warning": None},
-        "signals": {"source": cfg.get("source"), "include_other_trades": False,
-                    "dry_run_preview": True,
+        "signals": {"source": cfg.get("source"),
+                    "include_other_trades": bool(cfg.get("include_other_trades")),
+                    "dry_run_preview": cfg.get("dry_run_preview", True) is not False,
                     "recurring": bool(cfg.get("day_pass_recurring")),
                     "wallet_connected": bool(cfg.get("lnbits_url")),
+                    "source_site": None,
+                    "wallet": {"site": "demo.lnbits.com" if cfg.get("lnbits_url") else None,
+                               "warning": None, "page_on_file": bool(cfg.get("lnbits_url")),
+                               "autopay_cap_sats": 30000, "invoice_cap_sats": None,
+                               "new_site": "demo.lnbits.com", "new_warning": None},
                     "api_key": {"set": False, "last4": None}, "pass_on_file": True,
                     # the fixture's invoice is never paid: it stays waiting
                     "purchases": {"paid": [], "waiting": ["fixture-purchase"]}},
@@ -325,6 +331,49 @@ def _v2_post(tab, path, data):
                 "amount_sats": 10200 * data["days"],
                 "amount_usd": 10 * data["days"], "extends": False, "carried": 0,
                 "access_until": None, "qr": [[int(v) for v in r] for r in qr]}
+    if path == "/api/v2/settings/code":
+        cfg["self_edit_enabled"] = bool(data.get("self_edit_enabled"))
+        return {"ok": True, "saved": True}
+    if path == "/api/v2/proposal/request":
+        tab["proposal"] = True
+        return {"ok": True, "note": "(fixture server) Proposal ready: 1 file(s) changed."}
+    if path == "/api/v2/proposal/apply":
+        if token is None:
+            return _preview(tab, [{"key": "code", "label": "The agent's code",
+                                   "saved_now": "as it is now", "new": "1 file changed by the AI helper",
+                                   "direction": "neutral"}], _NOT,
+                            {"files": ["brokers/example.py"], "warnings": [], "restarts": True,
+                             "diff_sha256": data.get("diff_sha256")})
+        tab["proposal"] = False
+        return {"ok": True, "reply": "(fixture server) Applied 1 file(s). Restarting."}
+    if path in ("/api/v2/settings/source", "/api/v2/settings/signals", "/api/v2/wallet/create",
+                "/api/v2/wallet/fund", "/api/v2/wallet/connect", "/api/v2/wallet/recurring"):
+        direct = (path.endswith("source") and "agenthc_key" in data) or (
+            path.endswith("signals") and set(data) - {"confirm"} == {"dry_run_preview"})
+        if token is None and not direct:
+            return _preview(tab, [{"key": k, "label": k.replace("_", " ").capitalize(),
+                                   "saved_now": None, "new": v, "direction": "neutral"}
+                                  for k, v in data.items()] or [
+                                      {"key": "wallet", "label": "Payment wallet", "saved_now": None,
+                                       "new": {"site": "demo.lnbits.com", "new": True},
+                                       "direction": "neutral"}], _NOT)
+        if path.endswith("signals"):
+            if "scope" in data:
+                cfg["include_other_trades"] = data["scope"] == "all"
+            if "dry_run_preview" in data:
+                cfg["dry_run_preview"] = data["dry_run_preview"]
+        elif path.endswith("source") and "source" in data:
+            cfg["source"] = data["source"]
+        elif path.endswith("recurring"):
+            cfg["day_pass_recurring"] = bool(data.get("on"))
+        elif path.endswith("create") or path.endswith("connect"):
+            cfg["lnbits_url"] = "https://demo.lnbits.com"
+        elif path.endswith("fund"):
+            return {"ok": True, "bolt11": "lnbc" + "fixturefund" * 20, "sats": data.get("sats"),
+                    "note": "", "qr": None}
+        return {"ok": True, "saved": True}
+    if path == "/api/v2/wallet/page":
+        return {"ok": True, "url": "https://demo.lnbits.com/wallet?usr=fixture"}
     return None
 
 
@@ -409,7 +458,24 @@ class Handler(BaseHTTPRequestHandler):
                      "keys_url": "console.anthropic.com"}}},
                  "/api/pass/options": lambda: {"options": [1, 5, 20, 60]},
                  "/api/pass/status": lambda: {"status": "pending"},
-                 "/api/wallet/balance": lambda: {"ok": False, "error": "no wallet"}}
+                 "/api/wallet/balance": lambda: (
+                     {"ok": True, "sats": 41200} if tab["cfg"].get("lnbits_url")
+                     else {"ok": False, "error": "no wallet"}),
+                 "/api/wallet/quote": lambda: {"ok": True, "btc_usd": 97000.0, "usd": 0.0,
+                                               "day_passes": 0, "day_pass_sats": 10400,
+                                               "suggested_sats": 10400, "invoice_cap": None},
+                 "/api/proposal": lambda: (
+                     {"pending": True, "explanation": "(fixture) Adds a connector for another broker.",
+                      "warnings": [], "diff": "--- a/brokers/example.py\n+++ b/brokers/example.py\n"
+                                              "@@ -0,0 +1 @@\n+x = 1\n"}
+                     if tab.get("proposal") or name == "proposal-pending" else {"pending": False}),
+                 "/api/help/netcheck": lambda: {"ok": True, "text": "AgentHC: OK (fixture)\nGitHub (updates): OK (fixture)"},
+                 "/api/help/report": lambda: {"ok": True, "text": "agentic-trader support report\n(fixture)"},
+                 "/api/v2/agreement": lambda: {"ok": True, "text": "(fixture) The agreement text.", "terms_version": "fixture"},
+                 "/api/tip/options": lambda: {"ok": True, "valid_seconds": 3600,
+                                              "quote": {"btc_usd": 97000.0, "age_s": 30, "source": "fixture"},
+                                              "tiers": [{"amount_usd": n, "amount_sats": n * 1031, "available": True,
+                                                         "reason": None, "label": f"${n}"} for n in (100, 500, 1000)]}}
         if u.path in fixed:
             return self._send(fixed[u.path]())
         if u.path == "/api/v2/activity":
@@ -432,6 +498,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"error": "not found"}, status=404)
         if path == "/api/move/export":
             return self._send({"ok": True, "filename": "agentic-trader-fixture.atmove", "kb": 12})
+        if path == "/api/proposal/reject":
+            tab["proposal"] = False
+            return self._send({"ok": True, "reply": "proposal rejected"})
+        if path == "/api/tip/create":
+            return self._send({"ok": True, "bolt11": "lnbc" + "fixturetip" * 20, "qr": None,
+                               "payment_hash": "a" * 64, "amount_usd": data.get("amount_usd"),
+                               "amount_sats": (data.get("amount_usd") or 0) * 1031,
+                               "btc_usd": 97000.0, "expires_in": 3600})
+        if path == "/api/tip/status":
+            return self._send({"ok": True, "status": "pending"})
         if path == "/api/llm/models":
             return self._send({"ok": True, "provider": "anthropic",
                                "models": ["claude-a", "claude-b"], "suggested": "claude-a"})
