@@ -596,22 +596,26 @@ def _announce_state_hold(cfg, hold, webui):
     return True
 
 
-def _durability_banner():
+def _durability_banner(conditions=False):
     """Urgent dashboard lines while the agent's own records are in doubt:
-    a state hold (above), or a trade log that can't be written."""
+    a state hold (above), or a trade log that can't be written.
+    `conditions`: each line also names its condition (view_model.CONDITIONS)."""
     out = []
     try:
         hold = _state_hold()
         if hold is not None:
             out.append({"level": "urgent", "text": _state_hold_text(
-                hold, _load(CONFIG_PATH, {}) or {})})
+                hold, _load(CONFIG_PATH, {}) or {}), "condition": "state_hold"})
         if _unwritten_rows():
-            out.append({"level": "urgent", "text": _LOG_FAIL_TEXT})
+            out.append({"level": "urgent", "text": _LOG_FAIL_TEXT,
+                        "condition": "records_unwritten"})
         if _BAK_FAIL.get("stale"):
-            out.append({"level": "warn", "text": _BAK_FAIL_TEXT})
+            out.append({"level": "warn", "text": _BAK_FAIL_TEXT,
+                        "condition": "backup_failing"})
     except Exception:
         pass
-    return out
+    return out if conditions else [
+        {k: v for k, v in w.items() if k != "condition"} for w in out]
 
 
 # ── config.json: one lock, always read-modify-write ──────────────────────────
@@ -3872,11 +3876,19 @@ def _expiry_wake_check(cfg, state, save_state, prev_beat, now_et):
     return sent
 
 
-def expiry_banner(cfg, state, now_et=None, paused=False, acct=None):
+def expiry_banner(cfg, state, now_et=None, paused=False, acct=None,
+                  conditions=False):
     """Dashboard lines about the agent's own (live) rows at expiry:
     [{"level": info|warn|urgent, "text": ...}]; [] when none. `paused` and
     `acct` (the account the agent trades now) say whether the guard can
-    sell a row at all."""
+    sell a row at all. `conditions`: each line also names its condition
+    (view_model.CONDITIONS)."""
+    out = _expiry_banner(cfg, state, now_et, paused, acct)
+    return out if conditions else [
+        {k: v for k, v in w.items() if k != "condition"} for w in out]
+
+
+def _expiry_banner(cfg, state, now_et, paused, acct):
     try:
         now_et = now_et or _et_now()
         day = now_et.date().isoformat()
@@ -3890,7 +3902,8 @@ def expiry_banner(cfg, state, now_et=None, paused=False, acct=None):
                 continue
             contract = _contract_of(key)
             if parts[1] < day or (parts[1] == day and now_m >= close):
-                out.append({"level": "urgent", "text": (
+                out.append({"level": "urgent", "condition": "position_expired",
+                            "text": (
                     f"{contract} has expired and the agent still lists it — check "
                     "your broker account for an exercise/assignment")})
             elif parts[1] == day and now_et.weekday() < 5:
@@ -3899,19 +3912,23 @@ def expiry_banner(cfg, state, now_et=None, paused=False, acct=None):
                 if why:
                     # nobody will sell it: say so at any time of day
                     out.append({"level": ("urgent" if now_m >= guard
-                                          else "warn"), "text": (
+                                          else "warn"),
+                                "condition": "position_expiring_unsold", "text": (
                         f"{contract} expires today and {why} — sell it in your "
                         f"broker app before the {_hm(close)} ET close or it may "
                         "be exercised")})
                 elif alert is not None and now_m >= alert:
-                    out.append({"level": "urgent", "text": (
+                    out.append({"level": "urgent",
+                                "condition": "position_expiring_unsold", "text": (
                         f"{contract} expires today and is still open — sell it now "
                         "in your broker app or it may be exercised")})
                 elif guard is not None and now_m >= guard:
-                    out.append({"level": "warn", "text": (
+                    out.append({"level": "warn", "condition": "position_expiring",
+                                "text": (
                         f"{contract} expires today — the expiry guard is selling it")})
                 else:
-                    out.append({"level": "info", "text": (
+                    out.append({"level": "info", "condition": "position_expiring",
+                                "text": (
                         f"{contract} expires today — the agent sells it at "
                         f"{_hm(guard)} ET if it's still open then"
                         if guard is not None else
@@ -5616,14 +5633,20 @@ def cmd_run(app_window=False):
 
         def notices(c, st):
             # the banners get_status shows, each with a code
-            out = [{**w, "code": "records"} for w in _durability_banner()]
+            # (`condition`: what each is about, for the view-model's
+            # one-note-per-condition list; the notices themselves keep
+            # {level, code, text})
+            out = [{**w, "code": "records"}
+                   for w in _durability_banner(conditions=True)]
             out += [{**w, "code": "expiry"} for w in expiry_banner(
-                c, st, paused=bool(_full_hold_note()), acct=_status_acct(c))]
+                c, st, paused=bool(_full_hold_note()), acct=_status_acct(c),
+                conditions=True)]
             if cash.get("warning"):
                 out.append({"level": "warn", "code": "low_cash",
-                            "text": cash["warning"]})
+                            "condition": "low_cash", "text": cash["warning"]})
             if deploy_warn:
                 out.append({"level": "warn", "code": "second_copy",
+                            "condition": "second_copy",
                             "text": "Check for a second copy: " + deploy_warn})
             return out
 
