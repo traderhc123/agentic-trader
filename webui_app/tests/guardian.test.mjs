@@ -960,6 +960,13 @@ test("money shown red always carries its sign (lost today included)", () => {
   assert.equal(tone(-0), "");
 });
 
+test("chart: the end labels print the total to the cent, as the panels do", () => {
+  const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../src/v2/views/ResultsChart.tsx"), "utf8");
+  // rounded to whole dollars, −$0.40 read as a red "−$0" and $1,149.60 as $1,150
+  assert.doesNotMatch(src, /signed\([^)]*,\s*0\)/);
+  assert.equal(signed(-0.4), "−$0.40");
+});
+
 test("signal days: 'Paid' only for the purchase this dialog made", () => {
   // an older pass is active: the pass check says "active", but this purchase is nowhere
   assert.equal(purchaseFate("new", { paid: ["old"], waiting: [] }), "gone");

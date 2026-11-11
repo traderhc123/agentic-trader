@@ -76,7 +76,7 @@ export default function ResultsChart({ model, label, emptyText }: { model: Chart
   const lines = (["real", "practice"] as BookKey[]).filter((k) => model.end[k] != null);
   const name = (k: BookKey) => NAME[k][small ? 1 : 0];
   const gutter = lines.length
-    ? Math.min(150, Math.max(56, ...lines.map((k) => Math.max(textW(name(k), 13) + 16, textW(signed(model.end[k], 0), 14)))) + 14)
+    ? Math.min(150, Math.max(56, ...lines.map((k) => Math.max(textW(name(k), 13) + 16, textW(signed(model.end[k]), 14)))) + 14)
     : 12;
   const m = { l: Math.max(...T.map((t) => textW(axisMoney(t), 13))) + 14, t: 16, r: gutter, b: 30 };
   const plotW = Math.max(40, W - m.l - m.r);
@@ -172,7 +172,7 @@ export default function ResultsChart({ model, label, emptyText }: { model: Chart
                 {name(e.k)}
               </text>
               <text className={`endv ${tone(e.v)}`} x={W - m.r + 8} y={e.y + 15}>
-                {signed(e.v, 0)}
+                {signed(e.v)}
               </text>
             </g>
           ))}
