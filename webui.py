@@ -262,6 +262,31 @@ def setup_replaced():
     (agent.cmd_run's save_state) — however long the restart takes."""
     return bool(CONTROLS.get("replaced"))
 
+# The classic pages' timers: poll() pauses while the page is hidden and asks
+# once at once when it is shown again (a tab left open in the background
+# asked the agent — and through it AgentHC or the wallet — all day long);
+# `every` is a number of ms or a function of the ms since the start (null
+# ends it); o.stopWhen() true ends it; o.onStop runs when it ends by itself.
+# The same rules as webui_app/src/lib/polling.ts.
+_POLL_JS = """
+function poll(fn,every,o){
+  o=o||{};const t0=Date.now();let t=null,off=false,busy=false;
+  const clear=()=>{if(t!==null)clearTimeout(t);t=null;};
+  const end=(own)=>{if(off)return;off=true;clear();
+    document.removeEventListener('visibilitychange',vis);if(own&&o.onStop)o.onStop();};
+  const next=()=>{clear();if(off||document.hidden)return;
+    const ms=typeof every==='function'?every(Date.now()-t0):every;
+    if(ms==null){end(true);return;}t=setTimeout(run,ms);};
+  async function run(){t=null;if(off||busy||document.hidden)return;busy=true;
+    try{await fn();}catch(e){}finally{busy=false;}
+    if(off)return;if(o.stopWhen&&o.stopWhen()){end(true);return;}next();}
+  function vis(){if(off)return;clear();if(!document.hidden)run();}
+  document.addEventListener('visibilitychange',vis);
+  if(o.immediate!==false&&!document.hidden)run();else next();
+  return ()=>end(false);
+}
+"""
+
 _STYLE = """
 <style>
  :root{
@@ -855,7 +880,8 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
       <p id="fund-open" style="display:none">
       <button onclick="copyInvoice()"><svg class="i"><use href="#i-copy"/></svg>Copy invoice</button> <span id="copy-msg" class="up"></span>
       <a id="fund-link" class="btn" href="#"><svg class="i"><use href="#i-bolt"/></svg>Open in my Lightning wallet app</a>
-      · balance: <span id="fund-bal" class="num">0</span> sats
+      · balance: <span id="fund-bal" class="num">0</span> sats<span id="fund-bal-at" class="muted"></span>
+      <a id="fund-refresh" href="#" style="display:none" onclick="fundBalance();return false">Refresh</a>
       <span class="muted">(scan the QR with your phone's wallet, or copy the
       invoice and paste it in any Lightning app — updates automatically after
       you pay)</span></p>
@@ -1073,7 +1099,7 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 </div>
 </main>
 
-<script>
+<script>""" + _POLL_JS + """
 // HTML-escape helper, hoisted so every builder can use it (loadBrokers/brkFields
 // run during boot(), before any local definition would exist).
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
@@ -1218,7 +1244,7 @@ async function updCall(p,body,ms){
 async function checkUpdates(){
   document.getElementById('upd-pull').style.display='none';
   updBusy('checking');
-  const r=await updCall('/api/update/check',null,150000);
+  const r=await updCall('/api/update/check?force=1',null,150000);  // pressed: fresh
   if(!r.ok){updDone('<span class="err">'+esc(r.error||'update check failed')+'</span>');return;}
   if(!r.behind){updDone('<span class="ok">up to date ✓</span>');return;}
   updTarget=r.target||'';
@@ -1326,21 +1352,22 @@ async function buyPassNow(days){
   document.getElementById('pass-link').href='lightning:'+r.bolt11;
   document.getElementById('pass-copy-msg').textContent='';
   st.textContent='waiting for payment…';
-  if(passTimer)clearInterval(passTimer);
-  passTimer=setInterval(checkPass,3000);
+  if(passTimer)passTimer();
+  // every 3 s for 2 minutes, then every 15 s; paused while the page is hidden
+  passTimer=poll(checkPass,ms=>ms<120000?3000:15000,{immediate:false});
 }
 async function checkPass(){
   const r=await api('/api/pass/status');
   const st=document.getElementById('pass-status');
   if(r.status==='active'){
-    if(passTimer){clearInterval(passTimer);passTimer=null;}
+    if(passTimer){passTimer();passTimer=null;}
     document.getElementById('pass-box').style.display='none';
     {const n=Number(r.days_left);
     st.innerHTML='<span class="ok">✓ Access active — '+(Number.isFinite(n)&&r.days_left!=null?n+' signal day'+(n===1?'':'s'):'? signal days')+
       ' left</span>';}
   }else if(r.status==='pending'){st.textContent='waiting for payment…';}
   else if(r.status==='unpaid'){
-    if(passTimer){clearInterval(passTimer);passTimer=null;}
+    if(passTimer){passTimer();passTimer=null;}
     document.getElementById('pass-box').style.display='none';
     st.innerHTML='<span class="err">That invoice expired unpaid — pick a pass again.</span>';
   }else if(r.status==='exits_only'){st.innerHTML='<span class="err">Your signal days are used up — exits still come through for a few days. Buy more above.</span>';}
@@ -1355,8 +1382,9 @@ function srcChanged(){
 // Show only the pass sizes the feed server sells right now (it can take
 // sizes off sale, e.g. while its node can't receive that large a payment).
 // If the server can't be asked, every card stays visible. An empty list
-// means every size is paused. Re-checked every few minutes so a size comes
-// back on its own once the node has refilled.
+// means every size is paused. Re-checked every 15 minutes while the page is
+// visible (and when it is shown again) so a size comes back on its own once
+// the node has refilled.
 async function passSizes(){
   try{const r=await api('/api/pass/options');
     if(!Array.isArray(r.options))return;
@@ -1364,11 +1392,11 @@ async function passSizes(){
       b.style.display=r.options.indexOf(+b.dataset.days)>=0?'':'none';});
     const n=document.getElementById('pass-sizes-note');
     if(n)n.textContent=r.options.length?'':'Passes are paused for a little while — '+
-      'our node is refilling so it can receive the payment. This page checks again every few minutes.';
+      'our node is refilling so it can receive the payment. This page checks again every 15 minutes while it is open.';
   }catch(e){}
 }
 async function boot(){
-  passSizes();setInterval(passSizes,180000);
+  poll(passSizes,900000);  // at once, then every 15 min while visible
   const st=await api('/api/state');
   document.getElementById('disclaimer').innerHTML=mdLite(st.disclaimer);
   const notes=st.notes||{};
@@ -1547,9 +1575,23 @@ async function fundInvoice(){
   document.getElementById('fund-open').style.display='';
   const fl=document.getElementById('fund-link');
   fl.href='lightning:'+r.bolt11;fl.style.display='';
-  if(balTimer)clearInterval(balTimer);
-  balTimer=setInterval(async()=>{const b=await api('/api/wallet/balance');
-    if(b.ok)document.getElementById('fund-bal').textContent=b.sats.toLocaleString();},4000);
+  if(balTimer)balTimer();
+  // every 4 s until the balance changes or 10 minutes pass (paused while the
+  // page is hidden), then a Refresh link
+  let start=null,now=null;
+  document.getElementById('fund-refresh').style.display='none';
+  balTimer=poll(async()=>{now=await fundBalance();if(start===null)start=now;},
+    ms=>ms<600000?4000:null,
+    {immediate:false,stopWhen:()=>now!==null&&now!==start,
+     onStop:()=>{balTimer=null;document.getElementById('fund-refresh').style.display='';}});
+}
+async function fundBalance(){
+  const b=await api('/api/wallet/balance');
+  if(!b.ok)return null;
+  document.getElementById('fund-bal').textContent=b.sats.toLocaleString();
+  document.getElementById('fund-bal-at').textContent=' (as of '+
+    new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+')';
+  return b.sats;
 }
 async function doSource(){
   const v=document.getElementById('src').value;
@@ -2075,7 +2117,7 @@ _DASH_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   </div>
  </div>
 </main>
-<script>
+<script>""" + _POLL_JS + """
 async function api(p, body){
   const r=await fetch(p, body?{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)}:{});
@@ -2337,7 +2379,7 @@ async function send(){
   box.value='';chatAdd('me',text);
   const r=await api('/api/command',{text:text});chatAdd('agent',r.reply);refresh();
 }
-refresh();setInterval(refresh,5000);
+poll(refresh,5000);  // paused while the page is hidden, at once when shown
 </script></body></html>"""
 
 
