@@ -3107,6 +3107,21 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                  "contract": contract, "reason": why}, cfg,
                 code="after_signal_loss_sell"))
             return msg
+        # A wallet day-pass that ends before today's close, with no new one
+        # paid: a position opened now would lose its exit signal mid-session.
+        cover_ok, cover_until = _entry_cover(cfg, state)
+        if not cover_ok:
+            ends = datetime.fromtimestamp(cover_until, MARKET_TZ)
+            why = (f"the day-pass ends at {_hm(ends.hour * 60 + ends.minute)} ET, "
+                   "before today's close, and a new one is not paid")
+            msg = f"SKIPPED {contract}: {why}"
+            print(msg)
+            _log_trade(_row_facts(
+                {"action": "skip_rule", "book": book, "event_id": ev["event_id"],
+                 "contract": contract, "reason": why}, cfg,
+                code="pass_wont_cover",
+                params={"pass_ends_et": _hm(ends.hour * 60 + ends.minute)}))
+            return msg
         # Hard mechanical caps — independent of (and checked before) the LLM.
         # Counted from the rows of the mode the agent is in: real trades
         # when live, practice trades in dry-run — never one against the other.
@@ -3567,6 +3582,22 @@ def _skip_exited_entry(ev, cfg, state, save_state):
                     book="main" if str(ev.get("track", "main")) == "main" else "shadow",
                     check="signal_fresh", code="exit_already_arrived")
     return msg
+
+
+def _entry_cover(cfg, state):
+    """(ok, until_ts) from the AgentHC source's entry_cover: False while it
+    reads with a wallet day-pass that ends before today's close. Other
+    sources, and anything that goes wrong here: (True, None)."""
+    if (cfg or {}).get("source", "agenthc") != "agenthc":
+        return True, None
+    fn = getattr(SOURCES.get("agenthc"), "entry_cover", None)
+    if fn is None:
+        return True, None
+    try:
+        ok, until = fn(cfg, state, _close_epoch(cfg, _et_now().date().isoformat()))
+        return (True, None) if ok or until is None else (False, float(until))
+    except Exception:
+        return True, None
 
 
 def _poll_had_access(source):
