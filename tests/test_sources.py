@@ -725,3 +725,99 @@ def test_wallet_buys_at_most_one_daypass_a_day_with_a_pass_set_up(monkeypatch):
     state = {"autopay_spent": {"day": "2026-07-15", "sats": 12_000, "count": 1}}
     assert agenthc.poll(_wallet_cfg(), state, lambda s: None) == []
     assert wallet.paid == []
+
+
+# ── exit access: can the agent still get EXIT signals? (no-signal sell) ─────
+
+def _exit_flag():
+    return agenthc.had_exit_access(), agenthc.exit_loss_reason()
+
+
+def test_exits_only_read_has_exit_access_but_no_entry_access(monkeypatch):
+    srv = _PassServer(status="exits_only", days_left=0)
+    orig = srv.get
+
+    def get(url, params=None, headers=None, timeout=None):
+        r = orig(url, params, headers, timeout)
+        if not url.endswith("/pass"):
+            r._payload = {"events": [], "pass_days_left": 0, "pass_exits_only": True}
+        return r
+    monkeypatch.setattr(agenthc.requests, "get", get)
+    agenthc.poll(_pass_cfg(), {}, lambda s: None)
+    assert agenthc.had_access() is False
+    assert _exit_flag() == (True, "")
+
+
+def test_api_key_and_active_pass_reads_have_exit_access(monkeypatch):
+    monkeypatch.setattr(agenthc.requests, "get",
+                        lambda *a, **kw: FakeResp({"events": []}))
+    agenthc.poll({"agenthc_api_key": "k"}, {}, lambda s: None)
+    assert _exit_flag() == (True, "")
+    srv = _PassServer()
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    agenthc.poll(_pass_cfg(), {}, lambda s: None)
+    assert _exit_flag() == (True, "")
+
+
+def test_pass_unchecked_has_no_exit_access(monkeypatch):
+    srv = _PassAndWalletServer(pass_status_error=True)
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    assert agenthc.poll(_wallet_cfg(), {}, lambda s: None) == []
+    assert _exit_flag() == (False, "pass_unchecked")
+
+
+def test_unpaid_pass_has_no_exit_access(monkeypatch):
+    monkeypatch.setattr(agenthc.requests, "get", _PassServer(status="pending").get)
+    assert agenthc.poll(_pass_cfg(), {}, lambda s: None) == []
+    assert _exit_flag() == (False, "pass_unpaid")
+
+
+def test_ended_pass_has_no_exit_access(monkeypatch):
+    monkeypatch.setattr(agenthc.requests, "get", _PassServer(status="expired").get)
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: None)
+    assert agenthc.poll(_pass_cfg(), {}, lambda s: None) == []
+    assert _exit_flag() == (False, "pass_ended")
+
+
+def test_no_day_pass_has_no_exit_access(monkeypatch):
+    monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: (_ for _ in ()).throw(
+        AssertionError("no request without a pass")))
+    assert agenthc.poll({}, {}, lambda s: None) == []
+    assert _exit_flag() == (False, "no_day_pass")
+    # a 402 the wallet may not pay (recurring off): the same
+    resp = FakeResp({"payment": {"payment_request": _invoice(9500),
+                                 "macaroon": "MAC", "amount_sats": 9500}}, status=402)
+    monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
+    state = {"l402": {"token": "L402 m:p", "expires_at": time.time() + 3600,
+                      "paid_day": "2026-07-14"}}
+    assert agenthc.poll({}, state, lambda s: None) == []
+    assert _exit_flag() == (False, "no_day_pass")
+
+
+def test_refused_day_pass_has_no_exit_access(monkeypatch):
+    resp = FakeResp({"detail": "payment required"}, status=402)
+    monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
+    import notifications
+    monkeypatch.setattr(notifications, "notify", lambda cfg, text: None)
+    state = {"l402": {"token": "L402 m:p", "expires_at": time.time() + 3600,
+                      "paid_day": "2026-07-15"}}
+    assert agenthc.poll({}, state, lambda s: None) == []
+    assert _exit_flag() == (False, "day_pass_refused")
+    # offered again only after a pause: that skipped read is no access too
+    assert agenthc.poll({}, state, lambda s: None) == []
+    assert _exit_flag() == (False, "day_pass_refused")
+
+
+def test_feed_not_live_has_no_exit_access(monkeypatch):
+    resp = FakeResp({"detail": {"error": "feed_not_live"}}, status=403)
+    monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
+    assert agenthc.poll({"agenthc_api_key": "k"}, {}) == []
+    assert _exit_flag() == (False, "feed_not_live")
+    monkeypatch.setattr(agenthc.requests, "get", _PassServer().get)
+    agenthc.poll(_pass_cfg(), {}, lambda s: None)
+    monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
+    tid = agenthc._token_id(PASS_TOK)
+    state = {"pass_status": {tid: {"status": "active", "until_ts": 9e12}}}
+    assert agenthc.poll(_pass_cfg(), state, lambda s: None) == []
+    assert _exit_flag() == (False, "feed_not_live")

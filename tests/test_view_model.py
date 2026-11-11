@@ -730,6 +730,20 @@ def test_last_signal_falls_back_to_the_log_and_ignores_the_agents_own_events():
     assert s["last_signal_from"] == "activity_log"
 
 
+
+def test_a_no_signal_sale_is_not_a_signal():
+    assert vm._OWN_EVENT_IDS and "no-signal|" in vm._OWN_EVENT_IDS
+    rows = [
+        {"action": "skip_paused", "event_id": "ENTERED|SPY|1", "ts": at(10),
+         "contract": "SPY 2026-11-13 $1.0 C"},
+        # an older-looking row without the cause: told apart by its id
+        {"action": "exit", "event_id": f"no-signal|{SPY}|{TODAY}",
+         "ts": at(15, 30), "dry": False, "contract": "SPY 2026-11-13 $700.0 C"},
+    ]
+    s = build(rows=rows, rt=runtime(signal_at=None))["signals"]
+    assert s["last_signal"] == "2026-11-09T15:00:00Z"
+
+
 # ── the rows the agent really writes ────────────────────────────────────────
 
 def test_rows_handle_event_logs_become_activity(home, no_policy, monkeypatch):

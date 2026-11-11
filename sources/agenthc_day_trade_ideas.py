@@ -1094,7 +1094,31 @@ def _pay_day_pass(cfg, state, body, save_state):
     return True
 
 
-_LAST_POLL = {"access": True}
+_LAST_POLL = {"access": True, "exits": True, "why": ""}
+
+
+def _no_read(why):
+    """A poll() that read nothing: no entry and no exit signals. `why` is
+    the exit_loss_reason() code."""
+    _LAST_POLL["why"] = why
+    return []
+
+
+def had_exit_access():
+    """Whether the last poll() could read EXIT signals: True after every
+    read the feed answered (entries and exits, or a used-up pass's exits
+    only), False when it returned without reading (no pass or day-pass,
+    a pass not paid or not checked, a refused day-pass, a feed that isn't
+    publishing). The agent sells a held position before the close when
+    this stays False (agent.signal_loss_tick)."""
+    return bool(_LAST_POLL["exits"])
+
+
+def exit_loss_reason():
+    """Why the last poll() read no exit signals ("" when it did):
+    pass_unchecked, pass_unpaid, pass_ended, no_day_pass, day_pass_refused,
+    feed_not_live."""
+    return "" if _LAST_POLL["exits"] else str(_LAST_POLL.get("why") or "")
 
 
 def had_access():
@@ -1114,7 +1138,8 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     shadow book — several entries a day; your daily entry cap and budget
     still apply per trade).
     """
-    _LAST_POLL["access"] = False  # until the feed is actually read (below)
+    # until the feed is actually read (below)
+    _LAST_POLL.update(access=False, exits=False, why="")
     # A wallet day-pass payment saved earlier and not decided yet: ask the
     # wallet first. Paid → its token is used below; still undecided → the
     # wallet path stops further down (never a second payment for one day).
@@ -1137,15 +1162,15 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             # Status check failed (network/server error): the pass may well
             # be fine. Wait for the next poll — never pay the wallet on an
             # unknown, or the owner pays twice for the same day.
-            return []
+            return _no_read("pass_unchecked")
         if not (cfg.get("lnbits_url") and cfg.get("day_pass_recurring")):
             if "pending" in statuses:
-                return []  # invoice shown, not paid yet — nothing to read
+                return _no_read("pass_unpaid")  # invoice shown, not paid yet
             _pass_notice(cfg, state, save_state, "pass_expired_notified",
                          "Your AgentHC feed pass has run out — the agent gets no "
                          "signals until you buy more signal days (dashboard → "
                          "Settings → Signal source).")
-            return []
+            return _no_read("pass_ended")
         # else: fall through to the wallet's daily auto-pay
     # Skip the request entirely when access is impossible: no API key, no
     # live day-pass token, and buying one isn't allowed right now (recurring
@@ -1154,15 +1179,16 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     # cadence that's ~1,000 doomed invoices a day against the publisher's
     # node. The once-per-day notify inside _pass_purchase_allowed still fires.
     if undecided and not _headers(cfg, state):
-        return []
+        return _no_read("no_day_pass")
     if not _headers(cfg, state) and not _pass_purchase_allowed(cfg, state, save_state):
-        return []
+        return _no_read("no_day_pass")
     track = "all" if cfg.get("include_other_trades") else "main"
     headers = _headers(cfg, state)
     daypass = None if cfg.get("agenthc_api_key") else (state.get("l402") or {})
     if (daypass and headers.get("Authorization") and not _retried
             and time.time() - float(daypass.get("refused_at") or 0) < _REFUSED_RETRY_S):
-        return []  # AgentHC refused this paid pass a moment ago: offer it again later
+        # AgentHC refused this paid pass a moment ago: offer it again later
+        return _no_read("day_pass_refused")
     resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
                         params={"limit": 20, "track": track},
                         headers=headers, timeout=15)
@@ -1193,12 +1219,12 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             "entries, and no exit signals for positions it holds, so watch "
             "those yourself. If this doesn't clear up, contact AgentHC with "
             "the time of the payment from your wallet's payment list.")
-        return []
+        return _no_read("day_pass_refused")
     if resp.status_code == 402 and not _retried:
         if undecided or not _pass_purchase_allowed(cfg, state, save_state):
-            return []
+            return _no_read("no_day_pass")
         if not _buy_day_pass(cfg, state, resp.json(), save_state):
-            return []
+            return _no_read("no_day_pass")
         return poll(cfg, state, save_state, _retried=True)
     if resp.status_code == 401 and not _retried and not cfg.get("agenthc_api_key"):
         state.pop("l402", None)  # stale day-pass token — re-buy on next 402
@@ -1210,7 +1236,8 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             accept_terms(cfg)
             return poll(cfg, state, save_state, _retried=True)
         if isinstance(detail, dict) and detail.get("error") == "feed_not_live":
-            return []  # feed exists but isn't publishing yet — keep polling
+            # feed exists but isn't publishing yet — keep polling
+            return _no_read("feed_not_live")
         raise RuntimeError(f"403 from feed: {str(detail)[:200]}")
     resp.raise_for_status()
     if headers.get("Authorization"):
@@ -1226,7 +1253,7 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
         if (now.weekday() < 5 and 9 * 60 + 30 <= minute < 16 * 60
                 and _record_paid_day(state, now.strftime("%Y-%m-%d"))):
             save_state(state)
-    _LAST_POLL["access"] = True
+    _LAST_POLL.update(access=True, exits=True)
     return _parse_events(resp.json())
 
 
@@ -1241,7 +1268,7 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
     if resp.status_code == 403:
         detail = resp.json().get("detail", {})
         if isinstance(detail, dict) and detail.get("error") == "feed_not_live":
-            return []
+            return _no_read("feed_not_live")
         raise RuntimeError(f"403 from feed: {str(detail)[:200]}")
     resp.raise_for_status()
     body = resp.json()
@@ -1256,7 +1283,8 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
             save_state(state)
     left = body.get("pass_days_left", body.get("pass_trading_days_left"))
     exits_only = bool(body.get("pass_exits_only"))
-    _LAST_POLL["access"] = not exits_only
+    # a used-up pass still reads the exits: exit access, no entry access
+    _LAST_POLL.update(access=not exits_only, exits=True)
     rec = state.setdefault("pass_status", {}).get(_token_id(token))
     if rec is not None:
         new_status = "exits_only" if exits_only else "active"

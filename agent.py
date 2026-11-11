@@ -3094,6 +3094,19 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 "before_expiry_guard", code="past_expiry_guard",
                 params={"guard_et": _hm(guard_at)}))
             return msg
+        # The agent sold what it held today because no exit signal could
+        # reach it (signal_loss_tick): a new position would have no exit
+        # signal either.
+        if state.get("signal_loss_sold_day") == _et_now().date().isoformat():
+            why = ("no exit signals reached the agent today, so it sold what "
+                   "it held and opens nothing new until tomorrow")
+            msg = f"SKIPPED {contract}: {why}"
+            print(msg)
+            _log_trade(_row_facts(
+                {"action": "skip_rule", "book": book, "event_id": ev["event_id"],
+                 "contract": contract, "reason": why}, cfg,
+                code="after_signal_loss_sell"))
+            return msg
         # Hard mechanical caps — independent of (and checked before) the LLM.
         # Counted from the rows of the mode the agent is in: real trades
         # when live, practice trades in dry-run — never one against the other.
@@ -3931,6 +3944,375 @@ def expiry_guard_busy(cfg, state, now_et=None):
     starts = [m for m in (guard, alert) if m is not None]
     now_m = now_et.hour * 60 + now_et.minute
     return bool(starts) and min(starts) - 1 <= now_m < close
+
+
+# ── no-signal sell ───────────────────────────────────────────────────────────
+# A position the agent opened on a signal is closed by that trade's EXITED
+# signal. When no exit signal can reach the agent any more (the signal pass
+# ran out or isn't paid, a day-pass AgentHC refused, a feed that can't be
+# read), nothing would sell it: it could be carried past the close, and on
+# for days, with nobody watching. So, for the agent's OWN ledger rows only:
+#   - the main loop records when it lost its exit source during the regular
+#     session (_note_exit_source: state["signal_loss"]); the next read that
+#     can see exits clears it;
+#   - after SIGNAL_LOSS_WARN_S of loss with a real position held, one
+#     high-priority warning a day says what will happen and when;
+#   - from signal_loss_sell_et (default 15:30 ET, "off" = never) until the
+#     close, and at least SIGNAL_LOSS_LEAD_S after that warning, every row
+#     it holds (any expiry) is sold through handle_event — the normal sell
+#     path, a marketable limit (bid -5%), retried every loop — with the
+#     expiry guard's checks (dry-run hold, a sell already working, no bid);
+#   - after such a sale it opens nothing new that day (handle_event).
+# A short outage sells nothing: the next good read delivers the exit that
+# was missed. It is not a price stop. On early-close days the time moves
+# earlier by as much as the close does.
+
+SIGNAL_LOSS_DEFAULT = "15:30"
+SIGNAL_LOSS_WARN_S = 300    # loss this long, with a real position: warn
+SIGNAL_LOSS_LEAD_S = 900    # never sell sooner than this after the warning
+
+# exit_loss_reason() codes (and the loop's own) in the owner's words
+_SIGNAL_LOSS_WHY = {
+    "pass_ended": "your signal pass has run out",
+    "pass_unpaid": "your signal pass is not paid yet",
+    "pass_unchecked": "the agent could not check your signal pass with AgentHC",
+    "no_day_pass": "the agent has no day-pass for today",
+    "day_pass_refused": "AgentHC refused today's day-pass",
+    "feed_error": "the signal feed can't be read",
+    "feed_not_live": "the signal feed can't be read",
+    "feed_refused": "the signal feed is refusing the agent",
+}
+# what the owner can do about it ("" = nothing: the agent keeps trying)
+_SIGNAL_LOSS_FIX = {
+    "pass_ended": "buy signal days (dashboard → Settings → Signal source)",
+    "pass_unpaid": "buy signal days (dashboard → Settings → Signal source)",
+    "no_day_pass": "add sats to the agent's wallet",
+}
+SIGNAL_LOSS_OFF_HOW = "say \"no-signal sell off\" in the dashboard"
+
+
+def _poll_had_exit_access(source):
+    """False when the source says its last poll couldn't read EXIT signals
+    either (AgentHC: no pass, an unpaid or refused one, a feed that isn't
+    publishing). A source that doesn't say counts as reading them."""
+    try:
+        fn = getattr(source, "had_exit_access", None)
+        return True if fn is None else bool(fn())
+    except Exception:
+        return True
+
+
+def _poll_exit_loss_reason(source):
+    try:
+        fn = getattr(source, "exit_loss_reason", None)
+        why = fn() if fn is not None else ""
+        return str(why) if why else "feed_error"
+    except Exception:
+        return "feed_error"
+
+
+def _signal_loss_why(cause):
+    return _SIGNAL_LOSS_WHY.get(str(cause or ""), _SIGNAL_LOSS_WHY["feed_error"])
+
+
+def _in_session(cfg, now_et):
+    """A trading day, from the 09:30 open until that day's close."""
+    if not is_trading_day(cfg, now_et.date()):
+        return False
+    now_m = now_et.hour * 60 + now_et.minute
+    return _OPEN_MIN <= now_m < _close_min(cfg, now_et.date().isoformat())
+
+
+def _note_exit_source(cfg, state, save_state, status, cause="", now_et=None):
+    """After each loop's read of the feed: "ok" (exit signals could be read:
+    the loss record goes, and if the owner was warned today and nothing was
+    sold, they are told once that signals are back), "lost" (no exit signal
+    could be read: the loss starts now unless it already did — only inside
+    the regular session, when signals are published) or "skip" (the feed was
+    deliberately not read: no change). Never raises."""
+    try:
+        now_et = now_et or _et_now()
+        rec = state.get("signal_loss")
+        if status == "ok":
+            if rec is None:
+                return
+            state.pop("signal_loss", None)
+            day = now_et.date().isoformat()
+            told = (isinstance(rec, dict) and rec.get("warned_day") == day
+                    and state.get("signal_loss_sold_day") != day)
+            try:
+                save_state(state)
+            except Exception:
+                pass
+            if told:
+                msg = ("agentic-trader: exit signals are reaching your agent "
+                       "again. Nothing was sold.")
+                print(msg)
+                notify(cfg, msg)
+            return
+        if status != "lost" or not _in_session(cfg, now_et):
+            return
+        if not isinstance(rec, dict) or not isinstance(rec.get("since"), (int, float)):
+            rec = {"since": now_et.timestamp()}
+        changed = rec is not state.get("signal_loss") or rec.get("cause") != cause
+        rec["cause"] = str(cause or "feed_error")
+        state["signal_loss"] = rec
+        if changed:
+            save_state(state)
+    except Exception as exc:
+        print(f"no-signal sell: could not record the feed state ({str(exc)[:120]})")
+
+
+def _signal_loss_time(cfg, day):
+    """The no-signal sell time on `day` (minutes ET), or None when it is
+    switched off. On an early-close day it moves earlier by as much as the
+    close does, never before the 09:30 open (as _expiry_times)."""
+    at = _et_hhmm(cfg, "signal_loss_sell_et", SIGNAL_LOSS_DEFAULT)
+    if at is None:
+        return None
+    return max(_OPEN_MIN, at - (_REGULAR_CLOSE_MIN - _close_min(cfg, day)))
+
+
+def _signal_loss_rows(state):
+    """[(key, row)] ledger rows that hold contracts or have an order
+    working, of every expiry."""
+    rows = state.get("positions")
+    return [(k, r) for k, r in (list(rows.items()) if isinstance(rows, dict) else ())
+            if isinstance(r, dict) and (_int0(r.get("qty")) >= 1 or r.get("pending"))]
+
+
+def _clock_et(ts, now_et):
+    """"13:05" (today) or "Fri 15:42" (an earlier day), ET."""
+    t = datetime.fromtimestamp(float(ts), MARKET_TZ)
+    hm = _hm(t.hour * 60 + t.minute)
+    return hm if t.date() == now_et.date() else f"{t:%a} {hm}"
+
+
+def _broker_label(cfg, broker=None):
+    name = _broker_name(cfg, broker)
+    return _BROKER_NAMES.get(name, name)
+
+
+def _signal_loss_warning(cfg, rec, keys, now_et, sell_m, close_m, broker=None):
+    """Note W: what the agent will do about the positions it can't get an
+    exit signal for, and when."""
+    one = len(keys) == 1
+    it = "it" if one else "them"
+    contracts = ", ".join(_contract_label(k) for k in keys)
+    head = (f"agentic-trader: no exit signals have reached your agent since "
+            f"{_clock_et(rec['since'], now_et)} ET ({_signal_loss_why(rec.get('cause'))}). "
+            f"It holds {contracts}. ")
+    if sell_m is None:
+        return head + (f"The agent will not sell {it} on its own (the no-signal "
+                       f"sell is switched off): watch {it} and sell {it} "
+                       f"yourself at {_broker_label(cfg, broker)}.")
+    now_m = now_et.hour * 60 + now_et.minute
+    at_m = max(sell_m, now_m + -(-SIGNAL_LOSS_LEAD_S // 60)
+               + (1 if now_et.second else 0))
+    if at_m >= close_m:
+        configured = _et_hhmm(cfg, "signal_loss_sell_et", SIGNAL_LOSS_DEFAULT)
+        return head + ("The market closes before the agent would sell (it gives "
+                       "15 minutes' notice first), so it does not sell today. If "
+                       "exit signals are still missing tomorrow, it sells at "
+                       f"{_hm(configured)} ET.")
+    fix = _SIGNAL_LOSS_FIX.get(str(rec.get("cause") or ""))
+    return head + (f"If exit signals are not back by {_hm(at_m)} ET today, the "
+                   f"agent sells {it} itself, with a limit order 5% under the "
+                   f"bid, so {'it is' if one else 'they are'} not carried past "
+                   "the close with nobody watching. This is not a price stop: "
+                   "it happens only because the signals stopped. "
+                   + (f"To keep {it} open, {fix}. " if fix
+                      else "The agent keeps trying. ")
+                   + f"To switch this off, {SIGNAL_LOSS_OFF_HOW}.")
+
+
+def _contract_label(key):
+    try:
+        return _contract_of(key)
+    except ValueError:
+        return str(key)
+
+
+def _signal_loss_sell(cfg, state, save_state, broker, client, key, day, rec, now_et):
+    """Sell one ledger row the agent has no exit signal for. Returns
+    handle_event's line when an exit was placed, else None (retried on the
+    next loop)."""
+    row = state["positions"].get(key)
+    if not isinstance(row, dict):
+        return None
+    contract = _contract_label(key)
+    why = _signal_loss_why(rec.get("cause"))
+    ev = _exit_event(key, f"no-signal|{key}|{day}", "signal_loss")
+    if ev is None:
+        if _note_once(state, save_state, row, "signal_loss_noted", day):
+            msg = (f"no exit signals reach the agent ({why}), but it can't read "
+                   f"the contract of {contract}, so it won't sell it — check it "
+                   f"at {_broker_label(cfg, broker)}")
+            print(f"no-signal sell: {msg} (ledger row {key!r})")
+            notify(cfg, "⚠️ agentic-trader: " + msg, priority="high")
+        return None
+    since = _clock_et(rec["since"], now_et)
+    ev["guard_reason"] = (f"no exit signals since {since} ET ({why}): sold "
+                          "before the close")
+    if not row.get("dry"):
+        if _dry_run_holds_real_sells(cfg):
+            if _note_once(state, save_state, row, "signal_loss_noted", day):
+                print(f"no-signal sell: no exit signals reach the agent, but it "
+                      f"is in dry-run — it won't sell the real position {contract}")
+            return None
+        if (row.get("pending") or {}).get("side") == "sell":
+            print(f"no-signal sell: the sell for {contract} is still working — "
+                  "waiting for it")
+            return None
+        bid = _exit_bid(broker, client, cfg, ev, row)
+        if bid is not None and bid <= 0:
+            print(f"no-signal sell: {contract} has no bid — not selling; "
+                  "checking again next loop")
+            if _note_once(state, save_state, row, "signal_loss_no_bid", day):
+                notify(cfg, f"agentic-trader: {contract} has no bid, so the agent "
+                            f"did not sell it. No exit signals reach the agent "
+                            f"({why}); check it at {_broker_label(cfg, broker)}.")
+            return None
+    if getattr(client, "last_error", None):
+        print(f"no-signal sell: broker connection is down "
+              f"({client.last_error}) — trying the sell anyway")
+    print(f"no-signal sell: no exit signals since {since} ET ({why}) — "
+          f"selling {contract}")
+    try:
+        outcome = handle_event(ev, cfg, state, broker, client, save_state)
+    except ExitNotDone as exc:
+        print(f"no-signal sell: {exc} — retrying in ~{EXPIRY_GUARD_POLL_S}s")
+        return None
+    except Exception as exc:
+        print(f"no-signal sell: the sell of {contract} failed ({str(exc)[:150]}) "
+              f"— retrying in ~{EXPIRY_GUARD_POLL_S}s")
+        return None
+    if outcome:
+        state["signal_loss_sold_day"] = day
+        try:
+            save_state(state)
+        except Exception:
+            pass
+        dry = bool(row.get("dry"))
+        msg = (f"agentic-trader: {'[DRY-RUN] ' if dry else ''}sold {contract}. No "
+               f"exit signals had reached the agent since {since} ET ({why}), so "
+               "it closed the position before today's close. It opens nothing "
+               "new today.")
+        print(msg)
+        notify(cfg, msg, priority=None if dry else "high")
+    return outcome
+
+
+def signal_loss_tick(cfg, state, save_state, broker, client, paused=False,
+                     now_et=None):
+    """Once per heartbeat, right after the expiry guard: the no-signal
+    warning, and from the sell time the no-signal sells (not while
+    `paused`: a full hold). Returns the lines of exits it placed. Never
+    raises."""
+    try:
+        return _signal_loss_tick(cfg, state, save_state, broker, client,
+                                 paused, now_et or _et_now())
+    except Exception as exc:
+        print(f"no-signal sell error (non-fatal): {str(exc)[:150]}")
+        return []
+
+
+def _signal_loss_tick(cfg, state, save_state, broker, client, paused, now_et):
+    rec = state.get("signal_loss")
+    if not isinstance(rec, dict) or not isinstance(rec.get("since"), (int, float)):
+        return []
+    if not _in_session(cfg, now_et):
+        return []
+    rows = _signal_loss_rows(state)
+    if not rows:
+        return []
+    day = now_et.date().isoformat()
+    close_m = _close_min(cfg, day)
+    sell_m = _signal_loss_time(cfg, day)
+    now = now_et.timestamp()
+    now_m = now_et.hour * 60 + now_et.minute
+    real = [k for k, r in rows if _opened_live(r)]
+    if (real and rec.get("warned_day") != day
+            and now - float(rec["since"]) >= SIGNAL_LOSS_WARN_S):
+        rec["warned_at"], rec["warned_day"] = now, day
+        try:
+            save_state(state)
+        except Exception:
+            pass  # the warning matters more; saved with the next change
+        msg = _signal_loss_warning(cfg, rec, real, now_et, sell_m, close_m, broker)
+        print(msg)
+        notify(cfg, msg, priority="high")
+    if paused or sell_m is None or now_m < sell_m:
+        return []
+    done = []
+    for key, row in rows:
+        if _opened_live(row):
+            told = rec.get("warned_at") if rec.get("warned_day") == day else None
+        else:  # practice rows: no warning goes out for them
+            told = float(rec["since"]) + SIGNAL_LOSS_WARN_S
+        if told is None or now - float(told) < SIGNAL_LOSS_LEAD_S:
+            continue
+        out = _signal_loss_sell(cfg, state, save_state, broker, client, key,
+                                day, rec, now_et)
+        if out:
+            done.append(out)
+    return done
+
+
+def signal_loss_banner(cfg, state, now_et=None):
+    """The classic dashboard's line while the owner has been warned today
+    that the agent sells what it holds for lack of exit signals:
+    [{"level": "urgent", "text": ...}] or []. Never raises."""
+    try:
+        now_et = now_et or _et_now()
+        rec = state.get("signal_loss")
+        day = now_et.date().isoformat()
+        if (not isinstance(rec, dict) or rec.get("warned_day") != day
+                or not _in_session(cfg, now_et)):
+            return []
+        real = [k for k, r in _signal_loss_rows(state) if _opened_live(r)]
+        if not real:
+            return []
+        sell_m = _signal_loss_time(cfg, day)
+        told = float(rec["warned_at"])
+        at = datetime.fromtimestamp(told + SIGNAL_LOSS_LEAD_S, MARKET_TZ)
+        at_m = at.hour * 60 + at.minute + (1 if at.second else 0)
+        close_m = _close_min(cfg, day)
+        why = _signal_loss_why(rec.get("cause"))
+        one = len(real) == 1
+        what = f"{len(real)} real position{'' if one else 's'}"
+        if sell_m is None:
+            text = (f"No exit signals reach the agent ({why}). The no-signal "
+                    f"sell is off: sell your {what} yourself.")
+        elif max(sell_m, at_m) >= close_m:
+            text = (f"No exit signals reach the agent ({why}). It is too late "
+                    f"today for the agent to sell your {what} itself.")
+        else:
+            text = (f"No exit signals reach the agent ({why}). It sells your "
+                    f"{what} itself at {_hm(max(sell_m, at_m))} ET unless they "
+                    "are back.")
+        return [{"level": "urgent", "text": text}]
+    except Exception:
+        return []
+
+
+def signal_loss_busy(cfg, state, now_et=None):
+    """True from a minute before the no-signal sell time until the close
+    while the agent has lost its exit source and holds a position: the
+    heartbeat then runs every EXPIRY_GUARD_POLL_S."""
+    try:
+        now_et = now_et or _et_now()
+        rec = state.get("signal_loss")
+        if not isinstance(rec, dict) or not _signal_loss_rows(state):
+            return False
+        if not is_trading_day(cfg, now_et.date()):
+            return False
+        day = now_et.date().isoformat()
+        sell_m = _signal_loss_time(cfg, day)
+        now_m = now_et.hour * 60 + now_et.minute
+        return sell_m is not None and sell_m - 1 <= now_m < _close_min(cfg, day)
+    except Exception:
+        return False
 
 
 def _beat_save_due(cfg, state, last_saved, now, now_et=None):
@@ -4803,16 +5185,27 @@ def _expiry_guard_desc(cfg):
                           if close != _REGULAR_CLOSE_MIN else "")
 
 
+def _signal_loss_desc(cfg):
+    at = _et_hhmm(cfg, "signal_loss_sell_et", SIGNAL_LOSS_DEFAULT)
+    if at is None:
+        return ("off — with no exit signals the agent warns you but does not "
+                "sell")
+    return (f"with no exit signals, the agent sells what it holds at {_hm(at)} "
+            "ET (after a warning at least 15 minutes earlier)")
+
+
 def _expiry_command(t, cfg):
-    """'expiry guard on|off|HH:MM' and 'expiry alert on|off|HH:MM'.
-    Returns (handled, reply)."""
+    """'expiry guard on|off|HH:MM', 'expiry alert on|off|HH:MM' and
+    'no-signal sell on|off|HH:MM'. Returns (handled, reply)."""
     for name, key, default in (("expiry guard", "expiry_guard_et", EXPIRY_GUARD_DEFAULT),
-                               ("expiry alert", "expiry_alert_et", EXPIRY_ALERT_DEFAULT)):
+                               ("expiry alert", "expiry_alert_et", EXPIRY_ALERT_DEFAULT),
+                               ("no-signal sell", "signal_loss_sell_et",
+                                SIGNAL_LOSS_DEFAULT)):
         if t != name and not t.startswith(name + " "):
             continue
         arg = t[len(name):].strip()
         if not arg:
-            return True, f"Expiry guard: {_expiry_guard_desc(cfg)}."
+            return True, _expiry_reply(key, cfg)
         if arg == "on":
             arg = default
         if arg != "off":
@@ -4824,8 +5217,14 @@ def _expiry_command(t, cfg):
             arg = _hm(mins).zfill(5)
         cfg[key] = arg
         _save(CONFIG_PATH, cfg, private=True)
-        return True, f"Expiry guard: {_expiry_guard_desc(cfg)}."
+        return True, _expiry_reply(key, cfg)
     return False, ""
+
+
+def _expiry_reply(key, cfg):
+    if key == "signal_loss_sell_et":
+        return f"No-signal sell: {_signal_loss_desc(cfg)}."
+    return f"Expiry guard: {_expiry_guard_desc(cfg)}."
 
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -5758,7 +6157,8 @@ def cmd_run(app_window=False):
             "cash_warning": cash.get("warning", ""),
             # the owner's Pause doesn't stop the expiry guard; a full hold does
             "expiry_warnings": _durability_banner() + expiry_banner(
-                c, st, paused=bool(_full_hold_note()), acct=_status_acct(c)),
+                c, st, paused=bool(_full_hold_note()), acct=_status_acct(c))
+            + signal_loss_banner(c, st),
             "problems": _problems_with_ai_block(c),
             "budget_hints": _budget_hints(c),
             "would_have": dry_run_preview.summary(c),
@@ -6009,12 +6409,20 @@ def cmd_run(app_window=False):
                         events = source.poll(cfg, state, save_state)
                     except Exception as exc:
                         _loop_note_poll(source, None, exc)  # (dashboard)
+                        # no exit signal can be read: before any re-raise
+                        _note_exit_source(cfg, state, save_state, "lost",
+                                          "feed_error")
                         if not _exits_to_retry(state):
                             raise
                         # the feed can't be read, but the exits the agent
                         # still owes don't need it
                         poll_error, events = exc, []
                     if poll_error is None:
+                        if _poll_had_exit_access(source):
+                            _note_exit_source(cfg, state, save_state, "ok")
+                        else:
+                            _note_exit_source(cfg, state, save_state, "lost",
+                                              _poll_exit_loss_reason(source))
                         note_watching(cfg, access=_poll_had_access(source))
                         _loop_note_poll(source, events, None)  # (dashboard)
                     else:
@@ -6045,10 +6453,14 @@ def cmd_run(app_window=False):
             if cfg.get("source") == "agenthc":
                 _explain_connection_error(exc, cfg, state, save_state)
         # after the feed's own exit signals, and even when the feed is
-        # unreachable: sell what expires today, alert on what's still open
+        # unreachable: sell what expires today, alert on what's still open;
+        # then, with no exit signals since earlier in the session, sell what
+        # it holds before the close (signal_loss_tick)
         try:
             expiry_guard_tick(cfg, state, save_state, broker, client,
                               paused=held)
+            signal_loss_tick(cfg, state, save_state, broker, client,
+                             paused=held)
         finally:
             transfer.CYCLE_IDLE.set()  # cycle over: state is saved
         try:
@@ -6066,7 +6478,7 @@ def cmd_run(app_window=False):
             wait = 2
         else:
             wait = poll if _market_open_now() else max(poll, 300)
-            if expiry_guard_busy(cfg, state):
+            if expiry_guard_busy(cfg, state) or signal_loss_busy(cfg, state):
                 wait = min(wait, EXPIRY_GUARD_POLL_S)
         beat["wait"] = wait
         _loop_note(wait_s=wait)

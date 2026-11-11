@@ -232,6 +232,23 @@ whatever `max_autopay_sats` is set to.
   any other with `"early_close_days": ["YYYY-MM-DD"]`. The guard keeps
   running while the agent is paused, and in dry-run it still sells positions
   the agent bought with real orders (dry-run positions stay on paper).
+- **No-signal sell** (on by default): a position is closed by its trade's
+  exit signal, so when no exit signal can reach the agent any more (your
+  signal pass ran out or isn't paid, AgentHC refused the day-pass, the feed
+  can't be read) nothing would sell it. If that lasts 5 minutes during the
+  session while a real position is open, the agent sends one urgent
+  notification saying what it holds, why the signals stopped and when it
+  will sell. If the signals are not back by `signal_loss_sell_et` (default
+  `"15:30"` ET), it sells every position it opened (any expiry) the same
+  way as the expiry guard (a marketable limit at the bid −5%, retried every
+  ~10 s; no bid = no sell, a notification instead), always at least 15
+  minutes after that notification, and opens nothing new that day. Signals
+  that come back before then cancel it, and a short outage sells nothing
+  (the next read still delivers the missed exit). It is not a price stop.
+  Early-close days move it 3 hours earlier. It keeps running while the agent
+  is paused, but not in a hold. Set it to `"off"` or another time in
+  config.json, or say `no-signal sell off` / `no-signal sell 15:00` in the
+  dashboard; off, the agent still warns you but never sells on its own.
 - **Pause and dry-run, exactly**: **Pause** stops *new entries* only — exit
   signals, the expiry guard and the broker checks keep running for positions
   you already have, and the agent stays paused after a restart until you

@@ -1399,8 +1399,10 @@ def _pass(cfg, state, now):
 
 
 # event ids the agent makes up itself (the expiry guard, a close it found in
-# the account, a re-sold remainder, the ledger check): not signals
-_OWN_EVENT_IDS = ("expiry-guard|", "outside|", "ledger|", "exit-rest|")
+# the account, a re-sold remainder, the ledger check, the no-signal sell):
+# not signals
+_OWN_EVENT_IDS = ("expiry-guard|", "outside|", "ledger|", "exit-rest|",
+                  "no-signal|")
 
 
 def _last_signal(rows, rt):
