@@ -133,9 +133,11 @@ CONDITIONS = (
     # the agent itself
     "agent_stopped", "agent_not_answering", "state_hold", "handoff_hold",
     "restarting", "paused", "settings_unreadable", "ai_needed",
+    "consent_needed", "proposal_pending",
     # money and orders
     "broker_down", "positions_unmanaged", "low_cash",
     "daily_cap_reached", "daily_loss_reached", "position_cap_reached",
+    "budget_too_small",
     # signals
     "signal_pass", "feed_unreachable",
     # only the agent's own messages say these
@@ -148,9 +150,11 @@ _CONDITION_LEVEL = {
     "agent_stopped": "urgent", "agent_not_answering": "urgent",
     "state_hold": "urgent", "handoff_hold": "warn", "restarting": "info",
     "paused": "info", "settings_unreadable": "warn", "ai_needed": "warn",
+    "consent_needed": "warn", "proposal_pending": "info",
     "broker_down": "urgent", "positions_unmanaged": "urgent",
     "low_cash": "warn", "daily_cap_reached": "info",
     "daily_loss_reached": "warn", "position_cap_reached": "info",
+    "budget_too_small": "info",
     "signal_pass": "warn", "feed_unreachable": "warn"}
 # the condition of an agent message that names none, by its code
 _NOTICE_CODE_CONDITION = {"pass": "signal_pass", "low_cash": "low_cash",
@@ -196,6 +200,11 @@ def _types():
             "results": Ref("Results"),
             "notices": List(Ref("Notice")),
             "conditions": List(Ref("ConditionNote")),
+            "proposal": Ref("Proposal"),
+        },
+        "Proposal": {
+            "pending": "bool",
+            "diff_sha256": Opt("str"),
         },
         "Agent": {
             "running": "bool",
@@ -234,6 +243,30 @@ def _types():
             "last_signal": Opt("iso"),
             "last_signal_from": Opt(Enum("feed", "activity_log")),
             "pass": Ref("Pass"),
+            "preview": Opt(Ref("WouldHave")),
+        },
+        "WouldHave": {
+            "days": "int",
+            "would_take": "int",
+            "wins": "int",
+            "breakeven": "int",
+            "losses": "int",
+            "avg_paper_pnl_pct": Opt("num"),
+            "updated_at": Opt("iso"),
+            "error": Opt("str"),
+            "unavailable": "bool",
+            "rows": List(Ref("WouldHaveRow")),
+        },
+        "WouldHaveRow": {
+            "date": "str",
+            "contract": "str",
+            "entry_time": Opt("str"),
+            "exit_time": Opt("str"),
+            "hold_minutes": Opt("num"),
+            "paper_pnl_pct": Opt("num"),
+            "exit_kind": Opt("str"),
+            "would_take": "bool",
+            "skip_reason": Opt("str"),
         },
         "Pass": {
             "kind": Enum(*PASS_KINDS),
@@ -264,6 +297,16 @@ def _types():
             "positions_reached": "bool",
             "trade_size": {"main": Ref("TradeSize"), "other": Ref("TradeSize")},
             "cash": Ref("Cash"),
+            "budget_hints": List(Ref("BudgetHint")),
+        },
+        "BudgetHint": {
+            "book": book,
+            "budget": "num",
+            "skipped": "int",
+            "min_cost": "num",
+            "max_cost": "num",
+            "suggest": "int",
+            "would_take": "int",
         },
         "TradeSize": {
             "mode": Enum("budget", "contracts", "percent"),
@@ -319,7 +362,9 @@ def _types():
             "total": "int",
             "next": Opt("int"),
             "oldest": Opt("int"),
+            "day_lines": List(Ref("DayLines")),
         },
+        "DayLines": {"day": "str", "lines": "int"},
         "Activity": {
             "n": "int",
             "at": Opt("iso"),
@@ -349,6 +394,8 @@ def _types():
             "practice": Ref("Book"),
             "paper_account": Ref("Book"),
             "signal_cost": Ref("SignalCost"),
+            "paid_days": {"real": Opt(Ref("PaidDays")),
+                          "practice": Opt(Ref("PaidDays"))},
         },
         "Book": {
             "today": "num",
@@ -359,9 +406,12 @@ def _types():
             "lost": "int",
             "unmeasured": "int",
             "unmeasured_today": "int",
+            "opened_today": "int",
             "days": List(Ref("BookDay")),
         },
         "BookDay": {"day": "str", "pnl": "num", "closed": "int"},
+        "PaidDays": {"pnl": "num", "closed": "int", "days": "int",
+                     "paid_on": List("str"), "estimated_on": List("str")},
         "SignalCost": {
             "applies": "bool",
             "days_used": "int",
@@ -446,6 +496,12 @@ _DOC = {
     "NextAction.expiry_guard_at": "when the expiry guard would sell it on its "
                                   "expiry day, if it is still open then",
     "ActivityPage.next": "pass as ?before= for the page after this one",
+    "ActivityPage.day_lines": "for each market (ET) day this page has rows "
+                              "of, newest first: how many lines that day "
+                              "has in the whole log, so a page can tell a "
+                              "day it has only part of (\"\" = rows whose "
+                              "time could not be read)",
+    "DayLines.lines": "the day's lines in the whole log, of every kind",
     "Activity.n": "line number in the trade log: a stable row id",
     "Activity.known": "false: a kind this version can't describe",
     "Activity.real": "which book the row belongs to; null = not recorded",
@@ -460,12 +516,36 @@ _DOC = {
     "Book.last_7_days": "the last 7 calendar days (ET), today included",
     "Book.unmeasured_today": "sales today (ET) with no estimate: not in "
                              "`today`, and not in `days`",
+    "Book.opened_today": "entries today (the ET day `today` describes) in "
+                         "this book; the daily limit counts by UTC day "
+                         "instead (Limits.used_today)",
     "Results.real": "orders the agent sent to a real-money account (or one "
                     "not recorded as a paper-trading account)",
     "Results.paper_account": "orders filled in a broker's paper-trading "
                              "account (recorded on each line since this "
                              "version): not real money",
     "BookDay.day": "ET day the trades were closed",
+    "PaidDays.paid_on": "the book's `days` that were paid signal days",
+    "PaidDays.estimated_on": "the book's `days` from before paid days were "
+                             "recorded on which the agent took an entry "
+                             "(a feed entry needs a paid day)",
+    "Results.paid_days": "per book, trades OPENED on a paid signal day (agent.pnl_summary's "
+                      "pass figures, credited to the day the position was "
+                      "opened); null: the source has no per-day charge, or "
+                      "the book has no such figure",
+    "PaidDays.days": "paid signal days those trades were opened on",
+    "Limits.budget_hints": "today's (UTC) signals skipped because one "
+                           "contract cost more than the dollar trade size, "
+                           "and a size that would have taken about half of "
+                           "them (agent._budget_hints)",
+    "BudgetHint.suggest": "a dollar trade size (rounded up to $50)",
+    "Signals.preview": "practice mode with the AgentHC feed: what the "
+                       "owner's rules would have taken from the feed's "
+                       "closed trades of the past days (dry_run_preview); "
+                       "null when it is off or does not apply",
+    "WouldHave.error": "why the last refresh failed; null when it did not",
+    "Proposal.pending": "an AI-proposed code change is waiting for review",
+    "Proposal.diff_sha256": "sha256 of the whole diff (the text GET /api/proposal shows, unless it says truncated)",
     "SignalCost.applies": "false: this signal source has no per-day charge",
     "SignalCost.days_used": "signal days recorded as paid for",
     "SignalCost.days_estimated": "days from before that was recorded",
@@ -926,15 +1006,28 @@ def activity_page(rows, before=None, limit=ACTIVITY_LIMIT, _checked=False):
     limit = max(1, min(_int(limit, ACTIVITY_LIMIT) or ACTIVITY_LIMIT,
                        ACTIVITY_LIMIT_MAX))
     rows = rows if _checked else _clean_rows(rows)
+    rows_all = rows
     oldest = rows[0]["n"] if rows else None
     cut = _int(before)
     if cut is not None:
         rows = [r for r in rows if r["n"] < cut]
     page = rows[-limit:]
+    days = []
+    for r in reversed(page):
+        d = _row_day(r)
+        if d not in days:
+            days.append(d)
+    want = set(days)
+    lines = dict.fromkeys(days, 0)
+    for r in rows_all:
+        d = _row_day(r)
+        if d in want:
+            lines[d] += 1
     return {"rows": [activity_row(r) for r in reversed(page)],
             "total": len(rows),
             "next": page[0]["n"] if page and len(rows) > len(page) else None,
-            "oldest": oldest}
+            "oldest": oldest,
+            "day_lines": [{"day": d, "lines": lines[d]} for d in days]}
 
 
 # ── results ──────────────────────────────────────────────────────────────────
@@ -981,9 +1074,13 @@ def _results(rows, now):
                  - timedelta(days=6)).isoformat()
     books = {k: {"today": 0.0, "last_7_days": 0.0, "total": 0.0,
                  "closed": 0, "won": 0, "lost": 0, "unmeasured": 0,
-                 "unmeasured_today": 0, "days": {}}
+                 "unmeasured_today": 0, "opened_today": 0, "days": {}}
              for k in ("real", "practice", "paper_account")}
     for t in rows:
+        if t.get("action") == "entry":
+            # "Today so far · Opened": the ET day this panel describes
+            books[_book_key(t)]["opened_today"] += _row_day(t) == today
+            continue
         if t.get("action") != "exit":
             continue
         b = books[_book_key(t)]
@@ -1148,7 +1245,108 @@ def _limits(cfg, state, rows, mode, bp, now):
         "trade_size": {"main": _trade_size(cfg),
                        "other": _trade_size(cfg, "other_")},
         "cash": _cash(cfg, bp),
+        "budget_hints": _budget_hints(cfg, rows, now),
     }
+
+
+def _budget_hints(cfg, rows, now):
+    """agent._budget_hints over the same rows it reads (the newest 500) and
+    the same UTC day, as data. [] when there is none, or it can't be read."""
+    import agent as A
+    try:
+        hints = A._budget_hints(
+            cfg, trades=rows[-500:],
+            today=now.astimezone(timezone.utc).date().isoformat())
+    except Exception:
+        return []
+    out = []
+    for h in hints if isinstance(hints, list) else ():
+        vals = {k: _num(h.get(k)) for k in ("budget", "min_cost", "max_cost")}
+        ints = {k: _int(h.get(k)) for k in ("skipped", "suggest", "would_take")}
+        if None in vals.values() or None in ints.values():
+            continue
+        out.append({"book": "other" if h.get("book") in ("shadow", "other")
+                    else "main",
+                    "budget": round(vals["budget"], 2),
+                    "skipped": ints["skipped"],
+                    "min_cost": round(vals["min_cost"], 2),
+                    "max_cost": round(vals["max_cost"], 2),
+                    "suggest": ints["suggest"],
+                    "would_take": ints["would_take"]})
+    return out
+
+
+def _paid_figures(cfg, state, rows, results):
+    """Results.paid_days: per book, the result of trades opened on paid
+    signal days (agent.pnl_summary's pass figures, from the same rows; sales
+    in a broker's paper-trading account left out, as the real book leaves
+    them out) and which of the book's days were paid signal days."""
+    import agent as A
+    out = {"real": None, "practice": None}
+    try:
+        passes, kind, _from, _paid, _est = A._pass_day_kinds(cfg, state, rows)
+        if not passes:
+            return out
+        summary = A.pnl_summary(cfg, state, rows=[
+            t for t in rows if _book_key(t) != "paper_account"])
+    except Exception:
+        return out  # not known: shown as not known, never guessed
+    for key, book in (("real", "live"), ("practice", "dry")):
+        marks = {d["day"]: kind(d["day"]) for d in results[key]["days"]}
+        b = summary.get(book) or {}
+        p = b.get("pass") or {}
+        pnl, closed = _num(p.get("total")), _int(p.get("exits"))
+        if pnl is None or closed is None:
+            continue
+        out[key] = {
+            "pnl": round(pnl, 2), "closed": closed,
+            "days": sum(1 for d in b.get("days") or ()
+                        if isinstance(d, dict) and d.get("pass")),
+            "paid_on": [d for d, k in marks.items() if k == "paid"],
+            "estimated_on": [d for d, k in marks.items() if k == "est"]}
+    return out
+
+
+def _would_have(v):
+    """dry_run_preview.summary(cfg) as data (None: off, or not handed over)."""
+    if not isinstance(v, dict):
+        return None
+    rows = []
+    for r in v.get("rows") if isinstance(v.get("rows"), list) else ():
+        if not isinstance(r, dict):
+            continue
+        rows.append({
+            "date": _text(r.get("date"), 10) or "",
+            "contract": _text(r.get("contract"), _NAME) or "",
+            "entry_time": _text(r.get("entry_time"), 40),
+            "exit_time": _text(r.get("exit_time"), 40),
+            "hold_minutes": _num(r.get("hold_minutes")),
+            "paper_pnl_pct": _num(r.get("paper_pnl_pct")),
+            "exit_kind": _text(r.get("exit_kind"), 40),
+            "would_take": r.get("would_take") is True,
+            "skip_reason": _text(r.get("skip_reason")),
+        })
+    count = {k: max(0, _int(v.get(k), 0) or 0)
+             for k in ("days", "would_take", "wins", "breakeven", "losses")}
+    return {**count,
+            "avg_paper_pnl_pct": _num(v.get("avg_paper_pnl_pct")),
+            "updated_at": _iso(v.get("updated_at")),
+            "error": _text(v.get("error")),
+            "unavailable": v.get("unavailable") is True,
+            "rows": rows[:100]}
+
+
+def _proposal(v):
+    """A pending code proposal (self_edit.current()): whether there is one,
+    and the sha256 of its whole diff (self_edit.diff_sha256)."""
+    if not isinstance(v, dict):
+        return {"pending": False, "diff_sha256": None}
+    try:
+        import self_edit
+        sha = self_edit.diff_sha256(v)
+    except Exception:
+        sha = None
+    return {"pending": True, "diff_sha256": sha}
 
 
 # ── market ───────────────────────────────────────────────────────────────────
@@ -1623,8 +1821,9 @@ def _conditions(facts, notices, conds):
                                                  order[c["code"]]))
 
 
-def _fact_conditions(s, ai_blocked):
-    """The conditions a built Status shows by itself."""
+def _fact_conditions(s, ai_blocked, consent_ok=None):
+    """The conditions a built Status shows by itself. consent_ok: the
+    agreement on file is the current one (None: not known, say nothing)."""
     out = []
     a, pause, b, lim = s["agent"], s["pause"], s["broker"], s["limits"]
     if not a["running"]:
@@ -1639,6 +1838,10 @@ def _fact_conditions(s, ai_blocked):
         out.append("settings_unreadable")
     if ai_blocked:
         out.append("ai_needed")
+    if consent_ok is False:
+        out.append("consent_needed")
+    if s["proposal"]["pending"]:
+        out.append("proposal_pending")
     if b["connected"] is False:
         out.append("broker_down")
     if s["real_positions"] and not s["real_positions_managed"]:
@@ -1652,6 +1855,8 @@ def _fact_conditions(s, ai_blocked):
         out.append("daily_loss_reached")
     if lim["positions_reached"]:
         out.append("position_cap_reached")
+    if lim["budget_hints"]:
+        out.append("budget_too_small")
     sig, p = s["signals"], s["signals"]["pass"]
     # a last read that saw entry signals had a pass, whatever the prepaid
     # one says (the dashboard's own "no signal pass" note, derive.ts)
@@ -1695,6 +1900,10 @@ def build_status(cfg, state, rows, runtime=None, now=None,
                                  last_ok_at, last_error, buying_power,
                                  buying_power_at}
                notices          [{level, code, text}]
+               consent_ok       the agreement on file is the current one
+                                (agent.consent_ok; missing: not known)
+               proposal         self_edit.current() (missing: none)
+               preview          dry_run_preview.summary(cfg) (missing: off)
     now      an aware datetime (default: the clock)
     """
     import agent as A
@@ -1760,6 +1969,7 @@ def build_status(cfg, state, rows, runtime=None, now=None,
         "last_signal": last_signal,
         "last_signal_from": signal_from,
         "pass": _pass(cfg, state, now),
+        "preview": _would_have(rt.get("preview")),
     }
     market = _market(cfg, now)
     c["past_close"] = (c["now_et"].hour * 60 + c["now_et"].minute
@@ -1805,9 +2015,13 @@ def build_status(cfg, state, rows, runtime=None, now=None,
         "results": {**_results(rows, now),
                     "signal_cost": _signal_cost(cfg, state, rows, now)},
         "notices": notices,
+        "proposal": _proposal(rt.get("proposal")),
     }
+    status["results"]["paid_days"] = _paid_figures(cfg, state, rows,
+                                                   status["results"])
     status["conditions"] = _conditions(
-        _fact_conditions(status, c["ai_blocked"]), notices, conds)
+        _fact_conditions(status, c["ai_blocked"], rt.get("consent_ok")),
+        notices, conds)
     return status
 
 

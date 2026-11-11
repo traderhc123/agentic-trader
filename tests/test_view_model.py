@@ -363,11 +363,11 @@ def test_empty_first_run():
     assert s["positions"] == [] and s["real_positions"] == 0
     assert s["real_positions_managed"] is True
     assert s["activity"] == {"rows": [], "total": 0, "next": None,
-                             "oldest": None}
+                             "oldest": None, "day_lines": []}
     for book in ("real", "practice", "paper_account"):
         assert s["results"][book] == {
             "today": 0.0, "last_7_days": 0.0, "total": 0.0, "closed": 0,
-            "won": 0, "lost": 0, "unmeasured": 0, "unmeasured_today": 0,
+            "won": 0, "lost": 0, "unmeasured": 0, "unmeasured_today": 0, "opened_today": 0,
             "days": []}
     assert s["expiry_guard_on"] is True
     assert s["signals"]["last_poll"] is None
@@ -852,14 +852,14 @@ def test_results_never_mix_real_and_practice():
     r = build(rows=rows)["results"]
     assert r["real"] == {
         "today": 64.0, "last_7_days": -326.0, "total": -138.0, "closed": 4,
-        "won": 2, "lost": 2, "unmeasured": 2, "unmeasured_today": 2,
+        "won": 2, "lost": 2, "unmeasured": 2, "unmeasured_today": 2, "opened_today": 0,
         "days": [{"day": "2026-11-09", "pnl": 64.0, "closed": 1},
                  {"day": "2026-11-06", "pnl": -74.0, "closed": 1},
                  {"day": "2026-11-03", "pnl": -316.0, "closed": 1},
                  {"day": "2026-11-02", "pnl": 188.0, "closed": 1}]}
     assert r["practice"] == {
         "today": -20.0, "last_7_days": -20.0, "total": -20.0, "closed": 2,
-        "won": 0, "lost": 1, "unmeasured": 0, "unmeasured_today": 0,
+        "won": 0, "lost": 1, "unmeasured": 0, "unmeasured_today": 0, "opened_today": 0,
         "days": [{"day": "2026-11-09", "pnl": -20.0, "closed": 1},
                  {"day": "2026-11-02", "pnl": 0.0, "closed": 1}]}
 

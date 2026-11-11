@@ -1140,7 +1140,30 @@ def _paid_days(state):
     return days
 
 
-def pnl_summary(cfg=None, state=None):
+def _pass_day_kinds(cfg, state, rows):
+    """Which ET days were paid signal days (pnl_summary's "pass" marker):
+    (passes, kind(day) -> "paid" | "est" | None, tracked_from, paid days,
+    estimated days). See pnl_summary for what each one means."""
+    passes = (cfg.get("source", "agenthc") == "agenthc"
+              and not cfg.get("agenthc_api_key"))
+    paid = _paid_days(state) if passes else set()
+    recorded = _recorded_paid_days(state) if passes else set()
+    tracked_from = min(recorded) if recorded else None
+    entry_days = {_et_day(t.get("ts")) for t in rows
+                  if t.get("action") == "entry"} - {""}
+    est_days = set()
+    if passes:
+        est_days = {d for d in entry_days
+                    if tracked_from is None or d < tracked_from} - paid
+
+    def kind(day):
+        if day in paid:
+            return "paid"
+        return "est" if day in est_days else None
+    return passes, kind, tracked_from, paid, est_days
+
+
+def pnl_summary(cfg=None, state=None, rows=None):
     """All-time estimated realized P&L from the WHOLE trade log (the
     dashboard's Activity list only shows recent rows), split into live and
     dry-run, with a per-day breakdown and the total for pass days.
@@ -1162,23 +1185,8 @@ def pnl_summary(cfg=None, state=None):
     (`passes`); a subscription has no per-day charges to split by."""
     cfg = cfg if cfg is not None else (_load(CONFIG_PATH, {}) or {})
     state = state if state is not None else (_load(STATE_PATH, {}) or {})
-    rows = _read_trade_log()
-    passes = (cfg.get("source", "agenthc") == "agenthc"
-              and not cfg.get("agenthc_api_key"))
-    paid = _paid_days(state) if passes else set()
-    recorded = _recorded_paid_days(state) if passes else set()
-    tracked_from = min(recorded) if recorded else None
-    entry_days = {_et_day(t.get("ts")) for t in rows
-                  if t.get("action") == "entry"} - {""}
-    est_days = set()
-    if passes:
-        est_days = {d for d in entry_days
-                    if tracked_from is None or d < tracked_from} - paid
-
-    def kind(day):
-        if day in paid:
-            return "paid"
-        return "est" if day in est_days else None
+    rows = _read_trade_log() if rows is None else rows
+    passes, kind, tracked_from, paid, est_days = _pass_day_kinds(cfg, state, rows)
 
     def blank():
         return {"total": 0.0, "exits": 0, "wins": 0, "losses": 0,
@@ -2107,13 +2115,15 @@ def _problems_today():
 _COST_RE = re.compile(r"1 contract ≈ \$([\d,]+)")
 
 
-def _budget_hints(cfg):
+def _budget_hints(cfg, trades=None, today=None):
     """Per book: today's entries that cost more than the budget, what they
     cost, and a budget that would have covered most of them. Built from the
-    agent's own skip messages (the feed carries no prices). [] when none."""
-    today = datetime.now(timezone.utc).date().isoformat()
+    agent's own skip messages (the feed carries no prices). [] when none.
+    trades / today: the newest trade-log rows and the UTC day to read them
+    for (default: the last 500 rows on file, and today)."""
+    today = today or datetime.now(timezone.utc).date().isoformat()
     costs = {}
-    for t in _recent_trades(500):
+    for t in (_recent_trades(500) if trades is None else trades):
         if t.get("action") != "skip_budget" or not str(t.get("ts", "")).startswith(today):
             continue
         m = _COST_RE.search(str(t.get("reason", "")))
@@ -5047,19 +5057,30 @@ def _expiry_command(t, cfg):
         arg = t[len(name):].strip()
         if not arg:
             return True, f"Expiry guard: {_expiry_guard_desc(cfg)}."
-        if arg == "on":
-            arg = default
-        if arg != "off":
-            m = _HHMM_RE.match(arg)
-            mins = int(m.group(1)) * 60 + int(m.group(2)) if m else -1
-            if not 9 * 60 + 30 <= mins < _REGULAR_CLOSE_MIN:
-                return True, (f"Usage: {name} on | off | HH:MM (ET, 24-hour, "
-                              f"09:30-15:59; default {default})")
-            arg = _hm(mins).zfill(5)
+        arg = _expiry_setting(arg, default)
+        if arg is None:
+            return True, (f"Usage: {name} on | off | HH:MM (ET, 24-hour, "
+                          f"09:30-15:59; default {default})")
         cfg[key] = arg
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Expiry guard: {_expiry_guard_desc(cfg)}."
     return False, ""
+
+
+def _expiry_setting(arg, default):
+    """The value the expiry sell or its alert is saved as ("off", or "HH:MM"
+    between 09:30 and 15:59 ET) for what the owner gave: on | off | HH:MM.
+    None when it is none of those (nothing may be saved then). The chat's
+    "expiry guard|alert …" and the /v2 settings routes both use it."""
+    if arg == "on":
+        arg = default
+    if arg == "off":
+        return arg
+    m = _HHMM_RE.match(arg)
+    mins = int(m.group(1)) * 60 + int(m.group(2)) if m else -1
+    if not 9 * 60 + 30 <= mins < _REGULAR_CLOSE_MIN:
+        return None
+    return _hm(mins).zfill(5)
 
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -5846,6 +5867,16 @@ def view_snapshot(runtime=None, cfg=None):
             rt["notices"] = rt["notices"](c, st)
         except Exception:
             rt["notices"] = []
+    # what the classic /api/status and /api/proposal show besides (all read
+    # from files; a fact that can't be read is left out: not known)
+    for key, read in (("consent_ok", consent_ok),
+                      ("proposal", lambda: __import__("self_edit").current()),
+                      ("preview", lambda: __import__("dry_run_preview").summary(c))):
+        if key not in rt:
+            try:
+                rt[key] = read()
+            except Exception:
+                pass
     return view_model.build_status(c, st, _view_rows(), rt)
 
 

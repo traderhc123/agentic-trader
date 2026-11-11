@@ -8,8 +8,7 @@
 //                         dialog shows the SERVER's preview (account, cash,
 //                         size, limits, open real positions) and needs the
 //                         tick box, checked again by the server
-//   Stop the agent     -> the fixed command "stop" (POST /api/command; the
-//                         typed route has no stop)
+// (Stop is {action: "stop"}, two steps, from Settings: views/AgentDialogs.tsx.)
 // Nothing is assumed to have worked: the agent's own reply is shown, and the
 // band changes only when the next status says so.
 // UpdateDialog is the one that does not send a command: it installs the
@@ -26,10 +25,10 @@ import { UNKNOWN, contractName, count, etTime, plural, usd } from "./lib/format"
 import type { Offer, Phase } from "./lib/update";
 import { Dialog, ExpiresFlag, Icon, WillWont } from "./ui";
 
-export type DialogKind = "pause" | "resume" | "to-practice" | "to-live" | "stop";
+export type DialogKind = "pause" | "resume" | "to-practice" | "to-live";
 
 /** What a dialog asks the agent to do. */
-export type Cmd = { action: "pause" } | { action: "resume" } | { action: "set_mode"; mode: "practice" } | { action: "stop" };
+export type Cmd = { action: "pause" } | { action: "resume" } | { action: "set_mode"; mode: "practice" };
 
 const their = (n: number, one: string, many: string) => (n === 1 ? one : many);
 
@@ -279,7 +278,7 @@ export function ActionDialog({
             <Icon name="info" small />
             <span>
               Not available yet. The agent has no pause that also stops selling, so this page will not pretend it does. To turn the agent off
-              completely, use "Stop the agent" in Settings
+              completely, use "Stop the agent" in Settings, under The agent on this computer
               {n ? `; your ${plural(n, "real position")} would then be unwatched${expiring ? `, and ${contractName(expiring.contract, expiring.label)} expires today` : ""}` : ""}.
             </span>
           </span>
@@ -323,37 +322,7 @@ export function ActionDialog({
       </Dialog>
     );
 
-  // stop
-  return (
-    <Dialog
-      title="Stop the agent completely?"
-      lead="Use Pause for a break from new trades. Stopping is for when you want it off."
-      onClose={onClose}
-      foot={
-        <>
-          {cancel("Keep it running")}
-          <button className="btn btn-primary" id="dlg-ok" disabled={busy} onClick={() => onConfirm({ action: "stop" })}>
-            Stop the agent
-          </button>
-        </>
-      }
-    >
-      {n > 0 && (
-        <div className="callout callout-real">
-          <h4>Nobody will be selling {their(n, "this", "these")} while it is stopped</h4>
-          <PosList list={rp} />
-        </div>
-      )}
-      <WillWont
-        will={["Finish the cycle it is in, then shut down.", "Leave every open position exactly as it is at your broker."]}
-        wont={[
-          "Sell anything on the way out.",
-          "Sell real positions on exit signals or before expiry while it is stopped.",
-          "Answer this dashboard once it has stopped: this page will then say it can't reach the agent.",
-        ]}
-      />
-    </Dialog>
-  );
+  return null; // every kind has returned above
 }
 
 /** "Update the agent?": what will be installed (exactly the version the check

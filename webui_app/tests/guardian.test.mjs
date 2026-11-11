@@ -40,6 +40,9 @@ import {
   bookTodayNote,
   dayBooks,
   dayTally,
+  dayWhole,
+  paidMark,
+  problemGroups,
   isStale,
   linkOf,
   nextFor,
@@ -53,11 +56,32 @@ import {
 } from "../src/v2/lib/derive.ts";
 import { UNKNOWN, ago, contractName, dayLong, etDayKey, etTime, etWhen, plural, signed, span, tone, usd } from "../src/v2/lib/format.ts";
 import { UPDATE } from "../src/v2/lib/copy.ts";
-import { API, FAILED, confirmBody, getJson, onUnknownWrite, postJson, send } from "../src/v2/lib/http.ts";
+import { API, FAILED, askAgent, confirmBody, getJson, onUnknownWrite, postJson, send } from "../src/v2/lib/http.ts";
 import {
-  MOVE_TOOL,
+  CLASSIC,
+  DEPLOY_REGIONS,
+  SIZING_DISCLAIMER,
+  expiryTimePayload,
+  hintPayload,
+  hintSize,
+  hintWords,
+  agreementWords,
+  brokerWarning,
+  deploySsh,
+  readAddress,
+  readSats,
+  scopeWords,
+  sourceWords,
+  diffSha256,
+  etClockWords,
+  expiryAlertPayload,
+  readEtTime,
+  tipLapsed,
   ackGiven,
   SETUP_FROM_V2,
+  movePassProblem,
+  setupUnfinished,
+  unsoldWords,
   confirmLabel,
   limitMeans,
   limitRange,
@@ -75,7 +99,7 @@ import {
   v2Words,
   valueWords,
 } from "../src/v2/lib/settings.ts";
-import { ACTION_HOME, HOME_FILE, VIEWS, screenOf, todayLimitsLink } from "../src/v2/lib/screens.ts";
+import { ACTION_HOME, HOME_FILE, VIEWS, bandStartLink, screenOf, todayLimitsLink } from "../src/v2/lib/screens.ts";
 import { returnTo } from "../src/lib/returnTo.ts";
 import { fileURLToPath } from "node:url";
 import { RANGES, addDays, axisMoney, chartModel, niceTicks, rangeStart } from "../src/v2/lib/chart.ts";
@@ -1067,8 +1091,8 @@ test("http: every /v2 write is one same-origin JSON POST; failures never claim n
   assert.equal((await getJson(API.settings, fakeReply(401, {}))).why, "locked");
   assert.equal((await getJson(API.settings, fakeReply("down", null))).why, "network");
   for (const f of Object.values(FAILED)) for (const t of Object.values(f)) clean(t, "failure words");
-  // /v2 sends no free text: the classic command route is only the fixed "stop"
-  for (const [k, p] of Object.entries(API)) if (k !== "classicCommand") assert.ok(p !== "/api/command", k);
+  // /v2 sends no free text: the classic command route is never called
+  for (const [k, p] of Object.entries(API)) assert.ok(p !== "/api/command", k);
 });
 
 test("the setup wizard goes back to /v2 only when /v2 sent the owner there", () => {
@@ -1155,7 +1179,11 @@ test("no redundancy: the operator's example is one note, in the dashboard's word
   const cash = get("low-cash");
   assert.ok(notes(cash, "ok", "today").some((n) => n.go === "rules"));
   assert.equal(todayLimitsLink(cash, "ok"), false);
-  assert.equal(todayLimitsLink(get("live"), "ok"), true);
+  // (live: its budget hint's note links to Rules & limits already)
+  const live = get("live");
+  assert.equal(todayLimitsLink(live, "ok"), false);
+  const noHint = { ...live, limits: { ...live.limits, budget_hints: [] }, conditions: live.conditions.filter((c) => c.code !== "budget_too_small") };
+  assert.equal(todayLimitsLink(noHint, "ok"), true);
   // the band's own buttons are never repeated in a note
   for (const [, x] of states) for (const n of notes(x, linkOf(x, false), "today")) assert.ok(n.go == null || ["settings", "signals", "rules", "holdings"].includes(n.go));
 });
@@ -1198,21 +1226,618 @@ test("the settings never leave /v2: every remaining link to /setup or /dash is o
   }
   // each one, and why it stays:
   assert.deepEqual(found.sort(), [
-    // the constants the links use (Band's start link; Settings' move link)
-    "lib/settings.ts /dash#move",
+    // the constants the links use: the first-run wizard (finish setup; bring
+    // a setup to this computer) and Settings → This dashboard's one link
+    "lib/settings.ts /dash",
     "lib/settings.ts /setup?from=v2",
     // the Waiting screen, shown when there is no status to draw Settings from
     "App.tsx /dash",
-    // Settings → This dashboard: the one "Back to the classic dashboard"
-    "views/Settings.tsx /dash",
   ].sort());
-  assert.equal(MOVE_TOOL, "/dash#move");
-  // the start link (shown only when no agent runs) returns to /v2
-  assert.match(fs.readFileSync(path.join(SRC, "v2", "Band.tsx"), "utf8"), /href=\{SETUP_FROM_V2\}/);
+  assert.equal(CLASSIC, "/dash");
+  // where the constants are used: setup only to finish it or to bring a
+  // setup here; the classic page only from This dashboard
+  const uses = (name) =>
+    files.filter((f) => new RegExp(`\\b${name}\\b`).test(fs.readFileSync(f, "utf8").replace(/^import .*$/gm, ""))).map(rel).filter((f) => f !== "lib/settings.ts").sort();
+  // (Today: the one note about a changed agreement, accepted in setup)
+  assert.deepEqual(uses("SETUP_FROM_V2"), ["views/AgentDialogs.tsx", "views/Settings.tsx", "views/Today.tsx"]);
+  assert.deepEqual(uses("CLASSIC"), ["views/Settings.tsx"]);
+  // starting the agent never goes through setup: the band points at Settings
+  const band = fs.readFileSync(path.join(SRC, "v2", "Band.tsx"), "utf8");
+  assert.ok(!/SETUP_FROM_V2|\/setup/.test(band), "Band.tsx still sends the owner to setup");
   // the setup wizard's own links and its hop after starting honour from=v2
   for (const f of ["wizard/Wizard.tsx", "wizard/steps.tsx"]) {
     const t = fs.readFileSync(path.join(SRC, f), "utf8");
     assert.ok(!/["']\/dash["']/.test(t), `${f} still goes to /dash by itself`);
     assert.match(t, /returnTo\(\)/);
   }
+});
+
+// ── PR 4 groups 1-3: this dashboard, the agent, this computer ──────────────
+
+test("the agent: Start and Stop live in Settings; the band only points there", { skip }, () => {
+  assert.equal(ACTION_HOME.start, "settings");
+  assert.equal(ACTION_HOME.stop, "settings");
+  const get = (n) => states.find(([x]) => x === n)[1];
+  const stopped = get("stopped");
+  const l = linkOf(stopped, false);
+  assert.equal(l, "stopped");
+  // Settings has the Start button, and the band no link to itself
+  const set = screenOf("settings", stopped, l);
+  assert.ok(set.controls.includes("start") && !set.controls.includes("stop"));
+  assert.equal(bandStartLink("settings", stopped, l), false);
+  // every other page: one link to Settings, from the band or from a note
+  for (const view of VIEWS.filter((v) => v !== "settings")) {
+    const sc = screenOf(view, stopped, l);
+    assert.equal(sc.links.filter((x) => x === "settings").length, 1, view);
+    assert.ok(!sc.controls.includes("start"), view);
+  }
+  // an agent that runs: Stop, never Start, and no band link
+  const live = get("live");
+  assert.ok(screenOf("settings", live, "ok").controls.includes("stop"));
+  assert.ok(!screenOf("settings", live, "ok").controls.includes("start"));
+  for (const view of VIEWS) assert.equal(bandStartLink(view, live, "ok"), false, view);
+});
+
+test("the agent: Stop asks the server first and lists what it leaves unsold", () => {
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "AgentDialogs.tsx"), "utf8");
+  // one typed command, two steps (askPreview, then ReviewDialog with the token)
+  assert.match(src, /usePreview\(API\.command, payload\)/);
+  assert.match(src, /const payload = \{ action: "stop" \}/);
+  assert.match(src, /<UnsoldList p=\{p\} after="while it is stopped"/);
+  // Start: the typed route, never the setup wizard
+  assert.match(src, /send<StartDone>\(API\.agentStart, \{\}\)/);
+  assert.equal(API.agentStart, "/api/v2/agent/start");
+  assert.equal(API.command, "/api/v2/command");
+  // the words for a position left unsold, never null or NaN
+  const u = { id: "x", label: "SPY 700C", contract: { symbol: "SPY", expiry: "2026-11-13", strike: 700, side: "C" }, qty: 2, expires_today: true };
+  assert.equal(unsoldWords(u), "SPY 700C 2026-11-13, 2 contracts, expires today");
+  clean(unsoldWords({ ...u, contract: null, qty: null, label: null, expires_today: false }), "unsold, unknown");
+  assert.equal(unsoldWords({ ...u, contract: null, label: null, qty: null, expires_today: false }), "A position the agent can't name");
+  // Start is held back, with the reason, while setup is unfinished
+  const v = { consent: { accepted: true }, signals: { source: "agenthc" }, broker: { ready: true } };
+  assert.equal(setupUnfinished(v), "");
+  assert.match(setupUnfinished({ ...v, consent: { accepted: false } }), /agreement/);
+  assert.match(setupUnfinished({ ...v, signals: { source: null } }), /signal source/);
+  assert.match(setupUnfinished({ ...v, broker: { ready: false } }), /broker/);
+  assert.equal(setupUnfinished(null), "");
+});
+
+test("this computer: Move is one control, made of the classic routes and two-step finishes", () => {
+  // the passphrase rules of the classic move tool: 8 or more, typed twice alike
+  assert.match(movePassProblem("short", "short"), /at least 8/);
+  assert.match(movePassProblem("long enough", "long enougj"), /don't match/);
+  assert.equal(movePassProblem("long enough", "long enough"), "");
+  // the file is made and downloaded by the classic routes as they are
+  assert.equal(API.moveExport, "/api/move/export");
+  assert.equal(API.moveDownload, "/api/move/download");
+  assert.equal(API.deployStatus, "/api/deploy/status");
+  // retiring this computer and the cloud move are typed and two-step
+  assert.equal(API.moveFinish, "/api/v2/move/finish");
+  assert.equal(API.moveDeploy, "/api/v2/move/deploy");
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "AgentDialogs.tsx"), "utf8");
+  assert.match(src, /send<MoveFile>\(API\.moveExport, \{ passphrase: pw \}\)/);
+  assert.match(src, /askPreview\(API\.moveFinish, \{\}\)/);
+  assert.match(src, /askPreview\(API\.moveDeploy, payload\)/);
+  assert.ok(!/\/api\/finish/.test(src), "the cloud move never ends the setup server's wait");
+  // the regions are the server's own list (provision.REGIONS)
+  assert.deepEqual(DEPLOY_REGIONS.map(([k]) => k), ["nyc3", "sfo3", "tor1", "lon1", "fra1", "sgp1"]);
+  // one Move control in all of /v2, in Settings
+  let moves = 0;
+  for (const f of sources(path.join(SRC, "v2"))) moves += (fs.readFileSync(f, "utf8").match(/data-act="move"/g) || []).length;
+  assert.equal(moves, 1);
+});
+
+test("this dashboard: one switch, saved on the agent; one way to the classic page", () => {
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "Settings.tsx"), "utf8");
+  // the switch saves through the computer settings route, nothing else
+  assert.match(src, /send\(API\.computer, \{ dashboard: d \}\)/);
+  assert.equal((src.match(/data-act="dashboard"/g) || []).length, 1);
+  assert.equal((src.match(/data-act="classic"/g) || []).length, 1);
+  // the theme is set here only (not in the sidebar, not under More)
+  for (const f of sources(path.join(SRC, "v2")).filter((p) => p.endsWith(".tsx"))) {
+    const t = fs.readFileSync(f, "utf8");
+    if (rel(f) !== "views/Settings.tsx") assert.ok(!/toggleTheme\}|onClick=\{page\.toggleTheme/.test(t), `${rel(f)} toggles the theme`);
+  }
+  // open at login: a switch of its own on the same route
+  assert.match(src, /k="open_dashboard_at_login" act="open-at-login"/);
+});
+
+// ── PR 4 group 4: Settings → Help and support ──────────────────────────────
+
+test("help and support: the classic help tools, the tip and the agreement, in Settings, changing nothing", () => {
+  assert.equal(API.netcheck, "/api/help/netcheck");
+  assert.equal(API.report, "/api/help/report");
+  assert.equal(API.agreement, "/api/v2/agreement");
+  assert.deepEqual([API.tipOptions, API.tipCreate, API.tipStatus], ["/api/tip/options", "/api/tip/create", "/api/tip/status"]);
+  for (const a of ["netcheck", "report", "tip", "agreement"]) assert.equal(ACTION_HOME[a], "settings", a);
+  const set = fs.readFileSync(path.join(SRC, "v2", "views", "Settings.tsx"), "utf8");
+  for (const a of ["netcheck", "report", "tip", "agreement"]) assert.equal((set.match(new RegExp(`data-act="${a}"`, "g")) || []).length, 1, a);
+  // the dialogs call exactly those routes, and the tip never a wallet or pay route
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "SupportDialogs.tsx"), "utf8");
+  const used = [...new Set([...src.matchAll(/\bAPI\.([a-zA-Z]+)/g)].map((m) => m[1]))].sort();
+  assert.deepEqual(used, ["agreement", "netcheck", "report", "tipCreate", "tipOptions", "tipStatus"]);
+  assert.ok(!/\/api\/(wallet|pass|v2\/wallet|v2\/pass)/.test(src), "a support dialog names a wallet or pass route");
+  assert.match(src, /send<TipInvoice>\(API\.tipCreate, \{ amount_usd: t\.amount_usd \}\)/);
+  assert.match(src, /send\(API\.tipStatus, \{ payment_hash: inv\.payment_hash \}\)/);
+  // "thank you" only when AgentHC said the invoice was paid
+  assert.match(src, /c\.ok && c\.status === "paid"/);
+  // a code past its hour (and a minute's grace) is "not known", never "expired"
+  assert.equal(tipLapsed(0, 3600, 3600 * 1000 + 60000), false);
+  assert.equal(tipLapsed(0, 3600, 3600 * 1000 + 60001), true);
+  assert.equal(tipLapsed(0, NaN, 3600 * 1000 + 60001), true);
+  // the agreement in words, never null or a raw stamp
+  const c = { accepted: true, on_file: true, accepted_at: "2026-10-01T12:00:00+00:00", terms_version: "3", current_terms_version: "3" };
+  assert.equal(agreementWords(c), "You accepted it on 2026-10-01 (terms version 3). It is on file on this computer.");
+  assert.match(agreementWords({ ...c, accepted: false, current_terms_version: "4" }), /changed since you accepted it on 2026-10-01 \(version 3\): the current one is version 4/);
+  assert.match(agreementWords({ ...c, accepted: false, on_file: false, accepted_at: null, terms_version: null }), /No accepted agreement/);
+  for (const x of [c, { ...c, accepted: false }, { ...c, accepted: false, on_file: false, accepted_at: "junk", terms_version: null }, null]) clean(agreementWords(x), "agreement");
+});
+
+// ── PR 4 group 5: Settings → Code changes ──────────────────────────────────
+
+test("code changes: Apply is two steps bound to the sha256 of the diff shown; asking only proposes", async () => {
+  const { createHash } = await import("node:crypto");
+  for (const t of ["", "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n", "naïve → ünïcode ✓\r\n\ttabs"])
+    assert.equal(await diffSha256(t), createHash("sha256").update(t, "utf8").digest("hex"), JSON.stringify(t));
+  assert.equal(API.proposal, "/api/proposal");
+  assert.equal(API.proposalReject, "/api/proposal/reject");
+  assert.equal(API.proposalApply, "/api/v2/proposal/apply");
+  assert.equal(API.proposalRequest, "/api/v2/proposal/request");
+  assert.equal(API.code, "/api/v2/settings/code");
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "CodeDialogs.tsx"), "utf8");
+  // the sha of exactly the text shown, sent at both steps
+  assert.match(src, /sha: await diffSha256\(p\.diff\)/);
+  assert.match(src, /askPreview\(API\.proposalApply, \{ diff_sha256: shown\.sha \}\)/);
+  assert.match(src, /path=\{API\.proposalApply\}\s+payload=\{\{ diff_sha256: shown\.sha \}\}/);
+  assert.match(src, /<pre[^>]*>\s*\{shown\.p\.diff\}/);
+  // the request is only ever a request: the typed route, never the chat
+  assert.match(src, /send<\{ note\?: string \}>\(API\.proposalRequest, \{ request: t \}\)/);
+  assert.ok(!/\/api\/command|API\.command/.test(src));
+  // the dialog says the agent restarts
+  assert.match(src, /Apply and restart the agent/);
+  const set = fs.readFileSync(path.join(SRC, "v2", "views", "Settings.tsx"), "utf8");
+  for (const a of ["self-edit", "proposal", "proposal-request"]) {
+    assert.equal(ACTION_HOME[a], "settings", a);
+    assert.equal((set.match(new RegExp(`\\b(?:data-act|act)="${a}"`, "g")) || []).length, 1, a);
+  }
+  assert.match(set, /send\(API\.code, \{ self_edit_enabled: next \}\)/);
+});
+
+test("code changes: a pending change is one note on Today, linking to Settings", { skip }, () => {
+  for (const [name, s] of states) {
+    const ns = notes(s, linkOf(s, false), "today").filter((n) => n.codes.includes("proposal_pending"));
+    if (s.proposal?.pending && linkOf(s, false) === "ok") {
+      assert.equal(ns.length, 1, name);
+      assert.equal(ns[0].go, "settings", name);
+      clean(ns[0].title, name);
+      clean(ns[0].text, name);
+    } else if (!s.proposal?.pending) assert.equal(ns.length, 0, name);
+  }
+  assert.ok(states.some(([n]) => n === "proposal-pending"), "no fixture with a pending change");
+});
+
+// ── PR 4 group 6: Settings → Connections ───────────────────────────────────
+
+test("connections: the expiry-day warning time, and Robinhood's options warning on the broker row", () => {
+  // the chat's "expiry alert" rules: 09:30-15:59 Eastern, or off
+  assert.deepEqual(readEtTime("15:40"), { ok: true, value: "15:40" });
+  assert.deepEqual(readEtTime(" 9:45 "), { ok: true, value: "09:45" });
+  assert.deepEqual(readEtTime("15:59"), { ok: true, value: "15:59" });
+  for (const bad of ["16:00", "09:00", "9:29", "25:00", "3pm", "", "15:4", "on"]) {
+    const r = readEtTime(bad);
+    assert.equal(r.ok, false, bad);
+    assert.match(r.error, /09:30 to 15:59/);
+  }
+  // only what changed is sent; off is "off"
+  assert.deepEqual(expiryAlertPayload("15:50", false, "15:50"), { ok: true, value: undefined });
+  assert.deepEqual(expiryAlertPayload("15:50", false, "15:40"), { ok: true, value: "15:40" });
+  assert.deepEqual(expiryAlertPayload("15:50", true, "x"), { ok: true, value: "off" });
+  assert.deepEqual(expiryAlertPayload(null, true, "15:50"), { ok: true, value: undefined });
+  assert.deepEqual(expiryAlertPayload(null, false, "15:50"), { ok: true, value: "15:50" });
+  assert.equal(expiryAlertPayload("15:50", false, "16:30").ok, false);
+  assert.equal(etClockWords("15:50"), "3:50 PM ET");
+  assert.equal(etClockWords("09:45"), "9:45 AM ET");
+  assert.equal(etClockWords(null), "Off");
+  clean(etClockWords("junk"), "clock");
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "Settings.tsx"), "utf8");
+  assert.match(src, /payload\.expiry_alert_et = a\.value/);
+  assert.match(src, /send\(API\.alerts, payload\)/);
+  // the classic warning, as a code: words here, the link to Robinhood's form
+  assert.match(brokerWarning({ broker: { warning: "options_off" } }), /Options trading is not turned on/);
+  assert.equal(brokerWarning({ broker: { warning: null } }), "");
+  assert.equal(brokerWarning(null), "");
+  assert.match(src, /\{brokerWarning\(v\)\}\{" "\}\s*<a href=\{RH_OPTIONS_URL\}/);
+});
+
+// ── PR 4 group 7: Signals & pass ───────────────────────────────────────────
+
+test("signals & pass: source, scope, key, preview and the wallet, each one control there, each the typed route", () => {
+  assert.deepEqual(
+    [API.source, API.signals, API.recurring, API.walletCreate, API.walletFund, API.walletConnect, API.walletPage, API.walletQuote, API.walletBalance],
+    ["/api/v2/settings/source", "/api/v2/settings/signals", "/api/v2/wallet/recurring", "/api/v2/wallet/create", "/api/v2/wallet/fund", "/api/v2/wallet/connect", "/api/v2/wallet/page", "/api/wallet/quote", "/api/wallet/balance"],
+  );
+  const acts = ["source", "scope", "api-key", "preview", "wallet-create", "wallet-fund", "wallet-connect", "wallet-page", "recurring"];
+  const sig = fs.readFileSync(path.join(SRC, "v2", "views", "Signals.tsx"), "utf8");
+  for (const a of acts) {
+    assert.equal(ACTION_HOME[a], "signals", a);
+    assert.equal((sig.match(new RegExp(`\\b(?:data-act|act)="${a}"`, "g")) || []).length, 1, a);
+  }
+  const dlg = fs.readFileSync(path.join(SRC, "v2", "views", "SignalsDialogs.tsx"), "utf8");
+  // two steps (the server's preview, then the token) for everything but the key
+  assert.match(dlg, /askPreview\(API\.source, payload\)/);
+  assert.match(dlg, /usePreview\(API\.signals, payload\)/);
+  assert.match(dlg, /usePreview\(API\.walletCreate, payload\)/);
+  assert.match(dlg, /askPreview\(API\.walletFund, \{ sats: n\.value \}\)/);
+  assert.match(dlg, /askPreview\(API\.walletConnect, payload\)/);
+  assert.match(dlg, /usePreview\(API\.recurring, payload\)/);
+  // the key is written, saved straight away, never read back
+  assert.match(dlg, /send\(API\.source, \{ agenthc_key: k \}\)/);
+  assert.ok(!/value=\{v\.signals\.api_key/.test(dlg));
+  // the preview switch saves straight away on the same route
+  assert.match(sig, /send\(API\.signals, \{ dry_run_preview: next \}\)/);
+  // the wallet page link: fetched by POST, only in the click's handler, never read by a GET
+  const all = sources(path.join(SRC, "v2")).map((f) => [rel(f), fs.readFileSync(f, "utf8")]);
+  const pageUses = all.flatMap(([f, t]) => [...t.matchAll(/(\w+)(?:<\w+>)?\(API\.walletPage\b/g)].map((m) => `${f} ${m[1]}`));
+  assert.deepEqual(pageUses, ["views/Signals.tsx send"]);
+  assert.match(sig, /const openPage = async \(\) => \{[\s\S]*?window\.open\("", "_blank"\)[\s\S]*?send<WalletPage>\(API\.walletPage, \{\}\)/);
+  assert.match(sig, /data-act="wallet-page" disabled=\{lost\} onClick=\{openPage\}/);
+  for (const [f, t] of all) assert.ok(!/lnbits_wallet_page|wallet\?usr=/.test(t), f);
+  // the words
+  assert.equal(sourceWords({ source: "agenthc" }), "AgentHC Day Trade Ideas");
+  assert.equal(sourceWords({ source: "url", site: "feed.example" }), "A JSON feed at feed.example");
+  assert.equal(sourceWords({ source: "manual" }), "Your own commands file (commands.jsonl)");
+  assert.equal(sourceWords(null), "None chosen");
+  assert.equal(scopeWords("all"), "The main pick and other trades");
+  assert.equal(scopeWords("main"), "The main pick only");
+  assert.equal(valueWords("source", { source: "url", site: "feed.example" }), "A JSON feed at feed.example");
+  assert.equal(valueWords("scope", "all"), "The main pick and other trades");
+  assert.equal(valueWords("wallet", null), "None");
+  assert.equal(valueWords("wallet", { site: "demo.lnbits.com", new: true }), "A new wallet at demo.lnbits.com");
+  assert.equal(valueWords("wallet", { site: "lnbits.own.example", new: false }), "Your own wallet at lnbits.own.example");
+  assert.equal(valueWords("wallet_fund", 25000), "25,000 sats");
+  // what the owner types: the classic form's address rule; sats from 1,000 to the wallet's cap
+  assert.deepEqual(readAddress(" https://feed.example/x "), { ok: true, value: "https://feed.example/x" });
+  assert.equal(readAddress("http://localhost:8080/f").ok, true);
+  for (const bad of ["http://feed.example", "ftp://x", "", "https://", "feed.example"]) assert.equal(readAddress(bad).ok, false, bad);
+  assert.deepEqual(readSats("25,000", null), { ok: true, value: 25000 });
+  assert.equal(readSats("999", null).ok, false);
+  assert.equal(readSats("100001", 100000).ok, false);
+  assert.match(readSats("100001", 100000).error, /100,000/);
+  assert.equal(readSats("2.5", null).ok, false);
+});
+
+test("signals & pass: the practice preview panel (and its switch) only in practice mode", { skip }, () => {
+  for (const [name, s] of states) {
+    const sc = screenOf("signals", s, linkOf(s, false));
+    assert.equal(sc.controls.includes("preview"), s.mode === "practice", name);
+  }
+  const sig = fs.readFileSync(path.join(SRC, "v2", "views", "Signals.tsx"), "utf8");
+  assert.match(sig, /\{s\.mode === "practice" && <PreviewPanel page=\{page\} \/>\}/);
+});
+
+// ── PR 4 group 8: Rules & limits ───────────────────────────────────────────
+
+const RULES_SRC = () => fs.readFileSync(path.join(SRC, "v2", "views", "Rules.tsx"), "utf8");
+
+test("rules & limits: the expiry-day sell time is a two-step limits save, said in words", () => {
+  // the words of a preview line and of the confirm button
+  assert.equal(valueWords("expiry_sell_et", "15:30"), "3:30 PM ET");
+  assert.equal(valueWords("expiry_sell_et", null), "Off");
+  clean(valueWords("expiry_sell_et", 5), "sell time, not a time");
+  assert.equal(confirmLabel([{ key: "expiry_sell_et", label: "x", saved_now: "15:45", new: "15:30", direction: "lowers_risk" }]), "Sell at 3:30 PM ET");
+  assert.equal(confirmLabel([{ key: "expiry_sell_et", label: "x", saved_now: "15:45", new: null, direction: "raises_risk" }]), "Turn off the expiry-day sell");
+  // the page's own risk reading follows webui._expiry_direction
+  assert.equal(riskOf("expiry_sell_et", "15:45", null), "raises_risk");
+  assert.equal(riskOf("expiry_sell_et", null, "15:45"), "lowers_risk");
+  assert.equal(riskOf("expiry_sell_et", "15:30", "15:50"), "raises_risk");
+  assert.equal(riskOf("expiry_sell_et", "15:30", "10:15"), "lowers_risk");
+  assert.equal(riskOf("expiry_sell_et", "15:30", "15:30"), "neutral");
+  // only what changed is sent; off is "off"; the chat's range
+  assert.deepEqual(expiryTimePayload("15:45", false, "15:30"), { ok: true, value: "15:30" });
+  assert.deepEqual(expiryTimePayload("15:45", false, "15:45"), { ok: true, value: undefined });
+  assert.deepEqual(expiryTimePayload("15:45", true, ""), { ok: true, value: "off" });
+  assert.equal(expiryTimePayload("15:45", false, "16:00").ok, false);
+  // one control, in Rules & limits, on the limits route, two steps
+  const src = RULES_SRC();
+  assert.match(src, /const payload = \{ expiry_sell_et: parsed\.value \};\s*const a = await askPreview\(API\.limits, payload\)/);
+  assert.match(src, /<ReviewDialog\s+path=\{API\.limits\}[\s\S]*?Turn off the expiry-day sell\?/);
+  assert.equal((src.match(/data-row="expiry_sell"/g) || []).length, 1);
+  // the "Always on" list no longer says it (one place for the sell time)
+  const always = src.slice(src.indexOf("<h2>Always on</h2>"), src.indexOf("<h2>Which signals to take</h2>"));
+  assert.ok(!/[Ee]xpiry/.test(always), "the sell time is still in Always on");
+  for (const f of sources(path.join(SRC, "v2")).filter((p) => p.endsWith(".tsx")))
+    if (rel(f) !== "views/Rules.tsx") assert.ok(!/expiry_sell_et/.test(fs.readFileSync(f, "utf8")), `${rel(f)} sets the sell time`);
+});
+
+test("rules & limits: the budget hint pre-fills its book's size form with what typing it sends", { skip }, () => {
+  const live = states.find(([n]) => n === "live")[1];
+  const hints = live.limits.budget_hints;
+  assert.deepEqual(hints.map((h) => [h.book, h.suggest]), [["main", 1150], ["other", 300]]);
+  for (const h of hints) {
+    clean(hintWords(h), `hint ${h.book}`);
+    // "Use $S" is the size form with $S typed in: the same save
+    assert.deepEqual(hintSize(h), { mode: "budget", value: h.suggest });
+    assert.deepEqual(hintPayload(h), { trade_size: { [h.book]: { mode: "budget", value: h.suggest } } });
+  }
+  assert.equal(hintWords(hints[0]), "2 signals today cost more than your $500 main-pick size: one contract was $1,120 to $1,240. $1,150 would have taken 1 of them.");
+  const src = RULES_SRC();
+  // the size form's own payload, and the hint only opens that form
+  assert.match(src, /const payload = \{ trade_size: \{ \[book\]: same \? \{ mode: "same" \} : \{ mode, value: parsed\.value \} \} \};/);
+  assert.match(src, /onClick=\{\(\) => open0\(hintSize\(h\)\)\}/);
+  assert.match(src, /<SizeRow page=\{page\} book="main" hints=\{hints\("main"\)\} \/>/);
+  // Today says it once, as a note that links here
+  for (const [name, s] of states) {
+    const ns = notes(s, linkOf(s, false), "today").filter((n) => n.codes.includes("budget_too_small"));
+    assert.equal(ns.length, s.limits.budget_hints.length && !isStale(linkOf(s, false)) ? 1 : 0, name);
+  }
+  const n = notes(live, "ok", "today").find((x) => x.codes.includes("budget_too_small"));
+  assert.match(n.text, /\$1,150 would have taken/);
+});
+
+test("rules & limits: the adviser notice is said once, in the trade-size confirm dialog", () => {
+  assert.match(SIZING_DISCLAIMER, /^Nobody here is an investment adviser/);
+  let uses = 0;
+  for (const f of sources(path.join(SRC, "v2"))) {
+    const t = fs.readFileSync(f, "utf8");
+    if (rel(f) === "lib/settings.ts") continue;
+    assert.ok(!t.includes("investment adviser"), `${rel(f)} says it in its own words`);
+    uses += (t.match(/\{SIZING_DISCLAIMER\}/g) || []).length;
+  }
+  assert.equal(uses, 1);
+  const src = RULES_SRC();
+  const size = src.slice(src.indexOf("function SizeRow"), src.indexOf("function ExpiryRow"));
+  assert.match(size, /\{SIZING_DISCLAIMER\}/);
+});
+
+test("rules & limits: today's use is said once per limit, and every rule is listed", () => {
+  const src = RULES_SRC();
+  assert.ok(!/LimitsPanel/.test(src), "Rules & limits shows Today's limits panel again");
+  for (const words of ["used today", "lost today", "open now"]) assert.equal(src.split(words).length - 1, 1, words);
+  // PR 3 acceptance, checked here: all six built-in filters, the written
+  // rules with their off switch, and no "does not list them yet"
+  for (const k of ["rule_tickers", "rule_skip_tickers", "rule_sides", "rule_min_strike", "rule_loss_streak"]) assert.match(src, new RegExp(`\\["${k}", "`), k);
+  assert.match(src, /rule_skip_0dte: on/);
+  assert.match(src, /save\(null\)[\s\S]{0,40}Turn off written rules/);
+  assert.ok(!/does not list them yet/.test(src));
+});
+
+// ── PR 4 group 9: Results ──────────────────────────────────────────────────
+
+test("results: the result on paid signal days, and the paid-day marker in the by-day table", { skip }, () => {
+  const live = states.find(([n]) => n === "live")[1];
+  const pd = live.results.paid_days.real;
+  assert.ok(pd && pd.closed > 0 && pd.days > 0);
+  for (const d of pd.paid_on) assert.equal(paidMark(live, d), "paid signal day", d);
+  assert.equal(paidMark(live, "2026-10-01"), "");
+  // the practice week before paid days were recorded: estimated
+  assert.deepEqual(live.results.paid_days.practice.estimated_on.sort(), ["2026-10-28", "2026-10-29", "2026-10-30"]);
+  assert.equal(paidMark(live, "2026-10-28"), "paid signal day (estimated)");
+  assert.equal(paidMark({ ...live, results: { ...live.results, paid_days: { real: { ...pd, paid_on: [], estimated_on: ["2026-10-28"] }, practice: null } } }, "2026-10-28"), "paid signal day (estimated)");
+  assert.equal(paidMark({ ...live, results: { ...live.results, paid_days: { real: null, practice: null } } }, pd.paid_on[0]), "");
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "Results.tsx"), "utf8");
+  assert.match(src, /Result on paid signal days/);
+  assert.match(src, /<b className=\{tone\(pd\.real\.pnl\)\}>\{signed\(pd\.real\.pnl\)\}<\/b>/);
+  assert.match(src, /Each trade counts on the day it closed \(ET\)/);
+  assert.match(src, /paidMark\(s, d\.day\)/);
+});
+
+// ── PR 4 group 10: Today and Activity ──────────────────────────────────────
+
+test("ask your agent: one typed POST of the question, answers only, kept in the page", async () => {
+  assert.equal(API.ask, "/api/v2/ask");
+  assert.equal(ACTION_HOME.ask, "today");
+  const calls = [];
+  const ok = async (url, init) => (calls.push([url, init]), new Response(JSON.stringify({ ok: true, answer: "Because it cost too much." }), { status: 200 }));
+  assert.deepEqual(await askAgent("why the skip?", ok), { ok: true, answer: "Because it cost too much." });
+  assert.equal(calls[0][0], "/api/v2/ask");
+  assert.equal(calls[0][1].method, "POST");
+  assert.deepEqual(JSON.parse(calls[0][1].body), { question: "why the skip?" });
+  // the agent's refusal in its words; no answer = the read failures' words
+  const said = async () => new Response(JSON.stringify({ ok: false, error: "No AI helper is connected." }), { status: 200 });
+  assert.deepEqual(await askAgent("x", said), { ok: false, error: "No AI helper is connected." });
+  assert.deepEqual(await askAgent("x", async () => { throw new Error("down"); }), { ok: false, error: FAILED.network.read });
+  assert.deepEqual(await askAgent("x", async () => new Response("", { status: 401 })), { ok: false, error: FAILED.locked.read });
+  assert.deepEqual(await askAgent("x", async () => new Response("<html>", { status: 200 })), { ok: false, error: FAILED.server.read });
+  // a failed question never makes the page doubt its settings (it changed nothing)
+  let doubted = 0;
+  const off = onUnknownWrite(() => doubted++);
+  await askAgent("x", async () => { throw new Error("down"); });
+  off();
+  assert.equal(doubted, 0);
+  const today = fs.readFileSync(path.join(SRC, "v2", "views", "Today.tsx"), "utf8");
+  assert.equal((today.match(/data-act="ask"/g) || []).length, 1);
+  assert.match(today, /const r = await askAgent\(q\);/);
+  assert.ok(!/API\.command|\/api\/command|send\(/.test(today), "Today sends something else");
+  // the conversation lives in the page (this visit), never in storage
+  assert.match(today, /page\.addTalk\(\{ q, a: r\.answer/);
+  assert.ok(!/localStorage|sessionStorage/.test(today));
+});
+
+test("activity: problems grouped by kind, with how many, the newest and its fix", () => {
+  const p = (n, code, sym, hint = null) =>
+    row({ n, action: code === "order_rejected" ? "order_failed" : "skip_no_quote", reason_code: code, contract: { symbol: sym, expiry: "2026-11-13", strike: 100, side: "C" }, contract_text: `${sym} x`, stopped_at_check: "broker_order", hint, at: `2026-11-09T1${n}:00:00Z` });
+  // newest first: 3 problems of 2 kinds, and a line that is not a problem
+  const rows = [p(5, "order_rejected", "AAPL", "Add cash."), p(4, "no_quote", "PLTR"), p(3, "order_rejected", "META"), row({ n: 2 })];
+  const g = problemGroups(rows, "Robinhood");
+  assert.deepEqual(g.map((x) => [x.key, x.n, x.last.n]), [["order_rejected", 2, 5], ["no_quote", 1, 4]]);
+  assert.equal(g[0].hint, "Add cash.");
+  for (const x of g) {
+    clean(x.label, x.key);
+    assert.ok(!x.label.includes("AAPL") && !x.label.includes("PLTR"), x.label);
+  }
+  assert.deepEqual(problemGroups([row()], "Robinhood"), []);
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "Activity.tsx"), "utf8");
+  assert.match(src, /filter === "problem" \? problemGroups\(list, s\.broker\.name\)/);
+  assert.match(src, /onClick=\{\(\) => page\.openEv\(g\.last\.n\)\}/);
+});
+
+test("activity: problems by kind count every problem line of each fixture once", { skip }, () => {
+  for (const [name, s] of states) {
+    const g = problemGroups(s.activity.rows, s.broker.name);
+    const n = s.activity.rows.filter((e) => describe(e, s.broker.name).cat === "problem").length;
+    assert.equal(g.reduce((a, x) => a + x.n, 0), n, name);
+    assert.equal(new Set(g.map((x) => x.key)).size, g.length, name);
+  }
+});
+
+test("activity: a day the page has only part of is never summed as the whole day", { skip }, () => {
+  const e = (n, day) => row({ n, at: `${day}T15:00:00Z` });
+  const loaded = [e(9, "2026-11-09"), e(8, "2026-11-09"), e(7, "2026-11-06")];
+  // the server's count: the 6th has 4 lines, 1 loaded
+  assert.equal(dayWhole("2026-11-09", loaded, 2, true), true);
+  assert.equal(dayWhole("2026-11-06", loaded, 4, true), false);
+  assert.equal(dayWhole("2026-11-06", loaded, 1, true), true);
+  // no count: whole when an older day is loaded, or nothing older is left
+  assert.equal(dayWhole("2026-11-09", loaded, undefined, true), true);
+  assert.equal(dayWhole("2026-11-06", loaded, undefined, true), false);
+  assert.equal(dayWhole("2026-11-06", loaded, undefined, false), true);
+  assert.equal(dayWhole("", [row({ n: 1, at: null })], undefined, true), false);
+  // a fixture's first page: its oldest day is cut, its newest is whole
+  const live = states.find(([n]) => n === "live")[1];
+  const lines = Object.fromEntries(live.activity.day_lines.map((d) => [d.day, d.lines]));
+  const days = [...new Set(live.activity.rows.map((r) => etDayKey(r.at)))];
+  const more = live.activity.next != null;
+  assert.ok(more, "the fixture's log is longer than one page");
+  assert.equal(dayWhole(days[0], live.activity.rows, lines[days[0]], more), true);
+  assert.equal(dayWhole(days[days.length - 1], live.activity.rows, lines[days[days.length - 1]], more), false);
+  // the partial day's header has no sums: no P&L and no counts as totals
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "Activity.tsx"), "utf8");
+  const partial = src.slice(src.indexOf("if (!whole) {"), src.indexOf("const c = (f: (e: Row) => boolean)"));
+  assert.ok(partial.length > 0 && !/tot\(|signed\(|bought|sold/.test(partial), partial);
+  assert.match(partial, /of \$\{plural\(of, "line"\)\} loaded/);
+  // and the chip counts say they are of the lines loaded
+  assert.match(src, /The counts are of the \{plural\(loaded, "line"\)\} loaded so far/);
+});
+
+test("today so far: Opened is the Eastern day's count from the view-model", { skip }, () => {
+  for (const [name, s] of states) {
+    const d = dayBooks(s);
+    const want = s.mode !== "live" ? s.results.practice.opened_today : s.broker.paper_account ? s.results.paper_account.opened_today + s.results.real.opened_today : s.results.real.opened_today;
+    assert.equal(d.openedN, want, name);
+    assert.ok(Number.isInteger(d.openedN), name);
+  }
+  const today = fs.readFileSync(path.join(SRC, "v2", "views", "Today.tsx"), "utf8");
+  const day = today.slice(today.indexOf("function DayPanel"), today.indexOf("export function SignalCostLine"));
+  assert.ok(!/used_today/.test(day), "Today so far reads the limit's UTC-day count");
+  assert.match(day, /plural\(books\.openedN, books\.opened\)/);
+  assert.match(day, /dayWhole\(today, page\.rows, page\.feed\.dayLines\[today\], page\.hasOlder\)/);
+});
+
+test("a changed agreement: one note on Today, to the setup wizard where it is accepted", { skip }, () => {
+  for (const [name, s] of states) {
+    const ns = notes(s, linkOf(s, false), "today").filter((n) => n.codes.includes("consent_needed"));
+    const on = (s.conditions ?? []).some((c) => c.code === "consent_needed") && !isStale(linkOf(s, false));
+    assert.equal(ns.length, on ? 1 : 0, name);
+    if (on) {
+      assert.equal(ns[0].setup, true);
+      assert.equal(ns[0].go, null);
+      clean(ns[0].title, name);
+      clean(ns[0].text, name);
+    }
+  }
+  assert.ok(states.some(([n]) => n === "agreement-changed"), "no fixture with a changed agreement");
+  const today = fs.readFileSync(path.join(SRC, "v2", "views", "Today.tsx"), "utf8");
+  assert.match(today, /\{n\.setup && \([\s\S]*?href=\{SETUP_FROM_V2\}/);
+});
+
+// ── PR 4 group 11: what the inventory found said twice ─────────────────────
+
+test("no redundancy: the theme, the classic page and Move each have one place", () => {
+  const files = sources(path.join(SRC, "v2")).filter((p) => p.endsWith(".tsx"));
+  const count_ = (re) => files.reduce((a, f) => a + (fs.readFileSync(f, "utf8").match(re) || []).length, 0);
+  assert.equal(count_(/data-act="theme"/g), 1);
+  assert.equal(count_(/data-act="classic"/g), 1);
+  assert.equal(count_(/data-act="move"/g), 1);
+  // Move is made in the page: no link out of /v2 for it
+  const dlg = fs.readFileSync(path.join(SRC, "v2", "views", "AgentDialogs.tsx"), "utf8");
+  assert.ok(!/href=\{?["'`]\/(setup|dash)/.test(dlg));
+  // the sidebar and More carry no theme or classic-page control
+  for (const f of ["App.tsx", "views/Pages.tsx"]) {
+    const t = fs.readFileSync(path.join(SRC, "v2", f), "utf8");
+    assert.ok(!/toggleTheme\}|data-act="(theme|classic)"/.test(t), f);
+  }
+});
+
+
+// ── PR 4 review fixes ──────────────────────────────────────────────────────
+
+const v2src = (f) => fs.readFileSync(path.join(SRC, "v2", ...f.split("/")), "utf8");
+
+test("review: a code change too large to show whole is never offered for Apply", () => {
+  const src = v2src("views/CodeDialogs.tsx");
+  // the server says the diff is cut; then there is no Apply button at all
+  assert.match(src, /const cut = shown\.kind === "shown" && shown\.p\.truncated !== false;/);
+  assert.match(src, /\{!cut && \(\s*<button className="btn btn-primary" id="dlg-ok" onClick=\{apply\}/);
+  assert.match(src, /too large to show here in full/);
+  assert.match(src, /if \(shown\.kind !== "shown" \|\| !shown\.sha \|\| cut\) return;/);
+});
+
+test("review: the code-change dialog says it restarts only when the server says so", () => {
+  const src = v2src("views/CodeDialogs.tsx");
+  assert.match(src, /title=\{review\.restarts \? "Apply this code change and restart the agent\?" : "Apply this code change\?"\}/);
+  assert.match(src, /confirm=\{review\.restarts \? "Apply and restart the agent" : "Apply the change"\}/);
+  // before the server has said, the button names no restart
+  assert.ok(!/"Apply and restart…"/.test(src));
+  assert.match(src, /"Review and apply…"/);
+});
+
+test("review: the wallet page link is never kept in the page", () => {
+  const src = v2src("views/Signals.tsx");
+  assert.match(src, /useState<\{ err: string \} \| null>\(null\)/);
+  assert.ok(!/setLink\(\{ url/.test(src) && !/link\??\.url/.test(src), "the link is kept in state or the DOM");
+  // a blocked window: the link is not even asked for
+  const blocked = src.indexOf("if (!win) return setLink(");
+  const asked = src.indexOf("send<WalletPage>(API.walletPage, {})");
+  assert.ok(blocked > 0 && asked > blocked, "the link is fetched before the window is known to be open");
+});
+
+test("review: Start in practice says it is starting, with no Cancel, and keeps the agent's note", () => {
+  const src = v2src("views/AgentDialogs.tsx");
+  const start = src.slice(src.indexOf("export function StartDialog"), src.indexOf("// ── move to another computer"));
+  // its own POST, not askPreview (which dropped the reply's autostart note)
+  assert.match(start, /send<StartDone>\(API\.agentStart, \{\}\)/);
+  assert.ok(!/usePreview\(API\.agentStart/.test(start));
+  assert.match(start, /started\(page, r as unknown as StartDone\)/);
+  // practice: "Starting…", nothing that claims to cancel
+  assert.match(start, /if \(ask\.kind === "asking" && !live\)/);
+  const practice = start.slice(start.indexOf('if (ask.kind === "asking" && !live)'), start.indexOf('if (ask.kind !== "review")'));
+  assert.match(practice, /Starting the agent…/);
+  assert.ok(!/Cancel|Asking the agent what this would change/.test(practice));
+  assert.match(src, /\$\{r\.autostart_note \? ` \$\{r\.autostart_note\}` : ""\}/);
+});
+
+test("review: the cloud move keeps the classic page's guidance", () => {
+  const src = v2src("views/AgentDialogs.tsx");
+  assert.match(src, /sudo tail -50 \/var\/log\/cloud-init-output\.log/);
+  assert.match(src, /Droplets at cloud\.digitalocean\.com/);
+  assert.match(src, /setGone\(true\)/);
+  // the dashboard command: the server's own, or built from the address
+  assert.equal(deploySsh(null), null);
+  assert.equal(deploySsh({ status: "new", ip: "" }), null);
+  assert.equal(deploySsh({ status: "active", ip: "203.0.113.7" }), "ssh -L 8721:127.0.0.1:8721 trader@203.0.113.7");
+  assert.equal(deploySsh({ status: "active", ip: "203.0.113.7", ssh: "ssh -L 8721:127.0.0.1:8721 trader@203.0.113.7 -i k" }), "ssh -L 8721:127.0.0.1:8721 trader@203.0.113.7 -i k");
+  assert.equal(deploySsh({ status: "active", ip: "1.2.3.4; rm -rf ~" }), null);
+});
+
+test("review: field errors sit next to their field and are tied to it", () => {
+  const mv = v2src("views/AgentDialogs.tsx");
+  const move = mv.slice(mv.indexOf("export function MoveDialog"));
+  // the passphrase error: right under the two fields, which point at it
+  assert.equal((move.match(/aria-describedby=\{pwErr \? `\$\{id\}-pe` : undefined\}/g) || []).length, 2);
+  assert.ok(move.indexOf('<FieldError id={`${id}-pe`} text={pwErr} />') < move.indexOf("<h4>On the new computer</h4>"));
+  // the retire error: next to the Retire button, after the passphrase step
+  const retire = move.indexOf("I saved the file: retire this computer…");
+  const finishErr = move.indexOf('<FieldError id={`${id}-e`} text={err} />');
+  assert.ok(finishErr > retire && finishErr < move.indexOf("</ol>"));
+  assert.match(v2src("views/CodeDialogs.tsx"), /aria-describedby=\{`\$\{id\}-h\$\{err \? ` \$\{id\}-e` : ""\}`\}/);
+  assert.match(v2src("views/SignalsDialogs.tsx"), /aria-invalid=\{!!err \|\| undefined\}\s+aria-describedby=\{err \? `\$\{id\}-e` : undefined\}/);
+});
+
+test("review: the paid-day marks say how they relate to the result on paid signal days", () => {
+  const src = v2src("views/Results.tsx");
+  // the table counts a trade on the day it closed, the paid-day result on the day it opened: said where the marks are
+  assert.match(src, /Each trade counts on the day it closed \(ET\)/);
+  assert.match(src, /\{days\.slice\(0, showN\)\.some\(\(d\) => paidMark\(s, d\.day\)\) && \(/);
+  assert.match(src, /counts the trades opened on those days,\s+so it need not add up from the rows marked here/);
+  assert.match(src, /opened on \{plural\(pd\.real\.days, "paid signal day"\)\}, counted on the day each was\s+opened/);
 });

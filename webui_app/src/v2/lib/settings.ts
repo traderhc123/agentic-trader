@@ -6,15 +6,65 @@
 // field before anything is sent. What is saved, and what a change does to
 // the owner's risk in the confirm dialog, always comes from the server's own
 // preview (POST without `confirm`), never from here.
-import type { Change, Direction, Purchases, SettingsView, SignInEnd, SizeMode, SizeSpec } from "../../lib/settingsApi";
+import type { Change, DeployStatus, Direction, Purchases, SettingsView, SignInEnd, SizeMode, SizeSpec, Unsold } from "../../lib/settingsApi";
+import type { BudgetHint } from "../../lib/viewModel";
 import { count, plural, usd } from "./format.ts";
 
-/** The first-run wizard and the move tool are the only pages /v2 sends the
- *  owner to; the wizard brings them back here (webui._RETURN_TO). */
+/** The first-run wizard is the only page /v2 sends the owner to (to finish
+ *  setup, or to bring a setup to this computer); it brings them back here
+ *  (webui._RETURN_TO). */
 export const SETUP_FROM_V2 = "/setup?from=v2";
-/** "Move to another computer" lives in the classic dashboard's move tool
- *  (the setup wizard only has the receiving end); #move opens it. */
-export const MOVE_TOOL = "/dash#move";
+/** The classic dashboard: Settings → This dashboard opens it (once). */
+export const CLASSIC = "/dash";
+
+// ── move to another computer ────────────────────────────────────────────────
+
+/** What is wrong with the move file's passphrase ("" when nothing): the
+ *  classic move tool's rules, 8 characters or more, typed twice alike. */
+export function movePassProblem(pw: string, again: string): string {
+  if (pw.length < 8) return "Pick a passphrase of at least 8 characters.";
+  if (pw !== again) return "The two passphrases don't match.";
+  return "";
+}
+
+/** The DigitalOcean regions a cloud move can use (provision.REGIONS; the
+ *  server refuses any other). */
+export const DEPLOY_REGIONS: [string, string][] = [
+  ["nyc3", "New York"],
+  ["sfo3", "San Francisco"],
+  ["tor1", "Toronto"],
+  ["lon1", "London"],
+  ["fra1", "Frankfurt"],
+  ["sgp1", "Singapore"],
+];
+
+/** The command that opens a new cloud server's dashboard from this
+ *  computer: the server's own (deploy status "ssh"), or the classic page's
+ *  fallback built from its address. null until there is an address. */
+export function deploySsh(st: DeployStatus | null): string | null {
+  if (!st) return null;
+  if (typeof st.ssh === "string" && st.ssh.trim()) return st.ssh.trim();
+  const ip = typeof st.ip === "string" ? st.ip.trim() : "";
+  return /^[0-9A-Fa-f:.]{2,45}$/.test(ip) ? `ssh -L 8721:127.0.0.1:8721 trader@${ip}` : null;
+}
+
+/** One real position a stop or a move leaves unsold here, in words. */
+export function unsoldWords(u: Unsold): string {
+  const c = u.contract;
+  const name = c ? `${c.symbol} ${c.strike}${c.side} ${c.expiry}` : u.label || "A position the agent can't name";
+  const qty = typeof u.qty === "number" && Number.isFinite(u.qty) ? `, ${plural(u.qty, "contract")}` : "";
+  return `${name}${qty}${u.expires_today ? ", expires today" : ""}`;
+}
+
+/** Why Start can't be offered yet ("" when it can): the first-run steps
+ *  the wizard still has to do (the server checks again either way). */
+export function setupUnfinished(v: SettingsView | null): string {
+  if (!v) return "";
+  if (v.consent?.accepted === false) return "The agreement isn't accepted yet.";
+  if (!v.signals?.source) return "No signal source is chosen yet.";
+  if (v.broker?.ready === false) return "No broker is connected yet.";
+  return "";
+}
 
 /** "$1,150" for whole dollars, "$1,150.50" otherwise. */
 export const money = (n: number) => usd(n, Number.isInteger(n) ? 0 : 2);
@@ -146,6 +196,18 @@ export function valueWords(key: string, v: unknown): string {
   if (key === "mode") return v === "live" ? "LIVE" : v === "practice" ? "Practice" : "not known";
   if (key === "signal_days") return isNum(v) ? plural(v, "signal day") : "None";
   if (key === "robinhood") return v ? "Signed in" : "Not signed in";
+  if (key === "agent") return v === "running" ? "Running" : v === "stopped" ? "Stopped" : "not known";
+  if (key === "this_computer" && typeof v === "string" && v) return v.charAt(0).toUpperCase() + v.slice(1);
+  if (key === "source") return sourceWords(v as SourceShown | null);
+  if (key === "scope") return scopeWords(v);
+  if (key === "wallet") {
+    const w = v as { site?: string | null; new?: boolean } | null;
+    if (!w) return "None";
+    return `${w.new ? "A new wallet" : "Your own wallet"}${w.site ? ` at ${w.site}` : ""}`;
+  }
+  if (key === "wallet_fund") return isNum(v) ? `${count(v)} sats` : "not set";
+  if (key === "code" && typeof v === "string" && v) return v.charAt(0).toUpperCase() + v.slice(1);
+  if (key === "expiry_sell_et") return v == null || typeof v === "string" ? etClockWords(v) : "not known";
   if (typeof v === "boolean") return v ? "On" : "Off";
   if (isNum(v)) return count(v);
   if (v == null || v === "") return "not set";
@@ -169,6 +231,7 @@ export function confirmLabel(changes: Change[]): string {
     if (lossWords(c.saved_now) === "Off") return `Set the limit to ${to}`;
   }
   if (c.key === "trade_size.other" && c.new == null) return "Use the main-pick size";
+  if (c.key === "expiry_sell_et") return c.new == null ? "Turn off the expiry-day sell" : `Sell at ${to}`;
   const short = to.replace(/ a (trade|day)$| at once$/, "");
   return c.direction === "raises_risk" ? `Raise to ${short}` : c.direction === "lowers_risk" ? `Lower to ${short}` : `Change to ${short}`;
 }
@@ -177,6 +240,16 @@ export function confirmLabel(changes: Change[]): string {
  *  types ("This raises your risk"). Same rules as webui._risk_direction:
  *  bigger is riskier, and no daily loss limit is the riskiest. */
 export function riskOf(key: string, old: unknown, next: unknown): Direction {
+  if (key === "expiry_sell_et") {
+    // "HH:MM" or null (off): off raises the risk, a later time holds the
+    // contract longer into its last day (webui._expiry_direction)
+    const a = old as string | null;
+    const b = next as string | null;
+    if (a === b) return "neutral";
+    if (b == null) return "raises_risk";
+    if (a == null) return "lowers_risk";
+    return b > a ? "raises_risk" : "lowers_risk";
+  }
   if (key === "trade_size.main" || key === "trade_size.other") {
     const a = old as SizeSpec | null;
     const b = next as SizeSpec | null;
@@ -301,4 +374,135 @@ export function signInOutcome(since: number, end: SignInEnd | null | undefined):
       text: `Connected. Broker: Robinhood${acct}. Options trading is not turned on in this account, so Robinhood rejects the agent's orders until you apply for it at Robinhood.`,
     };
   return { kind: "done", text: `Connected. Broker: Robinhood${acct}.` };
+}
+
+// ── a tip ───────────────────────────────────────────────────────────────────
+
+/** A tip's payment code is past its validity (plus a minute's grace) and
+ *  AgentHC never said it was paid or expired: this page can no longer say
+ *  which, so it says both possibilities. */
+export const tipLapsed = (shownAt: number, validS: number, now: number): boolean =>
+  now > shownAt + (Number.isFinite(validS) && validS > 0 ? validS : 3600) * 1000 + 60000;
+
+// ── the agreement ───────────────────────────────────────────────────────────
+
+/** The agreement on file, in words (GET /api/v2/settings' consent). */
+export function agreementWords(c: { accepted: boolean; on_file: boolean; accepted_at: string | null; terms_version: string | null; current_terms_version: string } | null | undefined): string {
+  if (!c) return "Not known.";
+  const when = c.accepted_at && /^\d{4}-\d{2}-\d{2}/.test(c.accepted_at) ? ` on ${c.accepted_at.slice(0, 10)}` : "";
+  if (c.accepted) return `You accepted it${when}${c.terms_version ? ` (terms version ${c.terms_version})` : ""}. It is on file on this computer.`;
+  if (c.on_file)
+    return `The agreement changed since you accepted it${when}${c.terms_version ? ` (version ${c.terms_version})` : ""}: the current one is version ${c.current_terms_version}, and the agent needs it accepted in setup.`;
+  return "No accepted agreement is on file on this computer: the agent needs it accepted in setup.";
+}
+
+// ── a code change ───────────────────────────────────────────────────────────
+
+/** The sha256 (hex) of the diff exactly as this page shows it: what an
+ *  Apply is bound to (the server applies only the proposal whose diff has
+ *  it). null when this browser can't work it out (then nothing is applied). */
+export async function diffSha256(text: string): Promise<string | null> {
+  const subtle = (globalThis as { crypto?: Crypto }).crypto?.subtle;
+  if (!subtle) return null;
+  try {
+    const d = new Uint8Array(await subtle.digest("SHA-256", new TextEncoder().encode(text)));
+    return Array.from(d, (b) => b.toString(16).padStart(2, "0")).join("");
+  } catch {
+    return null;
+  }
+}
+
+// ── the expiry-day times ────────────────────────────────────────────────────
+
+/** An Eastern time of day the expiry sell or its alert accepts: "15:40",
+ *  "9:45" → "09:45"; from 09:30 to 15:59 (agent._expiry_setting). */
+export function readEtTime(text: string): Parsed<string> {
+  const m = /^\s*([01]?\d|2[0-3]):([0-5]\d)\s*$/.exec(String(text ?? ""));
+  const mins = m ? Number(m[1]) * 60 + Number(m[2]) : -1;
+  if (mins < 9 * 60 + 30 || mins >= 16 * 60) return { ok: false, error: "Enter a time from 09:30 to 15:59 (Eastern), like 15:40." };
+  return { ok: true, value: `${String(Math.floor(mins / 60)).padStart(2, "0")}:${String(mins % 60).padStart(2, "0")}` };
+}
+
+/** "3:50 PM ET" for a saved "15:50"; "Off" for none. */
+export function etClockWords(hhmm: string | null | undefined): string {
+  if (!hhmm) return "Off";
+  const m = /^(\d{2}):(\d{2})$/.exec(hhmm);
+  if (!m) return "not known";
+  const h = Number(m[1]);
+  return `${h % 12 || 12}:${m[2]} ${h < 12 ? "AM" : "PM"} ET`;
+}
+
+/** An expiry-day time for a save (the sell time on the limits route, the
+ *  alert on the alerts route): only when it differs from what is saved
+ *  (null = off). Undefined: leave it as it is. */
+export function expiryTimePayload(saved: string | null | undefined, off: boolean, text: string): Parsed<string | undefined> {
+  if (off) return { ok: true, value: saved == null ? undefined : "off" };
+  const t = readEtTime(text);
+  if (!t.ok) return t;
+  return { ok: true, value: t.value === saved ? undefined : t.value };
+}
+
+export const expiryAlertPayload = expiryTimePayload;
+
+// ── trade size: the wizard's words, and the budget hint ─────────────────────
+
+/** The classic sizing step's notice (wizard Sizing), said once in /v2: in
+ *  the trade-size confirm dialog. */
+export const SIZING_DISCLAIMER =
+  "Nobody here is an investment adviser and none of this software can advise position sizing. This number is your decision, made with money you can afford to lose entirely.";
+
+/** The size a budget hint suggests, as the trade-size form takes it. */
+export const hintSize = (h: BudgetHint): SizeSpec => ({ mode: "budget", value: h.suggest });
+
+/** The limits save "Use $S" leads to: exactly what typing $S in that book's
+ *  trade-size form sends (the classic hint button's "set [other ]budget S"). */
+export const hintPayload = (h: BudgetHint) => ({ trade_size: { [h.book]: { mode: "budget", value: h.suggest } } });
+
+/** One budget hint in words (agent._budget_hints, as the classic "why no
+ *  trades" panel said it). */
+export function hintWords(h: BudgetHint): string {
+  const which = h.book === "other" ? "other-trades" : "main-pick";
+  const cost = h.max_cost > h.min_cost ? `${money(h.min_cost)} to ${money(h.max_cost)}` : money(h.min_cost);
+  return `${plural(h.skipped, "signal")} today cost more than your ${money(h.budget)} ${which} size: one contract was ${cost}. ${money(h.suggest)} would have taken ${h.would_take} of them.`;
+}
+
+// ── the broker's own warning ────────────────────────────────────────────────
+
+/** What the broker row says about the agent's account beyond up/down: the
+ *  classic wizard's Robinhood warning (options not turned on), as a code. */
+export function brokerWarning(v: SettingsView | null | undefined): string {
+  if (v?.broker?.warning === "options_off")
+    return "Options trading is not turned on in this Robinhood account, so Robinhood rejects the agent's orders until you apply for it at Robinhood.";
+  return "";
+}
+
+// ── the signal source ───────────────────────────────────────────────────────
+
+export interface SourceShown {
+  source: string | null;
+  site?: string | null;
+}
+
+/** "AgentHC Day Trade Ideas", "Your own commands file", "A JSON feed at x". */
+export function sourceWords(v: SourceShown | null | undefined): string {
+  if (!v?.source) return "None chosen";
+  if (v.source === "agenthc") return "AgentHC Day Trade Ideas";
+  if (v.source === "manual") return "Your own commands file (commands.jsonl)";
+  if (v.source === "url") return v.site ? `A JSON feed at ${v.site}` : "A JSON feed";
+  return v.source;
+}
+
+export const scopeWords = (v: unknown): string => (v === "all" ? "The main pick and other trades" : v === "main" ? "The main pick only" : "not known");
+
+/** A feed or wallet address the agent accepts (the classic form's rule). */
+export function readAddress(text: string): Parsed<string> {
+  const t = String(text ?? "").trim();
+  if (/^https:\/\/[^\s/]+/.test(t) || /^http:\/\/(127\.0\.0\.1|localhost)([:/]|$)/.test(t)) return { ok: true, value: t };
+  return { ok: false, error: "Enter an address starting with https:// (or one on this computer)." };
+}
+
+/** Sats to add to the wallet: a whole number from 1,000 up to the wallet's
+ *  invoice cap when it has said one (the server refuses anything else). */
+export function readSats(text: string, cap: number | null | undefined): Parsed {
+  return readNumber(text, { low: 1000, high: cap && cap >= 1000 ? cap : 100_000_000, whole: true });
 }

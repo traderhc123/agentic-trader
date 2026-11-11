@@ -1,13 +1,17 @@
 // Today: what needs you, the one-sentence state with the last decision, what
 // is held and what the agent will do with it, what the agent is doing right
-// now, today's limits, today so far, money so far.
+// now, today's limits, today so far, money so far, and "Ask your agent"
+// (answers only: POST /api/v2/ask never runs a command).
+import { useId, useState } from "react";
 import type { Activity, Position, Status } from "../../lib/viewModel";
+import { askAgent } from "../lib/http";
 import { answerLook, answerWhy, describe, sellsHow, type Go } from "../lib/copy";
 import { notesOn, todayHasDay, todayLimitsLink } from "../lib/screens";
 import {
   brokerLabel,
   dayBooks,
   dayTally,
+  dayWhole,
   nextFor,
   paidFor,
   practicePositions,
@@ -17,6 +21,7 @@ import {
   type Note,
 } from "../lib/derive";
 import { UNKNOWN, contractName, count, dayLong, etDayKey, etTime, etWhen, plural, signed, tone, usd } from "../lib/format";
+import { SETUP_FROM_V2 } from "../lib/settings";
 import { ExpiresFlag, Icon, Stamp, Tag } from "../ui";
 import type { Page } from "../App";
 
@@ -57,6 +62,13 @@ export function Notes({ page, list, crit }: { page: Page; list: Note[]; crit?: b
               <button className="btn" data-go={n.go} onClick={() => page.go(n.go as Go)}>
                 {GO_WORDS[n.go]}
               </button>
+            </div>
+          )}
+          {n.setup && (
+            <div className="note-act">
+              <a className="btn" href={SETUP_FROM_V2}>
+                Read the agreement in setup
+              </a>
             </div>
           )}
         </div>
@@ -471,12 +483,12 @@ export function LimitsPanel({ page, linkLabel = "Change limits" }: { page: Page;
 function DayPanel({ page }: { page: Page }) {
   const s = page.s;
   const today = etDayKey(s.as_of);
-  const live = s.mode === "live";
   const t = dayTally(page.rows, today, page.hasOlder, s.broker.name);
   if (!todayHasDay(s, page.link)) return null;
   const books = dayBooks(s);
-  const opened = live ? s.limits.used_today.real : s.limits.used_today.practice;
-  const least = t.complete ? "" : "at least ";
+  // whole when the page has every line of today (the server's count says)
+  const complete = dayWhole(today, page.rows, page.feed.dayLines[today], page.hasOlder);
+  const least = complete ? "" : "at least ";
   return (
     <section className={`panel a-day ${page.stale ? "stale" : ""}`}>
       <div className="ph">
@@ -492,7 +504,7 @@ function DayPanel({ page }: { page: Page }) {
         <ul className="tally">
           <li>
             <span>Opened</span>
-            <b>{plural(opened, books.opened)}</b>
+            <b>{plural(books.openedN, books.opened)}</b>
           </li>
           {books.closed.map(({ label, word, day }) => (
             <li key={label}>
@@ -515,7 +527,7 @@ function DayPanel({ page }: { page: Page }) {
         <p className="tally-h">
           {t.stoppedTotal
             ? `Your limits and rules stopped ${least}${plural(t.stoppedTotal, "signal")}`
-            : t.complete
+            : complete
               ? "Your limits and rules stopped nothing today"
               : "Your limits and rules: see Activity for today's earlier signals"}
         </p>
@@ -534,7 +546,7 @@ function DayPanel({ page }: { page: Page }) {
               {least}
               {plural(t.problems, "problem")} today
             </>
-          ) : t.complete ? (
+          ) : complete ? (
             "No problems today"
           ) : (
             "No problems in the latest activity"
@@ -629,6 +641,101 @@ function MoneyPanel({ page }: { page: Page }) {
   );
 }
 
+// ── ask your agent ──────────────────────────────────────────────────────────
+
+/** Why the Ask box can't be used now ("" when it can). */
+function askBlocked(page: Page): string {
+  if (page.link === "lost") return "This page can't reach the agent right now, so it can't answer.";
+  if (!page.s.agent.running) return "The agent isn't running, so it can't answer. Start it in Settings.";
+  return "";
+}
+
+/** A question about the agent's own state, answered by the AI helper from
+ *  the agent's status and recent trades. It only ever answers: changing
+ *  something is done with the controls, never by asking. */
+function AskPanel({ page }: { page: Page }) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const id = useId();
+  const why = askBlocked(page);
+  const ask = async () => {
+    const q = text.trim();
+    if (!q) return setErr("Type a question first.");
+    if (q.length > 2000) return setErr("At most 2,000 characters.");
+    setBusy(true);
+    setErr("");
+    const r = await askAgent(q);
+    setBusy(false);
+    if (!r.ok) return setErr(r.error);
+    page.addTalk({ q, a: r.answer, at: new Date().toISOString() });
+    setText("");
+  };
+  return (
+    <section className="panel a-ask">
+      <div className="ph">
+        <h2>Ask your agent</h2>
+        <span className="meta">Answers only: it never changes a setting or places an order</span>
+      </div>
+      <div className="pb">
+        {page.talk.length > 0 && (
+          <ol className="talk" aria-label="This visit's questions and answers" aria-live="polite">
+            {page.talk.map((t, i) => (
+              <li key={i}>
+                <p className="talk-q">
+                  <b>You</b> {t.q}
+                </p>
+                <p className="talk-a">
+                  <b>Agent</b> <span>{t.a}</span>
+                </p>
+              </li>
+            ))}
+          </ol>
+        )}
+        <form
+          className="ask"
+          onSubmit={(e) => {
+            e.preventDefault();
+            ask();
+          }}
+        >
+          <label htmlFor={id}>Your question</label>
+          <div className="editor-row">
+            <input
+              id={id}
+              className="input"
+              autoComplete="off"
+              maxLength={2000}
+              value={text}
+              placeholder="Why did it skip the last signal?"
+              aria-invalid={!!err}
+              aria-describedby={`${id}-h${err ? ` ${id}-e` : ""}`}
+              disabled={!!why}
+              onChange={(e) => {
+                setText(e.target.value);
+                setErr("");
+              }}
+            />
+            <button type="submit" className="btn btn-primary" data-act="ask" disabled={busy || !!why}>
+              {busy ? "Asking…" : "Ask"}
+            </button>
+          </div>
+          {err && (
+            <span className="err" id={`${id}-e`} role="alert">
+              <Icon name="alert" small />
+              {err}
+            </span>
+          )}
+          <span className="help" id={`${id}-h`}>
+            {why ||
+              "Your AI helper answers from the agent's status and recent trades. To change something, use the controls: Pause and Practice / LIVE at the top, limits in Rules & limits. The questions and answers stay on this page until you close it."}
+          </span>
+        </form>
+      </div>
+    </section>
+  );
+}
+
 export function Today({ page }: { page: Page }) {
   const empty = statement(page.s, page.link).empty;
   const list = notesOn("today", page.s, page.link);
@@ -648,6 +755,7 @@ export function Today({ page }: { page: Page }) {
           {!empty && <MoneyPanel page={page} />}
         </div>
       </div>
+      <AskPanel page={page} />
     </div>
   );
 }
