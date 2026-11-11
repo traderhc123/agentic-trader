@@ -777,7 +777,9 @@ def test_practice_sell_of_an_empty_position_is_refused(home):
 # ── sources: a signal can't ask for a short ─────────────────────────────────
 
 def test_sources_drop_signals_that_would_mean_a_short(home, monkeypatch, capsys):
+    import sources
     from sources import agenthc_day_trade_ideas, generic_json_url, manual_file
+    monkeypatch.setattr(sources, "_LOGGED", set())
     good = {"event": "ENTERED", "ticker": "SPY", "expiry": EXPIRY, "strike": 752,
             "type": "C", "event_id": "g"}
     bad = [dict(good, event="SHORTED", event_id="b1"),
@@ -824,6 +826,26 @@ def test_sources_drop_signals_that_would_mean_a_short(home, monkeypatch, capsys)
     out = capsys.readouterr().out
     assert out.count("ignored a signal") == len(bad) * 2 + 4
     assert "never" in out
+
+    # the next poll sees the same lines: each was logged once already
+    agenthc_day_trade_ideas._parse_events(body)
+    generic_json_url.poll({"source_url": "https://feed.invalid/x"}, {})
+    manual_file.poll({}, {})
+    assert "ignored a signal" not in capsys.readouterr().out
+
+
+def test_sources_keep_an_entry_a_feed_labels_short(home):
+    """A third-party feed may label a bearish idea (a put to BUY) "short".
+    The entry is still a buy to open — only explicit sell-to-open words
+    (sell, sell_to_open, sto, write…) drop an entry."""
+    from sources import agenthc_day_trade_ideas, never_short_reason
+    ev = {"event": "ENTERED", "ticker": "SPY", "expiry": EXPIRY, "strike": 700,
+          "type": "P", "event_id": "bear", "side": "short"}
+    assert never_short_reason(ev, "ENTERED") == ""
+    assert [e["event_id"] for e in agenthc_day_trade_ideas._parse_events(
+        {"events": [ev]})] == ["bear"]
+    for word in ("sell", "sell_to_open", "STO", "write", "sell_short"):
+        assert never_short_reason(dict(ev, side=word), "ENTERED")
 
 
 # ── no order leaves by any other road ──────────────────────────────────────

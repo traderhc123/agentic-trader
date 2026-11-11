@@ -40,10 +40,13 @@ import math
 # short, and a source must not invent one: an event of a type other than
 # ENTERED / EXITED, an entry that says it sells or writes, or an entry with a
 # negative quantity is dropped with a logged reason (never_short_reason).
+# A bare "short" is NOT one of those words: feeds use it for a bearish idea
+# (a put the agent BUYS), and every entry is a buy to open anyway
+# (order_guard.check_order); the filter is only defence in depth.
 
 _SIDE_KEYS = ("side", "order_side", "action", "position_effect",
               "position_intent", "intent", "trade_side")
-_SELLISH = {"sell", "sell_to_open", "sell to open", "sto", "short", "sell_short",
+_SELLISH = {"sell", "sell_to_open", "sell to open", "sto", "sell_short",
             "short_sell", "sellshort", "write", "writes", "open_short"}
 _QTY_KEYS = ("qty", "quantity", "contracts", "size", "count")
 
@@ -76,9 +79,26 @@ def never_short_reason(raw, event):
     return ""
 
 
+_LOGGED = set()      # (source, signal, reason) already logged this run
+_LOGGED_MAX = 5000
+
+
 def log_ignored(source, raw, reason):
-    """The one line an ignored signal leaves in the log."""
+    """The one line an ignored signal leaves in the log — once per run: a
+    feed or commands file shows the same line again on every poll."""
+    import hashlib
+    import json
     from platform_compat import safe_print
+    try:
+        seen = json.dumps(raw, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        seen = repr(raw)
+    key = hashlib.sha256(f"{source}|{seen}|{reason}".encode("utf-8")).hexdigest()
+    if key in _LOGGED:
+        return
+    if len(_LOGGED) >= _LOGGED_MAX:
+        _LOGGED.clear()
+    _LOGGED.add(key)
     ident = ""
     if isinstance(raw, dict):
         ident = " ".join(str(raw.get(k)) for k in ("ticker", "expiry", "strike", "type")
