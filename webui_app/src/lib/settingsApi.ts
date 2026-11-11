@@ -60,7 +60,16 @@ export interface SettingsView {
   computer: {
     autostart: { supported: boolean; enabled: boolean | null; how: string };
     keep_awake: boolean;
+    /** open the dashboard after login (the chat's "open at login"); null: not known */
+    open_dashboard_at_login: boolean | null;
+    /** the dashboard "/" lands on */
+    dashboard: Dashboard;
   };
+  /** the expiry sell and its alert (HH:MM ET; null = off); null: not known */
+  expiry: Expiry | null;
+  code: { self_edit_enabled: boolean };
+  /** the agreement on file (its text: GET /api/v2/agreement) */
+  consent: Consent;
   ai: {
     connected: boolean;
     provider: string | null;
@@ -81,18 +90,56 @@ export interface SettingsView {
     fields: Record<string, boolean | Secret>;
     /** how the last Robinhood sign-in ended (seq 0: none since the agent started) */
     signin: SignInEnd;
+    /** the classic wizard's Robinhood warning, as a code (options not turned on) */
+    warning: "options_off" | null;
   };
   signals: {
     source: string | null;
     include_other_trades: boolean;
+    /** practice mode's "what it would have taken" preview is on */
+    dry_run_preview: boolean;
     recurring: boolean;
     wallet_connected: boolean;
+    /** a JSON feed's host name only (its address may carry a token); null otherwise */
+    source_site: string | null;
+    /** the payment wallet, secret-free (its page link only via POST /api/v2/wallet/page) */
+    wallet: WalletView;
     api_key: Secret;
     pass_on_file: boolean;
     /** signal-day purchases on file by id: paid, or an invoice that can still be paid
      *  (an invoice that expired unpaid is in neither) */
     purchases: Purchases;
   };
+}
+
+export type Dashboard = "classic" | "v2";
+
+export interface Expiry {
+  sell_et: string | null;
+  alert_et: string | null;
+  /** today's times (an early close moves both) */
+  effective_today: { sell_et: string | null; alert_et: string | null; close_et: string | null; early_close: boolean };
+  /** the classic status line ("sells at 15:45 ET, alert at 15:50 ET") */
+  described: string;
+  allowed: [string, string];
+}
+
+export interface Consent {
+  /** the agreement on file is the current one */
+  accepted: boolean;
+  on_file: boolean;
+  accepted_at: string | null;
+  terms_version: string | null;
+  current_terms_version: string;
+}
+
+/** A real position a stop or a move leaves with nobody selling it here. */
+export interface Unsold {
+  id: string;
+  label: string | null;
+  contract: { symbol: string; expiry: string; strike: number; side: "C" | "P" } | null;
+  qty: number | null;
+  expires_today: boolean;
 }
 
 /** One line of a server preview: Saved now → New. Values are as the server
@@ -120,6 +167,18 @@ export interface Preview {
   limits?: { max_entries_per_day: number | null; max_daily_loss_usd: number | null; max_open_positions: number | null };
   real_positions?: number | null;
   cash_low?: boolean | null;
+  /** stop / move: the real positions nobody sells here afterwards; null: not known */
+  unsold?: Unsold[] | null;
+  /** move: whether an agent runs behind this page (it stops) */
+  agent_running?: boolean;
+  /** start: the saved mode it starts in */
+  mode?: "live" | "practice";
+  /** a code change: the sha256 of the diff it applies, its files, the AI's
+   *  warnings, and whether the agent restarts on it */
+  diff_sha256?: string;
+  files?: string[];
+  warnings?: string[];
+  restarts?: boolean;
 }
 
 /** Every /v2 write answers with one of these (HTTP 200). */
@@ -145,6 +204,32 @@ export interface Invoice {
   access_until: string | null;
   /** the QR code as rows of dark (1) / light (0) modules; null when not made */
   qr?: number[][] | null;
+}
+
+/** POST /api/v2/agent/start, applied (start_local's answer). */
+export interface StartDone {
+  autostart_note?: string;
+}
+
+/** POST /api/move/export (classic, reused): the move file is ready to download. */
+export interface MoveFile {
+  filename: string;
+  kb: number;
+}
+
+/** POST /api/v2/move/finish or /api/v2/move/deploy, applied. */
+export interface MoveDone {
+  note: string;
+  here?: string;
+  retired?: boolean;
+}
+
+/** GET /api/deploy/status (classic, reused): the cloud server's progress. */
+export interface DeployStatus {
+  status: string;
+  ip: string;
+  ssh?: string;
+  error?: string;
 }
 
 /** POST /api/v2/command, applied: the agent's own reply. */
@@ -207,3 +292,96 @@ export interface PassCheck {
 }
 /** GET /api/wallet/balance */
 export type WalletBalance = { ok: true; sats: number } | { ok: false; error: string };
+
+// ── Settings → Help and support (classic routes, reused as they are) ────────
+
+/** GET /api/help/netcheck and GET /api/help/report: the text to show (the
+ *  report has keys, tokens, invoices and wallet ids taken out). */
+export interface HelpText {
+  ok: boolean;
+  text?: string;
+  error?: string;
+}
+
+/** GET /api/v2/agreement: the agreement's text, to read again. */
+export interface Agreement {
+  ok: true;
+  text: string;
+  terms_version: string;
+}
+
+/** GET /api/tip/options: the tip amounts AgentHC offers now. */
+export interface TipTier {
+  amount_usd: number;
+  /** null unless it matches AgentHC's own quote (the agent checked) */
+  amount_sats: number | null;
+  available: boolean;
+  reason: string | null;
+  label: string;
+}
+export type TipOptions =
+  | { ok: true; tiers: TipTier[]; quote: { btc_usd: number; age_s: number; source: string } | null; valid_seconds: number }
+  | { ok: false; error: string; unavailable?: boolean };
+
+/** POST /api/tip/create: the invoice the owner pays from their own wallet. */
+export interface TipInvoice {
+  bolt11: string;
+  qr: number[][] | null;
+  payment_hash: string;
+  amount_usd: number;
+  amount_sats: number;
+  btc_usd: number;
+  expires_in: number;
+}
+
+/** POST /api/tip/status */
+export type TipCheck = { ok: true; status: "pending" | "paid" | "expired" } | { ok: false; error: string; retry?: boolean; unknown?: boolean };
+
+// ── Settings → Code changes ─────────────────────────────────────────────────
+
+/** GET /api/proposal (classic, reused): the code change waiting for review. */
+/** GET /api/proposal (classic). truncated: the diff is cut (too large to
+ *  show whole), so it was never all shown and /v2 never applies it. */
+export type ProposalView = { pending: false } | { pending: true; explanation: string; warnings: string[]; diff: string; truncated?: boolean };
+
+/** POST /api/v2/proposal/apply, applied: the agent's own words. */
+export interface ApplyDone {
+  reply: string;
+}
+
+// ── Signals & pass → signal source and payment wallet ─────────────────────
+
+export interface WalletView {
+  /** the wallet's host name; null when there is no wallet */
+  site: string | null;
+  /** a public test server's warning, or null */
+  warning: string | null;
+  /** a wallet page link is on file (open it with POST /api/v2/wallet/page) */
+  page_on_file: boolean;
+  /** the most one day-pass payment may cost; null: not set */
+  autopay_cap_sats: number | null;
+  /** the wallet's largest invoice, when it has said; null: not known */
+  invoice_cap_sats: number | null;
+  /** where a new wallet would be made, and its test-server warning */
+  new_site: string | null;
+  new_warning: string | null;
+}
+
+/** GET /api/wallet/quote?sats=N (classic, reused): what N sats are worth now. */
+export type WalletQuote =
+  | { ok: true; btc_usd: number; usd: number; day_passes: number; day_pass_sats: number; suggested_sats: number; invoice_cap: number | null }
+  | { ok: false; error: string };
+
+/** POST /api/v2/wallet/fund, confirmed: the invoice to pay into the agent's wallet. */
+export interface FundInvoice {
+  bolt11: string;
+  sats: number;
+  /** said when the wallet made a smaller invoice than asked (its own cap) */
+  note: string;
+  qr: number[][] | null;
+}
+
+/** POST /api/v2/wallet/page */
+export interface WalletPage {
+  url: string;
+}

@@ -788,6 +788,8 @@ textarea.input{min-height:120px;resize:vertical;font-size:15px;line-height:1.45}
 .callout-warn{border-color:var(--warn-line);background:var(--warn-tint)}
 .callout-warn p{color:var(--ink)} .callout-warn .ic{color:var(--warn-ink)}
 .rule-text{grid-column:1 / -1;margin-top:8px;white-space:pre-wrap;font-size:14px;color:var(--ink2);border-left:3px solid var(--line2);padding-left:12px;overflow-wrap:anywhere}
+.setrow-hint{grid-column:1 / -1;margin-top:8px;display:flex;gap:8px 12px;align-items:center;flex-wrap:wrap;padding:8px 12px;border:1px solid var(--line2);border-radius:var(--r1);background:var(--well);font-size:14px}
+.setrow-hint > span{flex:1 1 260px;min-width:0}
 .bolt{display:block;font:13px/1.4 ui-monospace,Consolas,Menlo,monospace;background:var(--well);border:1px solid var(--line);border-radius:6px;padding:8px 12px;word-break:break-all;max-height:6.5em;overflow:auto;user-select:all}
 .note .agent-said{grid-column:2;margin-top:4px}
 .note .agent-said p{grid-column:auto;margin-top:4px}
@@ -810,3 +812,47 @@ textarea.input{min-height:120px;resize:vertical;font-size:15px;line-height:1.45}
   /* a wide value (the frame legend) goes under its label on a phone */
   .setrow .val:has(.legendrow){grid-row:auto;grid-column:1 / -1;justify-self:start;text-align:left}
 }
+
+/* Settings → This dashboard: "New | Classic" (a two-way choice, saved on the agent) */
+.seg{display:inline-flex;border:1px solid var(--line2);border-radius:var(--r1);overflow:hidden}
+.seg button{min-height:32px;padding:4px 14px;border:0;background:transparent;color:var(--ink2);font:inherit;font-weight:600;cursor:pointer}
+.seg button + button{border-left:1px solid var(--line2)}
+.seg button[aria-checked="true"]{background:var(--ink);color:var(--surface)}
+.seg button:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}
+.seg button:disabled{cursor:default}
+.seg button:disabled:not([aria-checked="true"]){color:var(--ink3)}
+/* the move dialog: numbered steps, then the cloud option */
+.steps{display:grid;gap:16px;margin:0;padding-left:20px}
+.steps li{display:grid;gap:8px}
+.steps h4,.subsec h4{margin:0;font-size:15px}
+.row-acts{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.subsec{display:grid;gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+@media (max-width:640px){.seg button{min-height:44px}.row-acts .btn{min-height:44px}}
+/* Settings → Help and support, Code changes; Signals & pass wallet */
+.helptext{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 ui-monospace,Consolas,Menlo,monospace;background:var(--well);border:1px solid var(--line);border-radius:6px;padding:8px 12px;max-height:22rem;overflow:auto;color:var(--ink)}
+.helptext-long{max-height:min(60vh,32rem)}
+.tip-opt{font:inherit;color:inherit;text-align:left}
+.tip-opt:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+.tip-opt[aria-disabled="true"]{opacity:.6;cursor:not-allowed}
+.tip-opt[aria-busy="true"]{border-color:var(--ink);box-shadow:inset 0 0 0 1px var(--ink)}
+.warnline{display:flex;gap:6px;align-items:flex-start;margin-top:4px;color:var(--ink)} .warnline .ic{color:var(--warn-ink);flex:none;margin-top:2px}
+.choices{display:grid;gap:12px}
+.choices .check span{display:grid;gap:2px}
+.choices .check small{font-weight:400}
+.ph .switch{margin-left:auto}
+.paid-mark{display:block;font:400 12px/1.3 var(--sans);color:var(--ink2);margin-top:2px}
+.a-ask{margin-top:16px}
+.ask{display:grid;gap:6px}
+.ask label{font-weight:650;font-size:14px}
+.ask .editor-row .input{flex:1 1 240px;min-width:0}
+.talk{list-style:none;margin:0 0 12px;padding:0;display:grid;gap:10px;max-height:420px;overflow:auto}
+.talk li{display:grid;gap:4px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+.talk p{margin:0;font-size:15px;overflow-wrap:anywhere;white-space:pre-wrap}
+.talk b{display:inline-block;min-width:3.5em;font-size:13px;color:var(--ink2)}
+.pgroups{list-style:none;margin:0;padding:0}
+.pgroups li + li{border-top:1px solid var(--line)}
+.pgroup{display:grid;gap:2px;width:100%;text-align:left;padding:10px 16px;min-height:44px;background:none;border:0;color:inherit;font:inherit;cursor:pointer}
+.pgroup:hover{background:var(--well)}
+.pg-t{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.pg-n{font:700 14px/1 var(--mono);color:var(--ink2)}
+.pg-s,.pg-h{font-size:14px;color:var(--ink2);overflow-wrap:anywhere}

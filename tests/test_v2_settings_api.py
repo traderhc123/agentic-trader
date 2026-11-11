@@ -71,7 +71,9 @@ def app(home, monkeypatch):
         webui._ALLOWED_HOSTS = hosts
         webui._ALLOWED_ORIGINS = tuple(f"http://{h}" for h in hosts)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        return Client(port)
+        client = Client(port)
+        client.handler = made["handler"]  # the routes it serves
+        return client
 
     yield start
     for srv in servers:
@@ -571,7 +573,7 @@ def test_going_live_is_refused_while_a_policy_blocks_entries(home, app):
     ("/api/v2/pass/buy", {"days": "5"}),
     ("/api/v2/pass/buy", {"days": 5, "price": 1}),
     ("/api/v2/wallet/recurring", {"on": "true"}),
-    ("/api/v2/command", {"action": "stop"}),
+    ("/api/v2/command", {"action": "stop", "scope": "all"}),
     ("/api/v2/command", {"action": "pause", "scope": "all"}),
     ("/api/v2/command", {"action": "set_mode", "mode": "paper"}),
     ("/api/v2/command", {"text": "go live"}),

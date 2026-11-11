@@ -16,9 +16,10 @@ Besides those states:
     never-loaded    fails from the first request
     locked          answers 401, like an expired dashboard login
 
-The Pause / Resume / Switch buttons work: POST /api/v2/command (and the
-classic POST /api/command, which the stop button sends) answers the way the
-agent does and moves this tab to the matching state. The settings forms
+The Pause / Resume / Switch / Stop / Start buttons work: POST
+/api/v2/command and /api/v2/agent/start answer the way the agent does and
+move this tab to the matching state (Stop and a LIVE Start preview first).
+The move dialog's file and finish answer in the server's shapes too. The settings forms
 work too, against a made-up copy of the state's settings kept per tab:
 GET /api/v2/settings and the /api/v2/... writes answer in the server's
 shapes (a preview with a token first for money-affecting ones), but nothing
@@ -84,7 +85,7 @@ _ALPACA = {"id": "alpaca", "name": "Alpaca (paper or live)", "fields": [
      "type": "checkbox", "default": True}]}
 # /api/v2/command action -> the classic command it stands for (MOVES)
 _V2_COMMAND = {"pause": "pause", "resume": "resume", "practice": "dry on",
-               "live": "dry off"}
+               "live": "dry off", "stop": "stop"}
 
 
 def _size(cfg, prefix):
@@ -92,6 +93,11 @@ def _size(cfg, prefix):
     key = {"budget": "budget_per_trade_usd", "contracts": "contracts_per_trade",
            "percent": "percent_per_trade"}.get(mode)
     return {"mode": mode, "value": cfg.get(prefix + key)} if key else None
+
+
+def _sell(cfg):
+    v = cfg.get("expiry_guard_et", "15:45")
+    return None if v == "off" else v
 
 
 def _settings(tab):
@@ -120,7 +126,18 @@ def _settings(tab):
                    for k in ("discord", "ntfy", "tg_token", "tg_chat")},
         "computer": {"autostart": {"supported": True, "enabled": bool(cfg.get("_autostart")),
                                    "how": "a login item"},
-                     "keep_awake": cfg.get("keep_awake", True) is not False},
+                     "keep_awake": cfg.get("keep_awake", True) is not False,
+                     "open_dashboard_at_login": cfg.get("open_dashboard_at_login", True) is not False,
+                     "dashboard": cfg.get("dashboard", "classic")},
+        "expiry": {"sell_et": _sell(cfg), "alert_et": "15:50",
+                   "effective_today": {"sell_et": _sell(cfg), "alert_et": "15:50",
+                                       "close_et": "16:00", "early_close": False},
+                   "described": "sells at 15:45 ET, alert at 15:50 ET",
+                   "allowed": ["09:30", "15:59"]},
+        "code": {"self_edit_enabled": bool(cfg.get("self_edit_enabled"))},
+        "consent": {"accepted": True, "on_file": True,
+                    "accepted_at": "2026-10-01T12:00:00+00:00",
+                    "terms_version": "fixture", "current_terms_version": "fixture"},
         "ai": {"connected": bool(cfg.get("_ai")), "provider": cfg.get("_ai"),
                "name": "Anthropic" if cfg.get("_ai") else None,
                "model": cfg.get("_ai_model"), "endpoint": None,
@@ -130,10 +147,18 @@ def _settings(tab):
                    "paper": bool(cfg.get("alpaca_paper")) if cfg.get("broker") == "alpaca" else False,
                    "fields": {},
                    "signin": {"seq": 0, "connected": None, "account_mask": None,
-                              "options_off": False, "error": None}},
-        "signals": {"source": cfg.get("source"), "include_other_trades": False,
+                              "options_off": False, "error": None},
+                   "warning": None},
+        "signals": {"source": cfg.get("source"),
+                    "include_other_trades": bool(cfg.get("include_other_trades")),
+                    "dry_run_preview": cfg.get("dry_run_preview", True) is not False,
                     "recurring": bool(cfg.get("day_pass_recurring")),
                     "wallet_connected": bool(cfg.get("lnbits_url")),
+                    "source_site": None,
+                    "wallet": {"site": "demo.lnbits.com" if cfg.get("lnbits_url") else None,
+                               "warning": None, "page_on_file": bool(cfg.get("lnbits_url")),
+                               "autopay_cap_sats": 30000, "invoice_cap_sats": None,
+                               "new_site": "demo.lnbits.com", "new_warning": None},
                     "api_key": {"set": False, "last4": None}, "pass_on_file": True,
                     # the fixture's invoice is never paid: it stays waiting
                     "purchases": {"paid": [], "waiting": ["fixture-purchase"]}},
@@ -188,6 +213,17 @@ def _v2_post(tab, path, data):
                                         "max_daily_loss_usd", "max_open_positions")},
                              "real_positions": gs.status(tab["state"])["real_positions"],
                              "cash_low": False})
+        if which == "stop" and token is None:
+            st = gs.status(tab["state"])
+            left = [{"id": x["id"], "label": x["label"], "contract": x["contract"],
+                     "qty": x["qty"], "expires_today": x["expires_today"]}
+                    for x in st["positions"] if x["real"]]
+            return _preview(tab, [{"key": "agent", "label": "Agent on this computer",
+                                   "saved_now": "running", "new": "stopped",
+                                   "direction": "raises_risk" if left else "neutral"}],
+                            ["It does not sell anything on the way out: open "
+                             "positions stay open at your broker."],
+                            {"unsold": left, "real_positions": len(left)})
         if which == "live" and ack is not True:
             return {"ok": False, "needs_acknowledge": True,
                     "error": "Tick the box to confirm you want real orders. Nothing was changed."}
@@ -208,6 +244,13 @@ def _v2_post(tab, path, data):
                 new[k] = data[k]
                 changes.append({"key": k, "label": label, "saved_now": cfg.get(k),
                                 "new": data[k], "direction": _risk(cfg.get(k), data[k], unl)})
+        if "expiry_sell_et" in data and data["expiry_sell_et"] != (cfg.get("expiry_guard_et") or "15:45"):
+            new["expiry_guard_et"] = data["expiry_sell_et"]
+            before, after = _sell(cfg), _sell(new)
+            changes.append({"key": "expiry_sell_et", "label": "Expiry-day sell time",
+                            "saved_now": before, "new": after,
+                            "direction": "raises_risk" if after is None or (before and after > before)
+                            else "lowers_risk"})
         for book, prefix in (("main", ""), ("other", "other_")):
             spec = (data.get("trade_size") or {}).get(book)
             if spec is None:
@@ -242,9 +285,34 @@ def _v2_post(tab, path, data):
     if path == "/api/v2/settings/computer":
         if "autostart" in data:
             cfg["_autostart"] = data["autostart"]
-        if "keep_awake" in data:
-            cfg["keep_awake"] = data["keep_awake"]
+        for k in ("keep_awake", "open_dashboard_at_login", "dashboard"):
+            if k in data:
+                cfg[k] = data[k]
         return {"ok": True, "saved": True, "autostart_note": ""}
+    if path == "/api/v2/agent/start":
+        if tab["state"] != "stopped":
+            return {"ok": False, "error": "The agent is already running. Nothing was changed."}
+        live = not cfg.get("dry_run")
+        if live and token is None:
+            return _preview(tab, [{"key": "agent", "label": "Agent on this computer",
+                                   "saved_now": "stopped", "new": "running",
+                                   "direction": "raises_risk"}],
+                            ["It does not change a setting: it runs with them as saved."],
+                            {"mode": "live", "trade_size": {"main": _size(cfg, "")},
+                             "limits": {k: cfg.get(k) for k in ("max_entries_per_day",
+                                        "max_daily_loss_usd", "max_open_positions")},
+                             "real_positions": gs.status(tab["state"])["real_positions"]})
+        tab["state"] = "live" if live else "practice"
+        return {"ok": True, "autostart_note": ""}
+    if path == "/api/v2/move/finish":
+        if token is None:
+            return _preview(tab, [{"key": "this_computer", "label": "This computer",
+                                   "saved_now": "runs the agent", "new": "retired",
+                                   "direction": "neutral"}],
+                            ["It does not sell anything."],
+                            {"unsold": [], "real_positions": 0, "agent_running": True})
+        tab["state"] = "stopped"
+        return {"ok": True, "note": "(fixture server) this computer is retired"}
     if path == "/api/v2/settings/ai":
         cfg["_ai"], cfg["_ai_model"] = data.get("provider") or "anthropic", data.get("model")
         return {"ok": True, "saved": True, "describe": "Anthropic"}
@@ -275,6 +343,56 @@ def _v2_post(tab, path, data):
                 "amount_sats": 10200 * data["days"],
                 "amount_usd": 10 * data["days"], "extends": False, "carried": 0,
                 "access_until": None, "qr": [[int(v) for v in r] for r in qr]}
+    if path == "/api/v2/ask":
+        # answer-only, as the agent's own route: never a command
+        q = str(data.get("question") or "").strip()
+        if not q:
+            return {"ok": False, "error": "Type a question first."}
+        return {"ok": True, "answer": "(fixture server) The agent would answer here from "
+                f"its status and recent trades. You asked: {q[:200]}"}
+    if path == "/api/v2/settings/code":
+        cfg["self_edit_enabled"] = bool(data.get("self_edit_enabled"))
+        return {"ok": True, "saved": True}
+    if path == "/api/v2/proposal/request":
+        tab["proposal"] = True
+        return {"ok": True, "note": "(fixture server) Proposal ready: 1 file(s) changed."}
+    if path == "/api/v2/proposal/apply":
+        if token is None:
+            return _preview(tab, [{"key": "code", "label": "The agent's code",
+                                   "saved_now": "as it is now", "new": "1 file changed by the AI helper",
+                                   "direction": "neutral"}], _NOT,
+                            {"files": ["brokers/example.py"], "warnings": [], "restarts": True,
+                             "diff_sha256": data.get("diff_sha256")})
+        tab["proposal"] = False
+        return {"ok": True, "reply": "(fixture server) Applied 1 file(s). Restarting."}
+    if path in ("/api/v2/settings/source", "/api/v2/settings/signals", "/api/v2/wallet/create",
+                "/api/v2/wallet/fund", "/api/v2/wallet/connect", "/api/v2/wallet/recurring"):
+        direct = (path.endswith("source") and "agenthc_key" in data) or (
+            path.endswith("signals") and set(data) - {"confirm"} == {"dry_run_preview"})
+        if token is None and not direct:
+            return _preview(tab, [{"key": k, "label": k.replace("_", " ").capitalize(),
+                                   "saved_now": None, "new": v, "direction": "neutral"}
+                                  for k, v in data.items()] or [
+                                      {"key": "wallet", "label": "Payment wallet", "saved_now": None,
+                                       "new": {"site": "demo.lnbits.com", "new": True},
+                                       "direction": "neutral"}], _NOT)
+        if path.endswith("signals"):
+            if "scope" in data:
+                cfg["include_other_trades"] = data["scope"] == "all"
+            if "dry_run_preview" in data:
+                cfg["dry_run_preview"] = data["dry_run_preview"]
+        elif path.endswith("source") and "source" in data:
+            cfg["source"] = data["source"]
+        elif path.endswith("recurring"):
+            cfg["day_pass_recurring"] = bool(data.get("on"))
+        elif path.endswith("create") or path.endswith("connect"):
+            cfg["lnbits_url"] = "https://demo.lnbits.com"
+        elif path.endswith("fund"):
+            return {"ok": True, "bolt11": "lnbc" + "fixturefund" * 20, "sats": data.get("sats"),
+                    "note": "", "qr": None}
+        return {"ok": True, "saved": True}
+    if path == "/api/v2/wallet/page":
+        return {"ok": True, "url": "https://demo.lnbits.com/wallet?usr=fixture"}
     return None
 
 
@@ -359,7 +477,25 @@ class Handler(BaseHTTPRequestHandler):
                      "keys_url": "console.anthropic.com"}}},
                  "/api/pass/options": lambda: {"options": [1, 5, 20, 60]},
                  "/api/pass/status": lambda: {"status": "pending"},
-                 "/api/wallet/balance": lambda: {"ok": False, "error": "no wallet"}}
+                 "/api/wallet/balance": lambda: (
+                     {"ok": True, "sats": 41200} if tab["cfg"].get("lnbits_url")
+                     else {"ok": False, "error": "no wallet"}),
+                 "/api/wallet/quote": lambda: {"ok": True, "btc_usd": 97000.0, "usd": 0.0,
+                                               "day_passes": 0, "day_pass_sats": 10400,
+                                               "suggested_sats": 10400, "invoice_cap": None},
+                 "/api/proposal": lambda: (
+                     {"pending": True, "explanation": "(fixture) Adds a connector for another broker.",
+                      "warnings": [], "diff": "--- a/brokers/example.py\n+++ b/brokers/example.py\n"
+                                              "@@ -0,0 +1 @@\n+x = 1\n",
+                      "truncated": False}
+                     if tab.get("proposal") or name == "proposal-pending" else {"pending": False}),
+                 "/api/help/netcheck": lambda: {"ok": True, "text": "AgentHC: OK (fixture)\nGitHub (updates): OK (fixture)"},
+                 "/api/help/report": lambda: {"ok": True, "text": "agentic-trader support report\n(fixture)"},
+                 "/api/v2/agreement": lambda: {"ok": True, "text": "(fixture) The agreement text.", "terms_version": "fixture"},
+                 "/api/tip/options": lambda: {"ok": True, "valid_seconds": 3600,
+                                              "quote": {"btc_usd": 97000.0, "age_s": 30, "source": "fixture"},
+                                              "tiers": [{"amount_usd": n, "amount_sats": n * 1031, "available": True,
+                                                         "reason": None, "label": f"${n}"} for n in (100, 500, 1000)]}}
         if u.path in fixed:
             return self._send(fixed[u.path]())
         if u.path == "/api/v2/activity":
@@ -380,6 +516,18 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if tab is None:
             return self._send({"error": "not found"}, status=404)
+        if path == "/api/move/export":
+            return self._send({"ok": True, "filename": "agentic-trader-fixture.atmove", "kb": 12})
+        if path == "/api/proposal/reject":
+            tab["proposal"] = False
+            return self._send({"ok": True, "reply": "proposal rejected"})
+        if path == "/api/tip/create":
+            return self._send({"ok": True, "bolt11": "lnbc" + "fixturetip" * 20, "qr": None,
+                               "payment_hash": "a" * 64, "amount_usd": data.get("amount_usd"),
+                               "amount_sats": (data.get("amount_usd") or 0) * 1031,
+                               "btc_usd": 97000.0, "expires_in": 3600})
+        if path == "/api/tip/status":
+            return self._send({"ok": True, "status": "pending"})
         if path == "/api/llm/models":
             return self._send({"ok": True, "provider": "anthropic",
                                "models": ["claude-a", "claude-b"], "suggested": "claude-a"})

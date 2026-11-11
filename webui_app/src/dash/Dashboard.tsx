@@ -22,7 +22,7 @@ import {
   type WouldHave,
 } from "../lib/api";
 import { cn } from "../lib/cn";
-import { copyToClipboard, useInterval } from "../lib/hooks";
+import { copyToClipboard, usePolling } from "../lib/hooks";
 import { cap1, eventWhen, eventWhenParts, hhmm, isToday, localWhen, money, parseContract, parsePositions, shortDate, type Contract } from "../lib/format";
 import { MovePanel } from "./MovePanel";
 import { PnlChart, type PnlPoint } from "./PnlChart";
@@ -158,7 +158,9 @@ export function Dashboard() {
       setConn("unreachable");
     }
   };
-  useInterval(refresh, 5000);
+  // every 5 s while the page is visible; paused while hidden, asked at once
+  // when shown again (local reads only, but nobody is looking)
+  usePolling(refresh, 5000);
 
   // Older Activity rows, fetched on demand ("Load older"), from just below
   // the oldest row on screen.

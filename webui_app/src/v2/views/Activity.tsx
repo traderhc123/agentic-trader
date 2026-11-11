@@ -1,10 +1,13 @@
 // Activity: one list of full-row buttons at every width, grouped by market
-// day, with the money tag that says whether an order existed. The drawer
-// shows the checks in the order the agent runs them, with "stopped here".
+// day, with the money tag that says whether an order existed. A day the page
+// has only part of says how much, and no totals (ActivityPage.day_lines).
+// The Problems filter groups them by kind. The drawer shows the checks in
+// the order the agent runs them, with "stopped here".
 import { useMemo, useState } from "react";
 import type { Activity as Row, Status } from "../../lib/viewModel";
 import { checkLabel, describe, type Cat, type Described } from "../lib/copy";
-import { contractName, count, dayLong, etDayKey, etTime, plural, signed, tone, usd } from "../lib/format";
+import { dayWhole, problemGroups } from "../lib/derive";
+import { contractName, count, dayLong, etDayKey, etTime, etWhen, plural, signed, tone, usd } from "../lib/format";
 import { Drawer, Icon, Stamp, Tag } from "../ui";
 import type { Page } from "../App";
 
@@ -100,6 +103,8 @@ export function ActivityView({ page }: { page: Page }) {
     (byDay.get(d) as Row[]).push(e);
   }
   const loaded = all.length;
+  const more = feed.canLoadOlder;
+  const groups = filter === "problem" ? problemGroups(list, s.broker.name) : [];
   return (
     <div className="view">
       {head}
@@ -117,6 +122,35 @@ export function ActivityView({ page }: { page: Page }) {
           <span>Real money only</span>
         </label>
       </div>
+      {more && (
+        <p className="small muted" data-counts="loaded">
+          The counts are of the {plural(loaded, "line")} loaded so far, not of the whole log ({count(feed.total)} lines).
+        </p>
+      )}
+      {groups.length > 0 && (
+        <section className={`panel ${page.stale ? "stale" : ""}`} data-problems="by-kind">
+          <div className="ph">
+            <h2>Problems by kind</h2>
+            <span className="meta">{more ? `In the ${plural(loaded, "line")} loaded so far` : "In the whole log"}</span>
+          </div>
+          <ul className="pgroups">
+            {groups.map((g) => (
+              <li key={g.key}>
+                <button className="pgroup" onClick={() => page.openEv(g.last.n)}>
+                  <span className="pg-t">
+                    <b>{g.label}</b>
+                    <span className="pg-n">×{count(g.n)}</span>
+                  </span>
+                  <span className="pg-s">
+                    Last {g.last.at ? etWhen(g.last.at, today) : "at a time not recorded"}, {contractName(g.last.contract, g.last.contract_text)}
+                  </span>
+                  {g.hint && <span className="pg-h">Fix: {g.hint}</span>}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
       <section className={`panel evpanel ${page.stale ? "stale" : ""}`}>
         {list.length === 0 && (
           <div className="pb">
@@ -126,6 +160,29 @@ export function ActivityView({ page }: { page: Page }) {
           </div>
         )}
         {[...byDay.entries()].map(([d, rows]) => {
+          // a day the page has only part of: how much, and no sums at all
+          // (a partial count or P&L is never shown as the day's)
+          const whole = dayWhole(d, all, feed.dayLines[d], more);
+          if (!whole) {
+            const have = all.filter((e) => etDayKey(e.at) === d).length;
+            const of = feed.dayLines[d];
+            return (
+              <div key={d || "undated"}>
+                <div className="day-h">
+                  <h2>{d ? `${d === today ? "Today, " : ""}${dayLong(d)}` : "Time not recorded"}</h2>
+                  <span className="day-t" data-partial>
+                    {of != null ? `${count(have)} of ${plural(of, "line")} loaded` : `${plural(have, "line")} loaded so far`}. Show earlier activity for the rest of
+                    the day and its totals.
+                  </span>
+                </div>
+                <ul className="evlist">
+                  {rows.map((e) => (
+                    <EvRow key={e.n} e={e} d={mm(e)} onOpen={page.openEv} />
+                  ))}
+                </ul>
+              </div>
+            );
+          }
           const c = (f: (e: Row) => boolean) => rows.filter(f).length;
           const b = c((e) => e.action === "entry");
           const so = c((e) => e.action === "exit");

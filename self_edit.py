@@ -187,12 +187,98 @@ def enabled(cfg):
     return bool(cfg.get("self_edit_enabled"))
 
 
+def corpus_mode(cfg):
+    """config self_edit_corpus: "full" (default) sends every source file;
+    "lean" leaves tests/ out (about 64% of the tree), so the model can't
+    update the tests in the same proposal."""
+    return "lean" if str((cfg or {}).get("self_edit_corpus", "")).strip().lower() \
+        == "lean" else "full"
+
+
+LEAN_NOTE = ("(The tests/ folder was left out of this tree to save tokens: "
+             "you can't see or update the tests.)")
+
+
+def prompt_text(corpus, request, lean=False):
+    """The proposal's user message: the source tree FIRST (sorted, the same
+    bytes for every request on an unchanged tree, so a provider's automatic
+    prefix cache can reuse it on the next request), the owner's request
+    LAST."""
+    return (f"CURRENT SOURCE TREE:\n{corpus}\n\n"
+            + (LEAN_NOTE + "\n\n" if lean else "")
+            + f"OWNER'S REQUEST:\n{request}")
+
+
 def current():
     try:
         with open(_proposal_path(), encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
+
+
+SHOWN_DIFF_MAX = 200000  # characters of diff the review shows
+
+
+def shown_diff(p):
+    """The diff of a proposal as the dashboard shows it for review (GET
+    /api/proposal): cut at SHOWN_DIFF_MAX characters (diff_truncated)."""
+    return "\n".join(c["diff"] for c in p.get("changes", []))[:SHOWN_DIFF_MAX]
+
+
+def _full_diff(p):
+    return "\n".join(str(c.get("diff", "")) if isinstance(c, dict) else ""
+                     for c in p.get("changes", []))
+
+
+def diff_truncated(p):
+    """True when the review shows only part of the diff: such a change was
+    never all shown, so /v2 never applies it."""
+    return len(_full_diff(p)) > SHOWN_DIFF_MAX
+
+
+def diff_sha256(p):
+    """sha256 of the WHOLE diff: what /v2 binds its Apply confirmation to.
+    When the review shows all of it (not diff_truncated), that is the sha256
+    of the text shown; a cut one never matches what a page shows. With
+    base_problem() it also binds the files' new contents: each diff must be
+    the one its content makes against the file as it is."""
+    import hashlib
+    return hashlib.sha256(_full_diff(p).encode("utf-8")).hexdigest()
+
+
+def _diff_text(rel, old, new):
+    return "".join(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=f"a/{rel}", tofile=f"b/{rel}"))
+
+
+def base_problem(p):
+    """"" when every change's diff is exactly what its new content makes
+    against the file as it is NOW; else why not. Apply writes whole files,
+    so a change made against older code (an update installed since, an edit
+    by hand) would quietly undo that: it must be asked for again."""
+    repo_real = os.path.realpath(_repo())
+    for ch in p.get("changes", []):
+        if not (isinstance(ch, dict) and all(isinstance(ch.get(k), str)
+                                             for k in ("path", "content", "diff"))):
+            return "the proposal file is damaged"
+        rel = ch["path"]
+        dst = os.path.realpath(os.path.join(repo_real, os.path.normpath(rel)))
+        if not dst.startswith(repo_real + os.sep):
+            return f"illegal path {rel!r}"
+        try:
+            if os.path.exists(dst):
+                with open(dst, encoding="utf-8") as f:
+                    now = f.read()
+            else:
+                now = ""
+        except (OSError, UnicodeDecodeError):
+            return f"{rel} can't be read to check it"
+        if _diff_text(rel, now, ch["content"]) != ch["diff"]:
+            return (f"{rel} changed since this was proposed (an update, or an "
+                    "edit by hand), and applying it would undo that")
+    return ""
 
 
 def reject():
@@ -212,7 +298,10 @@ def propose(cfg, request):
         return False, "Connect an AI model first (Setup → Connect your AI)."
 
     files = _repo_files()
-    corpus = "\n\n".join(f"===== {p} =====\n{c}" for p, c in sorted(files.items()))
+    lean = corpus_mode(cfg) == "lean"
+    shown = {p: c for p, c in files.items()
+             if not (lean and p.split("/")[0] == "tests")}
+    corpus = "\n\n".join(f"===== {p} =====\n{c}" for p, c in sorted(shown.items()))
     schema = {
         "type": "object",
         "properties": {
@@ -249,7 +338,7 @@ def propose(cfg, request):
     try:
         result = llm_client.complete_json(
             cfg, system,
-            f"OWNER'S REQUEST:\n{request}\n\nCURRENT SOURCE TREE:\n{corpus}",
+            prompt_text(corpus, request, lean),
             schema, max_tokens=64000, long=True, timeout=900)
     except llm_client.LLMError as exc:
         if exc.reason == "refused":
@@ -285,9 +374,7 @@ def propose(cfg, request):
         problem = _order_path_problem(rel, new)
         if problem:
             return False, f"proposal rejected: {problem}"
-        diff = "".join(difflib.unified_diff(
-            old.splitlines(keepends=True), new.splitlines(keepends=True),
-            fromfile=f"a/{rel}", tofile=f"b/{rel}"))
+        diff = _diff_text(rel, old, new)
         if any(m in diff for m in _GUARDED_MARKERS):
             warnings.append(f"⚠️ references consent-gate internals: {rel}")
         changes.append({"path": rel, "content": new, "diff": diff})
@@ -462,12 +549,28 @@ def _app_port():
         return 8721
 
 
-def apply_and_restart(restart=True):
+def apply_and_restart(restart=True, expect_sha256=None):
     """Apply the pending proposal: backup -> write -> compile-check ->
-    import-check -> rollback on failure -> restart. Returns (ok, message)."""
+    import-check -> rollback on failure -> restart. Returns (ok, message).
+    expect_sha256: apply only the proposal whose whole diff has this sha256
+    (diff_sha256), the one the owner reviewed, and only if all of it was
+    shown and it was made against the files as they are now (base_problem);
+    any other is left as it is."""
     prop = current()
     if not prop:
         return False, "no pending proposal"
+    if expect_sha256 is not None:
+        if diff_truncated(prop):
+            return False, ("this change is too large to review in the "
+                           "dashboard — nothing was applied; reject it and ask "
+                           "for a smaller change")
+        if diff_sha256(prop) != expect_sha256:
+            return False, ("the proposal waiting is not the one you reviewed — "
+                           "nothing was applied; review it again")
+        problem = base_problem(prop)
+        if problem:
+            return False, (f"{problem} — nothing was applied; reject it and "
+                           "ask again")
 
     # Re-validate paths at apply time — never trust the stored proposal file.
     repo_real = os.path.realpath(_repo())

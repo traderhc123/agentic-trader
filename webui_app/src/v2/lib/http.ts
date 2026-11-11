@@ -2,8 +2,9 @@
 // dashboard's login cookie, with no Origin trick or token of its own (the
 // server's host/origin guard and login check apply to every request alike).
 // Every read and write of /v2 goes through here: the typed settings routes
-// (/api/v2/...), the update pull, the few classic read-only routes /v2
-// reuses, and the one fixed command the stop button still sends.
+// (/api/v2/...), the update pull, and the few classic routes /v2 reuses as
+// they are (read-only, or making a file / an invoice that changes nothing).
+// /v2 sends no free text: the classic /api/command is never called.
 // No imports that exist at run time, so the Node tests load it as it is.
 import type { Reply } from "../../lib/settingsApi";
 
@@ -116,6 +117,37 @@ export function confirmBody(payload: Record<string, unknown>, token: string, ack
   return acknowledge === undefined ? { ...payload, confirm: token } : { ...payload, confirm: token, acknowledge };
 }
 
+/** One question to the agent and its answer, kept in the page only (this
+ *  visit: never stored, never sent back). */
+export interface Turn {
+  q: string;
+  a: string;
+  /** when the answer came, as the page's clock read it */
+  at: string;
+}
+
+/** POST /api/v2/ask: the agent's answer, or why there is none. Answer-only
+ *  (the server never runs a command from it), so a failed request changes
+ *  nothing and never makes the page doubt its settings. */
+export async function askAgent(question: string, f: Fetch = browserFetch): Promise<{ ok: true; answer: string } | { ok: false; error: string }> {
+  let r: Response;
+  try {
+    r = await postJson(API.ask, { question }, undefined, f);
+  } catch {
+    return { ok: false, error: FAILED.network.read };
+  }
+  if (r.status === 401 || r.status === 403) return { ok: false, error: FAILED.locked.read };
+  let j: { ok?: unknown; answer?: unknown; error?: unknown } | null = null;
+  try {
+    j = await r.json();
+  } catch {
+    /* not JSON */
+  }
+  if (r.status !== 200 || !j || typeof j !== "object") return { ok: false, error: FAILED.server.read };
+  if (j.ok === true && typeof j.answer === "string") return { ok: true, answer: j.answer };
+  return { ok: false, error: typeof j.error === "string" && j.error ? j.error : FAILED.server.read };
+}
+
 // The routes /v2 uses. One list, so a test can see every one of them.
 export const API = {
   settings: "/api/v2/settings",
@@ -128,6 +160,21 @@ export const API = {
   robinhood: "/api/v2/broker/robinhood",
   passBuy: "/api/v2/pass/buy",
   command: "/api/v2/command",
+  agentStart: "/api/v2/agent/start",
+  moveFinish: "/api/v2/move/finish",
+  moveDeploy: "/api/v2/move/deploy",
+  code: "/api/v2/settings/code",
+  source: "/api/v2/settings/source",
+  signals: "/api/v2/settings/signals",
+  recurring: "/api/v2/wallet/recurring",
+  walletCreate: "/api/v2/wallet/create",
+  walletFund: "/api/v2/wallet/fund",
+  walletConnect: "/api/v2/wallet/connect",
+  walletPage: "/api/v2/wallet/page",
+  proposalRequest: "/api/v2/proposal/request",
+  proposalApply: "/api/v2/proposal/apply",
+  // Today → Ask your agent: answers only, never a command
+  ask: "/api/v2/ask",
   // classic, read-only (or saving nothing), reused as they are
   brokers: "/api/brokers",
   aiProviders: "/api/llm/providers",
@@ -135,6 +182,21 @@ export const API = {
   passOptions: "/api/pass/options",
   passStatus: "/api/pass/status",
   walletBalance: "/api/wallet/balance",
-  // the one fixed command not in /api/v2/command: "stop" (see Dialogs.tsx)
-  classicCommand: "/api/command",
+  walletQuote: "/api/wallet/quote",
+  // the move file: made, then downloaded (a GET the browser saves)
+  moveExport: "/api/move/export",
+  moveDownload: "/api/move/download",
+  deployStatus: "/api/deploy/status",
+  // Settings → Help and support: reads, and a tip invoice the owner pays
+  // from their own wallet (the agent pays nothing and saves nothing)
+  netcheck: "/api/help/netcheck",
+  report: "/api/help/report",
+  agreement: "/api/v2/agreement",
+  tipOptions: "/api/tip/options",
+  tipCreate: "/api/tip/create",
+  tipStatus: "/api/tip/status",
+  // Settings → Code changes: the change waiting (read), and rejecting it
+  // (it only throws the proposal away)
+  proposal: "/api/proposal",
+  proposalReject: "/api/proposal/reject",
 } as const;

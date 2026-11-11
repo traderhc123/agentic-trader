@@ -1,11 +1,12 @@
 // Where the /v2 dashboard gets its data: GET /api/v2/status every 5 s (the
-// classic dashboard's cadence) and older Activity rows from /api/v2/activity
-// on demand. `command` is only the stop button's fixed "stop" (POST
-// /api/command); every other command goes through the typed
-// POST /api/v2/command (App.tsx).
+// classic dashboard's cadence) while the page is visible (paused while it
+// is hidden, asked at once when it is shown again) and older Activity rows
+// from /api/v2/activity on demand. Commands go through the typed POST
+// /api/v2/command (App.tsx, views/AgentDialogs.tsx); this page sends no free
+// text.
 import { useCallback, useEffect, useRef, useState } from "react";
+import { startPolling } from "../lib/polling";
 import { SCHEMA_VERSION, type Activity, type ActivityPage, type Status } from "../lib/viewModel";
-import { postJson } from "./lib/http";
 
 export const POLL_MS = 5000;
 const TIMEOUT_MS = 4000;
@@ -47,6 +48,13 @@ function merge(a: Activity[], b: Activity[]): Activity[] {
   return [...m.values()].sort((x, y) => y.n - x.n);
 }
 
+/** A page's day_lines as {day: lines} (none from a server that sends none). */
+function linesOf(page: ActivityPage): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const d of Array.isArray(page.day_lines) ? page.day_lines : []) if (d && typeof d.lines === "number") out[d.day] = d.lines;
+  return out;
+}
+
 export interface StatusFeed {
   status: Status | null;
   fetching: Fetching;
@@ -54,14 +62,15 @@ export interface StatusFeed {
   failing: boolean;
   /** every Activity row loaded this visit, newest first */
   rows: Activity[];
+  /** each loaded market day's line count in the whole log (ActivityPage.
+   *  day_lines), so a day the page has only part of is never summed as whole */
+  dayLines: Record<string, number>;
   total: number;
   canLoadOlder: boolean;
   loadingOlder: boolean;
   olderError: string;
   loadOlder: () => void;
   refresh: () => Promise<void>;
-  /** send one command; resolves to the agent's own reply */
-  command: (text: string) => Promise<{ ok: boolean; reply: string }>;
 }
 
 export function useStatus(): StatusFeed {
@@ -70,6 +79,7 @@ export function useStatus(): StatusFeed {
   const [failing, setFailing] = useState(false);
   const [rows, setRows] = useState<Activity[]>([]);
   const [total, setTotal] = useState(0);
+  const [dayLines, setDayLines] = useState<Record<string, number>>({});
   const [olderDone, setOlderDone] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState("");
@@ -101,13 +111,16 @@ export function useStatus(): StatusFeed {
       });
     // More new rows arrived than one page holds: the rows between were never fetched.
     const gap = more && prevMax != null && pageMin != null && pageMin > prevMax + 1;
+    const lines = linesOf(page);
     if (replaced || gap) {
       gen.current++;
       olderLoaded.current = false;
+      setDayLines(lines);
       setRows(first);
       setOlderDone(!more);
       setOlderError("");
     } else {
+      setDayLines((d) => ({ ...d, ...lines }));
       setRows((p) => merge(p, first));
       if (!olderLoaded.current) setOlderDone(!more);
     }
@@ -151,20 +164,25 @@ export function useStatus(): StatusFeed {
   }, [takeActivity]);
 
   useEffect(() => {
-    refresh();
-    const poll = setInterval(refresh, POLL_MS);
+    // paused while hidden (local reads only, but nobody is looking); asks at
+    // once when the page is shown again
+    const stop = startPolling(refresh, POLL_MS);
+    // shown again: the answer to the ask made then gets the usual margin
+    // before the page calls itself out of date
+    let shownAt = Date.now();
+    const shown = () => {
+      if (!document.hidden) shownAt = Date.now();
+    };
+    document.addEventListener("visibilitychange", shown);
     // A sleeping tab or computer misses polls without any fetch failing.
     const watch = setInterval(() => {
-      if (lastOk.current && Date.now() - lastOk.current > STALE_MS) setFailing(true);
+      if (document.hidden) return;
+      if (lastOk.current && Date.now() - Math.max(lastOk.current, shownAt) > STALE_MS) setFailing(true);
     }, 1000);
-    const wake = () => {
-      if (document.visibilityState === "visible") refresh();
-    };
-    document.addEventListener("visibilitychange", wake);
     return () => {
-      clearInterval(poll);
+      stop();
       clearInterval(watch);
-      document.removeEventListener("visibilitychange", wake);
+      document.removeEventListener("visibilitychange", shown);
     };
   }, [refresh]);
 
@@ -185,6 +203,7 @@ export function useStatus(): StatusFeed {
         return;
       }
       olderLoaded.current = true;
+      setDayLines((d) => ({ ...linesOf(page), ...d }));
       setRows((p) => merge(p, page.rows));
       setOlderDone(page.next == null || page.rows.length === 0);
     } catch {
@@ -194,26 +213,5 @@ export function useStatus(): StatusFeed {
     }
   }, [loadingOlder]);
 
-  const command = useCallback(
-    async (text: string) => {
-      try {
-        const r = await postJson("/api/command", { text });
-        if (r.status === 401 || r.status === 403) {
-          setFetching({ kind: "locked" });
-          return { ok: false, reply: "Your dashboard login expired, so nothing was changed. Open the login link again (python agent.py link)." };
-        }
-        const j = (await r.json()) as { reply?: unknown; error?: unknown };
-        if (r.status !== 200 || typeof j.reply !== "string")
-          return { ok: false, reply: `The agent did not accept that${typeof j.error === "string" ? `: ${j.error}` : ""}. Nothing was changed as far as this page knows.` };
-        return { ok: true, reply: j.reply };
-      } catch {
-        return { ok: false, reply: "Could not reach the agent, so this page does not know whether anything changed. Check the band at the top once it reconnects." };
-      } finally {
-        refresh();
-      }
-    },
-    [refresh],
-  );
-
-  return { status, fetching, failing, rows, total, canLoadOlder, loadingOlder, olderError, loadOlder, refresh, command };
+  return { status, fetching, failing, rows, dayLines, total, canLoadOlder, loadingOlder, olderError, loadOlder, refresh };
 }

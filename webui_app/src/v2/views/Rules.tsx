@@ -1,17 +1,24 @@
-// Rules & limits: the home of every limit, trade size and rule. Each row
-// shows the saved value (GET /api/v2/settings) and today's use (the status).
+// Rules & limits: the home of every limit, trade size, the expiry-day sell
+// time and every rule. Each row shows the saved value (GET /api/v2/settings)
+// and, for a limit, today's use (the status): said here once, as Today's
+// meters say it on Today. A budget hint sits in its trade-size row.
 // A limit or a trade size is changed in place, then confirmed in a dialog
 // that shows the server's own preview; rules (which signals to take, the
 // written rules) are not money-affecting and save straight away. After any
 // save the page reads the settings again and shows those.
 import { useEffect, useId, useState, type ReactNode } from "react";
 import type { Preview, SettingsView, SizeMode, SizeSpec } from "../../lib/settingsApi";
-import type { TradeSize } from "../../lib/viewModel";
+import type { BudgetHint, TradeSize } from "../../lib/viewModel";
 import { ReviewDialog, RiskLine, FieldError, SettingsDoubt, Switch, askPreview } from "../Forms";
 import { API, send } from "../lib/http";
 import {
   SIZE_MODE_WORDS,
   SIZE_RANGE,
+  SIZING_DISCLAIMER,
+  etClockWords,
+  expiryTimePayload,
+  hintSize,
+  hintWords,
   limitMeans,
   limitRange,
   lossWords,
@@ -26,10 +33,9 @@ import {
   type Book,
   type LimitKey,
 } from "../lib/settings";
-import { UNKNOWN, count, etDayKey, etWhen, plural, signed, tone, usd } from "../lib/format";
+import { UNKNOWN, count, etDayKey, etTime, etWhen, plural, signed, tone, usd } from "../lib/format";
 import { Icon, Stamp } from "../ui";
 import type { Page } from "../App";
-import { LimitsPanel } from "./Today";
 import { Row } from "./Pages";
 
 /** The size the agent runs on (status), when the saved one is not read yet. */
@@ -224,7 +230,7 @@ function LimitRow({ page, k, exp, now }: { page: Page; k: LimitKey; exp: string;
 
 const SIZE_LABEL: Record<Book, string> = { main: "Trade size, main pick", other: "Trade size, other trades" };
 
-function SizeRow({ page, book }: { page: Page; book: Book }) {
+function SizeRow({ page, book, hints }: { page: Page; book: Book; hints: BudgetHint[] }) {
   const v = page.settings.view;
   const st = page.s.limits.trade_size[book];
   const saved: SizeSpec | null | undefined = v ? v.limits.trade_size[book] : undefined;
@@ -240,9 +246,11 @@ function SizeRow({ page, book }: { page: Page; book: Book }) {
   const parsed = same ? ({ ok: true, value: 0 } as const) : readNumber(text, SIZE_RANGE[mode]);
   const next: SizeSpec | null = same ? null : parsed.ok ? { mode, value: parsed.value } : null;
   const shown = saved !== undefined ? sizeWords(saved, book) : book === "other" && st.same_as_main ? "Same as the main pick" : statusSize(st);
-  const open0 = () => {
-    setMode(saved ? saved.mode : book === "other" && v ? "same" : st.mode);
-    setText(saved?.value != null ? String(saved.value) : "");
+  // prefill: the size a budget hint suggests ("Use $1,150"): the form opens
+  // with it typed in, and Review sends what typing it would send
+  const open0 = (prefill?: SizeSpec) => {
+    setMode(prefill ? prefill.mode : saved ? saved.mode : book === "other" && v ? "same" : st.mode);
+    setText(prefill ? String(prefill.value) : saved?.value != null ? String(saved.value) : "");
     setErr("");
     setOpen(true);
     requestAnimationFrame(() => document.getElementById(`${id}-m`)?.focus());
@@ -268,7 +276,17 @@ function SizeRow({ page, book }: { page: Page; book: Book }) {
           : "The size for the provider's wider list of ideas. With no size of its own, the main-pick size applies."}
       </span>
       <span className="val">{shown}</span>
-      <span className="act">{!open && <ChangeButton act="size" label={label} page={page} onClick={open0} />}</span>
+      <span className="act">{!open && <ChangeButton act="size" label={label} page={page} onClick={() => open0()} />}</span>
+      {!open &&
+        hints.map((h) => (
+          <div key={h.book} className="setrow-hint" data-hint={h.book}>
+            <Icon name="info" small />
+            <span>{hintWords(h)}</span>
+            <button className="btn btn-sm" data-act="size" disabled={!!canEdit(page)} title={canEdit(page) || undefined} onClick={() => open0(hintSize(h))}>
+              Use {money(h.suggest)}
+            </button>
+          </div>
+        ))}
       {open && (
         <Editor
           error={err}
@@ -343,7 +361,136 @@ function SizeRow({ page, book }: { page: Page; book: Book }) {
             page.say(true, nv ? `Saved. ${label}: ${sizeWords(nv.limits.trade_size[book], book)}.` : "Saved. This page could not read your settings back yet; it shows them once it can.");
           }}
         >
-          {() => next && <p className="small">{sizeMeans(next, book)}</p>}
+          {() => (
+            <>
+              {next && <p className="small">{sizeMeans(next, book)}</p>}
+              <p className="small" data-disclaimer>
+                {SIZING_DISCLAIMER}
+              </p>
+            </>
+          )}
+        </ReviewDialog>
+      )}
+    </div>
+  );
+}
+
+// ── the expiry-day sell time (two-step, on the limits route) ───────────────
+
+function ExpiryRow({ page }: { page: Page }) {
+  const s = page.s;
+  const v = page.settings.view;
+  const e = v?.expiry ?? null;
+  // "HH:MM" or null (off); undefined: not read yet
+  const saved: string | null | undefined = e ? e.sell_et : undefined;
+  const [open, setOpen] = useState(false);
+  const [off, setOff] = useState(false);
+  const [text, setText] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const id = useId();
+  const label = "Expiry-day sell time";
+  const parsed = expiryTimePayload(saved ?? null, off, text);
+  const next = off ? null : parsed.ok ? (parsed.value ?? saved ?? null) : undefined;
+  // the soonest expiry sell among what is held (ISO times sort as text)
+  const guard = s.positions.map((p) => p.next.expiry_guard_at).filter((x): x is string => !!x).sort()[0] ?? null;
+  const shown = saved !== undefined ? etClockWords(saved) : s.expiry_guard_on ? "On" : "Off";
+  const today = e?.effective_today;
+  const open0 = () => {
+    setOff(saved === null);
+    setText(saved ?? e?.effective_today.sell_et ?? "15:45");
+    setErr("");
+    setOpen(true);
+    requestAnimationFrame(() => document.getElementById(id)?.focus());
+  };
+  const review = async () => {
+    if (!parsed.ok) return setErr(parsed.error);
+    if (parsed.value === undefined) return setErr("That is the time saved now.");
+    setBusy(true);
+    setErr("");
+    const payload = { expiry_sell_et: parsed.value };
+    const a = await askPreview(API.limits, payload);
+    setBusy(false);
+    if (a.kind === "review") setDraft({ payload, preview: a.preview });
+    else setErr(a.kind === "error" ? a.error : a.note);
+  };
+  return (
+    <div className="setrow" data-row="expiry_sell">
+      <span className="lbl">{label}</span>
+      <span className="exp">
+        On the day a contract expires, the agent sells it at this time (Eastern) if it is still open, so it is not exercised or left to expire.
+        Off: only an exit signal sells it. {e ? `Your expiry-day warning: ${etClockWords(e.alert_et)}, set in Settings under Connections → Alerts.` : ""}
+      </span>
+      <span className="val">
+        {shown}
+        <small>
+          {today?.early_close && today.sell_et ? `Today (early close): ${etClockWords(today.sell_et)}. ` : ""}
+          {guard ? `Next for what you hold: ${etWhen(guard, etDayKey(s.as_of))}` : ""}
+        </small>
+      </span>
+      <span className="act">{!open && <ChangeButton act="limits" label={label} page={page} onClick={open0} />}</span>
+      {open && (
+        <Editor
+          error={err}
+          errId={`${id}-e`}
+          busy={busy}
+          primary="Review change"
+          onPrimary={review}
+          onCancel={() => setOpen(false)}
+          risk={next !== undefined && saved !== undefined ? <RiskLine direction={riskOf("expiry_sell_et", saved, next)} same={next === saved} means={next == null ? "Nothing sells an expiring contract but an exit signal." : `Expiring contracts still open at ${etClockWords(next)} are sold then.`} /> : null}
+        >
+          <div className="editor-row">
+            <label className="check">
+              <input type="checkbox" checked={off} onChange={(x) => (setOff(x.target.checked), setErr(""))} />
+              <span>Off: do not sell on expiry day</span>
+            </label>
+            {!off && (
+              <div className="field">
+                <label htmlFor={id}>Sell at (HH:MM, Eastern, 09:30 to 15:59)</label>
+                <input
+                  id={id}
+                  className="input input-num"
+                  autoComplete="off"
+                  inputMode="numeric"
+                  value={text}
+                  aria-invalid={!!err}
+                  aria-describedby={err ? `${id}-e` : undefined}
+                  onChange={(x) => {
+                    setText(x.target.value);
+                    setErr("");
+                  }}
+                />
+              </div>
+            )}
+          </div>
+          <span className="muted small">
+            Saved now: <b>{shown}</b>
+          </span>
+        </Editor>
+      )}
+      {draft && (
+        <ReviewDialog
+          path={API.limits}
+          payload={draft.payload}
+          first={draft.preview}
+          title={draft.payload.expiry_sell_et === "off" ? "Turn off the expiry-day sell?" : "Change the expiry-day sell time?"}
+          cancel={`Keep ${shown}`}
+          live={s.mode === "live"}
+          onClose={() => setDraft(null)}
+          onDone={async () => {
+            setDraft(null);
+            setOpen(false);
+            const nv = await page.settings.reload();
+            page.refresh();
+            page.say(true, nv?.expiry ? `Saved. ${label}: ${etClockWords(nv.expiry.sell_et)}.` : "Saved. This page could not read your settings back yet; it shows them once it can.");
+          }}
+        >
+          {(p) =>
+            p.changes.some((c) => c.key === "expiry_sell_et" && c.new == null) ? (
+              <p className="small">An expiring contract is then sold only by an exit signal. Left alone it can be exercised or expire worthless.</p>
+            ) : null
+          }
         </ReviewDialog>
       )}
     </div>
@@ -599,12 +746,12 @@ export function RulesView({ page }: { page: Page }) {
   const live = s.mode === "live";
   const used = live ? L.used_today.real : L.used_today.practice;
   const lost = live ? L.realised_loss_today.real : L.realised_loss_today.practice;
+  const unmeasured = live ? L.unmeasured_exits_today.real : L.unmeasured_exits_today.practice;
   const n = L.open_positions.real + L.open_positions.practice;
   const mu = L.trade_size.main.usd;
   const ou = L.trade_size.other.usd;
   const perTrade = mu != null && ou != null ? Math.max(mu, ou) : null;
-  // the soonest expiry sell among what is held (ISO times sort as text)
-  const guard = s.positions.map((p) => p.next.expiry_guard_at).filter((x): x is string => !!x).sort()[0] ?? null;
+  const hints = (b: Book) => (L.budget_hints ?? []).filter((h) => h.book === b);
   const reload = page.settings.reload;
   useEffect(() => {
     reload();
@@ -639,25 +786,38 @@ export function RulesView({ page }: { page: Page }) {
         <div className="ph">
           <h2>Daily limits</h2>
         </div>
-        <LimitRow page={page} k="max_entries_per_day" exp="The most new positions the agent may open in one day. Selling is never limited." now={`${count(used)} used today`} />
+        {/* today's use is said here, once per limit (Today has the meters) */}
+        <LimitRow
+          page={page}
+          k="max_entries_per_day"
+          exp="The most new positions the agent may open in one day. Selling is never limited."
+          now={`${count(used)} used today${L.cap_reached ? ", limit reached" : ""}. The count starts again at ${etTime(L.resets_at)}.`}
+        />
         <LimitRow
           page={page}
           k="max_daily_loss_usd"
           exp="When the day's closed trades have lost this much, the agent opens nothing new until the next day. It is not a stop-loss: it never sells anything."
           now={
             <>
-              <span className={tone(-lost)}>{signed(-lost, 0)}</span> lost today
+              <span className={tone(-lost)}>{signed(-lost, 0)}</span> lost today{L.loss_limit_reached ? ", limit reached" : ""}
+              {unmeasured > 0 ? `, plus ${plural(unmeasured, "sale")} not measured` : ""}
             </>
           }
         />
-        <LimitRow page={page} k="max_open_positions" exp="The most positions held at the same time, real and practice counted together." now={`${count(n)} open now`} />
+        <LimitRow page={page} k="max_open_positions" exp="The most positions held at the same time, real and practice counted together." now={`${count(n)} open now${L.positions_reached ? ", limit reached" : ""}`} />
       </section>
       <section className={`panel ${page.stale ? "stale" : ""}`}>
         <div className="ph">
           <h2>Trade size</h2>
         </div>
-        <SizeRow page={page} book="main" />
-        <SizeRow page={page} book="other" />
+        <SizeRow page={page} book="main" hints={hints("main")} />
+        <SizeRow page={page} book="other" hints={hints("other")} />
+      </section>
+      <section className={`panel ${page.stale ? "stale" : ""}`}>
+        <div className="ph">
+          <h2>On expiry day</h2>
+        </div>
+        <ExpiryRow page={page} />
       </section>
       <div className="two">
         <section className={`panel ${page.stale ? "stale" : ""}`}>
@@ -724,14 +884,6 @@ export function RulesView({ page }: { page: Page }) {
                   window.
                 </span>
               </li>
-              {guard && (
-                <li>
-                  <Icon name="shield" />
-                  <span>
-                    <b>Expiry sell time.</b> For what you hold now, the next one is {etWhen(guard, etDayKey(s.as_of))}.
-                  </span>
-                </li>
-              )}
             </ul>
           </div>
         </section>
@@ -747,7 +899,6 @@ export function RulesView({ page }: { page: Page }) {
         <SkipSameDay page={page} />
         <PolicyRow page={page} />
       </section>
-      <LimitsPanel page={page} linkLabel={null} />
     </div>
   );
 }

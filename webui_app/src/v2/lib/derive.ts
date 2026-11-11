@@ -12,7 +12,7 @@
 //     "as of" the last report.
 import type { Activity, Book, Condition, Iso, Notice, Position, Status } from "../../lib/viewModel";
 import { GUARD_STILL, UNMANAGED_FALLBACK, UNMANAGED_SHORT, UNMANAGED_WHY, answerWhy, describe, leftToday, nextSay, own, sizeEach, type Go, type IconName, type NextSay } from "./copy.ts";
-import { v2Words } from "./settings.ts";
+import { hintWords, v2Words } from "./settings.ts";
 import { contractName, etDayKey, etTime, etWhen, dayLong, plural, span, secondsBetween, usd } from "./format.ts";
 
 /** How this page is connected to the agent. Independent of mode and pause.
@@ -296,6 +296,9 @@ export interface Note {
   agent: string[];
   /** the one page this note links to (the page that owns the action), or none */
   go: Go | null;
+  /** links to the first-run wizard instead (/setup, back to /v2): the
+   *  agreement is accepted there, and nowhere in /v2 */
+  setup?: boolean;
 }
 
 /** Where a condition is dealt with in /v2 (null: the band's own buttons, or
@@ -310,12 +313,16 @@ export const CONDITION_GO: Record<NoteCode, Go | null> = {
   paused: null,
   settings_unreadable: "settings",
   ai_needed: "settings",
+  // the agreement is accepted in the setup wizard (a link of its own)
+  consent_needed: null,
+  proposal_pending: "settings",
   broker_down: "settings",
   positions_unmanaged: "holdings",
   low_cash: "rules",
   daily_cap_reached: "rules",
   daily_loss_reached: "rules",
   position_cap_reached: "rules",
+  budget_too_small: "rules",
   signal_pass: "signals",
   feed_unreachable: "signals",
   records_unwritten: null,
@@ -324,6 +331,7 @@ export const CONDITION_GO: Record<NoteCode, Go | null> = {
   position_expired: "holdings",
   position_expiring_unsold: "holdings",
   position_expiring: "holdings",
+  feed_off_hours: null,
 };
 
 const LEVEL_OF: Record<Notice["level"], Note["level"]> = { urgent: "crit", warn: "warn", info: "info" };
@@ -472,6 +480,42 @@ export function notes(s: Status, l: Link, here?: Go | "today" | "activity" | "re
         }),
       );
     }
+    const has = (code: Condition) => (s.conditions ?? []).some((c) => c.code === code);
+    if (has("consent_needed"))
+      out.push(
+        note({
+          key: "consent",
+          codes: ["consent_needed"],
+          level: "warn",
+          icon: "info",
+          title: "The agreement has changed",
+          text: "AgentHC changed the agreement since you accepted it. Read and accept the new version in setup: until then the agent can't be started again on this computer.",
+          setup: true,
+        }),
+      );
+    const hints = s.limits.budget_hints ?? [];
+    if (hints.length)
+      out.push(
+        note({
+          key: "budget",
+          codes: ["budget_too_small"],
+          level: "info",
+          icon: "info",
+          title: "Your trade size skipped signals today",
+          text: hints.map(hintWords).join(" "),
+        }),
+      );
+    if (s.proposal?.pending)
+      out.push(
+        note({
+          key: "proposal",
+          codes: ["proposal_pending"],
+          level: "info",
+          icon: "info",
+          title: "Your AI helper proposed a code change",
+          text: "Nothing changes until you read it and apply it, under Code changes in Settings.",
+        }),
+      );
   }
 
   // the agent's own messages: folded into the note about the same condition,
@@ -675,15 +719,21 @@ export interface DayClosed {
   day: BookToday;
 }
 
-/** "Today so far": what the Opened count is called, and the Closed lines.
- *  Practice mode reads the practice book. LIVE reads the book its account
- *  books sales into (a broker's paper-trading account has its own), plus
- *  the other one when it has sales today (the account was switched). The
- *  Opened count is the agent's own (its limits count paper fills as live). */
-export function dayBooks(s: Status): { opened: string; closed: DayClosed[] } {
+/** "Today so far": what the Opened count is called and how many (the
+ *  Eastern day the panel describes: Book.opened_today, never the daily
+ *  limit's UTC-day count), and the Closed lines. Practice mode reads the
+ *  practice book. LIVE reads the book its account books sales into (a
+ *  broker's paper-trading account has its own), plus the other one when it
+ *  has sales today (the account was switched). */
+export function dayBooks(s: Status): { opened: string; openedN: number; closed: DayClosed[] } {
   const today = etDayKey(s.as_of);
+  const n = (B: Book) => (typeof B.opened_today === "number" ? B.opened_today : 0);
   if (s.mode !== "live")
-    return { opened: "practice trade", closed: [{ label: "Closed", word: "practice trade", day: bookToday(s.results.practice, today) }] };
+    return {
+      opened: "practice trade",
+      openedN: n(s.results.practice),
+      closed: [{ label: "Closed", word: "practice trade", day: bookToday(s.results.practice, today) }],
+    };
   const paper = s.broker.paper_account;
   const real = { word: "real-money trade", B: s.results.real, other: "Closed for real money" };
   const pap = { word: "paper-account trade", B: s.results.paper_account, other: "Closed in a paper account" };
@@ -691,7 +741,23 @@ export function dayBooks(s: Status): { opened: string; closed: DayClosed[] } {
   const closed: DayClosed[] = [{ label: "Closed", word: main.word, day: bookToday(main.B, today) }];
   const o = bookToday(second.B, today);
   if (o.closed || o.unmeasured) closed.push({ label: second.other, word: second.word, day: o });
-  return { opened: paper ? "live trade" : "real-money trade", closed };
+  // a paper account: "live trade" counts its entries and any real ones
+  return {
+    opened: paper ? "live trade" : "real-money trade",
+    openedN: paper ? n(s.results.paper_account) + n(s.results.real) : n(s.results.real),
+    closed,
+  };
+}
+
+/** The by-day table's marker for a paid signal day (results.paid_days:
+ *  either book's days that were paid for, or, from before that was
+ *  recorded, days the agent took an entry on). "" for any other day. */
+export function paidMark(s: Status, day: string): string {
+  const p = s.results.paid_days;
+  const books = [p?.real, p?.practice];
+  if (books.some((b) => b?.paid_on.includes(day))) return "paid signal day";
+  if (books.some((b) => b?.estimated_on.includes(day))) return "paid signal day (estimated)";
+  return "";
 }
 
 /** The line under a book's "Today" figure. */
@@ -739,3 +805,53 @@ export function dayTally(rows: Activity[], today: string, hasOlder: boolean, bro
 }
 
 export { dayLong };
+
+// ── Activity: problems by kind, and whole days ──────────────────────────────
+
+export interface ProblemGroup {
+  /** the reason code the group gathers */
+  key: string;
+  /** what went wrong, without one contract's name */
+  label: string;
+  n: number;
+  /** the newest line of this kind */
+  last: Activity;
+  /** the newest line's fix, when the agent wrote one */
+  hint: string | null;
+}
+
+/** The problem lines among `rows` (newest first), one group per kind with
+ *  how many and the newest one: the classic "problems today" list, over the
+ *  lines the page has. Groups come newest first. */
+export function problemGroups(rows: Activity[], broker: string | null): ProblemGroup[] {
+  const by = new Map<string, ProblemGroup>();
+  for (const e of rows) {
+    const d = describe(e, broker);
+    if (d.cat !== "problem") continue;
+    const key = e.reason_code || e.action || "unknown";
+    const g = by.get(key);
+    if (g) {
+      g.n++;
+      continue;
+    }
+    const name = contractName(e.contract, e.contract_text);
+    by.set(key, { key, label: d.sub.includes(name) ? d.title : d.sub, n: 1, last: e, hint: e.hint || null });
+  }
+  return [...by.values()];
+}
+
+/** Whether the page has every line of market day `day` (an ET day key, or
+ *  "" for lines whose time could not be read). `lines`: the whole log's
+ *  count for that day, as the server said (ActivityPage.day_lines);
+ *  `loaded`: every row the page has, newest first. With no count from the
+ *  server, a day is whole when a row of an older day is loaded or nothing
+ *  older is left to load. */
+export function dayWhole(day: string, loaded: Activity[], lines: number | undefined, moreToLoad: boolean): boolean {
+  const have = loaded.filter((e) => etDayKey(e.at) === day).length;
+  if (typeof lines === "number") return have >= lines;
+  if (!moreToLoad) return true;
+  return day !== "" && loaded.some((e) => {
+    const k = etDayKey(e.at);
+    return k !== "" && k < day;
+  });
+}

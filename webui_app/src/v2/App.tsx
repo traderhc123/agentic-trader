@@ -17,7 +17,7 @@ import { RulesView } from "./views/Rules";
 import { SettingsView } from "./views/Settings";
 import { SignalsView } from "./views/Signals";
 import { useSettings, type SettingsFeed } from "./useSettings";
-import { API, onUnknownWrite, send } from "./lib/http";
+import { API, onUnknownWrite, send, type Turn } from "./lib/http";
 import { VIEWS, type View } from "./lib/screens";
 import { ResultsView } from "./views/Results";
 import { Today } from "./views/Today";
@@ -40,7 +40,7 @@ export interface Page {
   go: (v: View) => void;
   openEv: (n: number) => void;
   openPos: (id: string) => void;
-  act: (a: BandAction | "stop") => void;
+  act: (a: BandAction) => void;
   /** the page load's update check, and the dialog that installs it */
   update: UpdateFeed;
   openUpdate: () => void;
@@ -50,6 +50,9 @@ export interface Page {
   say: (ok: boolean, text: string) => void;
   /** read the status again now (after a save) */
   refresh: () => void;
+  /** Today's "Ask your agent" conversation, this visit only */
+  talk: Turn[];
+  addTalk: (t: Turn) => void;
 }
 
 function viewFromHash(): View {
@@ -205,6 +208,8 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
   const [posId, setPosId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null);
+  const [talk, setTalk] = useState<Turn[]>([]);
+  const addTalk = useCallback((t: Turn) => setTalk((x) => [...x, t].slice(-50)), []);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>();
   const main = useRef<HTMLElement>(null);
   const theme = useTheme();
@@ -249,19 +254,11 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
   const run = useCallback(
     async (cmd: Cmd) => {
       setBusy(true);
-      let ok: boolean;
-      let text: string;
-      if (cmd.action === "stop") {
-        const r = await feed.command("stop");
-        ok = r.ok;
-        text = r.ok ? `The agent answered: ${r.reply}` : r.reply;
-      } else {
-        const r = await send<{ reply?: string }>(API.command, cmd);
-        ok = r.ok;
-        text = r.ok ? `The agent answered: ${(r as { reply?: string }).reply ?? "done."}` : r.error;
-        feed.refresh();
-        settings.reload();
-      }
+      const r = await send<{ reply?: string }>(API.command, cmd);
+      const ok = r.ok;
+      const text = r.ok ? `The agent answered: ${(r as { reply?: string }).reply ?? "done."}` : r.error;
+      feed.refresh();
+      settings.reload();
       setBusy(false);
       setDialog(null);
       say(ok, text);
@@ -269,7 +266,7 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
     [feed, say, settings],
   );
   const act = useCallback(
-    (a: BandAction | "stop") => {
+    (a: BandAction) => {
       if (a === "retry") {
         setBusy(true);
         feed.refresh().finally(() => setBusy(false));
@@ -316,6 +313,8 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
     settings,
     say,
     refresh: () => void feed.refresh(),
+    talk,
+    addTalk,
   };
   const ev = evN != null ? feed.rows.find((e) => e.n === evN) : undefined;
   const pos = posId != null ? status.positions.find((p) => p.id === posId) : undefined;
@@ -331,7 +330,7 @@ function Shell({ feed, status, upd }: { feed: StatusFeed; status: Status; upd: U
           Skip to content
         </a>
         <div className="frame" aria-hidden="true" />
-        <Band status={status} link={link} busy={busy} onAction={act} update={badge} onUpdate={openUpdate} />
+        <Band status={status} link={link} busy={busy} onAction={act} update={badge} onUpdate={openUpdate} view={view} onGo={go} />
         <div className="app">
           <aside className="side" aria-label="Sections">
             <div className="brand">

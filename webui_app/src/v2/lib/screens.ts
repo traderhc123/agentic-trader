@@ -27,8 +27,9 @@ export type ActionId =
   | "to-practice"
   | "to-live"
   | "retry"
-  | "start"
   | "update"
+  // Today
+  | "ask"
   // Rules & limits
   | "limits"
   | "size"
@@ -36,16 +37,37 @@ export type ActionId =
   | "policy"
   // Signals & pass
   | "buy-days"
+  | "source"
+  | "scope"
+  | "api-key"
+  | "preview"
+  | "wallet-create"
+  | "wallet-fund"
+  | "wallet-connect"
+  | "wallet-page"
+  | "recurring"
   // Settings
   | "broker"
   | "ai"
   | "alerts"
   | "autostart"
+  | "open-at-login"
   | "keep-awake"
   | "move"
+  | "start"
   | "stop"
   | "theme"
-  | "classic";
+  | "dashboard"
+  | "classic"
+  // Settings → Help and support
+  | "netcheck"
+  | "report"
+  | "tip"
+  | "agreement"
+  // Settings → Code changes
+  | "self-edit"
+  | "proposal"
+  | "proposal-request";
 
 export type Home = "band" | View;
 
@@ -55,22 +77,41 @@ export const ACTION_HOME: Record<ActionId, Home> = {
   "to-practice": "band",
   "to-live": "band",
   retry: "band",
-  start: "band",
   update: "band",
+  ask: "today",
   limits: "rules",
   size: "rules",
   filters: "rules",
   policy: "rules",
   "buy-days": "signals",
+  source: "signals",
+  scope: "signals",
+  "api-key": "signals",
+  preview: "signals",
+  "wallet-create": "signals",
+  "wallet-fund": "signals",
+  "wallet-connect": "signals",
+  "wallet-page": "signals",
+  recurring: "signals",
   broker: "settings",
   ai: "settings",
   alerts: "settings",
   autostart: "settings",
+  "open-at-login": "settings",
   "keep-awake": "settings",
   move: "settings",
+  start: "settings",
   stop: "settings",
   theme: "settings",
+  dashboard: "settings",
   classic: "settings",
+  netcheck: "settings",
+  report: "settings",
+  tip: "settings",
+  agreement: "settings",
+  "self-edit": "settings",
+  proposal: "settings",
+  "proposal-request": "settings",
 };
 
 /** The source file each home's controls are written in (the source scan in
@@ -103,7 +144,6 @@ function bandControls(s: Status, l: Link): ActionId[] {
   const a = bandModel(s, l).actions;
   const out: ActionId[] = [];
   if (a.retry) out.push("retry");
-  if (a.start) out.push("start");
   if (a.pause) out.push("pause");
   if (a.resume) out.push("resume");
   if (a.toPractice) out.push("to-practice");
@@ -116,6 +156,14 @@ export function notesOn(view: View, s: Status, l: Link) {
   if (view === "today") return notes(s, l, "today");
   if (view === "holdings") return notes(s, l, "holdings").filter((n) => n.level === "crit");
   return [];
+}
+
+/** The band's "Start it in Settings" link, shown while no agent runs: not
+ *  on Settings itself (the Start button is there), and not where a note on
+ *  the screen links to Settings already. */
+export function bandStartLink(view: View, s: Status, l: Link): boolean {
+  if (!bandModel(s, l).actions.start || view === "settings") return false;
+  return !notesOn(view, s, l).some((n) => n.go === "settings");
 }
 
 /** Today's "Change limits" link on its limits panel: only when nothing else
@@ -136,18 +184,24 @@ export function todayHasDay(s: Status, l: Link): boolean {
 export function screenOf(view: View, s: Status, l: Link): Screen {
   const ns = notesOn(view, s, l);
   const links: LinkTo[] = ns.flatMap((n) => (n.go ? [n.go] : []));
+  if (bandStartLink(view, s, l)) links.push("settings");
   const controls = bandControls(s, l);
   if (view === "today") {
+    controls.push("ask");
     if (s.positions.length) links.push("holdings");
     if (todayHasDay(s, l)) links.push("activity");
     links.push("results");
     if (statement(s, l).empty || todayLimitsLink(s, l)) links.push("rules");
   } else if (view === "rules") controls.push("limits", "size", "filters", "policy");
-  else if (view === "signals") controls.push("buy-days");
+  else if (view === "signals") {
+    controls.push("buy-days", "source", "scope", "api-key", "wallet-create", "wallet-fund", "wallet-connect", "wallet-page", "recurring");
+    if (s.mode === "practice") controls.push("preview");
+  }
   else if (view === "settings") {
     links.push("signals");
-    controls.push("broker", "ai", "alerts", "autostart", "keep-awake", "move", "theme", "classic");
-    if (s.agent.running) controls.push("stop");
+    controls.push("broker", "ai", "alerts", "autostart", "open-at-login", "keep-awake", "move", "theme", "dashboard", "classic");
+    controls.push("self-edit", "proposal", "proposal-request", "netcheck", "report", "tip", "agreement");
+    controls.push(s.agent.running ? "stop" : "start");
   }
   return { conditions: ns.map((n) => n.codes), controls, links };
 }
