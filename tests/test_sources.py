@@ -930,3 +930,75 @@ def test_day_pass_alerts_end_at_no_new_trades(monkeypatch):
     assert "the agent gets no new trades" in text
     assert "position" not in text and "watch" not in text
     assert not hasattr(agenthc, "_NO_SIGNALS")
+
+
+# ── an ended wallet day-pass is offered for exits while a position is open ──
+
+ENDED = "L402 MACOLD:pre"
+
+
+def _ended_state(real=True):
+    row = ({"option_id": "opt-1", "qty": 1, "live": True} if real
+           else {"option_id": "dry", "qty": 1, "dry": True})
+    return {"l402": {"token": ENDED, "expires_at": time.time() - 60,
+                     "paid_day": "2026-07-14"},
+            "positions": {"SPY|2026-07-17|600.0|C": row}}
+
+
+class _EndedTokenServer:
+    def __init__(self, status=200):
+        self.status, self.calls = status, []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append(dict(headers or {}))
+        if self.status != 200:
+            return FakeResp({"payment": {"payment_request": _invoice(9500),
+                                         "macaroon": "M"}}, status=self.status)
+        return FakeResp({"events": [
+            _feed_event(event="ENTERED", occurred_at="a"),
+            _feed_event(event="EXITED", occurred_at="b")],
+            "pass_exits_only": True})
+
+
+def test_ended_day_pass_still_reads_exits_for_a_real_position(monkeypatch):
+    srv = _EndedTokenServer()
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    state = _ended_state()
+    events = agenthc.poll({}, state, lambda s: None)
+    assert [e["event"] for e in events] == ["EXITED"]   # never an entry
+    assert srv.calls == [{"Authorization": ENDED}]
+    assert agenthc.had_access() is False
+    assert _exit_flag() == (True, "")
+    assert "exits_done" not in state["l402"]
+
+
+@pytest.mark.parametrize("status", [401, 402])
+def test_ended_day_pass_refused_is_asked_once_only(monkeypatch, status):
+    srv = _EndedTokenServer(status=status)
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    state = _ended_state()
+    saved = []
+    for _ in range(3):
+        assert agenthc.poll({}, state, saved.append) == []
+        assert _exit_flag() == (False, "no_day_pass")
+    assert len(srv.calls) == 1
+    assert state["l402"]["exits_done"] is True and saved
+
+
+def test_ended_day_pass_other_errors_mean_no_exits(monkeypatch):
+    srv = _EndedTokenServer(status=503)
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    state = _ended_state()
+    assert agenthc.poll({}, state, lambda s: None) == []
+    assert _exit_flag() == (False, "no_day_pass")
+    assert "exits_done" not in state["l402"]       # asked again next time
+    agenthc.poll({}, state, lambda s: None)
+    assert len(srv.calls) == 2
+
+
+def test_ended_day_pass_without_a_real_position_sends_nothing(monkeypatch):
+    srv = _EndedTokenServer()
+    monkeypatch.setattr(agenthc.requests, "get", srv.get)
+    for state in (_ended_state(real=False), {**_ended_state(), "positions": {}}):
+        assert agenthc.poll({}, state, lambda s: None) == []
+    assert srv.calls == []

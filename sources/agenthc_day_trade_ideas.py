@@ -1219,6 +1219,54 @@ def _no_read(why):
     return []
 
 
+def _holds_real_position(state):
+    """The agent's ledger holds a position bought with a real order (the
+    reading of agent._opened_live: a row that says neither way is real)."""
+    rows = (state or {}).get("positions")
+    for row in (rows.values() if isinstance(rows, dict) else ()):
+        if isinstance(row, dict) and (row.get("live") is True or (
+                not row.get("dry") and row.get("option_id") != "dry")):
+            return True
+    return False
+
+
+def _ended_daypass_exits(cfg, state, save_state):
+    """The wallet path has no pass to read with: while a real position is
+    open, offer the day-pass that ended (AgentHC can still serve the exits
+    of trades entered while it ran). Returns its EXITED events (never an
+    entry), or None: nothing to offer, or AgentHC answered with an error.
+    A 401/402 means it doesn't (an older server: one invoice, once), so the
+    token is not offered again."""
+    tok = (state or {}).get("l402")
+    if (cfg.get("agenthc_api_key") or not isinstance(tok, dict)
+            or not tok.get("token") or tok.get("exits_done")
+            or float(tok.get("expires_at") or 0) > time.time()
+            or not _holds_real_position(state)):
+        return None
+    track = "all" if cfg.get("include_other_trades") else "main"
+    try:
+        resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
+                         params={"limit": 20, "track": track},
+                         headers={"Authorization": tok["token"]}, timeout=15)
+        if resp.status_code in (401, 402):
+            tok["exits_done"] = True
+            save_state(state)
+            return None
+        if resp.status_code != 200:
+            return None
+        events = [e for e in _parse_events(resp.json()) if e["event"] == "EXITED"]
+    except Exception:
+        return None
+    _LAST_POLL["exits"] = True   # exits only: entry access stays False
+    return events
+
+
+def _no_day_pass(cfg, state, save_state):
+    """No wallet day-pass to read with (and none bought now)."""
+    got = _ended_daypass_exits(cfg, state, save_state)
+    return got if got is not None else _no_read("no_day_pass")
+
+
 def had_exit_access():
     """Whether the last poll() could read EXIT signals: True after every
     read the feed answered (entries and exits, or a used-up pass's exits
@@ -1295,9 +1343,9 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     # cadence that's ~1,000 doomed invoices a day against the publisher's
     # node. The once-per-day notify inside _pass_purchase_allowed still fires.
     if undecided and not _headers(cfg, state):
-        return _no_read("no_day_pass")
+        return _no_day_pass(cfg, state, save_state)
     if not _headers(cfg, state) and not _pass_purchase_allowed(cfg, state, save_state):
-        return _no_read("no_day_pass")
+        return _no_day_pass(cfg, state, save_state)
     track = "all" if cfg.get("include_other_trades") else "main"
     headers = _headers(cfg, state)
     daypass = None if cfg.get("agenthc_api_key") else (state.get("l402") or {})
@@ -1337,9 +1385,9 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
         return _no_read("day_pass_refused")
     if resp.status_code == 402 and not _retried:
         if undecided or not _pass_purchase_allowed(cfg, state, save_state):
-            return _no_read("no_day_pass")
+            return _no_day_pass(cfg, state, save_state)
         if not _buy_day_pass(cfg, state, resp.json(), save_state):
-            return _no_read("no_day_pass")
+            return _no_day_pass(cfg, state, save_state)
         return poll(cfg, state, save_state, _retried=True)
     if resp.status_code == 401 and not _retried and not cfg.get("agenthc_api_key"):
         state.pop("l402", None)  # stale day-pass token — re-buy on next 402
