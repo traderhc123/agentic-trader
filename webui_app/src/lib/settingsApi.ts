@@ -282,3 +282,47 @@ export interface PassCheck {
 }
 /** GET /api/wallet/balance */
 export type WalletBalance = { ok: true; sats: number } | { ok: false; error: string };
+
+// ── Settings → Help and support (classic routes, reused as they are) ────────
+
+/** GET /api/help/netcheck and GET /api/help/report: the text to show (the
+ *  report has keys, tokens, invoices and wallet ids taken out). */
+export interface HelpText {
+  ok: boolean;
+  text?: string;
+  error?: string;
+}
+
+/** GET /api/v2/agreement: the agreement's text, to read again. */
+export interface Agreement {
+  ok: true;
+  text: string;
+  terms_version: string;
+}
+
+/** GET /api/tip/options: the tip amounts AgentHC offers now. */
+export interface TipTier {
+  amount_usd: number;
+  /** null unless it matches AgentHC's own quote (the agent checked) */
+  amount_sats: number | null;
+  available: boolean;
+  reason: string | null;
+  label: string;
+}
+export type TipOptions =
+  | { ok: true; tiers: TipTier[]; quote: { btc_usd: number; age_s: number; source: string } | null; valid_seconds: number }
+  | { ok: false; error: string; unavailable?: boolean };
+
+/** POST /api/tip/create: the invoice the owner pays from their own wallet. */
+export interface TipInvoice {
+  bolt11: string;
+  qr: number[][] | null;
+  payment_hash: string;
+  amount_usd: number;
+  amount_sats: number;
+  btc_usd: number;
+  expires_in: number;
+}
+
+/** POST /api/tip/status */
+export type TipCheck = { ok: true; status: "pending" | "paid" | "expired" } | { ok: false; error: string; retry?: boolean; unknown?: boolean };

@@ -57,6 +57,8 @@ import { API, FAILED, confirmBody, getJson, onUnknownWrite, postJson, send } fro
 import {
   CLASSIC,
   DEPLOY_REGIONS,
+  agreementWords,
+  tipLapsed,
   ackGiven,
   SETUP_FROM_V2,
   movePassProblem,
@@ -1315,4 +1317,35 @@ test("this dashboard: one switch, saved on the agent; one way to the classic pag
   }
   // open at login: a switch of its own on the same route
   assert.match(src, /k="open_dashboard_at_login" act="open-at-login"/);
+});
+
+// ── PR 4 group 4: Settings → Help and support ──────────────────────────────
+
+test("help and support: the classic help tools, the tip and the agreement, in Settings, changing nothing", () => {
+  assert.equal(API.netcheck, "/api/help/netcheck");
+  assert.equal(API.report, "/api/help/report");
+  assert.equal(API.agreement, "/api/v2/agreement");
+  assert.deepEqual([API.tipOptions, API.tipCreate, API.tipStatus], ["/api/tip/options", "/api/tip/create", "/api/tip/status"]);
+  for (const a of ["netcheck", "report", "tip", "agreement"]) assert.equal(ACTION_HOME[a], "settings", a);
+  const set = fs.readFileSync(path.join(SRC, "v2", "views", "Settings.tsx"), "utf8");
+  for (const a of ["netcheck", "report", "tip", "agreement"]) assert.equal((set.match(new RegExp(`data-act="${a}"`, "g")) || []).length, 1, a);
+  // the dialogs call exactly those routes, and the tip never a wallet or pay route
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "SupportDialogs.tsx"), "utf8");
+  const used = [...new Set([...src.matchAll(/\bAPI\.([a-zA-Z]+)/g)].map((m) => m[1]))].sort();
+  assert.deepEqual(used, ["agreement", "netcheck", "report", "tipCreate", "tipOptions", "tipStatus"]);
+  assert.ok(!/\/api\/(wallet|pass|v2\/wallet|v2\/pass)/.test(src), "a support dialog names a wallet or pass route");
+  assert.match(src, /send<TipInvoice>\(API\.tipCreate, \{ amount_usd: t\.amount_usd \}\)/);
+  assert.match(src, /send\(API\.tipStatus, \{ payment_hash: inv\.payment_hash \}\)/);
+  // "thank you" only when AgentHC said the invoice was paid
+  assert.match(src, /c\.ok && c\.status === "paid"/);
+  // a code past its hour (and a minute's grace) is "not known", never "expired"
+  assert.equal(tipLapsed(0, 3600, 3600 * 1000 + 60000), false);
+  assert.equal(tipLapsed(0, 3600, 3600 * 1000 + 60001), true);
+  assert.equal(tipLapsed(0, NaN, 3600 * 1000 + 60001), true);
+  // the agreement in words, never null or a raw stamp
+  const c = { accepted: true, on_file: true, accepted_at: "2026-10-01T12:00:00+00:00", terms_version: "3", current_terms_version: "3" };
+  assert.equal(agreementWords(c), "You accepted it on 2026-10-01 (terms version 3). It is on file on this computer.");
+  assert.match(agreementWords({ ...c, accepted: false, current_terms_version: "4" }), /changed since you accepted it on 2026-10-01 \(version 3\): the current one is version 4/);
+  assert.match(agreementWords({ ...c, accepted: false, on_file: false, accepted_at: null, terms_version: null }), /No accepted agreement/);
+  for (const x of [c, { ...c, accepted: false }, { ...c, accepted: false, on_file: false, accepted_at: "junk", terms_version: null }, null]) clean(agreementWords(x), "agreement");
 });

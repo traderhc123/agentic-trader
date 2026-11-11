@@ -4823,19 +4823,30 @@ def _expiry_command(t, cfg):
         arg = t[len(name):].strip()
         if not arg:
             return True, f"Expiry guard: {_expiry_guard_desc(cfg)}."
-        if arg == "on":
-            arg = default
-        if arg != "off":
-            m = _HHMM_RE.match(arg)
-            mins = int(m.group(1)) * 60 + int(m.group(2)) if m else -1
-            if not 9 * 60 + 30 <= mins < _REGULAR_CLOSE_MIN:
-                return True, (f"Usage: {name} on | off | HH:MM (ET, 24-hour, "
-                              f"09:30-15:59; default {default})")
-            arg = _hm(mins).zfill(5)
+        arg = _expiry_setting(arg, default)
+        if arg is None:
+            return True, (f"Usage: {name} on | off | HH:MM (ET, 24-hour, "
+                          f"09:30-15:59; default {default})")
         cfg[key] = arg
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Expiry guard: {_expiry_guard_desc(cfg)}."
     return False, ""
+
+
+def _expiry_setting(arg, default):
+    """The value the expiry sell or its alert is saved as ("off", or "HH:MM"
+    between 09:30 and 15:59 ET) for what the owner gave: on | off | HH:MM.
+    None when it is none of those (nothing may be saved then). The chat's
+    "expiry guard|alert …" and the /v2 settings routes both use it."""
+    if arg == "on":
+        arg = default
+    if arg == "off":
+        return arg
+    m = _HHMM_RE.match(arg)
+    mins = int(m.group(1)) * 60 + int(m.group(2)) if m else -1
+    if not 9 * 60 + 30 <= mins < _REGULAR_CLOSE_MIN:
+        return None
+    return _hm(mins).zfill(5)
 
 
 # ── commands ─────────────────────────────────────────────────────────────────

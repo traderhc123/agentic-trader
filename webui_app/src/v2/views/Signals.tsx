@@ -12,6 +12,7 @@ import { API, getJson } from "../lib/http";
 import { purchaseFate } from "../lib/settings";
 import { UNKNOWN, count, etDayKey, etWhen, plural, usd } from "../lib/format";
 import { Dialog, Stamp } from "../ui";
+import { PayCode } from "./Pay";
 import type { Page } from "../App";
 
 const SOURCE_NAMES: Record<string, string> = { agenthc: "AgentHC Day Trade Ideas" };
@@ -40,19 +41,6 @@ const plain = (t: string, strong = true) => (
 /** Every size the wizard offers; the server says which are on sale now. */
 const SIZES = [1, 5, 20, 60];
 
-function QrCode({ m }: { m: number[][] }) {
-  const n = m.length;
-  let d = "";
-  for (let y = 0; y < n; y++) for (let x = 0; x < m[y].length; x++) if (m[y][x]) d += `M${x} ${y}h1v1h-1z`;
-  return (
-    <div className="qr">
-      <svg viewBox={`0 0 ${n} ${n}`} width="100%" height="100%" shapeRendering="crispEdges" role="img" aria-label="Payment code (Lightning invoice)">
-        <path d={d} fill="#000" />
-      </svg>
-    </div>
-  );
-}
-
 type Step =
   | { kind: "pick" }
   | { kind: "review"; days: number; preview: Preview }
@@ -67,7 +55,6 @@ function BuyDays({ page, onClose }: { page: Page; onClose: () => void }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [payWords, setPayWords] = useState("Waiting for your payment…");
-  const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setInterval>>();
 
   const loadSizes = async () => {
@@ -172,43 +159,21 @@ function BuyDays({ page, onClose }: { page: Page; onClose: () => void }) {
           </button>
         }
       >
-        <div className="pay">
-          {i.qr && i.qr.length > 0 && <QrCode m={i.qr} />}
-          <div style={{ display: "grid", gap: 12, minWidth: 0 }}>
-            <dl className="facts">
-              <dt>Price</dt>
-              <dd>
-                {i.amount_sats != null ? `${count(i.amount_sats)} sats` : UNKNOWN}
-                {i.amount_usd != null && <small>about {usd(i.amount_usd)}</small>}
-              </dd>
-              {i.carried > 0 && (
-                <>
-                  <dt>Carried over</dt>
-                  <dd>{plural(i.carried, "unused day")}</dd>
-                </>
-              )}
-            </dl>
-            <code className="bolt">{i.bolt11}</code>
-            <div className="editor-row">
-              <button
-                className="btn btn-sm"
-                onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(i.bolt11);
-                    setCopied(true);
-                  } catch {
-                    setCopied(false);
-                  }
-                }}
-              >
-                {copied ? "Copied" : "Copy the code"}
-              </button>
-              <a className="btn btn-sm" href={`lightning:${i.bolt11}`}>
-                Open in a wallet app
-              </a>
-            </div>
-          </div>
-        </div>
+        <PayCode bolt11={i.bolt11} qr={i.qr}>
+          <dl className="facts">
+            <dt>Price</dt>
+            <dd>
+              {i.amount_sats != null ? `${count(i.amount_sats)} sats` : UNKNOWN}
+              {i.amount_usd != null && <small>about {usd(i.amount_usd)}</small>}
+            </dd>
+            {i.carried > 0 && (
+              <>
+                <dt>Carried over</dt>
+                <dd>{plural(i.carried, "unused day")}</dd>
+              </>
+            )}
+          </dl>
+        </PayCode>
         <p className="wait" role="status" aria-live="polite">
           <span className="spin" aria-hidden="true" />
           {payWords}

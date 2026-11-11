@@ -10,7 +10,7 @@ import type { AiModels, AiProviders, BrokerForm, Dashboard, Preview, Secret, Set
 import { FieldError, ReviewDialog, SettingsDoubt, Switch, askPreview } from "../Forms";
 import { brokerLabel } from "../lib/derive";
 import { API, getJson, send } from "../lib/http";
-import { CLASSIC, RH_OPTIONS_URL, SETUP_FROM_V2, brokerName, setupUnfinished, signInOutcome } from "../lib/settings";
+import { CLASSIC, RH_OPTIONS_URL, SETUP_FROM_V2, agreementWords, brokerName, setupUnfinished, signInOutcome } from "../lib/settings";
 import { badgeFor, updateLine } from "../lib/update";
 import { UPDATE } from "../lib/copy";
 import { UNKNOWN, etDayKey, etTime, etWhen, usd } from "../lib/format";
@@ -18,6 +18,7 @@ import { Dialog, Icon, Stamp } from "../ui";
 import type { Page } from "../App";
 import { Row } from "./Pages";
 import { MoveDialog, StartDialog, StopDialog } from "./AgentDialogs";
+import { AgreementDialog, HelpTextDialog, TipDialog } from "./SupportDialogs";
 
 const SOURCE_NAMES: Record<string, string> = { agenthc: "AgentHC Day Trade Ideas" };
 const sourceName = (id: string) => (Object.prototype.hasOwnProperty.call(SOURCE_NAMES, id) ? SOURCE_NAMES[id] : id);
@@ -531,7 +532,7 @@ export function SettingsView({ page }: { page: Page }) {
   const a = s.agent;
   const v = page.settings.view;
   const why = cantEdit(page);
-  const [open, setOpen] = useState<"broker" | "ai" | "alerts" | "stop" | "start" | "move" | null>(null);
+  const [open, setOpen] = useState<"broker" | "ai" | "alerts" | "stop" | "start" | "move" | "netcheck" | "report" | "tip" | "agreement" | null>(null);
   const unfinished = setupUnfinished(v);
   const reload = page.settings.reload;
   useEffect(() => {
@@ -743,12 +744,57 @@ export function SettingsView({ page }: { page: Page }) {
           }
         />
       </section>
+      <section className="panel">
+        <div className="ph">
+          <h2>Help and support</h2>
+        </div>
+        <Row
+          label="Check my connection"
+          exp="Whether this computer can reach AgentHC (signals) and GitHub (updates) right now. It changes nothing."
+          act={
+            <button className="btn btn-sm" data-act="netcheck" aria-haspopup="dialog" disabled={page.link === "lost"} onClick={() => setOpen("netcheck")}>
+              Check…
+            </button>
+          }
+        />
+        <Row
+          label="Support report"
+          exp="A report to paste into a support request. The agent takes out your keys, tokens, invoices and wallet ids first."
+          act={
+            <button className="btn btn-sm" data-act="report" aria-haspopup="dialog" disabled={page.link === "lost"} onClick={() => setOpen("report")}>
+              Make the report…
+            </button>
+          }
+        />
+        <Row
+          label="Tip AgentHC"
+          exp="A thank-you of $100, $500 or $1,000, paid in sats from your own Lightning wallet app. It buys nothing, and your agent's wallet never pays it."
+          act={
+            <button className="btn btn-sm" data-act="tip" aria-haspopup="dialog" disabled={page.link === "lost"} onClick={() => setOpen("tip")}>
+              Tip…
+            </button>
+          }
+        />
+        <Row
+          label="Your agreement"
+          exp={!v ? UNKNOWN : agreementWords(v.consent)}
+          val={v ? (v.consent.accepted ? plain("Accepted") : <span className="tag tag-warn">Not accepted</span>) : undefined}
+          act={
+            <button className="btn btn-sm" data-act="agreement" aria-haspopup="dialog" disabled={page.link === "lost"} onClick={() => setOpen("agreement")}>
+              Read it…
+            </button>
+          }
+        />
+      </section>
       {open === "broker" && v && <BrokerDialog page={page} onClose={() => setOpen(null)} />}
       {open === "ai" && v && <AiDialog page={page} onClose={() => setOpen(null)} />}
       {open === "alerts" && v && <AlertsDialog page={page} onClose={() => setOpen(null)} />}
       {open === "stop" && <StopDialog page={page} onClose={() => setOpen(null)} />}
       {open === "start" && <StartDialog page={page} onClose={() => setOpen(null)} />}
       {open === "move" && <MoveDialog page={page} onClose={() => setOpen(null)} />}
+      {(open === "netcheck" || open === "report") && <HelpTextDialog kind={open} onClose={() => setOpen(null)} />}
+      {open === "tip" && <TipDialog onClose={() => setOpen(null)} />}
+      {open === "agreement" && <AgreementDialog onClose={() => setOpen(null)} />}
     </div>
   );
 }

@@ -143,4 +143,12 @@ export const API = {
   moveExport: "/api/move/export",
   moveDownload: "/api/move/download",
   deployStatus: "/api/deploy/status",
+  // Settings → Help and support: reads, and a tip invoice the owner pays
+  // from their own wallet (the agent pays nothing and saves nothing)
+  netcheck: "/api/help/netcheck",
+  report: "/api/help/report",
+  agreement: "/api/v2/agreement",
+  tipOptions: "/api/tip/options",
+  tipCreate: "/api/tip/create",
+  tipStatus: "/api/tip/status",
 } as const;

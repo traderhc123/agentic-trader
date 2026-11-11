@@ -343,3 +343,23 @@ export function signInOutcome(since: number, end: SignInEnd | null | undefined):
     };
   return { kind: "done", text: `Connected. Broker: Robinhood${acct}.` };
 }
+
+// ── a tip ───────────────────────────────────────────────────────────────────
+
+/** A tip's payment code is past its validity (plus a minute's grace) and
+ *  AgentHC never said it was paid or expired: this page can no longer say
+ *  which, so it says both possibilities. */
+export const tipLapsed = (shownAt: number, validS: number, now: number): boolean =>
+  now > shownAt + (Number.isFinite(validS) && validS > 0 ? validS : 3600) * 1000 + 60000;
+
+// ── the agreement ───────────────────────────────────────────────────────────
+
+/** The agreement on file, in words (GET /api/v2/settings' consent). */
+export function agreementWords(c: { accepted: boolean; on_file: boolean; accepted_at: string | null; terms_version: string | null; current_terms_version: string } | null | undefined): string {
+  if (!c) return "Not known.";
+  const when = c.accepted_at && /^\d{4}-\d{2}-\d{2}/.test(c.accepted_at) ? ` on ${c.accepted_at.slice(0, 10)}` : "";
+  if (c.accepted) return `You accepted it${when}${c.terms_version ? ` (terms version ${c.terms_version})` : ""}. It is on file on this computer.`;
+  if (c.on_file)
+    return `The agreement changed since you accepted it${when}${c.terms_version ? ` (version ${c.terms_version})` : ""}: the current one is version ${c.current_terms_version}, and the agent needs it accepted in setup.`;
+  return "No accepted agreement is on file on this computer: the agent needs it accepted in setup.";
+}
