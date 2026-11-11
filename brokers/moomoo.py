@@ -15,13 +15,24 @@ on ENTERED, sell on EXITED for positions this agent opened.
 Orders are placed as marketable LIMIT orders — buys at the ask, sells at
 the bid (market orders on options are not reliably accepted through OpenD)
 — qty from the same budget sizing as the other brokers.
+
+OpenD's place_order has no way to say "close only" for US options (its
+position_id is for moomoo Japan; TrdSide.SELL on a contract the account
+doesn't hold can open a short). So every sell first reads what the account
+holds, and is never sent for more than that, less what working sells are
+already selling — and is NOT sent at all while the holdings can't be read
+(_order, order_guard.check_order).
 """
 
+import math
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import broker_events
 import platform_compat
 
+from . import order_guard
 from .pricing import exit_qty, marketable_limit
 
 # Every status line in this module goes through safe_print: a console that
@@ -353,8 +364,101 @@ def _fail_kind(side):
     return "order_failed" if side == "buy" else "exit_failed"
 
 
-def _order(cfg, sdk, code, side, qty, price):
-    """Marketable limit at the given price. Returns order id or None."""
+def _sell_holding(cfg, sdk, code):
+    """(long contracts of `code` the account can sell right now, short
+    contracts of it), fresh from OpenD: the position's qty, capped by its
+    can_sell_qty, less what working sell orders on it still have to sell.
+    (None, None) when either list can't be read; a code not listed is
+    held 0."""
+    ctx = None
+    try:
+        ctx = _trade_ctx(cfg, sdk)
+        env = _trd_env(cfg, sdk)
+        ret, data = ctx.position_list_query(trd_env=env, refresh_cache=True)
+        if ret != sdk.RET_OK or data is None:
+            return None, None
+        held, short = 0, 0
+        for i in range(len(data)):
+            row = data.iloc[i]
+            if not row.get("code"):
+                return None, None
+            if str(row.get("code")) != code:
+                continue
+            q = float(row.get("qty"))
+            if not math.isfinite(q):
+                return None, None
+            if "SHORT" in str(row.get("position_side") or "LONG").upper() or q < 0:
+                short += int(round(abs(q)))
+                continue
+            can = row.get("can_sell_qty")
+            can = q if can is None else float(can)
+            if not math.isfinite(can):
+                return None, None
+            held += max(0, math.floor(min(q, can)))
+        if short:
+            return 0, short
+        ret, orders = ctx.order_list_query(trd_env=env, refresh_cache=True)
+        if ret != sdk.RET_OK or orders is None:
+            return None, None
+        working = 0
+        for i in range(len(orders)):
+            row = orders.iloc[i]
+            if str(row.get("code")) != code:
+                continue
+            status = str(row.get("order_status")).rsplit(".", 1)[-1].upper()
+            side = str(row.get("trd_side") or "").rsplit(".", 1)[-1].upper()
+            if status in _MM_DONE or not side.startswith("SELL"):
+                continue
+            left = float(row.get("qty") or 0) - float(row.get("dealt_qty") or 0)
+            if not math.isfinite(left):
+                return None, None
+            working += max(0, math.ceil(left))
+        return max(0, held - working), 0
+    except Exception:
+        return None, None
+    finally:
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
+def _expires_today(expiry):
+    try:
+        return str(expiry) == datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:
+        return False
+
+
+def _order(cfg, sdk, code, side, qty, price, effect=None, contract=None,
+           expiry=None):
+    """Marketable limit at the given price. Returns the order id (an
+    order_guard.OrderId: .qty is how many contracts it was for) or None.
+
+    THE ONLY place a moomoo order is sent. It sends nothing but a
+    buy-to-open or a sell-to-close (order_guard.check_order), and a sell
+    only for what OpenD says the account holds, less what working sells
+    are already selling. moomoo can't be told to only close a position,
+    so while the holdings can't be read NO sell is sent: the owner is told,
+    and the agent tries again on the next loop."""
+    contract = contract or code
+    held = None
+    if side == "sell":
+        held, short = _sell_holding(cfg, sdk, code)
+        if short:
+            msg = order_guard.short_text("moomoo", contract, short)
+            print(f"  ORDER NOT SENT: {msg}")
+            broker_events.report("exit_failed", msg, reason="short_seen",
+                                 short=short, option_id=code)
+            return None
+    try:
+        qty = order_guard.check_order(side, effect, qty, held,
+                                      broker_refuses_open=False)
+    except order_guard.RefusedOrder as exc:
+        order_guard.report_refusal("moomoo", side, qty, contract, exc,
+                                   expires_today=_expires_today(expiry))
+        return None
     ctx = None
     try:
         ctx = _trade_ctx(cfg, sdk)
@@ -387,7 +491,7 @@ def _order(cfg, sdk, code, side, qty, price):
         except Exception:
             oid = "submitted"
         print(f"  moomoo order {side} x{qty} {code} @ ${price:.2f} -> {oid}")
-        return oid
+        return order_guard.OrderId(oid, qty)
     except Exception as exc:
         print(f"  ORDER FAILED: {exc}")
         broker_events.report(_fail_kind(side), f"moomoo order error: {exc}")
@@ -446,8 +550,10 @@ def execute(cl, cfg, event, state):
                 "skip_no_quote" if "no quote" in note else "skip_sizing", note)
             return False
         print(f"ENTERED event -> buying {qty}x {contract} ({note})")
-        oid = _order(cfg, sdk, code, "buy", qty, ask)
+        oid = _order(cfg, sdk, code, "buy", qty, ask, effect="open",
+                     contract=contract)
         if oid:
+            qty = getattr(oid, "qty", qty)
             _remember_order(state, oid)
             row = {"option_id": code, "qty": qty,
                    "opened_event": event.get("event_id"),
@@ -489,8 +595,11 @@ def execute(cl, cfg, event, state):
             return False
         qty = exit_qty(pos, event)
         print(f"EXITED event -> selling {qty}x {contract}")
-        oid = _order(cfg, sdk, code, "sell", qty, price)
+        oid = _order(cfg, sdk, code, "sell", qty, price, effect="close",
+                     contract=contract, expiry=event.get("expiry"))
         if oid:
+            # never more than the account holds: may be fewer than the ledger
+            qty = getattr(oid, "qty", qty)
             _remember_order(state, oid)
             sold, sure = _confirm_sell(cfg, sdk, oid, qty)
             if not sure:
@@ -681,6 +790,43 @@ def held_option_qty(cl, cfg, option_ids):
                 busy.add(code)
         return {c: held.get(c, 0) for c in ids
                 if c not in busy and held.get(c, 0) >= net.get(c, 0)}
+    except Exception:
+        return None
+    finally:
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
+def short_option_qty(cl, cfg, option_ids):
+    """{moomoo code: SHORT contracts held (0 = none)} for the codes asked
+    about, or None when the account can't be read (brokers/__init__.py)."""
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    ids = sorted({str(i) for i in option_ids or () if str(i).startswith("US.")})
+    if not ids:
+        return {}
+    ctx = None
+    try:
+        sdk = _sdk()
+        ctx = _trade_ctx(cfg, sdk)
+        ret, data = ctx.position_list_query(trd_env=_trd_env(cfg, sdk),
+                                            refresh_cache=True)
+        if ret != sdk.RET_OK or data is None:
+            return None
+        out = {c: 0 for c in ids}
+        for i in range(len(data)):
+            row = data.iloc[i]
+            code = str(row.get("code") or "")
+            if code not in out:
+                continue
+            q = float(row.get("qty"))
+            if not math.isfinite(q):
+                return None
+            if "SHORT" in str(row.get("position_side") or "LONG").upper() or q < 0:
+                out[code] += int(round(abs(q)))
+        return out
     except Exception:
         return None
     finally:

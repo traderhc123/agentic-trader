@@ -538,7 +538,8 @@ def test_robinhood_guard_sell_is_a_bid_based_limit(monkeypatch):
                  "place_option_order": _mcp({"data": {"id": "o1"}})})
     placed = robinhood.place(rh, {"robinhood_account": "1"}, "opt-1", "sell",
                              "close", 2, marketable=True)
-    assert placed == {"order_id": "o1", "was_limit": True, "reprice": True}
+    assert placed == {"order_id": "o1", "was_limit": True, "reprice": True,
+                      "qty": 2}
     args = [a for n, a in rh.calls if n == "place_option_order"][-1]
     assert args["type"] == "limit" and args["price"] == "0.95"
     assert args["legs"][0]["position_effect"] == "close"

@@ -7,6 +7,7 @@ as marketable limits instead. The account must be agentic-enabled,
 options-approved, and funded — the setup wizard checks and explains each.
 """
 
+import math
 import os
 import sys
 import time
@@ -499,7 +500,8 @@ def _rpc_refusal(rh):
     return str(err.get("message") or f"error {err.get('code')}")[:300]
 
 
-def place(rh, cfg, option_id, side, effect, qty, marketable=False, ref_id=None):
+def place(rh, cfg, option_id, side, effect, qty, marketable=False, ref_id=None,
+          contract=None):
     """Submit the order. Returns {"order_id": ..., "was_limit": bool}, or
     None when Robinhood refused it; raises OrderUnconfirmed when there is
     no clear answer.
@@ -511,7 +513,31 @@ def place(rh, cfg, option_id, side, effect, qty, marketable=False, ref_id=None):
 
     ref_id: the id Robinhood files the order under. The same signal always
     sends the same one (order_guard.order_key), so a repeat can be told
-    apart from a new order; left out, a fresh one is made."""
+    apart from a new order; left out, a fresh one is made.
+
+    THE ONLY place a Robinhood order is sent. It sends nothing but a
+    buy-to-open or a sell-to-close (order_guard.check_order: side and
+    position_effect must match), and a sell never for more than Robinhood
+    says the account holds, less what its working sells are already
+    selling. When the holdings can't be read the sell goes out as before:
+    position_effect "close" makes Robinhood refuse it rather than open a
+    short. The result's "qty" is what the order was for."""
+    contract = contract or str(option_id)
+    held = None
+    if side == "sell":
+        held, short = _sell_holding(rh, cfg, option_id)
+        if short:
+            msg = order_guard.short_text("Robinhood", contract, short)
+            print(f"  ORDER NOT SENT: {msg}")
+            broker_events.report("exit_failed", msg, reason="short_seen",
+                                 short=short, option_id=str(option_id))
+            return None
+    try:
+        qty = order_guard.check_order(side, effect, qty, held,
+                                      broker_refuses_open=True)
+    except order_guard.RefusedOrder as exc:
+        order_guard.report_refusal("Robinhood", side, qty, contract, exc)
+        return None
     limit_price = _blackout_limit_price(rh, option_id, side)
     why = "opening blackout (pre-9:35 ET)"
     if limit_price is None and marketable:
@@ -525,7 +551,7 @@ def place(rh, cfg, option_id, side, effect, qty, marketable=False, ref_id=None):
     args = {
         "account_number": cfg["robinhood_account"],
         "legs": [{"option_id": option_id, "side": side, "position_effect": effect}],
-        "quantity": str(int(qty)),
+        "quantity": str(qty),
         "type": "market" if limit_price is None else "limit",
         "time_in_force": "gfd",
         "ref_id": ref_id or str(uuid.uuid4()),
@@ -562,7 +588,7 @@ def place(rh, cfg, option_id, side, effect, qty, marketable=False, ref_id=None):
         return None
     oid = _extract_order_id(result)
     print(f"  order {side}/{effect} x{qty} -> {oid or 'submitted (no id)'}")
-    out = {"order_id": oid, "was_limit": limit_price is not None}
+    out = {"order_id": oid, "was_limit": limit_price is not None, "qty": qty}
     if marketable:
         out["reprice"] = True
     return out
@@ -697,7 +723,8 @@ def _place_once(rh, cfg, state, pos_key, event, contract, option_id, side,
     known = {str(i) for i in (state.get("agent_order_ids") or [])
              + ((state["positions"].get(pos_key) or {}).get("order_ids") or [])}
     try:
-        placed = place(rh, cfg, option_id, side, effect, qty, ref_id=ref, **guard)
+        placed = place(rh, cfg, option_id, side, effect, qty, ref_id=ref,
+                       contract=contract, **guard)
     except OrderUnconfirmed as exc:
         placed = _adopt_or_note(rh, cfg, state, pos_key, contract, exc,
                                 event.get("event_id"))
@@ -970,9 +997,11 @@ def reconcile(rh, cfg, state, save_state):
             reprice = bool(pend.get("reprice"))
             unclear = False
             try:
+                # the effect follows the side: buy to open, sell to close
+                # (place() refuses any other pair)
                 replaced = place(rh, cfg, pos["option_id"], pend["side"],
                                  "open" if pend["side"] == "buy" else "close",
-                                 remaining,
+                                 remaining, contract=pos_key.replace("|", " "),
                                  **({"marketable": True} if reprice else {}))
             except OrderUnconfirmed as exc:
                 # found right away: it is the row's order; otherwise it is
@@ -987,7 +1016,8 @@ def reconcile(rh, cfg, state, save_state):
             if replaced:
                 if dead_unfilled:
                     _forget_order(state, pos, dead_id)
-                _record_pending(state, pos_key, replaced, pend["side"], remaining)
+                _record_pending(state, pos_key, replaced, pend["side"],
+                                replaced.get("qty", remaining))
                 print(f"  expiry guard: unfilled sell re-placed x{remaining} at a "
                       f"fresh price ({pos_key})" if reprice else
                       f"  blackout limit converted to market x{remaining} "
@@ -1081,7 +1111,7 @@ def execute(rh, cfg, event, state):
         if placed:
             state["positions"][pos_key] = {"option_id": option_id, "qty": 0,
                                            "opened_event": event.get("event_id")}
-            _record_pending(state, pos_key, placed, "buy", qty)
+            _record_pending(state, pos_key, placed, "buy", placed.get("qty", qty))
             _settle_fast(rh, cfg, state, pos_key)
             return True
     elif event["event"] == "EXITED":
@@ -1125,7 +1155,8 @@ def execute(rh, cfg, event, state):
         placed = _place_once(rh, cfg, state, pos_key, event, contract,
                              pos["option_id"], "sell", "close", qty, **guard)
         if placed:
-            _record_pending(state, pos_key, placed, "sell", qty)
+            # never more than the account holds: may be fewer than the ledger
+            _record_pending(state, pos_key, placed, "sell", placed.get("qty", qty))
             _settle_fast(rh, cfg, state, pos_key)
             return True
     return False
@@ -1201,9 +1232,10 @@ def held_option_qty(rh, cfg, option_ids):
         return None
 
 
-def _read_positions(rh, acct, ids):
-    want = set(ids)
-    held, busy = {}, set()
+def _position_rows(rh, acct):
+    """Every open option position row of the account (all pages), or None
+    when the whole list can't be read with certainty."""
+    out = []
     args = {"account_number": acct, "nonzero": True}
     first, pages = True, 0
     while pages < _POS_MAX_PAGES:
@@ -1213,7 +1245,7 @@ def _read_positions(rh, acct, ids):
         if not tool_ok(result):
             if first and "nonzero" in args:
                 # filter not accepted? retry once without it (zero-quantity
-                # rows then come back too, and are skipped below)
+                # rows then come back too, and are skipped by the readers)
                 del args["nonzero"]
                 first = False
                 continue
@@ -1223,15 +1255,105 @@ def _read_positions(rh, acct, ids):
         if rows is None:
             return None
         pages += 1
-        for row in rows:
-            if row is not None and not _count_position(row, want, held, busy):
-                return None
+        out.extend(row for row in rows if row is not None)
         if not nxt:
-            return {i: held.get(i, 0) for i in ids if i not in busy}
+            return out
         if str(nxt).startswith("http"):
             return None  # a REST page URL: not the MCP cursor we know
         args["cursor"] = str(nxt)
     return None  # still more pages: never answer from part of the list
+
+
+def _read_positions(rh, acct, ids):
+    rows = _position_rows(rh, acct)
+    if rows is None:
+        return None
+    want = set(ids)
+    held, busy = {}, set()
+    for row in rows:
+        if not _count_position(row, want, held, busy):
+            return None
+    return {i: held.get(i, 0) for i in ids if i not in busy}
+
+
+def _row_option_id(row):
+    # Never row["id"]: on REST rows that's the POSITION id, not the contract.
+    return str(row.get("option_id") or _last_seg(row.get("option")))
+
+
+def _sell_holding(rh, cfg, option_id):
+    """(long contracts of option_id the account can sell right now, short
+    contracts of it): the position's quantity less pending_sell_quantity
+    (what its working sell orders are already selling). (None, None) when
+    the account can't be read; a contract not listed is held 0."""
+    acct = (cfg or {}).get("robinhood_account")
+    if not acct or not _is_uuid(option_id):
+        return None, None
+    try:
+        rows = _position_rows(rh, str(acct))
+    except Exception:
+        return None, None
+    if rows is None:
+        return None, None
+    held, short, unknown = 0, 0, False
+    for row in rows:
+        if not isinstance(row, dict):
+            return None, None
+        if _row_option_id(row) != str(option_id):
+            continue
+        qkey = "quantity" if "quantity" in row else "qty" if "qty" in row else None
+        try:
+            q = _dec(row[qkey]) if qkey else None
+            pend = (_dec(row["pending_sell_quantity"])
+                    if "pending_sell_quantity" in row else None)
+        except (TypeError, ValueError):
+            return None, None
+        if q is None or not math.isfinite(q):
+            return None, None
+        if str(row.get("type") or "").lower() == "short" or q < 0:
+            short += int(round(abs(q)))
+            continue
+        if pend is None or not math.isfinite(pend):
+            unknown = True  # working sells can't be told apart
+            continue
+        held += max(0, math.floor(q - max(0.0, pend)))
+    if short:
+        return 0, short
+    return (None if unknown else held), 0
+
+
+def short_option_qty(rh, cfg, option_ids):
+    """{option_id: SHORT contracts held (0 = none)} for the ids asked about,
+    or None when the account can't be read (brokers/__init__.py)."""
+    ids = sorted({str(i) for i in option_ids or () if _is_uuid(i)})
+    if not ids:
+        return {}
+    acct = (cfg or {}).get("robinhood_account")
+    if not acct or getattr(rh, "last_error", None):
+        return None
+    try:
+        rows = _position_rows(rh, str(acct))
+    except Exception:
+        return None
+    if rows is None:
+        return None
+    out = {i: 0 for i in ids}
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        oid = _row_option_id(row)
+        if oid not in out:
+            continue
+        qkey = "quantity" if "quantity" in row else "qty" if "qty" in row else None
+        try:
+            q = _dec(row[qkey]) if qkey else None
+        except (TypeError, ValueError):
+            return None
+        if q is None or not math.isfinite(q):
+            return None
+        if str(row.get("type") or "").lower() == "short" or q < 0:
+            out[oid] += int(round(abs(q)))
+    return out
 
 
 def _count_position(row, want, held, busy):

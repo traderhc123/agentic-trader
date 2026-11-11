@@ -1727,7 +1727,9 @@ def test_alpaca_dead_exit_that_fills_late_never_sells_again(home, clock, monkeyp
             handle(st, alpaca, cfg=ALPACA, client=client)
     assert len(http.posts) == 1 and st["positions"][KEY]["qty"] == 2
     assert len(_on_hold(notes)) == 1 and "your Alpaca account" in _on_hold(notes)[0]
-    assert http.position_reads == 1 + 19 + 6   # once a minute after 10 min
+    # the adapter's own read right before its one sell, then the agent's
+    # reads: every poll for 10 min, once a minute after that
+    assert http.position_reads == 1 + 1 + 19 + 6
 
 
 @pytest.mark.parametrize("then", ["owner_sells", "first_sell_fills_late"])

@@ -13,7 +13,9 @@ re-persists the token file atomically after each refresh. Token file mode is
 import base64
 import hashlib
 import json
+import math
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -328,6 +330,12 @@ class RobinhoodMCP:
     # ── public API ───────────────────────────────────────────────────────
 
     def call_tool(self, name, arguments):
+        refused = order_tool_refusal(name, arguments)
+        if refused:
+            # never sent: a tool error, as Robinhood would answer a bad order
+            print(f"  ORDER NOT SENT: {refused}")
+            return {"isError": True, "content": [
+                {"type": "text", "text": json.dumps({"detail": refused})}]}
         with self._lock:
             return self._request("tools/call", {"name": name,
                                                 "arguments": arguments or {}})
@@ -336,6 +344,45 @@ class RobinhoodMCP:
         with self._lock:
             result = self._request("tools/list", {})
         return result.get("tools") if isinstance(result, dict) else None
+
+
+# The one order tool the agent may call, and the only leg shapes it may send:
+# buy to open, sell to close. brokers/robinhood.place is the caller (with its
+# own check of what the account holds); this is the backstop for any other
+# code that gets hold of the client.
+ORDER_TOOL = "place_option_order"
+_LEG_OK = {("buy", "open"), ("sell", "close")}
+_ORDER_WORDS = re.compile(r"(place|submit|replace|create|modify|edit|send)", re.I)
+
+
+def order_tool_refusal(name, arguments):
+    """Why this tool call must not be sent ("" = it may): any order tool but
+    place_option_order, or a place_option_order that isn't one buy-to-open
+    or sell-to-close leg of a whole number of contracts above zero."""
+    name = str(name or "")
+    if name != ORDER_TOOL:
+        if "order" in name.lower() and _ORDER_WORDS.search(name):
+            return (f"the agent never calls Robinhood's {name!r}: it only places "
+                    "single-leg buy-to-open and sell-to-close option orders")
+        return ""
+    args = arguments if isinstance(arguments, dict) else {}
+    legs = args.get("legs")
+    if not isinstance(legs, list) or len(legs) != 1 or not isinstance(legs[0], dict):
+        return "an option order that isn't exactly one leg — not sent"
+    leg = legs[0]
+    pair = (str(leg.get("side") or "").lower(),
+            str(leg.get("position_effect") or "").lower())
+    if pair not in _LEG_OK:
+        return (f"a {pair[0] or '?'}-to-{pair[1] or '?'} option order — the "
+                "agent only buys to open and sells to close; not sent")
+    try:
+        q = float(str(args.get("quantity")))
+    except (TypeError, ValueError):
+        q = float("nan")
+    if not (math.isfinite(q) and q >= 1 and q == int(q)):
+        return (f"an option order for {args.get('quantity')!r} contracts — the "
+                "quantity must be a whole number above zero; not sent")
+    return ""
 
 
 def content_json(result):
