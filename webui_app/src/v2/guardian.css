@@ -496,26 +496,36 @@ main:focus{outline:none}
 .periods dd small{display:block;font:400 13px/1.4 var(--sans);color:var(--ink2);letter-spacing:0;margin-top:2px}
 .book-practice .periods dd{font-weight:500}
 .chart-wrap{position:relative;border-radius:var(--r1)}
-.chart{width:100%;height:auto;overflow:visible}
+.chart{display:block;overflow:visible}
 .chart text{font:500 13px var(--sans);fill:var(--ink2);font-variant-numeric:tabular-nums}
 .chart .grid{stroke:var(--line);stroke-width:1}
-.chart .zero{stroke:var(--line2);stroke-width:1}
+.chart .zero{stroke:var(--line2);stroke-width:1.5}
 .chart .cross{stroke:var(--line2);stroke-width:1;stroke-dasharray:2 3}
 .chart .ln{fill:none;stroke-linejoin:round;stroke-linecap:round}
 .chart .ln-real{stroke:var(--real);stroke-width:2.5}
 .chart .ln-practice{stroke:var(--prac);stroke-width:2;stroke-dasharray:7 5}
-.chart .mk-real{fill:var(--real);stroke:var(--surface);stroke-width:2}
-.chart .mk-practice{fill:var(--surface);stroke:var(--prac);stroke-width:2}
+/* a day's mark: the book's shape and edge, filled green / red by that day's result */
+.chart .mk{stroke-width:2}
+.chart .mk-real{stroke:var(--real)}
+.chart .mk-practice{stroke:var(--prac)}
+.chart .mk.gain{fill:var(--gain-mark)}
+.chart .mk.loss{fill:var(--bad-mark)}
+.chart .mk.flat{fill:var(--surface)}
+.chart .mk-real.book{fill:var(--real)}
+.chart .mk-practice.book{fill:var(--surface)}
+.chart .mk.hot{fill:none;stroke-width:3}
 .chart .end{fill:var(--ink2);font-weight:600;font-size:13px}
 .chart .endv{fill:var(--ink);font-weight:700;font-size:14px}
+.chart .endv.gain{fill:var(--gain)}
+.chart .endv.loss{fill:var(--bad)}
 .chart .hit{fill:transparent}
-.legend{display:flex;gap:6px 16px;flex-wrap:wrap;font-size:13px;color:var(--ink2);font-weight:600}
-.legend span{display:inline-flex;gap:8px;align-items:center}
-.key{width:22px;height:0;display:inline-block}
-.key-real{border-top:3px solid var(--real)}
-.key-practice{border-top:2px dashed var(--prac)}
-.tip{position:absolute;top:0;pointer-events:none;background:var(--ink);color:var(--surface);font-size:13px;line-height:1.45;padding:8px 12px;border-radius:8px;white-space:nowrap;display:none;z-index:5;box-shadow:var(--shadow)}
-.tip b,.tip span{display:block}
+.chart-cap{font-size:13px;color:var(--ink2);margin-bottom:8px}
+.chart-cap + .chart-cap,.chart-wrap + .chart-cap{margin:8px 0 0}
+.chart-empty{position:absolute;display:grid;place-items:center;text-align:center;padding:12px;margin:0;font-size:15px;font-weight:600;color:var(--ink);pointer-events:none}
+.chart-empty span{background:var(--surface);padding:4px 8px;border-radius:4px;max-width:44ch}
+/* the day under the pointer: on the panel's own colours, so green / red read the same */
+.tip{position:absolute;top:0;pointer-events:none;background:var(--well);color:var(--ink);border:1px solid var(--line2);font-size:13px;line-height:1.45;padding:8px 12px;border-radius:8px;display:none;z-index:5;box-shadow:var(--shadow);white-space:normal;max-width:min(380px,100%)}
+.tip > b,.tip > span{display:block}
 .tbl-wrap{border-top:1px solid var(--line)}
 .tbl{width:100%;border-collapse:collapse;font-size:14px}
 .tbl th,.tbl td{padding:12px 16px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left}
@@ -714,10 +724,7 @@ main:focus{outline:none}
 a.side-btn{text-decoration:none}
 a.btn{text-decoration:none}
 .btn-quiet,a.btn-quiet{text-decoration:underline}
-.chart-canvas{height:260px;width:100%}
-.chart-loading{height:260px;display:grid;place-items:center}
 .chart-wrap:focus-visible{outline:2px solid var(--ink);outline-offset:4px}
-.tip{white-space:normal;max-width:min(360px,100%)}
 /* an option the agent cannot do yet: visibly off, with the reason readable */
 .choice-off{cursor:not-allowed;background:var(--well);border-style:dashed}
 .choice-off strong,.choice-off > span:not(.conseq){color:var(--ink3)}
@@ -738,7 +745,6 @@ a.btn{text-decoration:none}
 @media (max-width:760px){
   @keyframes drawer-up{from{transform:translateY(24px);opacity:0}to{transform:none;opacity:1}}
   .drawer.open{animation:drawer-up .18s ease-out}
-  .chart-canvas,.chart-loading{height:220px}
 }
 .h-paid{white-space:normal;overflow-wrap:anywhere;min-width:0}
 .h-paid small{white-space:nowrap}

@@ -54,6 +54,7 @@ import {
 import { UNKNOWN, ago, contractName, dayLong, etDayKey, etTime, etWhen, plural, signed, span, tone, usd } from "../src/v2/lib/format.ts";
 import { UPDATE } from "../src/v2/lib/copy.ts";
 import { postJson } from "../src/v2/lib/http.ts";
+import { RANGES, addDays, axisMoney, chartModel, niceTicks, rangeStart } from "../src/v2/lib/chart.ts";
 import {
   CHECK_PATH,
   PULL_PATH,
@@ -712,4 +713,104 @@ test("update: no badge in any state where this page can't reach the agent", { sk
       else assert.deepEqual(b, { count: 3 }, `${name} ${failing}`);
       clean(UPDATE.live(s.positions.filter((p) => p.real).length), name);
     }
+});
+
+// ── Results chart (lib/chart.ts) ─────────────────────────────────────────────
+
+const cents = (n) => Math.round(n * 100);
+const book = (days, over = {}) => {
+  const total = days.reduce((a, d) => a + d.pnl, 0);
+  return { today: 0, last_7_days: 0, total, closed: days.length, won: 0, lost: 0, unmeasured: 0, unmeasured_today: 0, days, ...over };
+};
+const withBooks = (real, practice) => ({ results: { real, practice, paper_account: book([]), signal_cost: {} } });
+const weekday = (d) => ![0, 6].includes(new Date(d + "T00:00:00Z").getUTCDay());
+
+test("chart: every period's last point is the figure the panels show", { skip }, () => {
+  let checked = 0;
+  for (const [name, s] of states) {
+    const today = etDayKey(s.as_of);
+    for (const [range] of RANGES) {
+      const C = chartModel(s, range, today);
+      assert.equal(C.real.length, C.days.length, name);
+      assert.equal(C.practice.length, C.days.length, name);
+      assert.ok(C.days.length > 0, `${name} ${range}: never a blank chart`);
+      assert.deepEqual([...C.days].sort(), C.days, name);
+      for (const k of ["real", "practice"]) {
+        const B = s.results[k];
+        const want = range === "all" ? B.total : range === "7d" ? B.last_7_days : null;
+        if (!B.days.length) assert.equal(C.end[k], null, `${name} ${range} ${k}: no line without a closed trade`);
+        else if (want != null) {
+          assert.equal(cents(C.end[k]), cents(want), `${name} ${range} ${k}`);
+          checked++;
+        }
+        if (range === "all") assert.equal(C.undated[k], 0, `${name} ${k}: everything dated is plotted`);
+        // a day with nothing closed carries the total forward
+        C[k].forEach((p, i) => {
+          if (i && p.pnl == null && C[k][i - 1].cum != null) assert.equal(p.cum, C[k][i - 1].cum, `${name} ${range} ${k} ${p.day}`);
+          if (p.pnl != null && p.cum != null) assert.equal(cents(p.cum), cents((i ? C[k][i - 1].cum ?? 0 : 0) + p.pnl));
+        });
+      }
+    }
+  }
+  assert.ok(checked >= 20, `only ${checked} totals checked`);
+});
+
+test("chart: weekdays only, the 7 days the panels count, ET day keys in any time zone", () => {
+  assert.equal(rangeStart("7d", "2026-11-09", null), "2026-11-03");
+  assert.equal(rangeStart("30d", "2026-11-09", null), "2026-10-11");
+  assert.equal(rangeStart("all", "2026-11-09", "2026-01-02"), "2026-01-02");
+  assert.equal(addDays("2026-03-08", 1), "2026-03-09"); // across a clock change
+  const s = withBooks(book([{ day: "2026-11-07", pnl: 5, closed: 1 }, { day: "2026-11-02", pnl: 10, closed: 1 }]), book([]));
+  const C = chartModel(s, "7d", "2026-11-09");
+  // Saturday Nov 7 is on the axis because a trade closed then; Sunday Nov 8 is not
+  assert.deepEqual(C.days, ["2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06", "2026-11-07", "2026-11-09"]);
+  assert.ok(C.days.every((d) => weekday(d) || d === "2026-11-07"));
+  // the Nov 2 trade is before the period: the line starts at $0, not at +$10
+  assert.deepEqual(C.real.map((p) => p.cum), [0, 0, 0, 0, 5, 5]);
+  assert.equal(C.end.real, 5);
+  assert.equal(C.end.practice, null);
+  assert.equal(C.quiet, false);
+  const A = chartModel(s, "all", "2026-11-09");
+  assert.equal(A.days[0], "2026-11-02");
+  assert.equal(A.end.real, 15);
+});
+
+test("chart: always draws something: one day, no days, no trades in the period", () => {
+  const one = chartModel(withBooks(book([{ day: "2026-11-09", pnl: -12.5, closed: 1 }]), book([])), "all", "2026-11-09");
+  assert.deepEqual(one.days, ["2026-11-09"]);
+  assert.deepEqual(one.real, [{ day: "2026-11-09", pnl: -12.5, closed: 1, cum: -12.5 }]);
+  assert.equal(one.empty, false);
+  const none = chartModel(withBooks(book([]), book([])), "all", "2026-11-09");
+  assert.equal(none.empty, true);
+  assert.ok(none.days.length >= 5, "empty axes still span a week");
+  assert.equal(none.end.real, null);
+  // a weekend-only period still has its day
+  assert.deepEqual(chartModel(withBooks(book([]), book([])), "7d", "2026-11-08").days.length, 5);
+  const quiet = chartModel(withBooks(book([{ day: "2026-09-01", pnl: 40, closed: 1 }]), book([])), "7d", "2026-11-09");
+  assert.equal(quiet.quiet, true);
+  assert.equal(quiet.end.real, 0);
+  assert.ok(quiet.real.every((p) => p.cum === 0));
+});
+
+test("chart: whole cents, and a total the days can't account for is reported, not hidden", () => {
+  const days = [0.1, 0.2, 0.3, 0.7, 1.1].map((pnl, i) => ({ day: `2026-11-0${i + 2}`, pnl, closed: 1 }));
+  const C = chartModel(withBooks(book(days), book([])), "all", "2026-11-06");
+  assert.equal(C.end.real, 2.4);
+  const odd = chartModel(withBooks(book(days, { total: 52.4 }), book([])), "all", "2026-11-06");
+  assert.equal(odd.undated.real, 50);
+  assert.equal(chartModel(withBooks(book(days, { total: 52.4 }), book([])), "7d", "2026-11-06").undated.real, 0);
+});
+
+test("chart: the money axis always has $0 and short labels", () => {
+  for (const [lo, hi] of [[0, 0], [5, 80], [-316, 212], [-0.4, 0], [-1234567.89, 98765432.1]]) {
+    const t = niceTicks(lo, hi);
+    assert.ok(t.includes(0), `${lo}..${hi}: ${t}`);
+    assert.ok(t[0] <= Math.min(0, lo) && t[t.length - 1] >= Math.max(0, hi), `${lo}..${hi}`);
+    assert.ok(t.length >= 2 && t.length <= 8, `${lo}..${hi}: ${t.length} ticks`);
+    for (const v of t) clean(axisMoney(v), String(v));
+  }
+  assert.equal(axisMoney(-200), "−$200");
+  assert.equal(axisMoney(12500), "$12.5k");
+  assert.equal(axisMoney(100000000), "$100M");
+  assert.equal(axisMoney(-2500000), "−$2.5M");
 });
