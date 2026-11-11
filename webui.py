@@ -3676,7 +3676,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         return {"ok": True, "note": msg}
 
     def update_check(_h):
-        return check_code_updates()
+        # "?force=1": the owner asked to check now (else a recent answer)
+        from urllib.parse import parse_qs, urlparse
+        try:
+            q = parse_qs(urlparse(getattr(_h, "path", "") or "").query)
+        except Exception:
+            q = {}
+        return check_code_updates(force=q.get("force", [""])[0] in ("1", "true"))
 
     def help_netcheck(_h):
         import support
@@ -4469,10 +4475,62 @@ def _remote_problem():
             "(forks: set AGENTIC_TRADER_UPDATE_REMOTE to your repo URL)")
 
 
-def check_code_updates():
+# The update check's last answer, given again for UPDATE_CHECK_MEMO_S (an
+# error for UPDATE_ERROR_MEMO_S): every page load asks, and each check is a
+# `git fetch` or a GitHub API call (60 an hour per address without a login).
+# Keyed by where updates come from and what is installed, so an update, a
+# changed remote or a new snapshot asks again. "Check now" passes force=True.
+UPDATE_CHECK_MEMO_S = 900
+UPDATE_ERROR_MEMO_S = 60
+_UPDATE_MEMO = {}
+
+
+def _update_memo_key():
+    """What a remembered answer depends on: the mode, the remote and the
+    installed commit (all local reads). None when it can't be told."""
+    try:
+        if _snapshot_mode():
+            import snapshot_update
+            return ("snapshot", snapshot_update.installed_commit(_repo_dir()))
+        return ("git", _git(["remote", "get-url", "origin"]).stdout.strip(),
+                _git(["rev-parse", "HEAD"]).stdout.strip())
+    except Exception:
+        return None
+
+
+def check_code_updates(force=False):
     """Fetch origin and report how far behind HEAD is. Never raises.
     Returns the exact commit (`target`) the user is shown, so the pull can
-    install THAT commit and nothing pushed after they looked."""
+    install THAT commit and nothing pushed after they looked.
+
+    The answer is remembered for UPDATE_CHECK_MEMO_S (errors for
+    UPDATE_ERROR_MEMO_S) and carries `checked_at` (ISO, UTC) — when it was
+    really checked; force=True checks again now."""
+    import time as _t
+    from datetime import datetime as _dt, timezone as _tz
+    key = _update_memo_key()
+    memo = _UPDATE_MEMO
+    if (not force and key is not None and memo.get("key") == key
+            and _t.monotonic() - memo["at"] < (
+                UPDATE_CHECK_MEMO_S if memo["result"].get("ok")
+                else UPDATE_ERROR_MEMO_S)):
+        return dict(memo["result"])
+    result = _check_code_updates()
+    result = dict(result) if isinstance(result, dict) else {
+        "ok": False, "error": "update check failed"}
+    result["checked_at"] = _dt.now(_tz.utc).isoformat(timespec="seconds")
+    memo.clear()
+    if key is not None:
+        memo.update(key=key, at=_t.monotonic(), result=dict(result))
+    return result
+
+
+def _forget_update_check():
+    """An update was installed (or tried): the next check asks again."""
+    _UPDATE_MEMO.clear()
+
+
+def _check_code_updates():
     problem = _install_write_problem()
     if problem:
         return {"ok": False, "error": problem}
@@ -4617,6 +4675,7 @@ def pull_code_updates(expect=None):
     merged over silently — a diverged tree is reported, not resolved.
     `expect` (the `target` from check_code_updates) pins the exact commit the
     user reviewed: if the remote moved since, nothing is installed."""
+    _forget_update_check()  # whatever happens, the next check asks again
     problem = _install_write_problem()
     if problem:
         return False, problem
