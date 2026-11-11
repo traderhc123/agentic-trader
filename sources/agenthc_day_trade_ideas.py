@@ -633,10 +633,13 @@ def _wallet_over_exits_only(cfg, state, save_state):
     return poll(cfg, state, save_state, _retried=True)
 
 
-def _prepaid_active(cfg, state):
-    """A prepaid pass with signal days left, as last checked (no request)."""
+def _prepaid_may_take_over(cfg, state):
+    """A prepaid pass that may give entries once the wallet day-pass ends:
+    one with signal days left as last checked, or one the agent has not
+    been able to check (a pass the owner just bought in the dashboard has
+    no status here until the agent asks AgentHC about it). No request."""
     cache = (state or {}).get("pass_status") or {}
-    return any((cache.get(_token_id(t)) or {}).get("status") == "active"
+    return any((cache.get(_token_id(t)) or {}).get("status") in (None, "active")
                for t in _pass_tokens(cfg))
 
 
@@ -652,12 +655,13 @@ def entry_cover(cfg, state, close_ts):
     """(ok, until_ts): can a position opened now still get its exit signal
     until `close_ts` (today's close)? False only while the feed is read with
     a wallet day-pass that ends before then and no other pass takes over
-    (a new one is not paid yet). until_ts = when that day-pass ends (None
-    without one). An API key, a prepaid pass and other sources: always ok."""
+    (a new one is not paid yet; a prepaid pass not checked yet counts as
+    taking over). until_ts = when that day-pass ends (None without one).
+    An API key, a prepaid pass and other sources: always ok."""
     if cfg.get("agenthc_api_key") or not _live_daypass(state):
         return True, None
     until = float((state.get("l402") or {}).get("expires_at") or 0)
-    if until >= close_ts or _prepaid_active(cfg, state):
+    if until >= close_ts or _prepaid_may_take_over(cfg, state):
         return True, until
     return False, until
 
@@ -667,7 +671,11 @@ def _renew_daypass(cfg, state, save_state):
     today's close: buy today's pass first (from 08:30 ET on a trading day,
     the usual one-a-day and spending limits), so it never runs out between
     an entry and its exit. A purchase that fails or isn't decided yet
-    leaves the running pass in use."""
+    leaves the running pass in use. Never while a prepaid pass may take
+    over when the day-pass ends: its status is asked first (poll() does not
+    ask while a day-pass runs, so a pass bought in the dashboard since then
+    is unknown here), and a pass that can't be checked counts as taking
+    over — the wallet never pays on an unknown."""
     tok = state.get("l402") or {}
     if not cfg.get("day_pass_recurring") or state.get("daypass_pending"):
         return
@@ -675,8 +683,12 @@ def _renew_daypass(cfg, state, save_state):
     if _next_buy_time(cfg, now) is not None:
         return   # not a trading day, before 08:30, or past the close
     running = float(tok.get("expires_at") or 0)
-    if running >= _close_ts(cfg, now.date()) or _prepaid_active(cfg, state):
+    if running >= _close_ts(cfg, now.date()):
         return
+    if _pass_tokens(cfg):
+        _refresh_pass(cfg, state, save_state)
+        if _prepaid_may_take_over(cfg, state):
+            return
     if not _pass_purchase_allowed(cfg, state, save_state):
         return
     track = "all" if cfg.get("include_other_trades") else "main"

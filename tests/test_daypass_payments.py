@@ -1065,6 +1065,68 @@ def test_entry_cover_with_a_day_pass_that_ends_before_the_close(clock):
     assert agenthc.entry_cover(cfg, st, close_ts)[0] is True
 
 
+class PassFeed(Feed):
+    """Feed + the prepaid pass status route: `passes` maps a token to the
+    status /pass answers (an Exception: the check fails)."""
+
+    def __init__(self, passes, **kw):
+        super().__init__(**kw)
+        self.passes, self.checks = passes, []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        if url.endswith("/pass"):
+            tok = (headers or {}).get("Authorization")
+            self.checks.append(tok)
+            st = self.passes[tok]
+            if isinstance(st, Exception):
+                raise st
+            return Resp({"status": st, "access_until": "2030-01-02T00:00:00+00:00",
+                         "days_left": 3 if st == "active" else 0})
+        return super().get(url, params, headers, timeout)
+
+
+def test_no_renewal_while_a_new_prepaid_pass_may_take_over(
+        monkeypatch, clock, alerts):
+    """The owner bought a prepaid pass in the dashboard last night: its
+    token is in the config, but the agent never asked about it (it reads
+    with the running day-pass). The wallet must not pay for a day-pass the
+    prepaid pass makes unnecessary, and entries stay open (the prepaid pass
+    takes over when the day-pass ends)."""
+    clock.now = _et(8, 30)
+    cfg = {**CFG, "lnbits_url": "https://w", "feed_pass": {"token": "P"}}
+    close_ts = _et(16, 0).timestamp()
+    for status in ("active", RuntimeError("status down")):
+        feed, wallet = PassFeed({"P": status}, sats=10_000), BalanceWallet()
+        _setup(monkeypatch, feed, wallet)
+        state = _running(_et(12, 0))
+        # before any poll: a pass the agent has not checked may take over
+        assert agenthc.entry_cover(cfg, state, close_ts)[0] is True
+        events = _poll(cfg, state)
+        assert wallet.paid == [] and feed.minted == 0, status
+        assert feed.checks == ["P"]
+        assert len(events) == 1 and state["l402"]["token"] == "L402 OLD:pre"
+        assert agenthc.entry_cover(cfg, state, close_ts)[0] is True
+
+
+def test_renewal_when_the_prepaid_pass_is_used_up_or_unpaid(
+        monkeypatch, clock, alerts):
+    """A prepaid pass that only gets exits, or an invoice nobody paid, does
+    not take over the entries: the running day-pass is renewed as before."""
+    clock.now = _et(8, 30)
+    cfg = {**CFG, "lnbits_url": "https://w", "feed_pass": {"token": "P"}}
+    close_ts = _et(16, 0).timestamp()
+    for status in ("exits_only", "pending"):
+        feed, wallet = PassFeed({"P": status}, sats=10_000), BalanceWallet()
+        _setup(monkeypatch, feed, wallet)
+        state = _running(_et(12, 0))
+        _poll(cfg, state)
+        assert len(wallet.paid) == 1, status
+        assert state["l402"]["token"] == "L402 MAC1:pre0001"
+        state = _running(_et(12, 0))
+        state["pass_status"] = {agenthc._token_id("P"): {"status": status}}
+        assert agenthc.entry_cover(cfg, state, close_ts)[0] is False
+
+
 def test_entry_is_skipped_when_the_day_pass_ends_before_the_close(
         monkeypatch, home, no_policy):
     import agent
