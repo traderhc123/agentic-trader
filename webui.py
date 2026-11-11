@@ -3387,6 +3387,17 @@ def _size_direction(old, new):
     return "neutral"  # a different kind of size can't be compared
 
 
+def _broker_direction(before, after):
+    """A broker change's risk: to a real-money account raises it, to a
+    paper-trading one (from a broker) lowers it; same kind, or not known,
+    can't be compared."""
+    if after["paper"] is None or before["paper"] == after["paper"]:
+        return "neutral"
+    if after["paper"]:
+        return "lowers_risk" if before["id"] else "neutral"
+    return "raises_risk"
+
+
 # /setup?from=<one of these>: where the wizard's "Dashboard" links and its
 # hop after "Start my agent" go. A fixed list: never an open redirect.
 _RETURN_TO = {"v2": "/v2", "dash": "/dash"}
@@ -3438,7 +3449,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     from lightning_wallet import LNbitsWallet, WalletError
 
     pending = {"oauth": None, "broker_last4": "", "rh_warning": "",
-               "finished": threading.Event()}
+               "finished": threading.Event(),
+               # where the browser lands after the Robinhood sign-in: "/"
+               # (classic), or "/v2" for a sign-in started from /v2
+               "oauth_return": None}
 
     # config.json is shared with the chat commands and the dashboard buttons,
     # which write it too (agent._apply_command). `cfg` is only this server's
@@ -4139,6 +4153,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         rh = RobinhoodMCP(_token_path())
         url, p = rh.auth_start()
         pending["oauth"] = (rh, p)
+        pending["oauth_return"] = None  # the classic landing, as always
         return {"url": url}
 
     def rh_callback(h):
@@ -4856,12 +4871,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             trial = {**cfg, "broker": p["broker"], **switch}
             after = {"id": p["broker"],
                      "paper": (all(switch.values()) if switch else None)}
-            if after["paper"] is None or before["paper"] == after["paper"]:
-                direction = "neutral"
-            elif after["paper"]:
-                direction = "lowers_risk" if before["id"] else "neutral"
-            else:
-                direction = "raises_risk"
+            direction = _broker_direction(before, after)
             notes = [f"It does not switch between Practice and LIVE: "
                      f"{'Practice' if A._mode(cfg) == 'practice' else 'LIVE'} "
                      "stays.", does_not_trade]
@@ -4877,6 +4887,46 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         if res.get("ok"):
             res = {**res, "saved": True, "settings": _settings_view()}
         return res
+
+    @_v2
+    def v2_robinhood(data):
+        """POST /api/v2/broker/robinhood: the classic Robinhood sign-in
+        (/api/rh/start) behind the same two-step confirmation as connecting
+        a key-based broker. The confirmed POST answers with the address to
+        sign in at; the broker changes only when the owner finishes there
+        (the classic /callback, which then lands on /v2)."""
+        from brokers import account_tag
+        p = _v2_payload(data, ())
+        if not A.consent_ok():
+            return {"ok": False, "error": "accept the agreement first"}
+        with A.CONFIG_LOCK:
+            _sync()
+            before = {"id": cfg.get("broker") or None,
+                      "paper": (account_tag(cfg).endswith(":paper")
+                                if cfg.get("broker") else None)}
+            # Robinhood's agentic accounts are real-money accounts
+            after = {"id": "robinhood", "paper": False}
+            notes = [f"It does not switch between Practice and LIVE: "
+                     f"{'Practice' if A._mode(cfg) == 'practice' else 'LIVE'} "
+                     "stays.", does_not_trade,
+                     "Nothing changes until you finish signing in at "
+                     "Robinhood."]
+            if before["id"] and before["id"] != "robinhood":
+                notes.append("Positions the agent opened in the account it "
+                             "uses now are not sold from the new one: look "
+                             "after those at your current broker.")
+            wait = _two_step("robinhood", p, data, [_change(
+                "broker", "Broker account", before, after,
+                _broker_direction(before, after))], notes)
+        if wait:
+            return wait
+        try:
+            res = rh_start(None)
+        except Exception as exc:
+            return {"ok": False, "error": "Couldn't start the Robinhood "
+                    f"sign-in ({_net_error_text(exc)}). Nothing was changed."}
+        pending["oauth_return"] = "/v2"
+        return {"ok": True, "url": res["url"]}
 
     @_v2
     def v2_pass_buy(data):
@@ -5075,6 +5125,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/v2/settings/computer": v2_computer,
                      "/api/v2/settings/ai": v2_ai,
                      "/api/v2/broker/connect": v2_broker_connect,
+                     "/api/v2/broker/robinhood": v2_robinhood,
                      "/api/v2/pass/buy": v2_pass_buy,
                      "/api/v2/wallet/recurring": v2_recurring,
                      "/api/v2/command": v2_command}
@@ -5100,7 +5151,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 return self._send(None, html=f"<h3>OAuth failed: {exc}</h3>"
                                              f"<p><a href='/'>back to setup</a></p>")
             self.send_response(302)
-            self.send_header("Location", "/")
+            # "/" as always; "/v2" only for a sign-in /v2 started (a fixed
+            # value set by the server, never taken from the request)
+            back = pending.get("oauth_return")
+            pending["oauth_return"] = None
+            self.send_header("Location", back if back in _RETURN_TO.values() else "/")
             self.end_headers()
             return
         return orig_get(self)
