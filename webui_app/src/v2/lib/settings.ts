@@ -379,3 +379,42 @@ export async function diffSha256(text: string): Promise<string | null> {
     return null;
   }
 }
+
+// ── the expiry-day times ────────────────────────────────────────────────────
+
+/** An Eastern time of day the expiry sell or its alert accepts: "15:40",
+ *  "9:45" → "09:45"; from 09:30 to 15:59 (agent._expiry_setting). */
+export function readEtTime(text: string): Parsed<string> {
+  const m = /^\s*([01]?\d|2[0-3]):([0-5]\d)\s*$/.exec(String(text ?? ""));
+  const mins = m ? Number(m[1]) * 60 + Number(m[2]) : -1;
+  if (mins < 9 * 60 + 30 || mins >= 16 * 60) return { ok: false, error: "Enter a time from 09:30 to 15:59 (Eastern), like 15:40." };
+  return { ok: true, value: `${String(Math.floor(mins / 60)).padStart(2, "0")}:${String(mins % 60).padStart(2, "0")}` };
+}
+
+/** "3:50 PM ET" for a saved "15:50"; "Off" for none. */
+export function etClockWords(hhmm: string | null | undefined): string {
+  if (!hhmm) return "Off";
+  const m = /^(\d{2}):(\d{2})$/.exec(hhmm);
+  if (!m) return "not known";
+  const h = Number(m[1]);
+  return `${h % 12 || 12}:${m[2]} ${h < 12 ? "AM" : "PM"} ET`;
+}
+
+/** The expiry alert part of an alerts save: only when it differs from what
+ *  is saved (null = off). Undefined: leave it as it is. */
+export function expiryAlertPayload(saved: string | null | undefined, off: boolean, text: string): Parsed<string | undefined> {
+  if (off) return { ok: true, value: saved == null ? undefined : "off" };
+  const t = readEtTime(text);
+  if (!t.ok) return t;
+  return { ok: true, value: t.value === saved ? undefined : t.value };
+}
+
+// ── the broker's own warning ────────────────────────────────────────────────
+
+/** What the broker row says about the agent's account beyond up/down: the
+ *  classic wizard's Robinhood warning (options not turned on), as a code. */
+export function brokerWarning(v: SettingsView | null | undefined): string {
+  if (v?.broker?.warning === "options_off")
+    return "Options trading is not turned on in this Robinhood account, so Robinhood rejects the agent's orders until you apply for it at Robinhood.";
+  return "";
+}

@@ -4949,9 +4949,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         """POST /api/v2/settings/alerts: Discord / ntfy / Telegram targets, as
         the classic Safety step saves them. null clears one (the classic form
         can't: a blank field there keeps what is set)."""
-        p = _v2_payload(data, tuple(src for src, _key in _ALERT_KEYS))
+        p = _v2_payload(data, tuple(src for src, _key in _ALERT_KEYS)
+                        + ("expiry_alert_et",))
         if not p:
-            raise _Invalid("Send at least one alert target. Nothing was changed.")
+            raise _Invalid("Send at least one alert target (or expiry_alert_et). "
+                           "Nothing was changed.")
         keep = {}
         for src, _key in _ALERT_KEYS:
             if src in p and p[src] is not None:
@@ -4959,12 +4961,25 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         if "discord" in keep and not keep["discord"].startswith("https://"):
             raise _Invalid("discord must be the webhook address (https://…). "
                            "Nothing was changed.")
+        # the expiry-day alert time: what the chat's "expiry alert off|HH:MM"
+        # saves, by the same check (a notification only: no money moves)
+        alert = None
+        if "expiry_alert_et" in p:
+            v = p["expiry_alert_et"]
+            alert = (A._expiry_setting(v, A.EXPIRY_ALERT_DEFAULT)
+                     if isinstance(v, str) and v != "on" else None)
+            if alert is None:
+                raise _Invalid('expiry_alert_et must be "off" or a time from '
+                               "09:30 to 15:59 (HH:MM, Eastern). Nothing was "
+                               "changed.")
         with A.CONFIG_LOCK:
             _sync()
             _apply_alert_targets(cfg, keep)
             for src, key in _ALERT_KEYS:
                 if src in p and p[src] is None:
                     cfg.pop(key, None)
+            if alert is not None:
+                cfg["expiry_alert_et"] = alert
             save()
             return {"ok": True, "saved": True, "settings": _settings_view()}
 

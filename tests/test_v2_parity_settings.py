@@ -28,6 +28,7 @@ import webui
 from test_v2_settings_api import (  # noqa: F401
     BASE, SECRETS, app, read_cfg, write_cfg)
 from test_v2_parity import _running
+from test_v2_settings_forms import rh  # noqa: F401
 
 
 # ── group 4: Settings → Help and support ────────────────────────────────────
@@ -262,6 +263,54 @@ def test_rejecting_is_the_classic_reject(home, app):
     _propose()
     assert c.post("/api/proposal/reject", {})["ok"] is True
     assert self_edit.current() is None and c.get("/api/proposal") == {"pending": False}
+
+
+# ── group 6: Settings → Connections ─────────────────────────────────────────
+
+@pytest.mark.parametrize("chat, sent", [("15:40", "15:40"), ("off", "off"),
+                                        ("9:45", "09:45"), ("15:59", "15:59")])
+def test_the_expiry_alert_time_is_the_chat_command(home, app, chat, sent):
+    from test_v2_settings_api import same_effect
+    write_cfg(home, BASE)
+    c = _running(app)
+    out = same_effect(home, BASE,
+                      lambda: c.post("/api/command", {"text": f"expiry alert {chat}"}),
+                      lambda: c.post("/api/v2/settings/alerts", {"expiry_alert_et": sent}))
+    assert out["expiry_alert_et"] == ("off" if chat == "off" else sent.zfill(5))
+    shown = c.get("/api/v2/settings")["expiry"]
+    assert shown["alert_et"] == (None if chat == "off" else sent.zfill(5))
+
+
+@pytest.mark.parametrize("bad", ["16:00", "09:00", "9:29", "25:00", "on", "OFF",
+                                 "", "3pm", None, 1540, True])
+def test_an_expiry_alert_time_outside_the_day_is_refused(home, app, bad):
+    write_cfg(home, BASE)
+    c = _running(app)
+    # the chat refuses it too (it shows the usage, and saves nothing)
+    if isinstance(bad, str) and bad and bad.lower() not in ("on", "off"):
+        c.post("/api/command", {"text": f"expiry alert {bad}"})
+        assert read_cfg(home) == BASE
+    r = c.post("/api/v2/settings/alerts", {"expiry_alert_et": bad})
+    assert r["ok"] is False and "09:30 to 15:59" in r["error"], bad
+    assert read_cfg(home) == BASE
+
+
+def test_the_alert_time_saves_with_the_alert_targets_or_alone(home, app):
+    write_cfg(home, BASE)
+    c = app()
+    r = c.post("/api/v2/settings/alerts", {"ntfy": "my-topic-name", "expiry_alert_et": "15:30"})
+    assert r["ok"] is True
+    assert read_cfg(home) == {**BASE, "ntfy_topic": "my-topic-name", "expiry_alert_et": "15:30"}
+
+
+def test_the_v2_robinhood_sign_in_is_the_classic_start(home, app, rh):  # noqa: F811
+    """POST /api/v2/broker/robinhood (built in PR 3) hands back the address
+    GET /api/rh/start gives, from the same sign-in code."""
+    write_cfg(home, BASE)
+    c = app()
+    classic = c.get("/api/rh/start")["url"]
+    assert c.confirmed("/api/v2/broker/robinhood", {})["url"] == classic
+    assert rh.started == [True, True]
 
 
 # ── the two-step rules, for every money or irreversible write built here ──

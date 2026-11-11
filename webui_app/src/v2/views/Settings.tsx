@@ -10,7 +10,7 @@ import type { AiModels, AiProviders, BrokerForm, Dashboard, Preview, Secret, Set
 import { FieldError, ReviewDialog, SettingsDoubt, Switch, askPreview } from "../Forms";
 import { brokerLabel } from "../lib/derive";
 import { API, getJson, send } from "../lib/http";
-import { CLASSIC, RH_OPTIONS_URL, SETUP_FROM_V2, agreementWords, brokerName, setupUnfinished, signInOutcome } from "../lib/settings";
+import { CLASSIC, RH_OPTIONS_URL, SETUP_FROM_V2, agreementWords, brokerName, brokerWarning, etClockWords, expiryAlertPayload, setupUnfinished, signInOutcome } from "../lib/settings";
 import { badgeFor, updateLine } from "../lib/update";
 import { UPDATE } from "../lib/copy";
 import { UNKNOWN, etDayKey, etTime, etWhen, usd } from "../lib/format";
@@ -368,6 +368,10 @@ function AlertsDialog({ page, onClose }: { page: Page; onClose: () => void }) {
   const v = page.settings.view as SettingsView;
   const [text, setText] = useState<Record<string, string>>({});
   const [drop, setDrop] = useState<Record<string, boolean>>({});
+  const savedAlert = v.expiry ? v.expiry.alert_et : undefined;
+  const [alertAt, setAlertAt] = useState(savedAlert ?? "15:50");
+  const [alertOff, setAlertOff] = useState(savedAlert === null);
+  const [alertErr, setAlertErr] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const id = useId();
@@ -378,14 +382,25 @@ function AlertsDialog({ page, onClose }: { page: Page; onClose: () => void }) {
       else if ((text[k] ?? "").trim()) payload[k] = text[k].trim();
     }
     if (payload.discord && !payload.discord.startsWith("https://")) return setErr("The Discord webhook is an address starting with https://.");
-    if (!Object.keys(payload).length) return setErr("Nothing to change: type a new value, or tick Remove.");
+    if (savedAlert !== undefined) {
+      const a = expiryAlertPayload(savedAlert, alertOff, alertAt);
+      if (!a.ok) return setAlertErr(a.error);
+      setAlertErr("");
+      if (a.value !== undefined) payload.expiry_alert_et = a.value;
+    }
+    if (!Object.keys(payload).length) return setErr("Nothing to change: type a new value, change the time, or tick Remove.");
     setErr("");
     setBusy(true);
     const r = await send(API.alerts, payload);
     setBusy(false);
     if (!r.ok) return setErr(r.error);
     const nv = await page.settings.reload();
-    page.say(true, nv ? `Saved. Alerts: ${ALERTS.filter(([k]) => nv.alerts[k].set).map(([, l]) => l).join(", ") || "none"}.` : "Saved. This page could not read your settings back yet.");
+    page.say(
+      true,
+      nv
+        ? `Saved. Alerts: ${ALERTS.filter(([k]) => nv.alerts[k].set).map(([, l]) => l).join(", ") || "none"}.${nv.expiry ? ` Expiry-day warning: ${etClockWords(nv.expiry.alert_et)}.` : ""}`
+        : "Saved. This page could not read your settings back yet.",
+    );
     onClose();
   };
   return (
@@ -427,6 +442,32 @@ function AlertsDialog({ page, onClose }: { page: Page; onClose: () => void }) {
           )}
         </div>
       ))}
+      {savedAlert !== undefined && (
+        <div className="field">
+          <label htmlFor={`${id}-x`}>Expiry-day warning (Eastern time)</label>
+          <input
+            id={`${id}-x`}
+            className="input"
+            inputMode="numeric"
+            autoComplete="off"
+            placeholder="15:50"
+            disabled={alertOff}
+            value={alertAt}
+            aria-invalid={!!alertErr || undefined}
+            aria-describedby={alertErr ? `${id}-xe` : undefined}
+            onChange={(e) => (setAlertAt(e.target.value), setAlertErr(""))}
+          />
+          <span className="help">
+            One urgent message on the day a position expires, before the expiry sell, so you can act yourself. From 09:30 to 15:59. Saved now:{" "}
+            {etClockWords(savedAlert)}.
+          </span>
+          <label className="check">
+            <input type="checkbox" checked={alertOff} onChange={(e) => (setAlertOff(e.target.checked), setAlertErr(""))} />
+            <span>No expiry-day warning</span>
+          </label>
+          <FieldError id={`${id}-xe`} text={alertErr} />
+        </div>
+      )}
       <FieldError id={`${id}-e`} text={err} />
     </Dialog>
   );
@@ -601,6 +642,15 @@ export function SettingsView({ page }: { page: Page }) {
                 {b.last_answer ? `Answered at ${etTime(b.last_answer)}. ` : ""}
                 {b.buying_power != null ? `Cash available ${usd(b.buying_power)}. ` : ""}
                 {b.paper_account ? "This is the broker's paper-trading account." : ""}
+                {brokerWarning(v) && (
+                  <span className="warnline">
+                    <Icon name="alert" small />
+                    {brokerWarning(v)}{" "}
+                    <a href={RH_OPTIONS_URL} target="_blank" rel="noopener noreferrer">
+                      Apply for options at Robinhood
+                    </a>
+                  </span>
+                )}
               </>
             )
           }
@@ -632,9 +682,10 @@ export function SettingsView({ page }: { page: Page }) {
           exp={
             !v
               ? UNKNOWN
-              : ALERTS.some(([k]) => v.alerts[k].set)
-                ? `Set: ${ALERTS.filter(([k]) => v.alerts[k].set).map(([, l]) => l).join(", ")}.`
-                : "None set. The agent tells you things only on this dashboard."
+              : (ALERTS.some(([k]) => v.alerts[k].set)
+                  ? `Set: ${ALERTS.filter(([k]) => v.alerts[k].set).map(([, l]) => l).join(", ")}.`
+                  : "None set. The agent tells you things only on this dashboard.") +
+                (v.expiry ? ` Expiry-day warning: ${etClockWords(v.expiry.alert_et)}.` : "")
           }
           act={
             <button className="btn btn-sm" data-act="alerts" aria-haspopup="dialog" disabled={!!why} title={why || undefined} onClick={() => setOpen("alerts")}>

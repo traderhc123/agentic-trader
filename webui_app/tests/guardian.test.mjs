@@ -58,7 +58,11 @@ import {
   CLASSIC,
   DEPLOY_REGIONS,
   agreementWords,
+  brokerWarning,
   diffSha256,
+  etClockWords,
+  expiryAlertPayload,
+  readEtTime,
   tipLapsed,
   ackGiven,
   SETUP_FROM_V2,
@@ -1392,4 +1396,37 @@ test("code changes: a pending change is one note on Today, linking to Settings",
     } else if (!s.proposal?.pending) assert.equal(ns.length, 0, name);
   }
   assert.ok(states.some(([n]) => n === "proposal-pending"), "no fixture with a pending change");
+});
+
+// ── PR 4 group 6: Settings → Connections ───────────────────────────────────
+
+test("connections: the expiry-day warning time, and Robinhood's options warning on the broker row", () => {
+  // the chat's "expiry alert" rules: 09:30-15:59 Eastern, or off
+  assert.deepEqual(readEtTime("15:40"), { ok: true, value: "15:40" });
+  assert.deepEqual(readEtTime(" 9:45 "), { ok: true, value: "09:45" });
+  assert.deepEqual(readEtTime("15:59"), { ok: true, value: "15:59" });
+  for (const bad of ["16:00", "09:00", "9:29", "25:00", "3pm", "", "15:4", "on"]) {
+    const r = readEtTime(bad);
+    assert.equal(r.ok, false, bad);
+    assert.match(r.error, /09:30 to 15:59/);
+  }
+  // only what changed is sent; off is "off"
+  assert.deepEqual(expiryAlertPayload("15:50", false, "15:50"), { ok: true, value: undefined });
+  assert.deepEqual(expiryAlertPayload("15:50", false, "15:40"), { ok: true, value: "15:40" });
+  assert.deepEqual(expiryAlertPayload("15:50", true, "x"), { ok: true, value: "off" });
+  assert.deepEqual(expiryAlertPayload(null, true, "15:50"), { ok: true, value: undefined });
+  assert.deepEqual(expiryAlertPayload(null, false, "15:50"), { ok: true, value: "15:50" });
+  assert.equal(expiryAlertPayload("15:50", false, "16:30").ok, false);
+  assert.equal(etClockWords("15:50"), "3:50 PM ET");
+  assert.equal(etClockWords("09:45"), "9:45 AM ET");
+  assert.equal(etClockWords(null), "Off");
+  clean(etClockWords("junk"), "clock");
+  const src = fs.readFileSync(path.join(SRC, "v2", "views", "Settings.tsx"), "utf8");
+  assert.match(src, /payload\.expiry_alert_et = a\.value/);
+  assert.match(src, /send\(API\.alerts, payload\)/);
+  // the classic warning, as a code: words here, the link to Robinhood's form
+  assert.match(brokerWarning({ broker: { warning: "options_off" } }), /Options trading is not turned on/);
+  assert.equal(brokerWarning({ broker: { warning: null } }), "");
+  assert.equal(brokerWarning(null), "");
+  assert.match(src, /\{brokerWarning\(v\)\}\{" "\}\s*<a href=\{RH_OPTIONS_URL\}/);
 });
