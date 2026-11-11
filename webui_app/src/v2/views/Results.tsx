@@ -1,29 +1,105 @@
 // Results: real money and practice are two books that never share a number.
-import { Suspense, lazy, useMemo, useState } from "react";
+// The chart comes first: each book's running total over 7 days, 30 days or
+// all time (lib/chart.ts), then the books' panels, the by-day table and the
+// cost ledger.
+import { useMemo, useState } from "react";
 import type { Book, Status } from "../../lib/viewModel";
+import { type ChartModel, type Range, RANGES, chartModel, isRange } from "../lib/chart";
 import { PAPER_BOOK_CAPTION, bookToday, bookTodayNote, realBookCaption } from "../lib/derive";
 import { dayLong, etDayKey, plural, signed, tone } from "../lib/format";
 import { Stamp, Tag } from "../ui";
 import type { Page } from "../App";
 import { SignalCostLine } from "./Today";
-import type { ChartModel, DayPoint } from "./ResultsChart";
+import ResultsChart from "./ResultsChart";
 
-const ResultsChart = lazy(() => import("./ResultsChart"));
+interface DayRow {
+  day: string;
+  real: { pnl: number; closed: number } | null;
+  practice: { pnl: number; closed: number } | null;
+}
 
-/** Both books on one calendar: every day either book closed a trade, oldest
- *  first, each with that day's result and the running total. */
-export function chartModel(s: Status): ChartModel {
-  const B = { real: s.results.real.days, practice: s.results.practice.days };
-  const days = [...new Set([...B.real, ...B.practice].map((d) => d.day))].sort();
-  const run = (k: "real" | "practice"): DayPoint[] => {
-    let cum: number | null = null;
-    return days.map((day) => {
-      const x = B[k].find((y) => y.day === day);
-      if (x) cum = (cum ?? 0) + x.pnl;
-      return { day, pnl: x ? x.pnl : null, closed: x ? x.closed : 0, cum: cum == null ? null : Math.round(cum * 100) / 100 };
-    });
+/** Every day either book closed a trade, newest first, each book's result
+ *  in its own column. */
+export function dayRows(s: Status): DayRow[] {
+  const by = (B: Book) => new Map(B.days.map((d) => [d.day, d]));
+  const R = by(s.results.real);
+  const P = by(s.results.practice);
+  return [...new Set([...R.keys(), ...P.keys()])]
+    .sort()
+    .reverse()
+    .map((day) => ({ day, real: R.get(day) ?? null, practice: P.get(day) ?? null }));
+}
+
+const RANGE_KEY = "at-results-range";
+function useRange(): [Range, (r: Range) => void] {
+  const [range, set] = useState<Range>(() => {
+    try {
+      const v = localStorage.getItem(RANGE_KEY);
+      return isRange(v) ? v : "all";
+    } catch {
+      return "all";
+    }
+  });
+  const pick = (r: Range) => {
+    set(r);
+    try {
+      localStorage.setItem(RANGE_KEY, r);
+    } catch {
+      /* private mode: the choice lasts for this visit */
+    }
   };
-  return { days, real: run("real"), practice: run("practice") };
+  return [range, pick];
+}
+
+function ChartPanel({ page, C, range, setRange }: { page: Page; C: ChartModel; range: Range; setRange: (r: Range) => void }) {
+  const s = page.s;
+  const today = etDayKey(s.as_of);
+  const unmeasured = s.results.real.unmeasured + s.results.practice.unmeasured;
+  const first = C.days[0];
+  const last = C.days[C.days.length - 1];
+  const period = `${dayLong(first)} to ${last === today ? "today" : dayLong(last)}`;
+  const end = (k: "real" | "practice", words: string) =>
+    C.end[k] == null ? `${words}: no closed trades.` : `${words}, ${signed(C.end[k])}.`;
+  const label = C.empty
+    ? "Chart of the running total of closed trades: empty, there are no closed trades yet."
+    : `Line chart of the running total of closed trades by market day, ${period}. ${end("real", "Real money, solid line")} ${end("practice", "Practice, dashed line")} Use the left and right arrow keys to read each day; the table of results by day has the same numbers.`;
+  const emptyText = !C.empty
+    ? undefined
+    : unmeasured > 0
+      ? "Nothing to plot yet: no sale so far could be measured."
+      : "No closed trades yet. Results appear here after the first sale.";
+  const undated = (["real", "practice"] as const).filter((k) => C.undated[k] !== 0);
+  return (
+    <section className={`panel ${page.stale ? "stale" : ""}`}>
+      <div className="ph">
+        <h2>Running total of closed trades</h2>
+        {!C.empty && (
+          <div className="chips" role="group" aria-label="Period">
+            {RANGES.map(([r, words]) => (
+              <button key={r} className="chip" aria-pressed={r === range} onClick={() => setRange(r)}>
+                {words}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      <div className="pb stale-c">
+        {!C.empty && (
+          <p className="chart-cap">
+            {period}, market days (ET). Each point is the total from the first day shown to that day.
+            {C.quiet ? ` Nothing closed in ${range === "7d" ? "these 7 days" : "these 30 days"}.` : ""}
+          </p>
+        )}
+        <ResultsChart model={C} label={label} emptyText={emptyText} />
+        {undated.map((k) => (
+          <p key={k} className="chart-cap">
+            Not on the chart: <b className={tone(C.undated[k])}>{signed(C.undated[k])}</b> of {k === "real" ? "real-money" : "practice"} results
+            from sales whose date could not be read. The All time total includes them.
+          </p>
+        ))}
+      </div>
+    </section>
+  );
 }
 
 function BookPanel({ k, B, cap, page }: { k: "real" | "practice" | "paper"; B: Book; cap: string; page: Page }) {
@@ -74,10 +150,12 @@ export function ResultsView({ page }: { page: Page }) {
   const A = s.results.paper_account;
   const hasPaper = A.closed > 0 || A.unmeasured > 0;
   const [allDays, setAllDays] = useState(false);
-  // rebuild only when the numbers change, not on every poll
-  const key = JSON.stringify([R.days, P.days]);
-  const C = useMemo(() => chartModel(s), [key]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [range, setRange] = useRange();
   const today = etDayKey(s.as_of);
+  // rebuild only when the numbers change, not on every poll
+  const key = JSON.stringify([R.days, P.days, R.total, P.total, range, today]);
+  const C = useMemo(() => chartModel(s, range, today), [key]); // eslint-disable-line react-hooks/exhaustive-deps
+  const days = useMemo(() => dayRows(s), [key]); // eslint-disable-line react-hooks/exhaustive-deps
   const head = (
     <div className="view-h">
       <div>
@@ -90,143 +168,120 @@ export function ResultsView({ page }: { page: Page }) {
       {page.stale && <Stamp at={page.asOf} />}
     </div>
   );
-  if (!C.days.length && !R.unmeasured && !P.unmeasured && !hasPaper)
+  const chart = <ChartPanel page={page} C={C} range={range} setRange={setRange} />;
+  // nothing closed in any book yet: the chart's own sentence says so
+  if (!days.length && !R.unmeasured && !P.unmeasured && !hasPaper)
     return (
       <div className="view">
         {head}
-        <div className="empty">
-          <h3>No closed trades yet</h3>
-          <p>
-            Results appear after the first trade is bought and then sold. Practice results and real-money results are always shown separately
-            and never added together.
-          </p>
-        </div>
+        {chart}
       </div>
     );
-  const days = [...C.days].reverse();
   const showN = allDays ? days.length : Math.min(days.length, 10);
-  const cell = (p: DayPoint) =>
-    p.pnl == null ? (
+  const cell = (x: DayRow["real"]) =>
+    x == null ? (
       <td className="r muted">none</td>
     ) : (
-      <td className={`r ${tone(p.pnl)}`}>
-        <b>{signed(p.pnl)}</b>
-        <small>{plural(p.closed, "trade")}</small>
+      <td className={`r ${tone(x.pnl)}`}>
+        <b>{signed(x.pnl)}</b>
+        <small>{plural(x.closed, "trade")}</small>
       </td>
     );
   const c = s.results.signal_cost;
   const net = c.applies && c.usd_paid != null ? R.total - c.usd_paid : null;
-  const label = `Line chart of the running total of closed trades by day. Real money, solid line, ends at ${signed(R.total)}. Practice, dashed line, ends at ${signed(P.total)}. Use the left and right arrow keys to read each day; the same numbers are in the table below.`;
   return (
     <div className="view">
       {head}
+      {chart}
       <div className="books">
         <BookPanel k="real" B={R} cap={realBookCaption(s)} page={page} />
         <BookPanel k="practice" B={P} cap="Pretend trades. Never counted as money." page={page} />
         {hasPaper && <BookPanel k="paper" B={A} cap={PAPER_BOOK_CAPTION} page={page} />}
       </div>
-      <section className={`panel ${page.stale ? "stale" : ""}`}>
-        <div className="ph">
-          <h2>Running total of closed trades</h2>
-          <span className="legend">
-            <span>
-              <i className="key key-real" />
-              Real money {signed(R.total, 0)}
-            </span>
-            <span>
-              <i className="key key-practice" />
-              Practice {signed(P.total, 0)}
-            </span>
-          </span>
-        </div>
-        {C.days.length > 0 && (
-          <div className="pb stale-c">
-            <Suspense fallback={<div className="chart-wrap chart-loading muted small">Drawing the chart…</div>}>
-              <ResultsChart model={C} label={label} />
-            </Suspense>
-          </div>
-        )}
-        <div className="tbl-wrap stale-c">
-          <table className="tbl tbl-days">
-            <caption className="sr">Result by day, real money and practice in separate columns</caption>
-            <thead>
-              <tr>
-                <th scope="col">Day</th>
-                <th scope="col" className="r">
-                  Real money
-                </th>
-                <th scope="col" className="r">
-                  Practice
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {days.slice(0, showN).map((d) => {
-                const i = C.days.indexOf(d);
-                return (
-                  <tr key={d}>
-                    <th scope="row">
-                      {d === today ? "Today, " : ""}
-                      {dayLong(d)}
-                    </th>
-                    {cell(C.real[i])}
-                    {cell(C.practice[i])}
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-        {days.length > showN && (
-          <div className="pfoot">
-            <button className="btn btn-sm" onClick={() => setAllDays(true)}>
-              Show all {days.length} days
-            </button>
-          </div>
-        )}
-      </section>
+      {days.length > 0 && (
         <section className={`panel ${page.stale ? "stale" : ""}`}>
           <div className="ph">
-            <h2>What it has cost you</h2>
-            <Tag kind="real" />
+            <h2>Result by day</h2>
           </div>
-          <div className="pb stale-c">
-            <ul className="money">
+          <div className="tbl-wrap stale-c">
+            <table className="tbl tbl-days">
+              <caption className="sr">Result by day, real money and practice in separate columns</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Day</th>
+                  <th scope="col" className="r">
+                    Real money
+                  </th>
+                  <th scope="col" className="r">
+                    Practice
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {days.slice(0, showN).map((d) => (
+                  <tr key={d.day}>
+                    <th scope="row">
+                      {d.day === today ? "Today, " : ""}
+                      {dayLong(d.day)}
+                    </th>
+                    {cell(d.real)}
+                    {cell(d.practice)}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {days.length > showN && (
+            <div className="pfoot">
+              <button className="btn btn-sm" onClick={() => setAllDays(true)}>
+                Show all {days.length} days
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+      <section className={`panel ${page.stale ? "stale" : ""}`}>
+        <div className="ph">
+          <h2>What it has cost you</h2>
+          <Tag kind="real" />
+        </div>
+        <div className="pb stale-c">
+          <ul className="money">
+            <li>
+              <span>
+                Real-money trades
+                <small>{plural(R.closed, "closed trade")}, all time</small>
+              </span>
+              <b className={tone(R.total)}>{signed(R.total)}</b>
+            </li>
+            {c.applies ? (
+              <SignalCostLine s={s} />
+            ) : (
               <li>
                 <span>
-                  Real-money trades
-                  <small>{plural(R.closed, "closed trade")}, all time</small>
+                  Signals
+                  <small>This signal source has no per-day charge.</small>
                 </span>
-                <b className={tone(R.total)}>{signed(R.total)}</b>
+                <b className="soft">none</b>
               </li>
-              {c.applies ? (
-                <SignalCostLine s={s} />
-              ) : (
-                <li>
-                  <span>
-                    Signals
-                    <small>This signal source has no per-day charge.</small>
-                  </span>
-                  <b className="soft">none</b>
-                </li>
-              )}
-              {net != null && (
-                <li className="total">
-                  <span>
-                    <strong>After signal cost</strong>
-                  </span>
-                  <b className={tone(net)}>{signed(net)}</b>
-                </li>
-              )}
-            </ul>
-            <p className="small muted" style={{ marginTop: 8 }}>
-              {c.applies && c.usd_paid == null
-                ? "The dollars paid for signal days are not tracked yet, so there is no after-cost total here. "
-                : ""}
-              Broker fees are not included; {s.broker.name || "your broker"} reports those.
-            </p>
-          </div>
-        </section>
+            )}
+            {net != null && (
+              <li className="total">
+                <span>
+                  <strong>After signal cost</strong>
+                </span>
+                <b className={tone(net)}>{signed(net)}</b>
+              </li>
+            )}
+          </ul>
+          <p className="small muted" style={{ marginTop: 8 }}>
+            {c.applies && c.usd_paid == null
+              ? "The dollars paid for signal days are not tracked yet, so there is no after-cost total here. "
+              : ""}
+            Broker fees are not included; {s.broker.name || "your broker"} reports those.
+          </p>
+        </div>
+      </section>
     </div>
   );
 }

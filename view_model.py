@@ -125,6 +125,35 @@ _ROW_CODES = ("past_expiry_guard", "exit_already_arrived",
 REASON_CODES = tuple(dict.fromkeys(tuple(_KIND_CODES.values()) + _ROW_CODES
                                    + ("unknown",)))
 
+# Every owner-facing condition, by one stable code: the screen states each
+# once (Status.conditions), whether the view-model sees it in the facts or
+# only the agent's own message (a Notice) says it. The UI matches the agent's
+# messages to its own notes by these codes, never by their text.
+CONDITIONS = (
+    # the agent itself
+    "agent_stopped", "agent_not_answering", "state_hold", "handoff_hold",
+    "restarting", "paused", "settings_unreadable", "ai_needed",
+    # money and orders
+    "broker_down", "positions_unmanaged", "low_cash",
+    "daily_cap_reached", "daily_loss_reached", "position_cap_reached",
+    # signals
+    "signal_pass", "feed_unreachable",
+    # only the agent's own messages say these
+    "records_unwritten", "backup_failing", "second_copy",
+    "position_expired", "position_expiring_unsold", "position_expiring")
+# the level a condition has when no agent message about it says more
+_CONDITION_LEVEL = {
+    "agent_stopped": "urgent", "agent_not_answering": "urgent",
+    "state_hold": "urgent", "handoff_hold": "warn", "restarting": "info",
+    "paused": "info", "settings_unreadable": "warn", "ai_needed": "warn",
+    "broker_down": "urgent", "positions_unmanaged": "urgent",
+    "low_cash": "warn", "daily_cap_reached": "info",
+    "daily_loss_reached": "warn", "position_cap_reached": "info",
+    "signal_pass": "warn", "feed_unreachable": "warn"}
+# the condition of an agent message that names none, by its code
+_NOTICE_CODE_CONDITION = {"pass": "signal_pass", "low_cash": "low_cash",
+                          "second_copy": "second_copy"}
+
 
 def check_ids():
     """The entry checks, in the order the agent runs them."""
@@ -134,7 +163,8 @@ def check_ids():
 
 def aliases():
     """Named unions (declared in the TypeScript as const arrays)."""
-    return {"CheckId": Enum(*check_ids()), "ReasonCode": Enum(*REASON_CODES)}
+    return {"CheckId": Enum(*check_ids()), "ReasonCode": Enum(*REASON_CODES),
+            "Condition": Enum(*CONDITIONS)}
 
 
 def _types():
@@ -163,6 +193,7 @@ def _types():
             "activity": Ref("ActivityPage"),
             "results": Ref("Results"),
             "notices": List(Ref("Notice")),
+            "conditions": List(Ref("ConditionNote")),
         },
         "Agent": {
             "running": "bool",
@@ -342,6 +373,11 @@ def _types():
             "code": "str",
             "text": "str",
         },
+        "ConditionNote": {
+            "code": Ref("Condition"),
+            "level": Enum("info", "warn", "urgent"),
+            "notices": List("int"),
+        },
     }
 
 
@@ -433,6 +469,15 @@ _DOC = {
     "SignalCost.days_estimated": "days from before that was recorded",
     "SignalCost.sats_paid": "null: the total paid is not recorded yet",
     "SignalCost.usd_paid": "null: the total paid is not recorded yet",
+    "Status.conditions": "every owner-facing condition true now, each once, "
+                         "most urgent first: one note per code on a screen",
+    "ConditionNote.level": "the most urgent of the condition's own level and "
+                           "its agent messages'",
+    "ConditionNote.notices": "indexes into `notices` of the agent's own "
+                             "messages about this condition (say it once: "
+                             "with the dashboard's note, or alone when it "
+                             "has none); a notice no condition lists is "
+                             "about something else",
 }
 
 _TYPES = {}
@@ -576,6 +621,12 @@ def typescript():
     out += [f'  "{c}",' for c in REASON_CODES]
     out += ["] as const;",
             "export type ReasonCode = (typeof REASON_CODES)[number];",
+            "",
+            "/** Every owner-facing condition code (Status.conditions). */",
+            "export const CONDITIONS = ["]
+    out += [f'  "{c}",' for c in CONDITIONS]
+    out += ["] as const;",
+            "export type Condition = (typeof CONDITIONS)[number];",
             ""]
     for name, fields in types().items():
         out.append(f"export interface {name} {{")
@@ -1511,8 +1562,11 @@ def _pass_notice(cfg, state, signals=None):
     return {"level": "warn", "code": "pass", "text": text}
 
 
-def _notices(rt, cfg=None, state=None, signals=None):
+def _notices(rt, cfg=None, state=None, signals=None, conds=None):
+    """The agent's own messages. `conds`: a list that gets, for each one,
+    the condition it is about (None: not a known one)."""
     out = []
+    conds = [] if conds is None else conds
     raw = rt.get("notices")
     for n in (raw if isinstance(raw, (list, tuple)) else ())[:50]:
         if not isinstance(n, dict) or not _text(n.get("text")):
@@ -1521,9 +1575,89 @@ def _notices(rt, cfg=None, state=None, signals=None):
             else "info"
         out.append({"level": level, "code": _text(n.get("code"), 40) or "note",
                     "text": _text(n.get("text"))})
+        conds.append(_notice_condition(n))
     note = _pass_notice(cfg or {}, state or {}, signals)
     if note and not any(n["text"] == note["text"] for n in out):
         out.append(note)
+        conds.append("signal_pass")
+    elif note:  # the same message, handed over by the agent as well
+        for i, n in enumerate(out):
+            if n["text"] == note["text"]:
+                conds[i] = "signal_pass"
+    return out
+
+
+def _notice_condition(n):
+    """The condition an agent message is about: the one it names, else the
+    one its code stands for; None when it is about none of them."""
+    c = n.get("condition")
+    if isinstance(c, str) and c in CONDITIONS:
+        return c
+    code = n.get("code")
+    return _NOTICE_CODE_CONDITION.get(code) if isinstance(code, str) else None
+
+
+_LEVEL_RANK = {"info": 0, "warn": 1, "urgent": 2}
+
+
+def _conditions(facts, notices, conds):
+    """Status.conditions: the conditions the facts show (`facts`, codes in
+    CONDITIONS order of importance) and those only an agent message says,
+    each once, with the agent messages about it."""
+    found = {}
+    for code in facts:
+        found.setdefault(code, {"code": code, "level": _CONDITION_LEVEL.get(
+            code, "warn"), "notices": []})
+    for i, code in enumerate(conds):
+        if code is None:
+            continue
+        c = found.setdefault(code, {"code": code, "level": notices[i]["level"],
+                                    "notices": []})
+        c["notices"].append(i)
+        if _LEVEL_RANK[notices[i]["level"]] > _LEVEL_RANK[c["level"]]:
+            c["level"] = notices[i]["level"]
+    order = {c: k for k, c in enumerate(CONDITIONS)}
+    return sorted(found.values(), key=lambda c: (-_LEVEL_RANK[c["level"]],
+                                                 order[c["code"]]))
+
+
+def _fact_conditions(s, ai_blocked):
+    """The conditions a built Status shows by itself."""
+    out = []
+    a, pause, b, lim = s["agent"], s["pause"], s["broker"], s["limits"]
+    if not a["running"]:
+        out.append("agent_stopped")
+    elif not a["answering"]:
+        out.append("agent_not_answering")
+    if pause["kind"] in ("state_hold", "handoff_hold", "restarting"):
+        out.append(pause["kind"])
+    elif pause["kind"] == "entries":
+        out.append("paused")
+    if not a["settings_readable"]:
+        out.append("settings_unreadable")
+    if ai_blocked:
+        out.append("ai_needed")
+    if b["connected"] is False:
+        out.append("broker_down")
+    if s["real_positions"] and not s["real_positions_managed"]:
+        out.append("positions_unmanaged")
+    if (lim["cash"]["low"] and b["buying_power"] is not None
+            and b["connected"] is not False):
+        out.append("low_cash")
+    if lim["cap_reached"]:
+        out.append("daily_cap_reached")
+    if lim["loss_limit_reached"]:
+        out.append("daily_loss_reached")
+    if lim["positions_reached"]:
+        out.append("position_cap_reached")
+    sig, p = s["signals"], s["signals"]["pass"]
+    # a last read that saw entry signals had a pass, whatever the prepaid
+    # one says (the dashboard's own "no signal pass" note, derive.ts)
+    if (p["status"] in ("exits_only", "none", "waiting", "unknown")
+            and sig["entry_access"] is not True and p["kind"] != "not_needed"):
+        out.append("signal_pass")
+    if sig["reading"] and sig["last_poll_ok"] is False:
+        out.append("feed_unreachable")
     return out
 
 
@@ -1638,7 +1772,9 @@ def build_status(cfg, state, rows, runtime=None, now=None,
                  and p["next"]["action"] in ("unmanaged", "unknown")]
     why = unmanaged[0]["next"]["reason_code"] if unmanaged else None
     limits = _limits(cfg, state, rows, mode, broker["buying_power"], now)
-    return {
+    conds = []
+    notices = _notices(rt, cfg, state, signals, conds)
+    status = {
         "schema": SCHEMA_VERSION,
         "as_of": _iso(now),
         "agent": {
@@ -1666,8 +1802,11 @@ def build_status(cfg, state, rows, runtime=None, now=None,
         "activity": activity_page(rows, limit=activity_limit, _checked=True),
         "results": {**_results(rows, now),
                     "signal_cost": _signal_cost(cfg, state, rows, now)},
-        "notices": _notices(rt, cfg, state, signals),
+        "notices": notices,
     }
+    status["conditions"] = _conditions(
+        _fact_conditions(status, c["ai_blocked"]), notices, conds)
+    return status
 
 
 if __name__ == "__main__":

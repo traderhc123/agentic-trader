@@ -1,6 +1,7 @@
 // Small building blocks of the /v2 dashboard: icons, money tags, the "as of"
 // stamp, and the one modal behaviour dialogs and the drawer share.
 import { useEffect, useRef, type ReactNode, type RefObject } from "react";
+import { createPortal } from "react-dom";
 import { TAG_WORDS, type TagKind } from "./lib/copy";
 import { etTime } from "./lib/format";
 import type { Iso } from "../lib/viewModel";
@@ -40,6 +41,9 @@ const PATHS = {
   more: ["M5 12h.1M12 12h.1M19 12h.1"],
   plug: ["M9 3v5M15 3v5M6 8h12v3a6 6 0 01-12 0V8zM12 17v4"],
   back: ["M15 6l-6 6 6 6"],
+  up: ["M12 19V5M6 11l6-6 6 6"],
+  down: ["M12 5v14M6 13l6 6 6-6"],
+  ext: ["M14 4h6v6M20 4l-9 9", "M18 14v5a1 1 0 01-1 1H5a1 1 0 01-1-1V7a1 1 0 011-1h5"],
 } as const;
 export type IconId = keyof typeof PATHS;
 
@@ -148,7 +152,7 @@ export function useModal(open: boolean, box: RefObject<HTMLElement>, onClose: ()
   }, [open, box]);
 }
 
-/** A confirm dialog in the design's shape: strip (orange for LIVE, hatched
+/** A confirm dialog in the design's shape: strip (blue for LIVE, hatched
  *  for practice), title, lead, body, then the safe button first in focus. */
 export function Dialog({
   tone,
@@ -167,7 +171,9 @@ export function Dialog({
 }) {
   const box = useRef<HTMLDivElement>(null);
   useModal(true, box, onClose);
-  return (
+  // outside #shell, which is inert while a dialog is open, wherever the
+  // dialog is opened from (the settings forms open theirs inside a page)
+  return createPortal(
     <div
       className="scrim open"
       onMouseDown={(e) => {
@@ -190,7 +196,8 @@ export function Dialog({
         <div className="dialog-body">{children}</div>
         <div className="dialog-foot">{foot}</div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

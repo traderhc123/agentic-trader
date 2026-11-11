@@ -68,6 +68,33 @@ export const REASON_CODES = [
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 
+/** Every owner-facing condition code (Status.conditions). */
+export const CONDITIONS = [
+  "agent_stopped",
+  "agent_not_answering",
+  "state_hold",
+  "handoff_hold",
+  "restarting",
+  "paused",
+  "settings_unreadable",
+  "ai_needed",
+  "broker_down",
+  "positions_unmanaged",
+  "low_cash",
+  "daily_cap_reached",
+  "daily_loss_reached",
+  "position_cap_reached",
+  "signal_pass",
+  "feed_unreachable",
+  "records_unwritten",
+  "backup_failing",
+  "second_copy",
+  "position_expired",
+  "position_expiring_unsold",
+  "position_expiring",
+] as const;
+export type Condition = (typeof CONDITIONS)[number];
+
 export interface Status {
   schema: 2;
   /** server time of this snapshot */
@@ -96,6 +123,8 @@ export interface Status {
   activity: ActivityPage;
   results: Results;
   notices: Notice[];
+  /** every owner-facing condition true now, each once, most urgent first: one note per code on a screen */
+  conditions: ConditionNote[];
 }
 
 export interface Agent {
@@ -367,4 +396,12 @@ export interface Notice {
   level: "info" | "warn" | "urgent";
   code: string;
   text: string;
+}
+
+export interface ConditionNote {
+  code: Condition;
+  /** the most urgent of the condition's own level and its agent messages' */
+  level: "info" | "warn" | "urgent";
+  /** indexes into `notices` of the agent's own messages about this condition (say it once: with the dashboard's note, or alone when it has none); a notice no condition lists is about something else */
+  notices: number[];
 }
