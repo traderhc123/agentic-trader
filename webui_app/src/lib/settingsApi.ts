@@ -89,6 +89,9 @@ export interface SettingsView {
     wallet_connected: boolean;
     api_key: Secret;
     pass_on_file: boolean;
+    /** signal-day purchases on file by id: paid, or an invoice that can still be paid
+     *  (an invoice that expired unpaid is in neither) */
+    purchases: Purchases;
   };
 }
 
@@ -125,8 +128,15 @@ export type Reply<Done = object> =
   | ({ ok: true; needs_confirm?: undefined; saved?: boolean; note?: string; settings?: SettingsView } & Done)
   | { ok: false; error: string; needs_acknowledge?: boolean; refresh_sizes?: boolean; unavailable?: boolean };
 
+export interface Purchases {
+  paid: string[];
+  waiting: string[];
+}
+
 /** POST /api/v2/pass/buy, confirmed: the Lightning invoice to pay. */
 export interface Invoice {
+  /** this purchase's id in SettingsView.signals.purchases */
+  purchase?: string;
   bolt11: string;
   amount_sats: number | null;
   amount_usd: number | null;

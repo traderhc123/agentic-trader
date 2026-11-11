@@ -363,7 +363,8 @@ def test_pass_buy_is_the_classic_handler_after_confirming(home, app, monkeypatch
                       scrub=lambda cfg: cfg["feed_pass_pending"].pop("bought_at"))
     assert bought == [5, 5] and replies[0]["bolt11"] == replies[1]["bolt11"]
     a = {k: v for k, v in replies[0].items()}
-    assert {k: v for k, v in replies[1].items()} == a
+    # /v2 also names the purchase, to follow it (test_a_v2_pass_purchase_...)
+    assert {k: v for k, v in replies[1].items() if k != "purchase"} == a
     assert out["source"] == "agenthc" and out["feed_pass_pending"]["token"] == "tok5"
     # the preview alone makes no invoice
     c.post("/api/v2/pass/buy", {"days": 20})
@@ -415,6 +416,49 @@ def test_a_change_made_while_the_invoice_is_made_stops_the_pass_buy(home, app, m
     r = c.post("/api/v2/pass/buy", {"days": 5, "confirm": first["preview"]["token"]})
     assert r == {"ok": False, "error": webui._REVIEW_AGAIN}
     assert read_cfg(home) == {**BASE, "budget_per_trade_usd": 5000.0}
+
+
+def test_a_v2_pass_purchase_is_followed_by_its_own_id(home, app, monkeypatch):
+    """/v2 says "Paid" only for the purchase it made: /api/pass/status says
+    'active' for any pass on file, so with an older pass still running an
+    invoice that expired unpaid looked paid."""
+    import time
+    from sources import agenthc_day_trade_ideas as hc
+    status = {"L402 OLD:paid": "active"}
+    monkeypatch.setattr(hc, "buy_pass", lambda days, extend_token=None: {
+        "payment_request": "lnbc20fakeinvoice", "amount_sats": 2000,
+        "amount_usd_approx": 20, "pass_token": "L402 NEW:paid",
+        "access_until": "2026-12-20"})
+    monkeypatch.setattr(hc, "pass_status", lambda tok: {
+        "status": status.get(tok, "invalid"), "days_left": 12,
+        "access_until": "2026-12-01"})
+    start = {**BASE, "feed_pass": {"token": "L402 OLD:paid", "days": 20}}
+    write_cfg(home, start)
+    c = app()
+    old_id, new_id = hc._token_id("L402 OLD:paid"), hc._token_id("L402 NEW:paid")
+    assert c.get("/api/v2/settings")["signals"]["purchases"] == {
+        "paid": [old_id], "waiting": []}
+    inv = c.confirmed("/api/v2/pass/buy", {"days": 20})
+    assert inv["purchase"] == new_id
+    assert "L402 NEW" not in json.dumps(c.get("/api/v2/settings"))
+    status["L402 NEW:paid"] = "pending"
+    assert c.get("/api/pass/status")["status"] == "pending"
+    assert c.get("/api/v2/settings")["signals"]["purchases"] == {
+        "paid": [old_id], "waiting": [new_id]}
+    # the invoice expires unpaid: the pass check still says "active" (the
+    # old pass), but this purchase is nowhere on file any more
+    cfg = read_cfg(home)
+    cfg["feed_pass_pending"]["bought_at"] = time.time() - 2 * 3600
+    write_cfg(home, cfg)
+    assert c.get("/api/pass/status")["status"] == "active"
+    p = c.get("/api/v2/settings")["signals"]["purchases"]
+    assert new_id not in p["paid"] and new_id not in p["waiting"]
+    # bought again and paid this time: on file as paid
+    write_cfg(home, start)
+    inv = c.confirmed("/api/v2/pass/buy", {"days": 20})
+    status["L402 NEW:paid"] = "active"
+    assert c.get("/api/pass/status")["status"] == "active"
+    assert inv["purchase"] in c.get("/api/v2/settings")["signals"]["purchases"]["paid"]
 
 
 def test_recurring_day_pass_is_the_classic_switch_after_confirming(home, app):

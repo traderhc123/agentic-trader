@@ -63,6 +63,7 @@ import {
   limitRange,
   limitsPayload,
   lossWords,
+  purchaseFate,
   readNumber,
   readTickers,
   riskOf,
@@ -913,6 +914,21 @@ test("settings: a limits save sends only what changed, and never the mode", () =
   assert.deepEqual(limitsPayload(saved, { other: null }), { trade_size: { other: { mode: "same" } } });
   for (const p of [limitsPayload(saved, { max_open_positions: 9 }), limitsPayload(saved, {})])
     for (const k of Object.keys(p)) assert.ok(!/dry|mode|paused/.test(k), k);
+});
+
+test("signal days: 'Paid' only for the purchase this dialog made", () => {
+  // an older pass is active: the pass check says "active", but this purchase is nowhere
+  assert.equal(purchaseFate("new", { paid: ["old"], waiting: [] }), "gone");
+  assert.equal(purchaseFate("new", { paid: ["old"], waiting: ["new"] }), "waiting");
+  assert.equal(purchaseFate("new", { paid: ["new"], waiting: [] }), "paid");
+  assert.equal(purchaseFate("new", { paid: ["old", "new"], waiting: [] }), "paid");
+  // the settings could not be read: not known, keep waiting
+  assert.equal(purchaseFate("new", null), "unknown");
+  assert.equal(purchaseFate("new", {}), "unknown");
+  // and the dialog never takes the pass check's "active" as this purchase paid
+  const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../src/v2/views/Signals.tsx"), "utf8");
+  assert.doesNotMatch(src, /if \(st === "active"\)/);
+  assert.match(src, /purchaseFate\(id, nv\?\.signals\.purchases\)/);
 });
 
 test("going LIVE: a tick given for one preview never confirms another", () => {

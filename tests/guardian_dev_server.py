@@ -128,11 +128,15 @@ def _settings(tab):
         "broker": {"id": cfg.get("broker"), "ready": True,
                    "account_mask": (cfg.get("robinhood_account") or "")[-4:] or None,
                    "paper": bool(cfg.get("alpaca_paper")) if cfg.get("broker") == "alpaca" else False,
-                   "fields": {}},
+                   "fields": {},
+                   "signin": {"seq": 0, "connected": None, "account_mask": None,
+                              "options_off": False, "error": None}},
         "signals": {"source": cfg.get("source"), "include_other_trades": False,
                     "recurring": bool(cfg.get("day_pass_recurring")),
                     "wallet_connected": bool(cfg.get("lnbits_url")),
-                    "api_key": {"set": False, "last4": None}, "pass_on_file": True},
+                    "api_key": {"set": False, "last4": None}, "pass_on_file": True,
+                    # the fixture's invoice is never paid: it stays waiting
+                    "purchases": {"paid": [], "waiting": ["fixture-purchase"]}},
     }
 
 
@@ -254,7 +258,8 @@ def _v2_post(tab, path, data):
                                            "paper": False if rh else paper},
                                    "direction": "neutral" if rh else ("lowers_risk" if paper else "neutral")}], _NOT)
         if rh:
-            return {"ok": True, "url": "https://robinhood.example/fixture-sign-in"}
+            return {"ok": True, "url": "https://robinhood.example/fixture-sign-in",
+                    "signin_seq": 0}
         cfg["broker"] = data.get("broker")
         cfg["alpaca_paper"] = bool((data.get("values") or {}).get("alpaca_paper"))
         return {"ok": True, "saved": True, "note": "connected (fixture)"}
@@ -266,7 +271,8 @@ def _v2_post(tab, path, data):
                             ["Nothing is paid yet: the next step shows a Lightning invoice "
                              "with its price, and nothing is paid until you pay it from your wallet."] + _NOT)
         qr = [[(x * y + x + y) % 3 == 0 for x in range(25)] for y in range(25)]
-        return {"ok": True, "bolt11": "lnbc" + "fixture" * 30, "amount_sats": 10200 * data["days"],
+        return {"ok": True, "bolt11": "lnbc" + "fixture" * 30, "purchase": "fixture-purchase",
+                "amount_sats": 10200 * data["days"],
                 "amount_usd": 10 * data["days"], "extends": False, "carried": 0,
                 "access_until": None, "qr": [[int(v) for v in r] for r in qr]}
     return None

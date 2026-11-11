@@ -4588,6 +4588,24 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         return {"key": key, "label": label, "saved_now": saved_now,
                 "new": new, "direction": direction}
 
+    def _pass_purchases():
+        """The signal-day purchases on file, by id (a hash of the pass
+        token, never the token): paid ones (the pass and paid spares) and
+        invoices that can still be paid. An unpaid invoice that expired is
+        in neither: the pass check drops it."""
+        from sources import agenthc_day_trade_ideas as hc
+        extra = cfg.get("feed_pass_extra")
+        extra = [e for e in extra if isinstance(e, dict)] if isinstance(extra, list) else []
+
+        def ids(entries):
+            return [hc._token_id(e["token"]) for e in entries
+                    if isinstance(e, dict) and isinstance(e.get("token"), str)
+                    and e["token"]]
+        return {"paid": ids([cfg.get("feed_pass")]
+                            + [e for e in extra if e.get("paid")]),
+                "waiting": ids([cfg.get("feed_pass_pending")]
+                               + [e for e in extra if not e.get("paid")])}
+
     def _settings_view():
         import keep_running
         import llm_client
@@ -4657,7 +4675,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                                  and cfg.get("lnbits_admin_key")),
                         "api_key": _secret(cfg.get("agenthc_api_key")),
                         "pass_on_file": bool(cfg.get("feed_pass")
-                                             or cfg.get("feed_pass_pending"))},
+                                             or cfg.get("feed_pass_pending")),
+                        "purchases": _pass_purchases()},
         }
 
     def v2_settings(_h):
@@ -5003,9 +5022,21 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         if wait:
             return wait
         try:
-            return _pass_buy_route(p, _save_if_unchanged(fp))
+            res = _pass_buy_route(p, _save_if_unchanged(fp))
         except _Changed:
             return {"ok": False, "error": _REVIEW_AGAIN}
+        if res.get("ok") and res.get("bolt11"):
+            # which purchase this invoice is (signals.purchases has its fate)
+            from sources import agenthc_day_trade_ideas as hc
+            extra = cfg.get("feed_pass_extra")
+            for e in [cfg.get("feed_pass_pending")] + (
+                    extra if isinstance(extra, list) else []):
+                if (isinstance(e, dict) and isinstance(e.get("token"), str)
+                        and isinstance(e.get("invoice"), dict)
+                        and e["invoice"].get("bolt11") == res["bolt11"]):
+                    res = {**res, "purchase": hc._token_id(e["token"])}
+                    break
+        return res
 
     @_v2
     def v2_recurring(data):

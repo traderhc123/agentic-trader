@@ -9,6 +9,7 @@ import type { Invoice, PassCheck, PassOptions, Preview, WalletBalance } from "..
 import type { Status } from "../../lib/viewModel";
 import { FieldError, ReviewDialog, askPreview } from "../Forms";
 import { API, getJson } from "../lib/http";
+import { purchaseFate } from "../lib/settings";
 import { UNKNOWN, count, etDayKey, etWhen, plural, usd } from "../lib/format";
 import { Dialog, Stamp } from "../ui";
 import type { Page } from "../App";
@@ -91,24 +92,32 @@ function BuyDays({ page, onClose }: { page: Page; onClose: () => void }) {
     else setErr(a.kind === "error" ? a.error : a.note);
   };
 
-  // the agent's own pass check, every 3 s while the invoice is open
-  const watch = (d: number) => {
+  // every 3 s while the invoice is open: the agent's own pass check (it
+  // files a paid invoice's pass), then where THIS purchase stands
+  const polling = useRef(false);
+  const watch = (d: number, id: string) => {
     clearInterval(timer.current);
     timer.current = setInterval(async () => {
-      const r = await getJson<PassCheck>(API.passStatus);
-      if (!r.ok) return setPayWords(`Waiting for your payment… (${r.error})`);
-      const st = r.body.status;
-      if (st === "active") {
-        clearInterval(timer.current);
-        const left = typeof r.body.days_left === "number" ? r.body.days_left : null;
-        setStep({ kind: "paid", days: d, left });
-        page.refresh();
-        page.settings.reload();
-      } else if (st === "unpaid") {
-        clearInterval(timer.current);
-        setPayWords("That payment code expired unpaid. Nothing was paid. Close this and buy again to get a new one.");
-      } else if (st === "error" && r.body.error) setPayWords(`Waiting for your payment… The last check said: ${r.body.error}`);
-      else setPayWords("Waiting for your payment…");
+      if (polling.current) return; // the last round is still out
+      polling.current = true;
+      try {
+        const r = await getJson<PassCheck>(API.passStatus);
+        const nv = await page.settings.reload();
+        const fate = purchaseFate(id, nv?.signals.purchases);
+        if (fate === "paid") {
+          clearInterval(timer.current);
+          const left = r.ok && r.body.status === "active" && typeof r.body.days_left === "number" ? r.body.days_left : null;
+          setStep({ kind: "paid", days: d, left });
+          page.refresh();
+        } else if (fate === "gone") {
+          clearInterval(timer.current);
+          setPayWords("That payment code expired unpaid. Nothing was paid. Close this and buy again to get a new one.");
+        } else if (!r.ok) setPayWords(`Waiting for your payment… (${r.error})`);
+        else if (r.body.status === "error" && r.body.error) setPayWords(`Waiting for your payment… The last check said: ${r.body.error}`);
+        else setPayWords("Waiting for your payment…");
+      } finally {
+        polling.current = false;
+      }
     }, 3000);
   };
 
@@ -131,7 +140,8 @@ function BuyDays({ page, onClose }: { page: Page; onClose: () => void }) {
             return;
           }
           setStep({ kind: "pay", days: step.days, inv });
-          watch(step.days);
+          if (typeof inv.purchase === "string") watch(step.days, inv.purchase);
+          else setPayWords("This page can't follow this payment. After you pay, the pass shows on this page within a minute.");
         }}
       >
         {() => (

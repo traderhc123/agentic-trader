@@ -6,7 +6,7 @@
 // field before anything is sent. What is saved, and what a change does to
 // the owner's risk in the confirm dialog, always comes from the server's own
 // preview (POST without `confirm`), never from here.
-import type { Change, Direction, SettingsView, SignInEnd, SizeMode, SizeSpec } from "../../lib/settingsApi";
+import type { Change, Direction, Purchases, SettingsView, SignInEnd, SizeMode, SizeSpec } from "../../lib/settingsApi";
 import { count, plural, usd } from "./format.ts";
 
 /** The first-run wizard and the move tool are the only pages /v2 sends the
@@ -244,6 +244,19 @@ export function v2Words(text: string): string {
  *  the token of the preview it was ticked for, so any new preview (Review
  *  again, or the server answering with a fresh one) starts unticked. */
 export const ackGiven = (tickedFor: string | null, token: string): boolean => tickedFor !== null && tickedFor === token;
+
+// ── a signal-day purchase ───────────────────────────────────────────────────
+
+/** Where one purchase stands, from GET /api/v2/settings' signals.purchases
+ *  (read after the pass check, which files a paid invoice's pass). Never
+ *  from the pass check's own "active": that is true of any pass on file,
+ *  so an older pass would make an unpaid invoice look paid. */
+export function purchaseFate(id: string, p: Purchases | null | undefined): "paid" | "waiting" | "gone" | "unknown" {
+  if (!p || !Array.isArray(p.paid) || !Array.isArray(p.waiting)) return "unknown";
+  if (p.paid.includes(id)) return "paid";
+  if (p.waiting.includes(id)) return "waiting";
+  return "gone"; // the pass check dropped it: the invoice expired unpaid
+}
 
 // ── the Robinhood sign-in, as the agent saw it end ──────────────────────────
 
