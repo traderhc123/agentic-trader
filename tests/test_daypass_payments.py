@@ -1127,6 +1127,57 @@ def test_renewal_when_the_prepaid_pass_is_used_up_or_unpaid(
         assert agenthc.entry_cover(cfg, state, close_ts)[0] is False
 
 
+class NotSentWallet(Wallet):
+    def pay_invoice(self, invoice):
+        raise lightning_wallet.PaymentNotSent("wallet server unreachable")
+
+
+def _loss():
+    return agenthc.had_exit_access(), agenthc.exit_loss_reason()
+
+
+def test_no_day_pass_says_what_the_owner_can_change(monkeypatch, clock, alerts):
+    """Why no day-pass reads the feed: the agent's no-signal warning tells
+    the owner what to do from this code, so each cause gets its own."""
+    cfg = {**CFG, "lnbits_url": "https://w"}
+    # Recurring day-pass OFF: the wallet never buys, adding sats won't help
+    feed = Feed(sats=10_000)
+    _setup(monkeypatch, feed, Wallet())
+    assert _poll({"lnbits_url": "https://w"}, {}) == []
+    assert _loss() == (False, "day_pass_off") and feed.gets == []
+    # the wallet is short of sats: the failed payment raises (a heartbeat
+    # error), but the cause is the wallet, not an unreadable feed — and it
+    # stays so while the agent waits to try again
+    _setup(monkeypatch, Feed(sats=10_000), Wallet(mode="refuse"))
+    state = {}
+    assert _poll(cfg, state) is None
+    assert _loss() == (False, "day_pass_short")
+    clock.tick(minutes=2)
+    assert _poll(cfg, state) == []
+    assert _loss() == (False, "day_pass_short")
+    # any other failed payment (here: the wallet can't be reached)
+    _setup(monkeypatch, Feed(sats=10_000), NotSentWallet())
+    state = {}
+    assert _poll(cfg, state) is None
+    assert _loss() == (False, "day_pass_failed")
+    clock.tick(minutes=2)
+    assert _poll(cfg, state) == []
+    assert _loss() == (False, "day_pass_failed")
+    # paid, the wallet hasn't said whether it went through: the agent waits
+    _setup(monkeypatch, Feed(sats=10_000), Wallet(mode="hang"))
+    state = {}
+    assert _poll(cfg, state) == []
+    assert _loss() == (False, "day_pass_undecided")
+    assert _poll(cfg, state) == []
+    assert _loss() == (False, "day_pass_undecided")
+    # today's day-pass was already paid once (its token was lost): no
+    # second purchase today
+    _setup(monkeypatch, Feed(sats=10_000), Wallet())
+    state = {"autopay_spent": {"day": "2026-07-15", "sats": 10_000, "count": 1}}
+    assert _poll(cfg, state) == []
+    assert _loss() == (False, "no_day_pass")
+
+
 def test_entry_is_skipped_when_the_day_pass_ends_before_the_close(
         monkeypatch, home, no_policy):
     import agent

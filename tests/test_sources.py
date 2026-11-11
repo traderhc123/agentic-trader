@@ -784,7 +784,7 @@ def test_no_day_pass_has_no_exit_access(monkeypatch):
     monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: (_ for _ in ()).throw(
         AssertionError("no request without a pass")))
     assert agenthc.poll({}, {}, lambda s: None) == []
-    assert _exit_flag() == (False, "no_day_pass")
+    assert _exit_flag() == (False, "day_pass_off")
     # a 402 the wallet may not pay (recurring off): the same
     resp = FakeResp({"payment": {"payment_request": _invoice(9500),
                                  "macaroon": "MAC", "amount_sats": 9500}}, status=402)
@@ -792,7 +792,7 @@ def test_no_day_pass_has_no_exit_access(monkeypatch):
     state = {"l402": {"token": "L402 m:p", "expires_at": time.time() + 3600,
                       "paid_day": "2026-07-14"}}
     assert agenthc.poll({}, state, lambda s: None) == []
-    assert _exit_flag() == (False, "no_day_pass")
+    assert _exit_flag() == (False, "day_pass_off")
 
 
 def test_refused_day_pass_has_no_exit_access(monkeypatch):
@@ -980,7 +980,7 @@ def test_ended_day_pass_refused_is_asked_once_only(monkeypatch, status):
     saved = []
     for _ in range(3):
         assert agenthc.poll({}, state, saved.append) == []
-        assert _exit_flag() == (False, "no_day_pass")
+        assert _exit_flag() == (False, "day_pass_off")
     assert len(srv.calls) == 1
     assert state["l402"]["exits_done"] is True and saved
 
@@ -990,7 +990,7 @@ def test_ended_day_pass_other_errors_mean_no_exits(monkeypatch):
     monkeypatch.setattr(agenthc.requests, "get", srv.get)
     state = _ended_state()
     assert agenthc.poll({}, state, lambda s: None) == []
-    assert _exit_flag() == (False, "no_day_pass")
+    assert _exit_flag() == (False, "day_pass_off")
     assert "exits_done" not in state["l402"]       # asked again next time
     agenthc.poll({}, state, lambda s: None)
     assert len(srv.calls) == 2

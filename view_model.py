@@ -98,8 +98,9 @@ PASS_STATES = ("active", "exits_only", "waiting", "none", "unknown")
 # why no exit signal reaches the agent (agent._note_exit_source: the source's
 # exit_loss_reason(), or feed_error when its read failed)
 EXIT_LOSS_CAUSES = ("pass_ended", "pass_unpaid", "pass_unchecked", "no_day_pass",
-                    "day_pass_refused", "feed_error", "feed_not_live",
-                    "feed_refused")
+                    "day_pass_off", "day_pass_short", "day_pass_failed",
+                    "day_pass_undecided", "day_pass_refused", "feed_error",
+                    "feed_not_live", "feed_refused")
 
 # trade-log kinds ("action") -> the reason code a row of that kind gets when
 # the row itself doesn't carry a more exact one. Anything else is "unknown".

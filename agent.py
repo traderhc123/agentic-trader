@@ -4008,17 +4008,41 @@ _SIGNAL_LOSS_WHY = {
     "pass_unpaid": "your signal pass is not paid yet",
     "pass_unchecked": "the agent could not check your signal pass with AgentHC",
     "no_day_pass": "the agent has no day-pass for today",
+    "day_pass_off": ("Recurring day-pass is off, so the agent has no day-pass "
+                     "for today"),
+    "day_pass_short": ("the agent's wallet does not hold enough sats for "
+                       "today's day-pass"),
+    "day_pass_failed": "the agent's wallet could not pay for today's day-pass",
+    "day_pass_undecided": ("the agent's wallet has not said whether today's "
+                           "day-pass payment went through"),
     "day_pass_refused": "AgentHC refused today's day-pass",
     "feed_error": "the signal feed can't be read",
     "feed_not_live": "the signal feed can't be read",
     "feed_refused": "the signal feed is refusing the agent",
 }
-# what the owner can do about it ("" = nothing: the agent keeps trying)
+# what the owner can do about it (none: the agent keeps trying)
+_BUY_DAYS = "buy signal days (dashboard → Settings → Signal source)"
 _SIGNAL_LOSS_FIX = {
-    "pass_ended": "buy signal days (dashboard → Settings → Signal source)",
-    "pass_unpaid": "buy signal days (dashboard → Settings → Signal source)",
-    "no_day_pass": "add sats to the agent's wallet",
+    "pass_ended": _BUY_DAYS,
+    "pass_unpaid": _BUY_DAYS,
+    "no_day_pass": _BUY_DAYS,
+    "day_pass_short": ("add sats to the agent's wallet (dashboard → Settings "
+                       "→ Signal source)"),
+    "day_pass_failed": ("check the agent's wallet in the dashboard (Settings "
+                        "→ Signal source), or buy signal days there"),
 }
+
+
+def _signal_loss_fix(cfg, cause):
+    """The fix note W gives for `cause`, or None (the agent keeps trying)."""
+    cause = str(cause or "")
+    if cause == "day_pass_off":
+        # sats change nothing while the wallet may not buy; with no wallet
+        # there is nothing to switch on
+        return ("switch Recurring day-pass on, or buy signal days (dashboard "
+                "→ Settings → Signal source)" if cfg.get("lnbits_url")
+                else _BUY_DAYS)
+    return _SIGNAL_LOSS_FIX.get(cause)
 SIGNAL_LOSS_OFF_HOW = "say \"no-signal sell off\" in the dashboard"
 
 
@@ -4146,7 +4170,7 @@ def _signal_loss_warning(cfg, rec, keys, now_et, sell_m, close_m, broker=None):
                        "15 minutes' notice first), so it does not sell today. If "
                        "exit signals are still missing tomorrow, it sells at "
                        f"{_hm(configured)} ET.")
-    fix = _SIGNAL_LOSS_FIX.get(str(rec.get("cause") or ""))
+    fix = _signal_loss_fix(cfg, rec.get("cause"))
     return head + (f"If exit signals are not back by {_hm(at_m)} ET today, the "
                    f"agent sells {it} itself, with a limit order 5% under the "
                    f"bid, so {'it is' if one else 'they are'} not carried past "
@@ -6480,9 +6504,11 @@ def cmd_run(app_window=False):
                         events = source.poll(cfg, state, save_state)
                     except Exception as exc:
                         _loop_note_poll(source, None, exc)  # (dashboard)
-                        # no exit signal can be read: before any re-raise
+                        # no exit signal can be read: before any re-raise.
+                        # The source may say why (the wallet could not pay
+                        # for the day-pass); else the feed can't be read
                         _note_exit_source(cfg, state, save_state, "lost",
-                                          "feed_error")
+                                          _poll_exit_loss_reason(source))
                         if not _exits_to_retry(state):
                             raise
                         # the feed can't be read, but the exits the agent

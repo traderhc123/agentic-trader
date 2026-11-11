@@ -142,6 +142,33 @@ def test_short_outage_sells_nothing(sent):
     assert _tick(state, b, et(15, 30)) == [] and b.calls == []
 
 
+@pytest.mark.parametrize("cause, cfg, says, never", [
+    # Recurring day-pass OFF: sats change nothing, the switch (or a pass) does
+    ("day_pass_off", {"lnbits_url": "https://w"},
+     "Recurring day-pass is off, so the agent has no day-pass for today",
+     "switch Recurring day-pass on, or buy signal days"),
+    ("day_pass_off", {}, "Recurring day-pass is off",
+     "buy signal days (dashboard → Settings → Signal source)"),
+    ("day_pass_short", {}, "the agent's wallet does not hold enough sats",
+     "add sats to the agent's wallet"),
+    ("day_pass_failed", {}, "the agent's wallet could not pay for today's",
+     "check the agent's wallet"),
+    ("day_pass_undecided", {}, "has not said whether today's day-pass payment",
+     "The agent keeps trying."),
+    ("no_day_pass", {}, "the agent has no day-pass for today",
+     "buy signal days (dashboard → Settings → Signal source)"),
+])
+def test_the_warning_names_the_fix_for_the_cause(sent, cause, cfg, says, never):
+    state = _state(KEY, since=et(10, 0), cause=cause)
+    _tick(state, Broker(), et(10, 10), cfg=cfg)
+    (w,) = _warnings(sent)
+    assert says in w and never in w
+    if cause != "day_pass_short":
+        assert "add sats" not in w
+    if cause == "day_pass_off" and not cfg:
+        assert "Recurring day-pass on" not in w      # no wallet to switch on
+
+
 def test_off_never_sells_and_says_so(sent):
     cfg = {"signal_loss_sell_et": "off"}
     state = _state(KEY, since=et(10, 0))

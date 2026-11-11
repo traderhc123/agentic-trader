@@ -197,7 +197,7 @@ export interface Pass {
 
 export interface ExitLoss {
   since: Iso;
-  cause: "pass_ended" | "pass_unpaid" | "pass_unchecked" | "no_day_pass" | "day_pass_refused" | "feed_error" | "feed_not_live" | "feed_refused";
+  cause: "pass_ended" | "pass_unpaid" | "pass_unchecked" | "no_day_pass" | "day_pass_off" | "day_pass_short" | "day_pass_failed" | "day_pass_undecided" | "day_pass_refused" | "feed_error" | "feed_not_live" | "feed_refused";
   /** when the agent sells what it holds today because of it (the no-signal sell); null = it won't today */
   sell_at: Iso | null;
   /** true: the agent will sell its positions itself at sell_at unless exit signals come back */

@@ -702,6 +702,24 @@ def test_a_poll_that_raises_records_the_lost_exit_source_before_the_re_raise(
     assert loss["since"] == START.timestamp()   # the first failed read
 
 
+def test_a_poll_that_raises_records_the_cause_the_source_gives(
+        home, monkeypatch, sent, clock):
+    """The wallet could not pay for today's day-pass: the read raised, but
+    the source says why, and that is the cause on record (the warning then
+    says to add sats), not an unreadable feed."""
+    class ShortWallet:
+        @staticmethod
+        def poll(cfg, st, save_state):
+            raise RuntimeError("Day-pass payment failed — nothing was paid")
+
+        had_exit_access = staticmethod(lambda: False)
+        exit_loss_reason = staticmethod(lambda: "day_pass_short")
+    state = {"seen": [], "positions": {KEY: {"option_id": "stub", "qty": 1}}}
+    _broker, saved = run_loop(home, monkeypatch, state, [[]], clock=clock,
+                              source=ShortWallet)
+    assert saved["signal_loss"]["cause"] == "day_pass_short"
+
+
 def test_a_read_that_works_clears_the_record(home, monkeypatch, sent, clock):
     state = {"seen": [], "positions": {KEY: {"option_id": "stub", "qty": 1}}}
     seen = []

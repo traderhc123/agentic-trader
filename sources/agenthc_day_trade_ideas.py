@@ -970,6 +970,7 @@ def _daypass_paid(state, pending, preimage):
                      "paid_day": pending.get("day")}
     state.pop("daypass_pending", None)
     state.pop("daypass_retry_at", None)
+    state.pop("daypass_retry_why", None)
     state.pop("daypass_no_receipt", None)   # this wallet does give receipts
     _daypass_alert_clear(state)
     if isinstance(pending.get("day"), str):
@@ -1122,6 +1123,7 @@ def _buy_day_pass(cfg, state, body, save_state, running_until=None):
         return _pay_day_pass(cfg, state, body, save_state, running_until)
     except Exception as exc:
         state["daypass_retry_at"] = time.time() + _PAY_RETRY_S
+        state["daypass_retry_why"] = getattr(exc, "loss_code", "day_pass_failed")
         save_state(state)
         if isinstance(exc, InvoiceRefused):
             then = (_running_text(running_until) if running_until
@@ -1227,7 +1229,9 @@ def _pay_day_pass(cfg, state, body, save_state, running_until=None):
                 "Your agent's wallet could not pay for today's day-pass "
                 f"({amount:,} sats): {why}. Nothing was paid. {then} "
                 f"{_retry_text()}")
-            raise RuntimeError(f"Day-pass payment failed — nothing was paid: {reason}")
+            err = RuntimeError(f"Day-pass payment failed — nothing was paid: {reason}")
+            err.loss_code = "day_pass_short" if short else "day_pass_failed"
+            raise err
         if outcome != "paid":
             if outcome == "unknown":
                 print(f"Day-pass payment of {amount:,} sats: the wallet has "
@@ -1296,10 +1300,39 @@ def _ended_daypass_exits(cfg, state, save_state):
     return events
 
 
+def _day_pass_loss_code(cfg, state, now=None):
+    """Why the wallet path has no day-pass to read with, as the code the
+    agent's no-signal warning turns into the owner's fix (no request, no
+    change; the same order as _pass_purchase_allowed):
+    day_pass_undecided  a payment the wallet hasn't decided yet;
+    day_pass_off        Recurring day-pass is off: the wallet never buys;
+    day_pass_short      the last payment failed: not enough sats;
+    day_pass_failed     the last payment failed otherwise (wallet down or
+                        gone, invoice refused, a wallet without receipts);
+    no_day_pass         anything else (today already paid once, the
+                        daily cap, the market closed)."""
+    if state.get("daypass_pending"):
+        return "day_pass_undecided"
+    now = now or _now_et()
+    day = now.strftime("%Y-%m-%d")
+    if (state.get("pass_charged_day") == day
+            or (_one_pass_a_day(cfg) and _autopay_spent_today(state, now)["count"] >= 1)
+            or _next_buy_time(cfg, now) is not None):
+        return "no_day_pass"
+    if not cfg.get("day_pass_recurring"):
+        return "day_pass_off"
+    if isinstance(state.get("daypass_no_receipt"), dict):
+        return "day_pass_failed"
+    if time.time() < float(state.get("daypass_retry_at") or 0):
+        why = state.get("daypass_retry_why")
+        return why if why in ("day_pass_short", "day_pass_failed") else "day_pass_failed"
+    return "no_day_pass"
+
+
 def _no_day_pass(cfg, state, save_state):
     """No wallet day-pass to read with (and none bought now)."""
     got = _ended_daypass_exits(cfg, state, save_state)
-    return got if got is not None else _no_read("no_day_pass")
+    return got if got is not None else _no_read(_day_pass_loss_code(cfg, state))
 
 
 def had_exit_access():
@@ -1314,8 +1347,10 @@ def had_exit_access():
 
 def exit_loss_reason():
     """Why the last poll() read no exit signals ("" when it did):
-    pass_unchecked, pass_unpaid, pass_ended, no_day_pass, day_pass_refused,
-    feed_not_live."""
+    pass_unchecked, pass_unpaid, pass_ended, day_pass_refused,
+    feed_not_live, or a _day_pass_loss_code (no_day_pass, day_pass_off,
+    day_pass_short, day_pass_failed, day_pass_undecided). Also set when
+    poll() raised because the wallet could not pay for the day-pass."""
     return "" if _LAST_POLL["exits"] else str(_LAST_POLL.get("why") or "")
 
 
@@ -1432,7 +1467,14 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     if resp.status_code == 402 and not _retried:
         if undecided or not _pass_purchase_allowed(cfg, state, save_state):
             return _no_day_pass(cfg, state, save_state)
-        if not _buy_day_pass(cfg, state, resp.json(), save_state):
+        try:
+            bought = _buy_day_pass(cfg, state, resp.json(), save_state)
+        except Exception:
+            # nothing was paid (reported already); the error still reaches
+            # the loop, which records this cause and not an unreadable feed
+            _LAST_POLL["why"] = _day_pass_loss_code(cfg, state)
+            raise
+        if not bought:
             return _no_day_pass(cfg, state, save_state)
         return poll(cfg, state, save_state, _retried=True)
     if resp.status_code == 401 and not _retried and not cfg.get("agenthc_api_key"):
