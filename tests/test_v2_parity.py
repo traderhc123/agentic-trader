@@ -311,6 +311,15 @@ def test_every_route_has_a_v2_caller_or_a_classic_only_reason(home, app):
             assert not quoted, f"{method} {path}: called now; mark it v2 in PARITY.md"
     # every row names a real route
     assert set(kinds) <= set(routes), set(kinds) - set(routes)
+    # PR 4 is finished: no row waits for a later group
+    assert not [k for k, v in kinds.items() if v.startswith("pending")], kinds
+    # and every classic-only route is named, with the rest of the reasons,
+    # in the "Classic-only, because…" list
+    with open(os.path.join(ROOT, "webui_app", "PARITY.md"), encoding="utf-8") as f:
+        why = f.read().split("## Classic-only, because", 1)[1].split("\n## ", 1)[0]
+    named = set(re.findall(r"`(/api/[^`]+)`", why))
+    classic = {p for (p, _m), v in kinds.items() if v == "classic"}
+    assert classic <= named, sorted(classic - named)
 
 
 # ── group 1: the dashboard switch ───────────────────────────────────────────
