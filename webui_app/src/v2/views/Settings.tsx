@@ -528,7 +528,7 @@ function DashboardSwitch({ page }: { page: Page }) {
     page.say(
       true,
       nv
-        ? `Saved. The dashboard's address now opens the ${nv.computer.dashboard === "v2" ? "new" : "classic"} dashboard.`
+        ? `Saved. The dashboard's address and the agent's login link now open the ${nv.computer.dashboard === "v2" ? "new" : "classic"} dashboard.`
         : "Saved. This page could not read your settings back yet.",
     );
   };
@@ -759,8 +759,8 @@ export function SettingsView({ page }: { page: Page }) {
             !v
               ? UNKNOWN
               : auto?.enabled === false
-                ? "Opens this dashboard, already signed in, after the agent starts at login. Start at login is off, so nothing opens yet."
-                : "Opens this dashboard, already signed in, after the agent starts at login."
+                ? "Opens the dashboard chosen under This dashboard, already signed in, after the agent starts at login. Start at login is off, so nothing opens yet."
+                : "Opens the dashboard chosen under This dashboard, already signed in, after the agent starts at login."
           }
           act={<ComputerSwitch page={page} k="open_dashboard_at_login" act="open-at-login" label="Open the dashboard at login" />}
         />
@@ -804,7 +804,7 @@ export function SettingsView({ page }: { page: Page }) {
           label="Dashboard"
           exp={
             <>
-              Which dashboard the agent's address opens: this new one, or the classic one you had before. Both stay available.{" "}
+              Which dashboard the agent's address and its login link open: this new one, or the classic one you had before. Both stay available.{" "}
               <a data-act="classic" href={CLASSIC}>
                 Open the classic dashboard
               </a>

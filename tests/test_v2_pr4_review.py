@@ -190,3 +190,30 @@ def test_a_change_made_against_older_code_is_never_applied_from_v2(home, app, re
     done = c.confirmed("/api/v2/proposal/apply", {"diff_sha256": sha})
     assert done["ok"] is True, done
     assert (repo / "helper_mod.py").read_text(encoding="utf-8") == "A = 2\n"
+
+
+# ── the dashboard switch: the agent's login link follows the choice ──
+
+def test_the_login_link_opens_the_chosen_dashboard(home, app, monkeypatch):
+    """agent.py link, start and open-at-login all open /dash?k=…: with the
+    new dashboard chosen, that lands on /v2 (it used to land on classic
+    whatever was chosen). Typed without the login, /dash stays classic."""
+    from test_v2_parity import _get_raw
+    monkeypatch.setattr(webui, "_app_v2", lambda: "<!doctype html><title>v2</title>")
+    write_cfg(home, BASE)
+    c = _running(app)
+    link = agent._dashboard_link()
+    path = link[link.index("/", len("http://")):]
+    assert path.startswith("/dash?k=")
+    assert _get_raw(c, path)[:2] == (302, "/dash")  # classic: as before
+    write_cfg(home, {**BASE, "dashboard": "v2"})
+    assert _get_raw(c, path)[:2] == (302, "/v2")
+    assert _get_raw(c, "/dash")[:2] == (200, None)  # both always answer
+    assert _get_raw(c, f"/v2?k={webui.ui_token()}")[:2] == (302, "/v2")
+    assert _get_raw(c, f"/setup?k={webui.ui_token()}")[:2] == (302, "/setup")
+    # no /v2 in this build: classic, whatever was chosen
+    monkeypatch.setattr(webui, "_app_v2", lambda: None)
+    assert _get_raw(c, path)[:2] == (302, "/dash")
+    # the setup server (no agent behind it) is not the agent's dashboard
+    monkeypatch.setattr(webui, "_app_v2", lambda: "<!doctype html><title>v2</title>")
+    assert _get_raw(app(), path)[:2] == (302, "/dash")

@@ -2394,10 +2394,17 @@ class _Handler(BaseHTTPRequestHandler):
         if not _token_ok(k):
             self._send(None, 403, html=_LOCKED_PAGE)
             return True
+        to = u.path or "/"
+        if (to == "/dash" and self.v2 and self.landing == "/dash"
+                and self._remembered() == "v2"):
+            # the agent's login link (agent.py link, start, opening the
+            # dashboard at login) opens the dashboard the owner chose;
+            # /dash typed without it is always the classic one
+            to = "/v2"
         self.send_response(302)
         self.send_header("Set-Cookie", f"{_SESSION_COOKIE}={k}; Path=/; HttpOnly; "
                          "SameSite=Lax; Max-Age=31536000")
-        self.send_header("Location", u.path or "/")
+        self.send_header("Location", to)
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         return True
