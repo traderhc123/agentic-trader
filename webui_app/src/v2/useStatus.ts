@@ -1,9 +1,11 @@
 // Where the /v2 dashboard gets its data: GET /api/v2/status every 5 s (the
-// classic dashboard's cadence) and older Activity rows from /api/v2/activity
-// on demand. `command` is only the stop button's fixed "stop" (POST
-// /api/command); every other command goes through the typed
+// classic dashboard's cadence) while the page is visible — paused while it
+// is hidden, asked at once when it is shown again — and older Activity rows
+// from /api/v2/activity on demand. `command` is only the stop button's fixed
+// "stop" (POST /api/command); every other command goes through the typed
 // POST /api/v2/command (App.tsx).
 import { useCallback, useEffect, useRef, useState } from "react";
+import { startPolling } from "../lib/polling";
 import { SCHEMA_VERSION, type Activity, type ActivityPage, type Status } from "../lib/viewModel";
 import { postJson } from "./lib/http";
 
@@ -151,20 +153,25 @@ export function useStatus(): StatusFeed {
   }, [takeActivity]);
 
   useEffect(() => {
-    refresh();
-    const poll = setInterval(refresh, POLL_MS);
+    // paused while hidden (local reads only, but nobody is looking); asks at
+    // once when the page is shown again
+    const stop = startPolling(refresh, POLL_MS);
+    // shown again: the answer to the ask made then gets the usual margin
+    // before the page calls itself out of date
+    let shownAt = Date.now();
+    const shown = () => {
+      if (!document.hidden) shownAt = Date.now();
+    };
+    document.addEventListener("visibilitychange", shown);
     // A sleeping tab or computer misses polls without any fetch failing.
     const watch = setInterval(() => {
-      if (lastOk.current && Date.now() - lastOk.current > STALE_MS) setFailing(true);
+      if (document.hidden) return;
+      if (lastOk.current && Date.now() - Math.max(lastOk.current, shownAt) > STALE_MS) setFailing(true);
     }, 1000);
-    const wake = () => {
-      if (document.visibilityState === "visible") refresh();
-    };
-    document.addEventListener("visibilitychange", wake);
     return () => {
-      clearInterval(poll);
+      stop();
       clearInterval(watch);
-      document.removeEventListener("visibilitychange", wake);
+      document.removeEventListener("visibilitychange", shown);
     };
   }, [refresh]);
 

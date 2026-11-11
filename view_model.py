@@ -140,7 +140,9 @@ CONDITIONS = (
     "signal_pass", "feed_unreachable",
     # only the agent's own messages say these
     "records_unwritten", "backup_failing", "second_copy",
-    "position_expired", "position_expiring_unsold", "position_expiring")
+    "position_expired", "position_expiring_unsold", "position_expiring",
+    # the market is closed: the signal feed is read about once an hour
+    "feed_off_hours")
 # the level a condition has when no agent message about it says more
 _CONDITION_LEVEL = {
     "agent_stopped": "urgent", "agent_not_answering": "urgent",

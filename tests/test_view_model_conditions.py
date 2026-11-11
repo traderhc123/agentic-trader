@@ -184,6 +184,35 @@ def test_the_agent_tags_its_own_banners(home, monkeypatch):
         "position_expired", "position_expiring_unsold"}
 
 
+def test_the_feed_notices_name_their_condition(monkeypatch):
+    """The agent's two feed lines (agent._feed_notice): a feed that keeps
+    refusing is the one "feed can't be read" note, its words folded in; the
+    hourly reads while the market is closed are their own condition."""
+    refused = ("Signal feed refused (403 key_revoked) since 09:25 ET; next "
+               "try 09:28 ET (say 'check now' to try at once)")
+    idle = ("Signal feed: last read 09:00 ET (market closed, next regular "
+            "read Mon 09:25 ET)")
+    monkeypatch.setattr(agent, "_feed_schedule_note", lambda *a, **k: refused)
+    n = agent._feed_notice({}, None)
+    assert n == {"level": "warn", "code": "feed_refused",
+                 "condition": "feed_unreachable", "text": refused}
+    s = build(rt=runtime(poll_ok=False, notices=[n]))
+    assert [c for c in s["conditions"] if c["code"] == "feed_unreachable"] == [
+        {"code": "feed_unreachable", "level": "warn", "notices": [0]}]
+    well_formed(s)
+    monkeypatch.setattr(agent, "_feed_schedule_note", lambda *a, **k: idle)
+    n = agent._feed_notice({}, None)
+    assert n["condition"] == "feed_off_hours" and n["level"] == "info"
+    s = build(rt=runtime(notices=[n]))
+    assert [c for c in s["conditions"] if c["code"] == "feed_off_hours"] == [
+        {"code": "feed_off_hours", "level": "info", "notices": [0]}]
+    assert s["notices"] == [{"level": "info", "code": "feed_schedule",
+                             "text": idle}]
+    well_formed(s)
+    monkeypatch.setattr(agent, "_feed_schedule_note", lambda *a, **k: "")
+    assert agent._feed_notice({}, None) is None
+
+
 def test_the_typescript_lists_the_condition_codes():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(root, *vm.TS_PATH.split("/")), encoding="utf-8") as f:

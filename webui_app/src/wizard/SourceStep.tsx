@@ -8,7 +8,8 @@ import { QR } from "../components/ui/qr";
 import { Msg, err, info, ok, type MsgT } from "../components/ui/tag";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
-import { copyToClipboard } from "../lib/hooks";
+import { copyToClipboard, usePolling } from "../lib/hooks";
+import { PASS_SIZES_MS, balanceEvery, passStatusEvery } from "./polls";
 import { BackBtn, Spacer } from "./steps";
 import { Block, Notice, StepCard, useWiz } from "./Wizard";
 
@@ -41,35 +42,41 @@ export function SourceStep() {
   const [inv, setInv] = useState<Invoice | null>(null);
   const [showHelp, setShowHelp] = useState(false);
   const [copied, setCopied] = useState("");
-  const passTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  // the invoice being waited for (its bolt11): non-null while polling its status
+  const [waitingFor, setWaitingFor] = useState<string | null>(null);
+  const waiting = useRef(false);
   const helpTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Show only the pass sizes the feed server sells right now (it can take
   // sizes off sale while its node can't receive that large a payment). If the
   // server can't be asked, every card stays visible. An empty list means
-  // every size is paused. Re-checked every 3 minutes.
-  useEffect(() => {
-    const load = () =>
+  // every size is paused. Asked when the page opens or is shown again, then
+  // every 15 minutes while it is visible (each ask goes on to AgentHC).
+  usePolling(
+    () =>
       api<{ options?: number[] }>("/api/pass/options")
         .then((r) => Array.isArray(r.options) && setSizes(r.options))
-        .catch(() => {});
-    load();
-    const id = setInterval(load, 180000);
-    return () => clearInterval(id);
-  }, []);
+        .catch(() => {}),
+    PASS_SIZES_MS,
+  );
+
+  // An unpaid invoice: every 3 s for the first 2 minutes, then every 15 s;
+  // paused while the page is hidden (and checked at once when it is shown
+  // again — e.g. back from the wallet app). The agent itself re-checks a
+  // pending pass every minute either way.
+  usePolling(checkPass, waitingFor ? passStatusEvery : null, { immediate: false }, waitingFor);
 
   useEffect(() => {
     if (st?.pass) checkPass();
     return () => {
-      if (passTimer.current) clearInterval(passTimer.current);
       if (helpTimer.current) clearTimeout(helpTimer.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const stopPoll = () => {
-    if (passTimer.current) clearInterval(passTimer.current);
-    passTimer.current = null;
+    waiting.current = false;
+    setWaitingFor(null);
   };
 
   async function checkPass() {
@@ -134,10 +141,10 @@ export function SourceStep() {
     setCopied("");
     setShowHelp(false);
     if (helpTimer.current) clearTimeout(helpTimer.current);
-    helpTimer.current = setTimeout(() => passTimer.current && setShowHelp(true), 120000);
+    helpTimer.current = setTimeout(() => waiting.current && setShowHelp(true), 120000);
     setPassMsg(info("Waiting for payment…"));
-    stopPoll();
-    passTimer.current = setInterval(checkPass, 3000);
+    waiting.current = true;
+    setWaitingFor(r.bolt11 || String(Date.now()));
   };
 
   const save = async () => {
@@ -246,7 +253,7 @@ export function SourceStep() {
             {sizes != null && sizes.length === 0 && (
               <p role="status" className="m-0 text-sm text-muted">
                 Passes are paused for a little while: our node is refilling so it can receive the payment. This page checks again
-                every few minutes.
+                every 15 minutes while it is open.
               </p>
             )}
             {passMsg && (
@@ -374,12 +381,36 @@ function AgentWallet() {
   const [bal, setBal] = useState<number | null>(null);
   const [copied, setCopied] = useState("");
   const [recurring, setRecurring] = useState(!!st?.recurring);
-  const balTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const quoteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // After "Fund": the balance every 4 s until it changes or 10 minutes pass
+  // (paused while the page is hidden), then a Refresh button.
+  const [watchFor, setWatchFor] = useState<string | null>(null);
+  const [balAt, setBalAt] = useState<Date | null>(null);
+  const balStart = useRef<number | null>(null);
+  const balNow = useRef<number | null>(null);
+  const readBalance = async () => {
+    const b = await api("/api/wallet/balance");
+    if (b && b.ok) {
+      setBal(b.sats);
+      setBalAt(new Date());
+      // unknown when Fund was pressed: the first answer is the "before"
+      if (balStart.current == null) balStart.current = b.sats;
+      balNow.current = b.sats;
+    }
+  };
+  usePolling(
+    readBalance,
+    watchFor ? balanceEvery : null,
+    {
+      immediate: false,
+      stopWhen: () => balNow.current != null && balNow.current !== balStart.current,
+      onStop: () => setWatchFor(null),
+    },
+    watchFor,
+  );
 
   useEffect(
     () => () => {
-      if (balTimer.current) clearInterval(balTimer.current);
       if (quoteTimer.current) clearTimeout(quoteTimer.current);
     },
     [],
@@ -415,7 +446,12 @@ function AgentWallet() {
       })
       .catch(() => {});
     api("/api/wallet/balance")
-      .then((b) => b && b.ok && setBal(b.sats))
+      .then((b) => {
+        if (b && b.ok) {
+          setBal(b.sats);
+          setBalAt(new Date());
+        }
+      })
       .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [!!made]);
@@ -456,8 +492,14 @@ function AgentWallet() {
           // the invoice and balance on screen belonged to the old wallet
           setInv(null);
           setBal(null);
+          setBalAt(null);
           api("/api/wallet/balance")
-            .then((b) => b && b.ok && setBal(b.sats))
+            .then((b) => {
+        if (b && b.ok) {
+          setBal(b.sats);
+          setBalAt(new Date());
+        }
+      })
             .catch(() => {});
         }
       } else if (!replace && (r.needs_replace || (await connectedWallet()))) {
@@ -479,11 +521,9 @@ function AgentWallet() {
     setInv({ bolt11: r.bolt11, qr: r.qr });
     setNote(r.note || "");
     setCopied("");
-    if (balTimer.current) clearInterval(balTimer.current);
-    balTimer.current = setInterval(async () => {
-      const b = await api("/api/wallet/balance");
-      if (b.ok) setBal(b.sats);
-    }, 4000);
+    balStart.current = bal;
+    balNow.current = bal;
+    setWatchFor(r.bolt11 || String(Date.now()));
   };
 
   const toggleRecurring = async () => {
@@ -587,13 +627,26 @@ function AgentWallet() {
                   </LinkButton>
                   {copied && <span className="text-xs text-up">{copied}</span>}
                 </div>
-                <p className="m-0 text-xs text-muted">Updates automatically after you pay.</p>
+                <p className="m-0 text-xs text-muted">
+                  {watchFor ? "Updates automatically after you pay." : "Paid? Press Refresh to see the new balance."}
+                </p>
               </div>
             </div>
           )}
           {bal != null && (
-            <p className="m-0 text-sm text-fg2">
-              Balance: <span className="font-mono text-fg">{bal.toLocaleString()}</span> sats
+            <p className="m-0 flex flex-wrap items-center gap-2 text-sm text-fg2">
+              <span>
+                Balance: <span className="font-mono text-fg">{bal.toLocaleString()}</span> sats
+                {balAt && (
+                  <span className="text-xs text-muted">
+                    {" "}
+                    (as of {balAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })})
+                  </span>
+                )}
+              </span>
+              {inv && !watchFor && (
+                <Button onClick={() => void readBalance()}>Refresh</Button>
+              )}
             </p>
           )}
           <Notice>

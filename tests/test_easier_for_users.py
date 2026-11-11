@@ -216,7 +216,7 @@ def test_wizard_hides_pass_sizes_not_on_sale():
     html = webui._WIZARD_HTML
     assert "passSizes()" in html and "/api/pass/options" in html
     assert "Array.isArray(r.options)" in html          # [] hides every card
-    assert "setInterval(passSizes" in html             # sizes come back on their own
+    assert "poll(passSizes" in html                    # sizes come back on their own
     assert 'id="pass-sizes-note"' in html
 
 
