@@ -543,7 +543,7 @@ _DOC = {
                        "null when it is off or does not apply",
     "WouldHave.error": "why the last refresh failed; null when it did not",
     "Proposal.pending": "an AI-proposed code change is waiting for review",
-    "Proposal.diff_sha256": "sha256 of the diff GET /api/proposal shows",
+    "Proposal.diff_sha256": "sha256 of the whole diff (the text GET /api/proposal shows, unless it says truncated)",
     "SignalCost.applies": "false: this signal source has no per-day charge",
     "SignalCost.days_used": "signal days recorded as paid for",
     "SignalCost.days_estimated": "days from before that was recorded",
@@ -1336,7 +1336,7 @@ def _would_have(v):
 
 def _proposal(v):
     """A pending code proposal (self_edit.current()): whether there is one,
-    and the sha256 of the diff the review shows."""
+    and the sha256 of its whole diff (self_edit.diff_sha256)."""
     if not isinstance(v, dict):
         return {"pending": False, "diff_sha256": None}
     try:

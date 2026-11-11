@@ -104,3 +104,89 @@ def test_a_subscriber_with_only_a_key_can_switch_back_to_agenthc(home, app, was)
     write_cfg(home, start)
     r = c.confirmed("/api/v2/settings/source", {"source": "agenthc"})
     assert r["ok"] is True and r["saved"] is True and key not in json.dumps(r)
+
+
+# ── code changes: Apply is bound to all of the change, against the files now ──
+
+@pytest.fixture
+def repo(tmp_path, monkeypatch):
+    """A throwaway source tree for self_edit (never the real one)."""
+    import self_edit
+    r = tmp_path / "repo"
+    r.mkdir()
+    (r / "helper_mod.py").write_text("A = 1\n", encoding="utf-8")
+    monkeypatch.setattr(self_edit, "_repo", lambda: str(r))
+    monkeypatch.setattr(self_edit, "_import_problem", lambda paths: "")
+    return r
+
+
+def _udiff(rel, old, new):
+    import difflib  # as self_edit.propose makes it
+    return "".join(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=f"a/{rel}", tofile=f"b/{rel}"))
+
+
+def _stage(changes):
+    """A proposal as self_edit.propose writes it: [(path, old, new)]."""
+    import self_edit
+    with open(self_edit._proposal_path(), "w", encoding="utf-8") as f:
+        json.dump({"request": "r", "explanation": "x", "warnings": [],
+                   "changes": [{"path": p, "content": new, "diff": _udiff(p, old, new)}
+                               for p, old, new in changes]}, f)
+
+
+def _sha_text(text):
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_a_change_too_large_to_show_whole_is_never_applied_from_v2(home, app, repo):
+    """The review shows the diff cut at 200,000 characters: what is not
+    shown can't have been reviewed, so /v2 says it is cut and refuses it
+    (it used to apply all of it, bound to the cut text only)."""
+    import self_edit
+    big = "".join(f"LINE_{i:06d} = {i}\n" for i in range(6000))  # ~110k each
+    _stage([("big_a.py", "", big), ("big_b.py", "", big)])
+    c = app()
+    shown = c.get("/api/proposal")
+    assert shown["pending"] is True and shown["truncated"] is True
+    full = "\n".join(ch["diff"] for ch in self_edit.current()["changes"])
+    assert len(shown["diff"]) < len(full)
+    for sha in (_sha_text(shown["diff"]), _sha_text(full)):
+        r = c.post("/api/v2/proposal/apply", {"diff_sha256": sha})
+        assert r["ok"] is False and "needs_confirm" not in r and "too large" in r["error"]
+        ok, msg = self_edit.apply_and_restart(restart=False, expect_sha256=sha)
+        assert ok is False
+    assert sorted(p.name for p in repo.iterdir()) == ["helper_mod.py"]
+    assert self_edit.current() is not None  # still waiting: Reject it
+    # a change that fits is shown whole and is not marked cut
+    _stage([("helper_mod.py", "A = 1\n", "A = 2\n")])
+    assert c.get("/api/proposal")["truncated"] is False
+
+
+def test_a_change_made_against_older_code_is_never_applied_from_v2(home, app, repo):
+    """An update (or a hand edit) changed the file after the AI helper
+    wrote its change: applying it would write the old whole file back over
+    the update. /v2 refuses at the preview and at the confirm."""
+    import self_edit
+    _stage([("helper_mod.py", "A = 1\n", "A = 2\n")])
+    c = app()
+    sha = _sha_text(c.get("/api/proposal")["diff"])
+    first = c.post("/api/v2/proposal/apply", {"diff_sha256": sha})
+    assert first["needs_confirm"] is True
+    updated = "A = 1\nB = 3  # from an update\n"
+    (repo / "helper_mod.py").write_text(updated, encoding="utf-8")
+    r = c.post("/api/v2/proposal/apply", {"diff_sha256": sha,
+                                          "confirm": first["preview"]["token"]})
+    assert r["ok"] is False and "changed since" in r["error"]
+    r = c.post("/api/v2/proposal/apply", {"diff_sha256": sha})
+    assert r["ok"] is False and "needs_confirm" not in r and "changed since" in r["error"]
+    ok, msg = self_edit.apply_and_restart(restart=False, expect_sha256=sha)
+    assert ok is False and "changed since" in msg
+    assert (repo / "helper_mod.py").read_text(encoding="utf-8") == updated
+    # the same change against the file as it is: applied
+    (repo / "helper_mod.py").write_text("A = 1\n", encoding="utf-8")
+    done = c.confirmed("/api/v2/proposal/apply", {"diff_sha256": sha})
+    assert done["ok"] is True, done
+    assert (repo / "helper_mod.py").read_text(encoding="utf-8") == "A = 2\n"

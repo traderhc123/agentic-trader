@@ -134,7 +134,7 @@ export interface Status {
 export interface Proposal {
   /** an AI-proposed code change is waiting for review */
   pending: boolean;
-  /** sha256 of the diff GET /api/proposal shows */
+  /** sha256 of the whole diff (the text GET /api/proposal shows, unless it says truncated) */
   diff_sha256: string | null;
 }
 

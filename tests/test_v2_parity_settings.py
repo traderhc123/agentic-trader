@@ -101,7 +101,9 @@ def test_the_agreement_route_is_the_text_on_file(home, app):
 
 # ── group 5: Settings → Code changes ────────────────────────────────────────
 
-DIFF = "--- a/sources/x.py\n+++ b/sources/x.py\n@@ -1 +1 @@\n-a\n+b\n"
+# what self_edit.propose writes for a new file sources/x.py holding "b\n"
+# (/v2 applies only a diff that its content makes against the tree as it is)
+DIFF = "--- a/sources/x.py\n+++ b/sources/x.py\n@@ -0,0 +1 @@\n+b\n"
 
 
 def _propose(diff=DIFF, explanation="x"):

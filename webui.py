@@ -4141,7 +4141,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"pending": False}
         return {"pending": True, "explanation": p.get("explanation", ""),
                 "warnings": p.get("warnings", []),
-                "diff": self_edit.shown_diff(p)}
+                "diff": self_edit.shown_diff(p),
+                # the diff above is cut: /v2 says so and never applies it
+                "truncated": self_edit.diff_truncated(p)}
 
     def proposal_apply(_h, _data):
         import self_edit
@@ -5574,9 +5576,18 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         if not isinstance(prop, dict):
             return {"ok": False, "error": "No code change is waiting. Nothing "
                     "was changed."}
+        if self_edit.diff_truncated(prop):
+            return {"ok": False, "error": "This change is too large to show "
+                    "here in full, so part of it was never shown and it can't "
+                    "be applied from this page. Reject it and ask for a "
+                    "smaller change. Nothing was changed."}
         if self_edit.diff_sha256(prop) != sha:
             return {"ok": False, "error": "The code change waiting is not the "
                     "one you reviewed. Read it again. Nothing was changed."}
+        stale = self_edit.base_problem(prop)
+        if stale:
+            return {"ok": False, "error": f"This change can't be applied: "
+                    f"{stale}. Reject it and ask again. Nothing was changed."}
         files = [str(ch.get("path", ""))[:200] for ch in prop.get("changes", [])
                  if isinstance(ch, dict)]
         restarts = get_status is not None
