@@ -2956,14 +2956,17 @@ _WALLET_EXISTS = ("Your agent already has a wallet, so no new one was created "
 
 
 @_one_at_a_time
-def _wallet_create(cfg, save, data):
+def _wallet_create(cfg, save, data, switching=None):
     """Create the agent's own wallet. Never replaces one that is already set
     up unless the request says {"replace": true} — and then the old wallet's
     keys are saved to a file in the agent's private folder before the agent
     switches, so sats left in it can still be moved out. No file, no
     replacement. The file is only written once the new wallet exists: a
     failed try leaves no file calling a wallet "replaced" that is still the
-    agent's."""
+    agent's. switching: for /v2, a context the switch (old-wallet file,
+    keys, save) runs inside once LNbits has answered; it may raise to stop
+    it, and then the new wallet is empty and simply goes unused."""
+    import contextlib
     import lightning_wallet
     had = bool(cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"))
     if had and (data or {}).get("replace") is not True:
@@ -2977,23 +2980,24 @@ def _wallet_create(cfg, save, data):
     except lightning_wallet.WalletError as exc:
         return {"ok": False, "error": str(exc)[:200]
                 + (" Your current wallet was not changed." if had else "")}
-    if had:
-        try:
-            old_file = lightning_wallet.keep_old_wallet(cfg)
-        except OSError as exc:
-            # the new wallet is empty and simply goes unused
-            return {"ok": False, "error":
-                    "Your wallet was not replaced: its details could not be "
-                    f"saved first ({str(exc)[:120]}). Nothing changed — "
-                    "your agent still uses the wallet it had."}
-    cfg["source"] = "agenthc"
-    cfg["lnbits_url"] = url
-    cfg["lnbits_admin_key"] = key
-    cfg.pop("lnbits_wallet_page", None)   # never show the old wallet's page
-    if page:
-        cfg["lnbits_wallet_page"] = page
-    cfg.setdefault("max_autopay_sats", 30_000)
-    save()
+    with (switching() if switching else contextlib.nullcontext()):
+        if had:
+            try:
+                old_file = lightning_wallet.keep_old_wallet(cfg)
+            except OSError as exc:
+                # the new wallet is empty and simply goes unused
+                return {"ok": False, "error":
+                        "Your wallet was not replaced: its details could not be "
+                        f"saved first ({str(exc)[:120]}). Nothing changed — "
+                        "your agent still uses the wallet it had."}
+        cfg["source"] = "agenthc"
+        cfg["lnbits_url"] = url
+        cfg["lnbits_admin_key"] = key
+        cfg.pop("lnbits_wallet_page", None)   # never show the old wallet's page
+        if page:
+            cfg["lnbits_wallet_page"] = page
+        cfg.setdefault("max_autopay_sats", 30_000)
+        save()
     out = {"ok": True, "page": page, "warning": lightning_wallet.demo_warning(url)}
     if had:
         out.update({
@@ -4667,6 +4671,21 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 save()
         return guarded
 
+    def _unchanged_since(fp):
+        """As _save_if_unchanged, for a classic helper that does more than
+        save once the slow answer is in (writes a file first): the whole
+        step runs in one CONFIG_LOCK hold, and only while config.json still
+        has the fingerprint `fp`. Else _Changed before anything is done."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def held():
+            with A.CONFIG_LOCK:
+                if _fingerprint() != fp:
+                    raise _Changed()
+                yield
+        return held
+
     def _change(key, label, saved_now, new, direction):
         return {"key": key, "label": label, "saved_now": saved_now,
                 "new": new, "direction": direction}
@@ -5736,6 +5755,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         sent back (it opens the wallet: POST /api/v2/wallet/page)."""
         import lightning_wallet
         p = _v2_payload(data, ("replace",))
+        if not isinstance(p.get("replace", False), bool):
+            raise _Invalid("replace must be true or false. Nothing was changed.")
+        if not A.consent_ok():  # as the classic /api/wallet/create
+            return {"ok": False, "error": "accept the agreement first"}
         with A.CONFIG_LOCK:
             _sync()
             had = _wallet_now()
@@ -5755,11 +5778,17 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "It does not put any sats in the new wallet: it starts empty."]
                 + _wallet_notes(bool(had)),
                 extra={"warning": lightning_wallet.demo_warning(new) or None})
+            fp = _fingerprint()  # what the token was just redeemed against
         if wait:
             return wait
-        # LNbits is asked outside the lock; _wallet_create saves only the
-        # wallet's own keys (and the source), onto the file as it is then
-        res = _wallet_create(cfg, save, {"replace": True} if had else {})
+        # LNbits is asked outside the lock (it can take seconds); the switch
+        # to the new wallet happens only if nothing was saved meanwhile (a
+        # wallet or source another tab confirmed is never overwritten)
+        try:
+            res = _wallet_create(cfg, save, {"replace": True} if had else {},
+                                 switching=_unchanged_since(fp))
+        except _Changed:
+            return {"ok": False, "error": _REVIEW_AGAIN}
         if not res.get("ok"):
             return {"ok": False, "error": res.get("error")
                     or "The wallet was not made. Nothing was changed."}
