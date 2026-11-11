@@ -402,3 +402,127 @@ def test_dashboard_banner_while_warned(sent):
     assert agent.signal_loss_banner({}, state, et(16, 5)) == []
     agent._note_exit_source({}, state, lambda s: None, "ok", now_et=et(13, 30))
     assert agent.signal_loss_banner({}, state, et(13, 31)) == []
+
+
+# ── a feed that comes and goes (review F4) ──────────────────────────────────
+
+def _backs(sent):
+    return [m for m, _p in sent if "reaching your agent again" in m]
+
+
+def test_a_flapping_feed_warns_once_and_once_more_before_the_sale(sent):
+    """Losses all morning: one warning and one "back" note, not one of each
+    per loss. A loss still there 15 minutes before the sell time gets the
+    day's one more warning, and the sale waits 15 minutes after it."""
+    state = _state(KEY)
+    b = Broker()
+    for h, m in ((10, 0), (10, 10), (10, 20), (11, 0), (13, 0)):
+        _note(state, "lost", et(h, m), "feed_error")
+        _tick(state, b, et(h, m + 6))
+        _tick(state, b, et(h, m + 8))
+        _note(state, "ok", et(h, m + 9))
+    assert len(_warnings(sent)) == 1 and len(_backs(sent)) == 1
+    # the afternoon loss is still there at 15:15: warned again, for 15:30
+    _note(state, "lost", et(14, 0), "feed_error")
+    _tick(state, b, et(14, 30))
+    assert len(_warnings(sent)) == 1
+    assert agent.signal_loss_sell_at({}, state, et(14, 30)) == et(15, 30).timestamp()
+    _tick(state, b, et(15, 15))
+    assert len(_warnings(sent)) == 2 and "by 15:30 ET today" in _warnings(sent)[1]
+    assert _tick(state, b, et(15, 29)) == [] and b.calls == []
+    assert _tick(state, b, et(15, 30)) and len(b.calls) == 1
+
+
+def test_a_late_loss_after_the_day_s_warnings_is_not_sold_unwarned(sent):
+    """Two warnings already went out today. A third loss gets none, so it is
+    never sold (no sale without its own warning 15 minutes before)."""
+    state = _state(KEY)
+    b = Broker()
+    for h, m in ((10, 0), (15, 15)):
+        _note(state, "lost", et(h, m), "feed_error")
+        _tick(state, b, et(h, m + 6))
+        _note(state, "ok", et(h, m + 8))
+    assert len(_warnings(sent)) == 2 and len(_backs(sent)) == 2
+    _note(state, "lost", et(15, 30), "feed_error")
+    assert agent.signal_loss_sell_at({}, state, et(15, 36)) is None
+    for now in (et(15, 36), et(15, 50), et(15, 59)):
+        assert _tick(state, b, now) == []
+    assert b.calls == [] and len(_warnings(sent)) == 2
+
+
+def test_the_second_warning_after_the_reminder_time_gives_its_own_notice(sent):
+    state = _state(KEY)
+    b = Broker()
+    _note(state, "lost", et(10, 0), "feed_error")
+    _tick(state, b, et(10, 6))
+    _note(state, "ok", et(10, 8))
+    _note(state, "lost", et(15, 20), "feed_error")
+    _tick(state, b, et(15, 25))                  # warned now: sells 15:40
+    (_first, w) = _warnings(sent)
+    assert "by 15:40 ET today" in w
+    assert _tick(state, b, et(15, 39)) == [] and b.calls == []
+    assert _tick(state, b, et(15, 40)) and len(b.calls) == 1
+
+
+def test_the_count_starts_again_each_day(sent):
+    state = _state(KEY)
+    b = Broker()
+    for day in ((2026, 11, 6), (2026, 11, 9)):
+        _note(state, "lost", et(10, 0, day=day), "feed_error")
+        _tick(state, b, et(10, 6, day=day))
+        _note(state, "ok", et(10, 8, day=day))
+    assert len(_warnings(sent)) == 2 and len(_backs(sent)) == 2
+
+
+# ── a full hold blocks the sale: the warning says so (review F6) ────────────
+
+def test_a_full_hold_says_it_will_not_sell(sent):
+    state = _state(KEY, since=et(10, 0))
+    b = Broker()
+    _tick(state, b, et(10, 6), paused=True)
+    _tick(state, b, et(11, 0), paused=True)
+    (w,) = [m for m, _p in sent if "no exit signals have reached" in m]
+    assert "on hold, so it places no orders: it does not sell it" in w
+    assert "sell it yourself at" in w and "sells it itself" not in w
+    (ban,) = agent.signal_loss_banner({}, state, et(11, 0), paused=True)
+    assert "on hold" in ban["text"] and "sell it yourself" in ban["text"]
+    assert agent.signal_loss_banner({}, state, et(11, 0)) == []
+    # the hold warning is no notice of a sale: when the hold ends at 15:20
+    # the real warning goes out, and the sale waits 15 minutes after it
+    assert _tick(state, b, et(15, 20)) == []
+    real = [m for m, _p in sent if "If exit signals are not back" in m]
+    assert len(real) == 1 and "by 15:35 ET today" in real[0]
+    assert _tick(state, b, et(15, 34)) == [] and b.calls == []
+    assert _tick(state, b, et(15, 35)) and len(b.calls) == 1
+
+
+def test_the_warning_says_where_to_switch_it_off(sent):
+    state = _state(KEY, since=et(10, 0))
+    _tick(state, Broker(), et(10, 6))
+    (w,) = _warnings(sent)
+    assert ('set "No-signal sell" to Off in the dashboard (Rules & limits), '
+            'or say "no-signal sell off" in the classic dashboard') in w
+
+
+def test_the_activity_rows_have_their_own_codes_and_checks(monkeypatch, no_policy):
+    """The no-signal sale and the entries it (and a short day-pass) skips
+    reach the dashboard with their own reason codes, each skip stopped at
+    its own entry check."""
+    import view_model as vm
+    state = _state(KEY, since=et(13, 0))
+    b = Broker()
+    _tick(state, b, et(13, 10))
+    _tick(state, b, et(15, 30))
+    monkeypatch.setattr(agent, "_et_now", lambda: et(15, 40))
+    ev = {"event": "ENTERED", "ticker": "SPY", "expiry": "2026-11-13",
+          "strike": 600.0, "type": "C", "event_id": "e1"}
+    agent.handle_event(ev, {}, state, StubBroker(), object(), lambda s: None)
+    rows = [{**r, "n": i} for i, r in enumerate(_log())]
+    page = vm.activity_page(rows, limit=10)["rows"]
+    got = {(r["reason_code"], r["stopped_at_check"]) for r in page}
+    assert ("signal_loss", None) in got
+    assert ("after_signal_loss_sell", "exits_reachable") in got
+    assert "pass_wont_cover" in vm.REASON_CODES
+    ids = vm.check_ids()
+    assert ids.index("before_expiry_guard") < ids.index("exits_reachable") \
+        < ids.index("pass_covers_close") < ids.index("daily_cap")

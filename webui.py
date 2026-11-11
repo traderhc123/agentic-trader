@@ -4823,6 +4823,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                          "open_dashboard_at_login": open_at_login,
                          "dashboard": _dashboard_pref(cfg)},
             "expiry": _expiry_view(),
+            "no_signal": _no_signal_view(),
             "code": {"self_edit_enabled": bool(cfg.get("self_edit_enabled"))},
             "consent": _consent_view(),
             "ai": {"connected": bool(ai), "provider": ai.get("provider"),
@@ -4896,6 +4897,19 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "described": A._expiry_guard_desc(cfg),
                 "allowed": ["09:30", "15:59"],
             }
+        except Exception:
+            return None  # not known: shown as not known
+
+    def _no_signal_view():
+        """The no-signal sell (the chat's "no-signal sell"): the time saved
+        and today's (an early close moves it). HH:MM ET; null = off."""
+        try:
+            day = A._et_now().date().isoformat()
+            return {"sell_et": _hhmm(A._et_hhmm(cfg, "signal_loss_sell_et",
+                                                A.SIGNAL_LOSS_DEFAULT)),
+                    "today_et": _hhmm(A._signal_loss_time(cfg, day)),
+                    "default": A.SIGNAL_LOSS_DEFAULT,
+                    "allowed": ["09:30", "15:59"]}
         except Exception:
             return None  # not known: shown as not known
 
@@ -5003,6 +5017,26 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 changes.append(_change("expiry_sell_et", "Expiry-day sell time",
                                        before, after,
                                        _expiry_direction(before, after)))
+        if "no_signal_sell_et" in p:
+            # the chat's "no-signal sell off|HH:MM", by the same check and
+            # into the same key; off, or a later time, raises the risk (a
+            # position nobody can get an exit signal for stays open longer)
+            v = p["no_signal_sell_et"]
+            sell = (A._expiry_setting(v, A.SIGNAL_LOSS_DEFAULT)
+                    if isinstance(v, str) and v != "on" else None)
+            if sell is None:
+                raise _Invalid('no_signal_sell_et must be "off" or a time from '
+                               "09:30 to 15:59 (HH:MM, Eastern). Nothing was "
+                               "changed.")
+            new["signal_loss_sell_et"] = sell
+            before = _hhmm(A._et_hhmm(cfg, "signal_loss_sell_et",
+                                      A.SIGNAL_LOSS_DEFAULT))
+            after = _hhmm(A._et_hhmm(new, "signal_loss_sell_et",
+                                     A.SIGNAL_LOSS_DEFAULT))
+            if before != after:
+                changes.append(_change("no_signal_sell_et", "No-signal sell time",
+                                       before, after,
+                                       _expiry_direction(before, after)))
         for key, label, default, unlimited in (
                 ("max_entries_per_day", "New trades per day", 5, False),
                 ("max_daily_loss_usd", "Daily loss limit", None, True),
@@ -5017,12 +5051,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     @_v2
     def v2_limits(data):
         """POST /api/v2/settings/limits: trade size per book, new trades per
-        day, daily loss limit, positions open at once, and the expiry-day
-        sell time (the chat's "expiry guard"). Partial: only the keys sent
-        change. Never touches Practice/LIVE or the pause."""
+        day, daily loss limit, positions open at once, the expiry-day sell
+        time (the chat's "expiry guard") and the no-signal sell time (the
+        chat's "no-signal sell"). Partial: only the keys sent change. Never
+        touches Practice/LIVE or the pause."""
         p = _v2_payload(data, ("trade_size", "max_entries_per_day",
                                "max_daily_loss_usd", "max_open_positions",
-                               "expiry_sell_et"))
+                               "expiry_sell_et", "no_signal_sell_et"))
         if not p:
             raise _Invalid("Send at least one limit. Nothing was changed.")
         with A.CONFIG_LOCK:

@@ -1264,7 +1264,7 @@ def test_exit_loss_says_since_when_why_and_when_it_sells():
     x = build(cfg={**LIVE_PASS, "signal_loss_sell_et": "14:30"}, st=late,
               rt=runtime(feed_access=False))["signals"]["exit_loss"]
     assert x["cause"] == "feed_error"
-    assert x["sell_at"] == "2026-11-09T19:56:07Z" and x["armed"] is True
+    assert x["sell_at"] == "2026-11-09T19:57:00Z" and x["armed"] is True
     # nothing held: nothing to sell
     none = build(cfg=LIVE_PASS, st={**st, "positions": {}},
                  rt=runtime(feed_access=False))["signals"]["exit_loss"]
@@ -1284,3 +1284,35 @@ def test_the_no_signal_warning_is_part_of_the_positions_condition():
     (c,) = [c for c in s["conditions"] if c["code"] == "positions_unmanaged"]
     assert [s["notices"][i]["code"] for i in c["notices"]] == ["signal_loss"]
     assert c["level"] == "urgent"
+
+
+def test_exit_loss_is_not_armed_when_nothing_will_sell():
+    since = datetime(2026, 11, 9, 19, 0, tzinfo=timezone.utc)
+    st = {**state(**{SPY: real_pos()}),
+          "signal_loss": {"since": since.timestamp(), "cause": "pass_ended"}}
+    for rt in (runtime(feed_access=False, hold="state_hold"), None):
+        x = build(cfg=LIVE_PASS, st=st, rt=rt)["signals"]["exit_loss"]
+        assert x["armed"] is False and x["sell_at"] is None, rt
+
+
+@pytest.mark.parametrize("alert", ["daypass_failed_notified",
+                                   "daypass_invoice_notified",
+                                   "daypass_low_balance_notified"])
+def test_a_renewal_or_balance_alert_shows_while_the_running_day_pass_reads(alert):
+    """The 08:30 renewal failed (or the wallet is low) while today's
+    day-pass still reads entries: the agent's alert stays on the dashboard,
+    once, as the signal-pass condition (review F5)."""
+    text = ("Your agent's wallet could not pay for today's day-pass (10,000 "
+            "sats): the wallet did not make the payment. Nothing was paid.")
+    cfg = {**CFG, "dry_run": False, "agenthc_api_key": "", "feed_pass": None,
+           "lnbits_url": "https://wallet.example", "day_pass_recurring": True}
+    st = {**state(**{SPY: real_pos()}),
+          "l402": {"token": "t", "expires_at": NOW.timestamp() + 3600},
+          "daypass_alert": alert, "pass_notice": text}
+    s = build(cfg=cfg, st=st, rt=runtime(feed_access=True))
+    assert [n["text"] for n in s["notices"] if n["code"] == "pass"] == [text]
+    (c,) = [c for c in s["conditions"] if c["code"] == "signal_pass"]
+    assert len(c["notices"]) == 1
+    # an older lapse notice (no day-pass alert) still goes once entries read
+    s = build(cfg=cfg, st={**st, "daypass_alert": None}, rt=runtime(feed_access=True))
+    assert not [n for n in s["notices"] if n["code"] == "pass"]

@@ -3138,6 +3138,8 @@ ENTRY_CHECKS = (
     ("signal_fresh", ("skip_stale",)),
     ("not_paused", ("skip_paused",)),
     ("before_expiry_guard", ("skip_rule",)),
+    ("exits_reachable", ("skip_rule",)),
+    ("pass_covers_close", ("skip_rule",)),
     ("daily_cap", ("skip_daily_cap",)),
     ("position_cap", ("skip_position_cap",)),
     ("daily_loss", ("skip_daily_loss",)),
@@ -3329,7 +3331,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             _log_trade(_row_facts(
                 {"action": "skip_rule", "book": book, "event_id": ev["event_id"],
                  "contract": contract, "reason": why}, cfg,
-                code="after_signal_loss_sell"))
+                "exits_reachable", code="after_signal_loss_sell"))
             return msg
         # A wallet day-pass that ends before today's close, with no new one
         # paid: a position opened now would lose its exit signal mid-session.
@@ -3343,7 +3345,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             _log_trade(_row_facts(
                 {"action": "skip_rule", "book": book, "event_id": ev["event_id"],
                  "contract": contract, "reason": why}, cfg,
-                code="pass_wont_cover",
+                "pass_covers_close", code="pass_wont_cover",
                 params={"pass_ends_et": _hm(ends.hour * 60 + ends.minute)}))
             return msg
         # Hard mechanical caps — independent of (and checked before) the LLM.
@@ -4210,8 +4212,12 @@ def expiry_guard_busy(cfg, state, now_et=None):
 #   - the main loop records when it lost its exit source during the regular
 #     session (_note_exit_source: state["signal_loss"]); the next read that
 #     can see exits clears it;
-#   - after SIGNAL_LOSS_WARN_S of loss with a real position held, one
-#     high-priority warning a day says what will happen and when;
+#   - after SIGNAL_LOSS_WARN_S of loss with a real position held, a
+#     high-priority warning says what will happen and when. A feed that
+#     comes and goes does not repeat it: after the day's first warning, one
+#     more at most (when a later loss is still there SIGNAL_LOSS_LEAD_S
+#     before the sell time), and the "signals are back" note only after a
+#     warning of the same loss (state["signal_loss_day"]);
 #   - from signal_loss_sell_et (default 15:30 ET, "off" = never) until the
 #     close, and at least SIGNAL_LOSS_LEAD_S after that warning, every row
 #     it holds (any expiry) is sold through handle_event — the normal sell
@@ -4267,7 +4273,13 @@ def _signal_loss_fix(cfg, cause):
                 "→ Settings → Signal source)" if cfg.get("lnbits_url")
                 else _BUY_DAYS)
     return _SIGNAL_LOSS_FIX.get(cause)
-SIGNAL_LOSS_OFF_HOW = "say \"no-signal sell off\" in the dashboard"
+SIGNAL_LOSS_OFF_HOW = ("set \"No-signal sell\" to Off in the dashboard (Rules & "
+                       "limits), or say \"no-signal sell off\" in the classic "
+                       "dashboard")
+# warnings (note W) a day: the first, and one more for a later loss that is
+# still there when the sale nears (a feed that comes and goes is not told
+# again every time)
+SIGNAL_LOSS_WARNS_A_DAY = 2
 
 
 def _poll_had_exit_access(source):
@@ -4372,15 +4384,21 @@ def _broker_label(cfg, broker=None):
     return _BROKER_NAMES.get(name, name)
 
 
-def _signal_loss_warning(cfg, rec, keys, now_et, sell_m, close_m, broker=None):
+def _signal_loss_warning(cfg, rec, keys, now_et, sell_m, close_m, broker=None,
+                         held=False):
     """Note W: what the agent will do about the positions it can't get an
-    exit signal for, and when."""
+    exit signal for, and when. `held`: a full hold (agent.cmd_run), which
+    blocks every order, this sale included."""
     one = len(keys) == 1
     it = "it" if one else "them"
     contracts = ", ".join(_contract_label(k) for k in keys)
     head = (f"agentic-trader: no exit signals have reached your agent since "
             f"{_clock_et(rec['since'], now_et)} ET ({_signal_loss_why(rec.get('cause'))}). "
             f"It holds {contracts}. ")
+    if held:
+        return head + (f"The agent is on hold, so it places no orders: it does "
+                       f"not sell {it} while the hold lasts. Watch {it} and sell "
+                       f"{it} yourself at {_broker_label(cfg, broker)}.")
     if sell_m is None:
         return head + (f"The agent will not sell {it} on its own (the no-signal "
                        f"sell is switched off): watch {it} and sell {it} "
@@ -4482,6 +4500,33 @@ def _signal_loss_sell(cfg, state, save_state, broker, client, key, day, rec, now
     return outcome
 
 
+def _signal_loss_day(state, day):
+    """Today's count of no-signal warnings ({"day", "warns"}), or {}."""
+    rec = state.get("signal_loss_day")
+    return rec if isinstance(rec, dict) and rec.get("day") == day else {}
+
+
+def _signal_loss_warn_due(state, day, sell_m, now_m):
+    """May a warning go out for a loss that has not had one today? The
+    day's first, at once; one more, only once the sale nears (a later loss
+    still there SIGNAL_LOSS_LEAD_S before the sell time, or one that starts
+    after that); none after that. A loss that gets no warning is never
+    sold (the sale always follows its own loss's warning)."""
+    warns = int(_signal_loss_day(state, day).get("warns") or 0)
+    if warns == 0:
+        return True
+    if warns >= SIGNAL_LOSS_WARNS_A_DAY or sell_m is None:
+        return False
+    return now_m >= sell_m - SIGNAL_LOSS_LEAD_S // 60
+
+
+def _signal_loss_save(state, save_state):
+    try:
+        save_state(state)
+    except Exception:
+        pass  # the warning matters more; saved with the next change
+
+
 def signal_loss_tick(cfg, state, save_state, broker, client, paused=False,
                      now_et=None):
     """Once per heartbeat, right after the expiry guard: the no-signal
@@ -4511,13 +4556,24 @@ def _signal_loss_tick(cfg, state, save_state, broker, client, paused, now_et):
     now = now_et.timestamp()
     now_m = now_et.hour * 60 + now_et.minute
     real = [k for k, r in rows if _opened_live(r)]
-    if (real and rec.get("warned_day") != day
-            and now - float(rec["since"]) >= SIGNAL_LOSS_WARN_S):
+    lasted = now - float(rec["since"]) >= SIGNAL_LOSS_WARN_S
+    if real and lasted and paused and rec.get("held_told_day") != day:
+        # a full hold blocks the sale: say so, once a day; this is no
+        # notice of a sale (warned_at stays unset: once the hold ends the
+        # real warning goes out, and the sale waits SIGNAL_LOSS_LEAD_S)
+        rec["held_told_day"] = day
+        _signal_loss_save(state, save_state)
+        msg = _signal_loss_warning(cfg, rec, real, now_et, sell_m, close_m,
+                                   broker, held=True)
+        print(msg)
+        notify(cfg, msg, priority="high")
+    elif (real and lasted and not paused and rec.get("warned_day") != day
+            and _signal_loss_warn_due(state, day, sell_m, now_m)):
         rec["warned_at"], rec["warned_day"] = now, day
-        try:
-            save_state(state)
-        except Exception:
-            pass  # the warning matters more; saved with the next change
+        told = _signal_loss_day(state, day)
+        state["signal_loss_day"] = {**told, "day": day,
+                                    "warns": int(told.get("warns") or 0) + 1}
+        _signal_loss_save(state, save_state)
         msg = _signal_loss_warning(cfg, rec, real, now_et, sell_m, close_m, broker)
         print(msg)
         notify(cfg, msg, priority="high")
@@ -4563,10 +4619,19 @@ def signal_loss_sell_at(cfg, state, now_et=None):
         open_ts = datetime(d.year, d.month, d.day, _OPEN_MIN // 60, _OPEN_MIN % 60,
                            tzinfo=MARKET_TZ).timestamp()
         if any(_opened_live(r) for _k, r in rows):
-            told = (float(rec["warned_at"]) if rec.get("warned_day") == day
-                    and isinstance(rec.get("warned_at"), (int, float))
-                    else max(now_et.timestamp(), open_ts,
-                             float(rec["since"]) + SIGNAL_LOSS_WARN_S))
+            if (rec.get("warned_day") == day
+                    and isinstance(rec.get("warned_at"), (int, float))):
+                told = float(rec["warned_at"])
+            else:
+                # the warning still to come (_signal_loss_warn_due): none
+                # left today means no sale today
+                warns = int(_signal_loss_day(state, day).get("warns") or 0)
+                if warns >= SIGNAL_LOSS_WARNS_A_DAY:
+                    return None
+                told = max(now_et.timestamp(), open_ts,
+                           float(rec["since"]) + SIGNAL_LOSS_WARN_S)
+                if warns:
+                    told = max(told, sell_ts - SIGNAL_LOSS_LEAD_S)
         else:
             told = float(rec["since"]) + SIGNAL_LOSS_WARN_S
         at = max(sell_ts, told + SIGNAL_LOSS_LEAD_S)
@@ -4576,15 +4641,17 @@ def signal_loss_sell_at(cfg, state, now_et=None):
         return None
 
 
-def signal_loss_banner(cfg, state, now_et=None):
+def signal_loss_banner(cfg, state, now_et=None, paused=False):
     """The classic dashboard's line while the owner has been warned today
     that the agent sells what it holds for lack of exit signals:
-    [{"level": "urgent", "text": ...}] or []. Never raises."""
+    [{"level": "urgent", "text": ...}] or []. `paused`: a full hold, which
+    blocks that sale. Never raises."""
     try:
         now_et = now_et or _et_now()
         rec = state.get("signal_loss")
         day = now_et.date().isoformat()
-        if (not isinstance(rec, dict) or rec.get("warned_day") != day
+        if (not isinstance(rec, dict) or day not in (
+                rec.get("warned_day"), rec.get("held_told_day"))
                 or not _in_session(cfg, now_et)):
             return []
         real = [k for k, r in _signal_loss_rows(state) if _opened_live(r)]
@@ -4593,7 +4660,13 @@ def signal_loss_banner(cfg, state, now_et=None):
         why = _signal_loss_why(rec.get("cause"))
         what = f"{len(real)} real position{'' if len(real) == 1 else 's'}"
         at = signal_loss_sell_at(cfg, state, now_et)
-        if _signal_loss_time(cfg, day) is None:
+        if paused:
+            text = (f"No exit signals reach the agent ({why}). It is on hold, "
+                    f"so it does not sell your {what} itself while the hold "
+                    f"lasts: sell {'it' if len(real) == 1 else 'them'} yourself.")
+        elif rec.get("warned_day") != day:
+            return []   # told only about the hold, which has ended
+        elif _signal_loss_time(cfg, day) is None:
             text = (f"No exit signals reach the agent ({why}). The no-signal "
                     f"sell is off: sell your {what} yourself.")
         elif at is None:
@@ -6523,7 +6596,7 @@ def cmd_run(app_window=False):
             # the owner's Pause doesn't stop the expiry guard; a full hold does
             "expiry_warnings": _durability_banner() + expiry_banner(
                 c, st, paused=bool(_full_hold_note()), acct=_status_acct(c))
-            + signal_loss_banner(c, st),
+            + signal_loss_banner(c, st, paused=bool(_full_hold_note())),
             "problems": _problems_with_ai_block(c),
             "budget_hints": _budget_hints(c),
             "would_have": dry_run_preview.summary(c),
@@ -6563,7 +6636,8 @@ def cmd_run(app_window=False):
             # dashboard's own positions note says the same condition)
             out += [{**w, "code": "signal_loss",
                      "condition": "positions_unmanaged"}
-                    for w in signal_loss_banner(c, st)]
+                    for w in signal_loss_banner(
+                        c, st, paused=bool(_full_hold_note()))]
             if cash.get("warning"):
                 out.append({"level": "warn", "code": "low_cash",
                             "condition": "low_cash", "text": cash["warning"]})

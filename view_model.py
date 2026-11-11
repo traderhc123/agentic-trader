@@ -125,6 +125,9 @@ _ROW_CODES = ("past_expiry_guard", "exit_already_arrived",
               "rule_not_in_list", "rule_skip_list", "rule_side",
               "rule_min_strike", "rule_0dte", "rule_loss_streak",
               "expiry_guard", "exit_remainder", "closed_outside",
+              # the no-signal sell (agent.signal_loss_tick) and the two
+              # entries it and a short wallet day-pass skip
+              "signal_loss", "after_signal_loss_sell", "pass_wont_cover",
               # an order that went in and may have filled (agent
               # _report_problem placed=True): never "rejected"/"failed"
               "buy_unconfirmed", "sell_unconfirmed", "buy_partly_filled")
@@ -914,7 +917,7 @@ def _reason_code(row, ui, action, known):
     if action == "exit":
         if row.get("manual"):
             return "closed_outside"
-        if row.get("cause") in ("expiry_guard", "exit_remainder"):
+        if row.get("cause") in ("expiry_guard", "exit_remainder", "signal_loss"):
             return row["cause"]
     return _KIND_CODES.get(action, "unknown")
 
@@ -1629,18 +1632,22 @@ def _pass(cfg, state, now):
     return none
 
 
-def _exit_loss(cfg, state, now):
+def _exit_loss(cfg, state, now, blocked=False):
     """Since when no exit signal can reach the agent and why, and when it
     sells what it holds because of that (agent.signal_loss_tick) — None
-    while exit signals arrive."""
+    while exit signals arrive. `blocked`: nothing will sell then (the agent
+    is stopped or on a full hold, or practice mode holds real sells)."""
     import agent as A
     rec = state.get("signal_loss")
     if not isinstance(rec, dict) or _num(rec.get("since")) is None:
         return None
     try:
-        at = A.signal_loss_sell_at(cfg, state, now.astimezone(A.MARKET_TZ))
+        at = None if blocked else A.signal_loss_sell_at(
+            cfg, state, now.astimezone(A.MARKET_TZ))
     except Exception:
         at = None   # can't tell: never promise a sale
+    if at:
+        at = math.ceil(at / 60) * 60   # the minute it sells, as the banner says
     cause = rec.get("cause")
     return {"since": _iso(rec["since"]),
             "cause": cause if cause in EXIT_LOSS_CAUSES else "feed_error",
@@ -1784,6 +1791,11 @@ def _capabilities(c, limits, market, signals, positions):
     return {"opening": opening, "closing": closing, "listening": listening}
 
 
+# day-pass alerts that are about the NEXT pass while one still runs
+_RUNNING_DAYPASS_ALERTS = ("daypass_failed_notified", "daypass_invoice_notified",
+                           "daypass_low_balance_notified")
+
+
 def _pass_notice(cfg, state, signals=None):
     """The signal-pass message the agent saved for the owner (a pass that
     ran out, a day-pass AgentHC refused…), shown when the classic page
@@ -1797,6 +1809,13 @@ def _pass_notice(cfg, state, signals=None):
     if not text:
         return None
     p = signals.get("pass") if isinstance(signals, dict) else None
+    # the wallet could not renew the day-pass that still runs, or holds too
+    # little for the next one: true while that pass still reads entries
+    # (the agent clears it once a day-pass is paid)
+    if (state.get("daypass_alert") in _RUNNING_DAYPASS_ALERTS
+            and not (isinstance(p, dict)
+                     and p.get("kind") in ("subscription", "not_needed"))):
+        return {"level": "warn", "code": "pass", "text": text}
     if isinstance(p, dict):
         if signals.get("entry_access") is True \
                 or p.get("kind") in ("subscription", "not_needed"):
@@ -2021,7 +2040,8 @@ def build_status(cfg, state, rows, runtime=None, now=None,
         "last_signal": last_signal,
         "last_signal_from": signal_from,
         "pass": _pass(cfg, state, now),
-        "exit_loss": _exit_loss(cfg, state, now),
+        "exit_loss": _exit_loss(cfg, state, now, blocked=bool(
+            not running or hold or c["holds_real_sells"])),
         "preview": _would_have(rt.get("preview")),
     }
     market = _market(cfg, now)
