@@ -17,6 +17,13 @@ import agent  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def _no_phone_remote(monkeypatch):
+    """start_app would also open the phone API on the fixed port 8722; tests
+    of the phone API switch it back on (tests/test_remote_access.py)."""
+    monkeypatch.setenv("AGENT_REMOTE", "0")
+
+
+@pytest.fixture(autouse=True)
 def _no_order_waits(monkeypatch):
     """moomoo's exit fill check polls with sleeps: none in tests."""
     from brokers import moomoo

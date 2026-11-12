@@ -33,6 +33,8 @@ Robinhood's trading MCP).
                              # (everything except the owner's own steps)
     python agent.py fund N   # print a Lightning invoice to add N sats
     python agent.py link     # print the dashboard login link
+    python agent.py pair     # pair the phone app: shows a one-time QR code
+    python agent.py devices  # list paired phones (devices revoke ID removes one)
     python agent.py netcheck # can't reach AgentHC? names the cause (antivirus,
                              # VPN, DNS filter…) and the fix
 
@@ -7530,6 +7532,56 @@ def cmd_fund(sats):
     print_funding_invoice(wallet, sats)
 
 
+def cmd_pair(url=None):
+    """Pair the phone app with this agent (remote_access.py).
+
+    Prints a QR code the app scans. `url` is the address the phone uses; by
+    default this machine's Tailscale HTTPS name (`tailscale serve`)."""
+    import remote_access as RA
+    url = (url or RA.tailscale_url() or "").rstrip("/")
+    if not url:
+        print("Phone pairing needs a private address for this computer.\n"
+              "  1. Install Tailscale here and on your phone (tailscale.com, free),\n"
+              "     signed in to the same account.\n"
+              f"  2. Run:  tailscale serve --bg --https=443 http://127.0.0.1:{RA.REMOTE_PORT}\n"
+              "  3. Run:  python agent.py pair\n"
+              "(Already have an HTTPS address for it? python agent.py pair https://...)")
+        return
+    code = RA.new_pairing_code()
+    link = RA.pairing_link(url, code)
+    print("Scan this with the agentic-trader phone app (Settings → Pair with my agent).")
+    print(f"The code works ONCE and expires in {RA.PAIR_TTL_S // 60} minutes.\n")
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(link)
+        qr.print_ascii(invert=True)
+    except Exception:
+        print("(QR display unavailable — enter these in the app instead)")
+    print(f"\nAddress: {url}\nCode:    {code}")
+    print(f"\nThe phone must be on your tailnet, and the agent must be running "
+          f"(python agent.py start). If the app can't connect, check:\n"
+          f"  tailscale serve status   → should show https://… proxy http://127.0.0.1:{RA.REMOTE_PORT}")
+
+
+def cmd_devices(args):
+    """List paired phones, or `devices revoke <id>`."""
+    import remote_access as RA
+    if len(args) >= 2 and args[0] == "revoke":
+        print("Removed." if RA.revoke(args[1]) else f"No paired phone with id {args[1]}.")
+        return
+    devs = RA.list_devices()
+    if not devs:
+        print("No phones paired. Pair one with: python agent.py pair")
+        return
+    import datetime as _dt
+    for d in devs:
+        seen = _dt.datetime.fromtimestamp(d.get("last_seen") or 0).strftime("%Y-%m-%d %H:%M")
+        print(f"  {d['id']}  {d.get('name', '')!s:<24} last seen {seen}"
+              f"{'  · notifications on' if d.get('push') else ''}")
+    print("Remove one with: python agent.py devices revoke <id>")
+
+
 def _dashboard_link():
     import webui
     return f"http://127.0.0.1:{webui.APP_PORT}/dash?k={webui.ui_token()}"
@@ -7890,6 +7942,11 @@ def main():
         import webui
         print("Dashboard login link (keep it private — it unlocks the dashboard):")
         print(f"  {_dashboard_link()}")
+    elif cmd == "pair":
+        cmd_pair(sys.argv[2] if len(sys.argv) > 2 and sys.argv[2].startswith("https://")
+                 else None)
+    elif cmd == "devices":
+        cmd_devices(sys.argv[2:])
     elif cmd == "fund":
         amount = sys.argv[2] if len(sys.argv) > 2 else "20000"
         if not amount.isdigit():

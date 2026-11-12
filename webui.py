@@ -2566,6 +2566,144 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send({"ok": False, "error": str(exc)[:200]}, 500)
 
 
+# ── phone remote (remote_access.py) ──────────────────────────────────────────
+# A second listener, also loopback-only, for the phone app. The owner
+# publishes it on their own tailnet (`tailscale serve`); nothing here is on
+# the internet. It serves an ALLOWLIST of the dashboard's own v2 routes, and
+# only to a paired phone's bearer token: no cookies, and any request that
+# carries a browser Origin is refused, so no web page can drive it.
+REMOTE_GET = frozenset({
+    "/api/v2/status", "/api/v2/activity", "/api/v2/settings",
+    "/api/v2/agreement"})
+REMOTE_POST = frozenset({
+    "/api/v2/command", "/api/v2/agent/start", "/api/v2/settings/limits",
+    "/api/v2/settings/rules", "/api/v2/settings/alerts",
+    "/api/v2/settings/signals", "/api/v2/pass/buy", "/api/v2/ask"})
+# NOT reachable from a phone: code edits and proposals, moving the install,
+# wallet keys, broker sign-in, AI keys, computer settings and the consent
+# itself. Those stay on the owner's computer.
+REMOTE_MAX_BODY = 64 * 1024
+REMOTE_API_VERSION = 1
+
+
+def remote_handler(base):
+    """The phone API handler, built on the app's handler so every allowed
+    route runs exactly as it does for the dashboard."""
+    import remote_access as RA
+
+    class R(base):
+        device = None
+
+        def _no_browser(self):
+            if self.headers.get("Origin") is not None:
+                self._send({"error": "forbidden origin"}, 403)
+                return False
+            return True
+
+        def _bearer(self):
+            h = self.headers.get("Authorization") or ""
+            return h[7:].strip() if h[:7].lower() == "bearer " else ""
+
+        def _remote_ok(self):
+            if not self._no_browser():
+                return False
+            self.device = RA.device_for_token(self._bearer())
+            if not self.device:
+                self._send({"error": "this phone is not paired — run "
+                            "`python agent.py pair` and scan the code"}, 401)
+                return False
+            return True
+
+        def _body(self):
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length < 0 or length > REMOTE_MAX_BODY:
+                raise ValueError("request too large")
+            data = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError("expected a JSON object")
+            return data
+
+        def _me(self):
+            return {"id": self.device.get("id"), "name": self.device.get("name")}
+
+        def do_GET(self):
+            path = self.path.split("?")[0]
+            if not self._remote_ok():
+                return
+            if path == "/api/remote/whoami":
+                return self._send({"ok": True, "device": self._me(),
+                                   "api": REMOTE_API_VERSION})
+            fn = self.routes_get.get(path) if path in REMOTE_GET else None
+            if fn is None:
+                return self._send({"error": "not found"}, 404)
+            try:
+                res = fn(self)
+                if isinstance(res, RawResponse):
+                    return self._send({"error": "not available on the phone"}, 404)
+                return self._send(res)
+            except Exception as exc:
+                return self._send({"ok": False, "error": str(exc)[:200]}, 500)
+
+        def do_POST(self):
+            path = self.path.split("?")[0]
+            if path == "/api/remote/pair":
+                if not self._no_browser():
+                    return
+                try:
+                    data = self._body()
+                except Exception as exc:
+                    return self._send({"error": str(exc)[:200]}, 400)
+                r = RA.pair(data.get("code"), data.get("name"),
+                            data.get("push_token"))
+                return self._send(r, 200 if "token" in r else 403)
+            if not self._remote_ok():
+                return
+            try:
+                data = self._body()
+            except Exception as exc:
+                return self._send({"error": str(exc)[:200]}, 400)
+            if path == "/api/remote/push":
+                tok = data.get("push_token") or None
+                ok = RA.set_push_token(self.device["id"], tok)
+                return self._send({"ok": ok} if ok else
+                                  {"ok": False, "error": "not an Expo push token"},
+                                  200 if ok else 400)
+            if path == "/api/remote/unpair":
+                return self._send({"ok": RA.revoke(self.device["id"])})
+            fn = self.routes_post.get(path) if path in REMOTE_POST else None
+            if fn is None:
+                return self._send({"error": "not found"}, 404)
+            try:
+                return self._send(fn(self, data))
+            except Exception as exc:
+                return self._send({"ok": False, "error": str(exc)[:200]}, 500)
+
+    return R
+
+
+class _RemoteServer(_AppServer):
+    """The phone API's own server class (so code that hooks the dashboard
+    server, e.g. a test capturing _AppServer, never mistakes one for the
+    other)."""
+
+
+def start_remote(base, port=None):
+    """Serve the phone API on 127.0.0.1:<port>. Returns the server, or None
+    when turned off (AGENT_REMOTE=0) or the port is taken. Never raises."""
+    import remote_access as RA
+    if os.getenv("AGENT_REMOTE", "1").strip().lower() in ("0", "off", "false", "no"):
+        return None
+    try:
+        srv = _RemoteServer(("127.0.0.1", RA.REMOTE_PORT if port is None else port),
+                            remote_handler(base))
+    except OSError as exc:
+        print(f"Phone remote not started (port {RA.REMOTE_PORT}: {exc}). "
+              "The dashboard is unaffected.")
+        return None
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
 # ── the setup wizard ─────────────────────────────────────────────────────────
 
 def _install_requirements():
@@ -6167,6 +6305,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     url = f"http://127.0.0.1:{APP_PORT}/"
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
+    if not wait_finish:
+        start_remote(W)
     if wait_finish:
         login = f"{url}setup?k={ui_token()}"
         print(f"Setup running at {login}  (Ctrl-C to abort)")
