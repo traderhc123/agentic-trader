@@ -9,6 +9,7 @@ Autonomous + silent is a bad combination. Configure any (or all) of:
   - Telegram:         config `telegram_bot_token` + `telegram_chat_id`
     (@BotFather to create a bot; message it once, then get chat id from
     https://api.telegram.org/bot<TOKEN>/getUpdates)
+  - Phone app:        automatic for phones paired with `agent.py pair`
 
 notify() is fail-soft: a broken webhook never interrupts trading.
 """
@@ -53,7 +54,38 @@ def notify(cfg, text, priority=None):
             sent = True
         except Exception:
             pass
+    if _expo_push(text, priority):
+        sent = True
     return sent
+
+
+_EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+
+
+def _expo_push(text, priority=None):
+    """Push `text` to every paired phone (remote_access). Never raises.
+
+    Goes through Expo's push service, which hands it to Apple / Google; the
+    phone app registered its token when it paired. Only the alert text is
+    sent, never keys or account data."""
+    try:
+        import remote_access
+        tokens = remote_access.push_tokens()
+    except Exception:
+        return False
+    if not tokens:
+        return False
+    first, _, rest = text.strip().partition("\n")
+    msgs = [{"to": t, "title": first[:100] or "agentic-trader",
+             "body": (rest.strip() or first)[:900], "sound": "default",
+             "priority": "high" if priority == "high" else "default"}
+            for t in tokens]
+    try:
+        requests.post(_EXPO_PUSH_URL, json=msgs, timeout=_TIMEOUT,
+                      headers={"Accept": "application/json"})
+        return True
+    except Exception:
+        return False
 
 
 def setup(cfg):

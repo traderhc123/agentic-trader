@@ -196,6 +196,31 @@ price, no invoice).
 A tip is a thank-you and buys nothing; the agent's wallet never pays it,
 whatever `max_autopay_sats` is set to.
 
+## 📱 Phone app (remote for your own agent)
+
+The Agentic Trader phone app (iPhone and Android) is a remote control for the
+agent **you** run. It talks straight to your computer or VPS. There is no
+server in between, and your broker login never leaves your machine.
+
+1. Install [Tailscale](https://tailscale.com) (free) on the computer running
+   the agent **and** on your phone, signed in to the same account.
+2. Publish the agent's phone API on your private tailnet only (HTTPS, nothing
+   on the internet):
+   ```
+   tailscale serve --bg --https=443 http://127.0.0.1:8722
+   ```
+3. With the agent running, run `python agent.py pair` and scan the QR code in
+   the app. The code works once and expires in 10 minutes.
+
+From the phone you can watch positions and activity, pause/resume, switch
+practice/live, change limits, rules, alerts and signal settings, buy a day
+pass and ask questions. Alerts arrive as push notifications. Wallet keys,
+broker sign-in, AI keys, code changes and the consent stay on the computer.
+
+Each phone gets its own token (stored here only as a SHA-256 hash).
+`python agent.py devices` lists paired phones; `python agent.py devices revoke
+<id>` cuts one off. Set `AGENT_REMOTE=0` to switch the phone API off entirely.
+
 ## How it works
 
 - Every `poll_seconds` (default 30) the agent polls the configured source for
