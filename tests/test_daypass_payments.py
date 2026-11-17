@@ -1213,7 +1213,8 @@ def test_low_balance_after_a_purchase_alerts_once(monkeypatch, clock, alerts):
     (text,) = alerts
     ends = datetime.fromtimestamp(state["l402"]["expires_at"], agenthc.MARKET_TZ)
     assert text == ("Your agent's wallet has 4,000 sats left, less than one "
-                    "day-pass (about 10,000 sats). Add sats in the dashboard "
+                    "day-pass plus the wallet's routing-fee reserve (about "
+                    "10,100 sats). Add sats in the dashboard "
                     "(Settings → Signal source). If it cannot buy the next "
                     "pass, the agent takes no new trades from "
                     f"{ends.hour}:{ends.minute:02d} ET on Thursday Jul 16.")

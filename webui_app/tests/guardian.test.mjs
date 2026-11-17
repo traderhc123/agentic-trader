@@ -146,7 +146,7 @@ test("every reason code has words, with and without its numbers", () => {
     for (const real of [true, false, null])
       for (const params of [{}, PARAMS, { cost_usd: "x", cap: null }])
         for (const extra of [{}, { reason_text: "the agent's own words", hint: "do this", qty: 2, quote_price: 1.5, est_pnl_usd: -12.5, fill_price: 2 }]) {
-          const action = code === "entered" ? "entry" : /^exit_|expiry_guard|closed_outside/.test(code) && !/failed|partial/.test(code) ? "exit" : "skip_x";
+          const action = code === "entered" ? "entry" : /^exit_|expiry_guard|closed_outside|expired_unsold/.test(code) && !/failed|partial/.test(code) ? "exit" : "skip_x";
           const d = describe(row({ reason_code: code, action, real, reason_params: params, ...extra }), "Robinhood");
           for (const k of ["title", "sub", "what", "why", "can", "money", "group"]) clean(d[k], `${code}.${k}`);
           assert.ok(["trade", "limit", "problem", "other"].includes(d.cat), code);
@@ -2017,4 +2017,18 @@ test("rules & limits: the no-signal sell time is a two-step limits save next to 
   assert.ok(src.indexOf("<NoSignalRow page={page} />") - src.indexOf("<ExpiryRow page={page} />") < 400, "next to the expiry sell");
   for (const f of sources(path.join(SRC, "v2")).filter((p) => p.endsWith(".tsx")))
     if (rel(f) !== "views/Rules.tsx") assert.ok(!/no_signal_sell_et/.test(fs.readFileSync(f, "utf8")), `${rel(f)} sets the no-signal sell time`);
+});
+
+test("a contract that expired unsold is never described as a sale or an order", () => {
+  for (const [real, paper, tag] of [[true, false, "real"], [false, false, "prac"], [true, true, "paper"]]) {
+    const d = describe(row({ action: "exit", reason_code: "expired_unsold", real, paper_account: paper, mode_at_time: "live",
+      order_sent: false, filled: null, stopped_at_check: null, qty: 5, est_pnl_usd: -1000 }), "Robinhood");
+    const said = [d.title, d.sub, d.what, d.money].join(" ");
+    assert.ok(!/^(Sold|Practice sale)/.test(d.title), d.title);
+    assert.ok(!/sell order|exit signal|order was filled|order was sent to/i.test(said), said);
+    assert.match(d.what, /No order was sent/);
+    assert.match(d.what, /−\$1,000/);
+    assert.equal(d.tag, tag);
+    assert.equal(d.cat, "trade");
+  }
 });

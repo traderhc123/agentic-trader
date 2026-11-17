@@ -38,6 +38,14 @@ DEFAULT_LNBITS = os.getenv("AGENTIC_TRADER_LNBITS", "https://demo.lnbits.com")
 DEMO_HOSTS = ("demo.lnbits.com", "legend.lnbits.com")
 
 
+def fee_reserve_sats(sats):
+    """Sats LNbits keeps back for routing fees when it pays `sats`: the
+    larger of 2 sats and 1% (its defaults, lnbits_reserve_fee_min and
+    lnbits_reserve_fee_percent). LNbits refuses a payment unless the wallet
+    holds the amount plus this ("You must reserve at least ...")."""
+    return max(2, -(-int(sats) // 100))
+
+
 def demo_warning(url):
     """A plain-English warning when `url` is a public demo/test instance."""
     from urllib.parse import urlparse
@@ -318,7 +326,7 @@ def wallet_setup(cfg):
         day_usd, day_sats = usd_words(day["usd"]), day["sats"] or DAY_PASS_SATS_EST
     except Exception:
         day_usd, day_sats = "$50", DAY_PASS_SATS_EST
-    if bal < day_sats:
+    if bal < day_sats + fee_reserve_sats(day_sats):   # LNbits keeps a fee reserve
         print(f"Balance looks low for a ~{day_usd}/day pass. Fund it now?")
         raw = input("Amount in sats to request (blank to skip): ").strip()
         if raw.isdigit() and int(raw) > 0:

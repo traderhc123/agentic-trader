@@ -25,7 +25,7 @@ def test_missing_ai_skip_is_a_problem_not_a_policy_veto(home, monkeypatch):
 
 def test_failing_ai_skip_is_also_a_problem(home, monkeypatch):
     monkeypatch.setattr(agent, "notify", lambda cfg, msg: None)
-    monkeypatch.setattr(llm_policy, "evaluate", lambda c, e, l: {
+    monkeypatch.setattr(llm_policy, "evaluate", lambda c, e, l, **kw: {
         "act": False, "ai_problem": True,
         "reason": "AI key invalid/missing (Setup → Connect your AI) — skipping (fail-safe)"})
     agent.handle_event(make_event(event_id="e2"), {}, {"positions": {}},
@@ -41,7 +41,7 @@ def test_ai_rate_limit_gets_the_ai_hint_not_the_robinhood_one():
 
 def test_real_rule_veto_is_still_a_policy_veto(home, monkeypatch):
     monkeypatch.setattr(agent, "notify", lambda cfg, msg: None)
-    monkeypatch.setattr(llm_policy, "evaluate", lambda c, e, l: {
+    monkeypatch.setattr(llm_policy, "evaluate", lambda c, e, l, **kw: {
         "act": False, "reason": "rule: skip puts"})
     agent.handle_event(make_event(event_id="e3"), {}, {"positions": {}},
                        None, None, lambda s: None)
