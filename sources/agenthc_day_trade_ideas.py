@@ -23,7 +23,8 @@ from zoneinfo import ZoneInfo
 import requests  # noqa: F401  (tests stub requests.get/post; _http calls them)
 
 from lightning_wallet import (PaymentNotSent, PaymentRefused, WalletKeyRejected,
-                              wallet_fingerprint, wallet_from_cfg, wallet_setup)
+                              fee_reserve_sats, wallet_fingerprint,
+                              wallet_from_cfg, wallet_setup)
 from net_check import http as _http  # steps around a broken proxy setting
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -59,6 +60,7 @@ PASS_LOW_DAYS = 2               # warn when this many signal days (or fewer) rem
 _USABLE = ("active", "exits_only")
 _PENDING_RECHECK_S = 60         # status poll cadence while an invoice is unpaid
 _INVOICE_LIFETIME_S = 3600      # server invoices expire after 1h
+_UNPAID_RECHECK_S = 3600        # an invoice AgentHC called unpaid: asked again this often
 
 # Wallet day-pass (the agent pays ~$50 from its own wallet).
 _DAYPASS_S = 23 * 3600          # how long the agent uses a paid day-pass token
@@ -87,6 +89,12 @@ PASS_USED_UP_TEXT = ("Your signal pass is used up: no new trades until you buy "
                      "trades your agent already opened still arrive.")
 PASS_RUN_OUT_TEXT = ("Your signal pass has run out: no new trades until you "
                      f"buy more signal days ({_SETTINGS}).")
+KEY_BALANCE_EMPTY_TEXT = (
+    "AgentHC asked for payment on your Premium API key: the key's balance "
+    "can't pay for today's signals. Top up your key with AgentHC. While an "
+    "API key is set your agent never buys a day-pass with its wallet, so "
+    "nothing was paid. Until the key is topped up the agent gets no new "
+    "trades.")
 
 
 class PassUnavailable(RuntimeError):
@@ -667,24 +675,70 @@ def _token_id(token):
     return hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
+def _main_pass_token(cfg):
+    main = cfg.get("feed_pass")
+    return main.get("token") if isinstance(main, dict) else None
+
+
+def _invoice_overdue(rec, now):
+    """The pass invoice first seen in `rec` can't be paid any more (its
+    lifetime, plus slack for clocks that differ, is over)."""
+    try:
+        first = float(rec.get("first_seen", now))
+    except (TypeError, ValueError):
+        first = 0.0
+    return now - first > _INVOICE_LIFETIME_S + 300
+
+
+def _pass_status_unknown(cfg, rec, token, now):
+    """True while a saved pass status can't be relied on until AgentHC is
+    asked again: an invoice past its lifetime that AgentHC has not answered
+    for since (the owner may have paid it while the agent wasn't checking),
+    an "unpaid" saved by an older version from elapsed time alone, or an
+    "unpaid" pass that has since become the main pass (the dashboard saw it
+    paid). The agent reads nothing and the wallet buys nothing meanwhile."""
+    st = rec.get("status")
+    if st == "pending":
+        return _invoice_overdue(rec, now)
+    if st == "unpaid":
+        try:
+            said_after_expiry = (float(rec.get("checked") or 0)
+                                 > float(rec.get("first_seen") or 0)
+                                 + _INVOICE_LIFETIME_S + 300)
+        except (TypeError, ValueError):
+            said_after_expiry = False
+        return (not said_after_expiry
+                or (token == _main_pass_token(cfg) and not rec.get("main")))
+    return False
+
+
+def _known_status(cfg, rec, token, now=None):
+    """A pass's saved status, or None while it is not known (no check has
+    answered yet, or _pass_status_unknown). No request."""
+    rec = rec if isinstance(rec, dict) else {}
+    now = time.time() if now is None else now
+    return None if _pass_status_unknown(cfg, rec, token, now) else rec.get("status")
+
+
 def _refresh_pass(cfg, state, save_state, force=False):
     """Return the usable (active) pass token, checking the server only when
-    needed: pending invoices at most once a minute until they expire, active
-    passes only after their end time or when the feed refused them."""
+    needed: pending invoices at most once a minute, an invoice past its
+    lifetime until AgentHC answers for it (only AgentHC's answer makes it
+    "unpaid", never the time alone), "unpaid" ones once an hour and as soon
+    as one becomes the main pass, active passes only after their end time
+    or when the feed refused them."""
     cache = state.setdefault("pass_status", {})
     now = time.time()
+    main = _main_pass_token(cfg)
     best, best_until = None, 0.0
     for token in _pass_tokens(cfg):
         tid = _token_id(token)
         rec = cache.get(tid) or {}
         st = rec.get("status")
-        if st == "pending" and now - rec.get("first_seen", now) > _INVOICE_LIFETIME_S + 300:
-            rec["status"] = st = "unpaid"   # invoice expired without payment
-            cache[tid] = rec
-            save_state(state)
         stale = (force or st is None
-                 or (st == "pending" and now - rec.get("checked", 0) > _PENDING_RECHECK_S
-                     and now - rec.get("first_seen", now) < _INVOICE_LIFETIME_S + 300)
+                 or _pass_status_unknown(cfg, rec, token, now)
+                 or (st == "pending" and now - rec.get("checked", 0) > _PENDING_RECHECK_S)
+                 or (st == "unpaid" and now - rec.get("checked", 0) > _UNPAID_RECHECK_S)
                  or (st in _USABLE and now > rec.get("until_ts", 0)))
         if stale:
             try:
@@ -693,9 +747,15 @@ def _refresh_pass(cfg, state, save_state, force=False):
                 fresh = None
             if fresh is not None:
                 until_ts = _iso_ts(fresh.get("access_until"))
-                rec = {"status": fresh.get("status"), "until_ts": until_ts,
+                first_seen = rec.get("first_seen", now)
+                status = fresh.get("status")
+                if status == "pending" and _invoice_overdue({"first_seen": first_seen}, now):
+                    # AgentHC itself says not paid, and it can't be any more
+                    status = "unpaid"
+                rec = {"status": status, "until_ts": until_ts,
                        "days_left": fresh.get("days_left", fresh.get("trading_days_left")),
-                       "checked": now, "first_seen": rec.get("first_seen", now)}
+                       "checked": now, "first_seen": first_seen,
+                       "main": token == main}
                 if fresh.get("exits_until"):
                     rec["exits_until"] = _iso_ts(fresh["exits_until"]) or None
                 cache[tid] = rec
@@ -994,13 +1054,21 @@ def _wallet_over_exits_only(cfg, state, save_state):
     return poll(cfg, state, save_state, _retried=True)
 
 
-def _prepaid_may_take_over(cfg, state):
+def _prepaid_may_take_over(cfg, state, entries=False):
     """A prepaid pass that may give entries once the wallet day-pass ends:
     one with signal days left as last checked, or one the agent has not
     been able to check (a pass the owner just bought in the dashboard has
-    no status here until the agent asks AgentHC about it). No request."""
+    no status here until the agent asks AgentHC about it). No request.
+    `entries` (entry_cover): only a pass never checked yet counts as not
+    known; one whose saved status went stale (an invoice past its lifetime
+    AgentHC hasn't answered for, an old "unpaid") counts by that saved
+    status, so new entries are refused rather than allowed on a guess. The
+    renewal keeps treating it as unknown: the wallet never pays on one."""
     cache = (state or {}).get("pass_status") or {}
-    return any((cache.get(_token_id(t)) or {}).get("status") in (None, "active")
+    if entries:
+        return any(((cache.get(_token_id(t)) or {}).get("status")
+                    in (None, "active")) for t in _pass_tokens(cfg))
+    return any(_known_status(cfg, cache.get(_token_id(t)), t) in (None, "active")
                for t in _pass_tokens(cfg))
 
 
@@ -1022,7 +1090,7 @@ def entry_cover(cfg, state, close_ts):
     if cfg.get("agenthc_api_key") or not _live_daypass(state):
         return True, None
     until = float((state.get("l402") or {}).get("expires_at") or 0)
-    if until >= close_ts or _prepaid_may_take_over(cfg, state):
+    if until >= close_ts or _prepaid_may_take_over(cfg, state, entries=True):
         return True, until
     return False, until
 
@@ -1119,6 +1187,11 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
     owner paid for today once already) — a lost or refused token is not a
     reason to pay again. Only an owner who set max_autopay_sats_per_day
     themselves (and has no prepaid pass) allows more, up to that many sats."""
+    if cfg.get("agenthc_api_key"):
+        # A Premium key reads the feed with the key only: a wallet day-pass
+        # would never be sent, so buying one only loses sats (poll() tells
+        # the owner to top up the key instead).
+        return False
     now = now or _now_et()
     day = now.strftime("%Y-%m-%d")
     paid_today = (state.get("pass_charged_day") == day
@@ -1353,19 +1426,24 @@ def _daypass_paid(state, pending, preimage):
 
 def _check_balance(cfg, state, save_state, wallet, paid_sats):
     """Right after a day-pass was paid: one balance read. A wallet that holds
-    less than that pass cost can't buy the next one, so the owner hears it
-    the day before. A balance that can't be read is ignored."""
+    less than that pass cost plus the wallet's routing-fee reserve
+    (fee_reserve_sats: LNbits refuses the payment without it) can't buy the
+    next one, so the owner hears it the day before. A balance that can't be
+    read is ignored."""
     try:
         bal = wallet.balance_sats()
         ends = datetime.fromtimestamp(float(state["l402"]["expires_at"]), MARKET_TZ)
+        need = int(paid_sats or 0)
+        need += fee_reserve_sats(need)
     except Exception:
         return
-    if isinstance(bal, bool) or not isinstance(bal, int) or bal >= int(paid_sats or 0):
+    if isinstance(bal, bool) or not isinstance(bal, int) or bal >= need:
         return
     _daypass_alert(
         cfg, state, save_state, "daypass_low_balance_notified",
         f"Your agent's wallet has {bal:,} sats left, less than one day-pass "
-        f"(about {int(paid_sats):,} sats). Add sats in the dashboard (Settings "
+        f"plus the wallet's routing-fee reserve (about {need:,} sats). Add "
+        "sats in the dashboard (Settings "
         "→ Signal source). If it cannot buy the next pass, the agent takes no "
         f"new trades from {ends.hour}:{ends.minute:02d} ET on "
         f"{ends:%A %b} {ends.day}.")
@@ -1577,7 +1655,9 @@ def _pay_day_pass(cfg, state, body, save_state, running_until=None):
         if outcome == "failed":
             reason = str(exc)[:200]   # the wallet's own words: console only
             short = (isinstance(exc, PaymentRefused) and re.search(
-                r"insufficient|not enough|balance", reason, re.I))
+                # LNbits' fee reserve: "You must reserve at least (N sat) to
+                # cover potential routing fees" is a short balance too
+                r"insufficient|not enough|balance|reserve|routing fee", reason, re.I))
             if isinstance(exc, WalletKeyRejected):
                 why = ("the wallet's server did not accept the agent's "
                        "wallet key — the wallet may no longer exist (public "
@@ -1814,8 +1894,7 @@ def payment_pending(cfg, state):
     cache = state.get("pass_status")
     cache = cache if isinstance(cache, dict) else {}
     for token in _pass_tokens(cfg):
-        rec = cache.get(_token_id(token))
-        if not isinstance(rec, dict) or rec.get("status") in (None, "pending"):
+        if _known_status(cfg, cache.get(_token_id(token)), token) in (None, "pending"):
             return True
     return False
 
@@ -1866,10 +1945,11 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
                     return got
             return _poll_with_pass(cfg, state, save_state, token, _retried)
         cache = state.get("pass_status") or {}
-        statuses = {(cache.get(_token_id(t)) or {}).get("status")
+        statuses = {_known_status(cfg, cache.get(_token_id(t)), t)
                     for t in _pass_tokens(cfg)}
         if None in statuses:
-            # Status check failed (network/server error): the pass may well
+            # Status check failed (network/server error), or an expired
+            # invoice AgentHC hasn't answered for yet: the pass may well
             # be fine. Wait for the next poll — never pay the wallet on an
             # unknown, or the owner pays twice for the same day.
             return _no_read("pass_unchecked")
@@ -1930,6 +2010,13 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             "doesn't clear up, contact AgentHC with "
             "the time of the payment from your wallet's payment list.")
         return _no_read("day_pass_refused")
+    if resp.status_code == 402 and cfg.get("agenthc_api_key"):
+        # The Premium key's balance can't pay for today. The agent never
+        # buys a wallet day-pass while a key is set (it would not be sent
+        # with the key): nothing is paid, the owner is told to top up.
+        _pass_notice(cfg, state, save_state, "key_balance_notified",
+                     KEY_BALANCE_EMPTY_TEXT)
+        return _no_read("feed_refused")
     if resp.status_code == 402 and not _retried:
         if undecided or not _pass_purchase_allowed(cfg, state, save_state):
             return _no_day_pass(cfg, state, save_state)

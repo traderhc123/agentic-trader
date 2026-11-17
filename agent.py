@@ -7885,9 +7885,13 @@ def _feed_access_check(cfg, state, check):
         try:
             bal = wallet.balance_sats()
             from sources.agenthc_day_trade_ideas import usd_words
+            from lightning_wallet import fee_reserve_sats
             day_usd, day = _day_pass_price()
-            check("feed_access", bal >= day, "Wallet funded",
-                  f"{bal:,} sats ({'~' + str(bal // day) + ' more market day(s)' if bal >= day else f'below one ~{usd_words(day_usd)} day-pass (~{day:,} sats)'})",
+            # LNbits refuses a payment unless the wallet also holds its
+            # routing-fee reserve ("You must reserve at least ...")
+            need = day + fee_reserve_sats(day)
+            check("feed_access", bal >= need, "Wallet funded",
+                  f"{bal:,} sats ({'~' + str(bal // need) + ' more market day(s)' if bal >= need else f'below one ~{usd_words(day_usd)} day-pass (~{day:,} sats + ~{need - day:,} sats LNbits fee reserve)'})",
                   "python agent.py fund 100000   (the OWNER pays the invoice)",
                   who="owner")
         except WalletError as exc:
