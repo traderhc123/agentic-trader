@@ -4668,13 +4668,87 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         cfg.setdefault("llm_fallback", "skip")
 
     # ── move to another computer ──
-    def move_export(_h, data):
+    def _end_move_hold():
+        """Lift the hold an unfinished "Create move file" put on the
+        heartbeat (only that one: never a server hand-off's), and forget
+        that file — what it holds is out of date as soon as trading here
+        resumes, so "I saved the file" needs a new one."""
         import transfer
+        token = pending.pop("move_hold", None)
+        pending.pop("move_blob", None)
+        if token is not None and transfer.HANDOFF.get("by") is token:
+            transfer.HANDOFF["by"] = None
+            transfer.HANDOFF["hold"] = False
+
+    def _move_hold_expired(token):
+        import transfer
+        if pending.get("move_hold") is not token:
+            return  # finished (this computer is retired) or exported again
+        _end_move_hold()
+        msg = ("The move to another computer was not finished within "
+               f"{max(1, round(transfer.MOVE_HOLD_S / 60))} minutes, so the "
+               "agent here carries on trading. The move file you made is out "
+               "of date now: to move, create a new one.")
+        print(msg)
         try:
-            blob = transfer.export_bundle(str(data.get("passphrase") or ""))
-        except transfer.TransferError as exc:
-            return {"ok": False, "error": str(exc)}
+            A.notify(cfg, msg)
+        except Exception:
+            pass
+
+    def move_export(_h, data):
+        import keep_running
+        import provision
+        import transfer
+        pw = str(data.get("passphrase") or "")
+        if len(pw) < transfer.MIN_PASSPHRASE:
+            return {"ok": False, "error": (
+                f"pick a passphrase of at least {transfer.MIN_PASSPHRASE} "
+                "characters")}
+        running_here = get_status is not None
+        if not running_here and keep_running.is_running():
+            # This page can't hold an agent that runs in another process:
+            # a trade it made after the copy would be missing on the new
+            # computer, and nobody would ever sell it.
+            return {"ok": False, "error": (
+                "the agent is running on this computer right now, in the "
+                "background or another window. Stop it first with: "
+                "python agent.py stop — then create the move file again. "
+                "Nothing was changed.")}
+        _end_move_hold()  # an earlier, unfinished export: replaced by this one
+        token = None
+        if running_here:
+            # The new computer gets a copy of this one's memory (positions,
+            # signals handled, passes bought). Hold the heartbeat — no feed
+            # read, no orders, exits included, "resume" can't lift it — and
+            # wait until the cycle it is in has finished and saved, exactly as
+            # a move to a server does. It stays on hold until "I saved the
+            # file" retires this computer, or lifts by itself after
+            # transfer.MOVE_HOLD_S (the file is dropped then: out of date).
+            if not transfer.HANDOFF["hold"]:
+                token = object()
+                transfer.HANDOFF["by"] = token
+                transfer.HANDOFF["hold"] = True
+                pending["move_hold"] = token
+            if not transfer.CYCLE_IDLE.wait(provision.CYCLE_WAIT_S):
+                _end_move_hold()
+                return {"ok": False, "error": (
+                    "the agent is in the middle of handling a trade signal, "
+                    "so its positions can't be copied safely right now. No "
+                    "move file was made and nothing changed. Wait a minute, "
+                    "then press the button again.")}
+        try:
+            blob = transfer.export_bundle(pw)
+        except BaseException as exc:
+            _end_move_hold()
+            if isinstance(exc, transfer.TransferError):
+                return {"ok": False, "error": str(exc)}
+            raise
         pending["move_blob"] = blob
+        if token is not None:
+            timer = threading.Timer(transfer.MOVE_HOLD_S, _move_hold_expired,
+                                    args=(token,))
+            timer.daemon = True
+            timer.start()
         return {"ok": True, "filename": transfer.export_filename(),
                 "kb": max(1, len(blob) // 1024)}
 
@@ -4691,9 +4765,23 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         """After the owner saved the file: retire this computer so the two
         can never both trade."""
         import transfer
+        running_here = get_status is not None
+        if not pending.get("move_blob") or (
+                running_here and not transfer.HANDOFF["hold"]):
+            # No file, or the agent here has been trading again since it was
+            # made (its hold ran out): retiring now would leave whatever it
+            # did since missing on the new computer.
+            _end_move_hold()
+            return {"ok": False, "error": (
+                "Create and download your move file first (a file made "
+                "earlier is out of date: the agent here kept trading after "
+                "it). This computer was not retired; nothing was changed.")}
         note = transfer.mark_moved_away()
+        # retired: the hold stays on (no orders here ever again); only its
+        # time limit goes
+        pending.pop("move_hold", None)
         pending.pop("move_blob", None)
-        if get_status is not None:  # the agent is running: stop it
+        if running_here:  # the agent is running: stop it
             CONTROLS["stop"] = True
             note += "; the agent here is stopping"
         return {"ok": True, "note": note}
@@ -4724,6 +4812,14 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             try:
                 info = transfer.import_bundle(blob, pw,
                                               replace=bool(data.get("replace")))
+            except transfer.ImportIncomplete:
+                if running_here:
+                    # some files ARE the imported ones now and could not be
+                    # put back: this process's memory must never be saved
+                    # over them and it must not trade on a mixed setup —
+                    # it stays on hold until it is restarted
+                    CONTROLS["replaced"] = True
+                raise
             except Exception:
                 if running_here:
                     # nothing changed: carry on as before — the owner's

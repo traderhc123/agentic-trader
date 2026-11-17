@@ -54,6 +54,15 @@ from zoneinfo import ZoneInfo
 
 MARKET_TZ = ZoneInfo("America/New_York")
 
+# `python agent.py run` (and the restart bootstrap in platform_compat, which
+# uses runpy) runs this file as __main__. webui.py, view_model.py and
+# transfer.py do `import agent`: without this line that loads a SECOND copy
+# of this file with its own CONFIG_LOCK, settings and holds, so a dashboard
+# settings save and a chat "dry on" (or the loop's safety auto-pause) did
+# not exclude each other and the save could write LIVE back. One module.
+if __name__ == "__main__":
+    sys.modules.setdefault("agent", sys.modules[__name__])
+
 import llm_policy
 from brokers import BROKERS, account_tag, order_guard
 from brokers.market_hours import REGULAR_CLOSE_MIN, close_minute, is_trading_day
@@ -150,21 +159,27 @@ def _write_json(path, payload, private):
     the system reports it could not put them on the disk, the temp file is
     removed and `path` is left as it was (OSError)."""
     import platform_compat
-    tmp = path + ".tmp"
+    import tempfile
+    # A temp file of its own, in the same folder (so the swap is a rename):
+    # two threads saving the same file at once each write their own, never
+    # one shared `path`.tmp that the other truncates or swaps away.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                               prefix=os.path.basename(path) + ".",
+                               suffix=".tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
             f.flush()
             _fsync(f.fileno())
-    except OSError:
+        if private and not platform_compat.IS_WINDOWS:
+            os.chmod(tmp, 0o600)  # Windows: inherits the locked directory's ACL
+        _replace(tmp, path)
+    except BaseException:
         try:
             os.remove(tmp)
         except OSError:
             pass
         raise
-    if private and not platform_compat.IS_WINDOWS:
-        os.chmod(tmp, 0o600)  # Windows: inherits the locked directory's ACL
-    _replace(tmp, path)
     if not platform_compat.IS_WINDOWS:
         try:  # make the swap itself durable (POSIX: fsync the folder)
             fd = os.open(os.path.dirname(path), os.O_RDONLY)
@@ -383,7 +398,8 @@ _STATE_HELD_NOTE = (
 
 # The same for a hand-off to a server (transfer.HANDOFF): Resume is refused.
 _HANDOFF_NOTE = (
-    "This setup is being moved, or was moved, to a server. The agent on this "
+    "This setup is being moved, or was moved, to a server or another "
+    "computer. The agent on this "
     "computer places NO orders at all, exits and the expiry guard included, "
     "and reads no signals, so the two can never both trade. Resume is "
     "switched off; if the move fails, the agent carries on here by itself.")
@@ -7824,6 +7840,21 @@ def cmd_export(path):
     import transfer
     if not path:
         path = transfer.export_filename()
+    if keep_running.is_running() or keep_running.supervisor_running():
+        # The file must hold everything this computer has done: a trade the
+        # running agent makes after the copy is taken would be missing on
+        # the new computer (nobody would sell it). Stop it BEFORE the copy.
+        print("The agent is running on this computer. It must stop before the "
+              "move file is made, or a trade it makes meanwhile would be "
+              "missing on the new computer.")
+        if input("Stop it now? [Y/n] ").strip().lower() not in ("", "y", "yes"):
+            print("Nothing exported. Stop it with: python agent.py stop — then "
+                  "export again.")
+            sys.exit(1)
+        if not keep_running.stop():
+            print("It could not be stopped, so nothing was exported. Run: "
+                  "python agent.py stop — then export again.")
+            sys.exit(1)
     pw = getpass.getpass("Pick a passphrase for the move file (8+ characters): ")
     if getpass.getpass("Type it again: ") != pw:
         print("The passphrases didn't match — nothing exported.")

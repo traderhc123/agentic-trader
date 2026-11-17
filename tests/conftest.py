@@ -49,9 +49,16 @@ def _no_state_hold_left_over(monkeypatch):
     one test's hold must not stop the next test's loop. The same for "a
     move file was imported" (webui.CONTROLS["replaced"]), after which the
     loop saves nothing."""
+    import transfer
     import webui
     monkeypatch.setitem(agent._STATE_HELD, "on", False)
     monkeypatch.setitem(webui.CONTROLS, "replaced", False)
+    # a "Create move file" holds the heartbeat until "I saved the file"
+    # (or transfer.MOVE_HOLD_S): never into the next test
+    monkeypatch.setitem(transfer.HANDOFF, "hold", False)
+    monkeypatch.setitem(transfer.HANDOFF, "by", None)
+    monkeypatch.setattr(transfer, "MOVE_HOLD_S", 24 * 3600)
+    transfer.CYCLE_IDLE.set()
 
 
 @pytest.fixture(autouse=True)

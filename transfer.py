@@ -67,9 +67,21 @@ class TransferError(Exception):
 #                    (reconcile, feed poll, orders, state save). The heartbeat
 #                    clears it, THEN reads the hold; the mover sets the hold,
 #                    THEN waits for idle — so one always sees the other.
-HANDOFF = {"hold": False}
+#   HANDOFF["by"]    who set the hold when it was a dashboard "Create move
+#                    file" (webui): only that one lifts it again, when the
+#                    owner doesn't finish the move within MOVE_HOLD_S.
+HANDOFF = {"hold": False, "by": None}
 CYCLE_IDLE = threading.Event()
 CYCLE_IDLE.set()
+# How long a dashboard export holds the heartbeat (no orders, exits
+# included) waiting for "I saved the file". After that the agent here
+# carries on and the file is dropped as out of date.
+MOVE_HOLD_S = 10 * 60
+
+
+class ImportIncomplete(TransferError):
+    """An import failed part-way AND some of this computer's files could not
+    be put back: the folder holds a mix of the two setups."""
 
 
 def home():
@@ -215,7 +227,10 @@ def existing_setup():
 
 def import_bundle(blob, passphrase, replace=False):
     """Decrypt and install a move file into AGENT_HOME. Returns a summary
-    dict. Raises TransferError (nothing written) on any problem."""
+    dict. All or nothing: raises TransferError with this computer's files
+    as they were on any problem — or, only if a file it had already
+    replaced could not be put back, ImportIncomplete (config.json then set
+    to dry-run, best effort). Imported settings are always dry-run."""
     if len(blob) > MAX_BUNDLE_BYTES:
         raise TransferError("that file is too large to be a move file")
     payload = decrypt(blob, passphrase)
@@ -239,35 +254,134 @@ def import_bundle(blob, passphrase, replace=False):
     if existing_setup() and not replace:
         raise TransferError("NEEDS_REPLACE")
 
+    # Safety: the old computer may still be running. Start in dry-run until
+    # the owner confirms it's off and says `dry off`. Set in the copy BEFORE
+    # anything is installed, so no file of the new setup is ever on disk
+    # without it.
+    try:
+        cfg = json.loads(z.read("home/config.json"))
+    except Exception:
+        raise TransferError("the move file's settings are damaged")
+    if not isinstance(cfg, dict):
+        raise TransferError("the move file's settings are damaged")
+    was_live = not cfg.get("dry_run")
+    cfg["dry_run"] = True
+
     root = home()
     os.makedirs(root, exist_ok=True)
     import platform_compat
     platform_compat.make_private(root, is_dir=True)
-    for m in members:
-        rel = m[len("home/"):]
-        if not _travels(rel):
-            continue
-        dest = os.path.join(root, *rel.split("/"))
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        tmp = dest + ".import-tmp"
-        with open(tmp, "wb") as f:
-            f.write(z.read(m))
-        if not platform_compat.IS_WINDOWS:
-            os.chmod(tmp, 0o600)
-        os.replace(tmp, dest)
-
-    # Safety: the old computer may still be running. Start in dry-run until
-    # the owner confirms it's off and says `dry off`.
-    cfg_path = os.path.join(root, "config.json")
-    with open(cfg_path, encoding="utf-8") as f:
-        cfg = json.load(f)
-    was_live = not cfg.get("dry_run")
-    cfg["dry_run"] = True
-    tmp = cfg_path + ".import-tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-    os.replace(tmp, cfg_path)
+    # 1) every file written next to its place first (nothing replaced yet);
+    #    config.json goes in LAST, so a setup without its forced dry-run is
+    #    never there, not even half-way.
+    staged = []   # (tmp, dest)
+    try:
+        for m in members:
+            rel = m[len("home/"):]
+            if not _travels(rel) or rel == "config.json":
+                continue
+            staged.append(_stage(root, rel, z.read(m)))
+        staged.append(_stage(root, "config.json",
+                             json.dumps(cfg, indent=2).encode("utf-8")))
+    except BaseException:
+        _discard(tmp for tmp, _dest in staged)
+        raise
+    # 2) swap them in, keeping a copy of each file they replace; on any
+    #    failure put every one back: all of the move file, or none of it.
+    _install_all(staged)
     resume_here()  # a fresh import is meant to run here
     return {"files": len(members), "created_at": manifest.get("created_at"),
             "from_os": manifest.get("from_os"), "was_live": was_live,
             "source": cfg.get("source"), "broker": cfg.get("broker")}
+
+
+# Names end in ".tmp" so a left-over one never travels in a move file.
+_STAGE_SUFFIX = ".import.tmp"
+_BACKUP_SUFFIX = ".import-bak.tmp"
+
+
+def _stage(root, rel, data):
+    import platform_compat
+    dest = os.path.join(root, *rel.split("/"))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + _STAGE_SUFFIX
+    with open(tmp, "wb") as f:
+        f.write(data)
+    if not platform_compat.IS_WINDOWS:
+        os.chmod(tmp, 0o600)
+    return tmp, dest
+
+
+def _discard(paths):
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _swap(src, dst):
+    """os.replace, retried briefly (Windows: a file someone has open)."""
+    import agent
+    agent._replace(src, dst)
+
+
+def _install_all(staged):
+    import shutil
+    done = []      # (dest, backup or None) already replaced
+    try:
+        for tmp, dest in staged:
+            backup = None
+            try:
+                if os.path.exists(dest):
+                    backup = dest + _BACKUP_SUFFIX
+                    shutil.copy2(dest, backup)
+                _swap(tmp, dest)
+            except BaseException:
+                _discard([backup] if backup else [])
+                raise
+            done.append((dest, backup))
+    except BaseException as exc:
+        _discard(tmp for tmp, _dest in staged)
+        failed = []
+        for dest, backup in reversed(done):
+            try:
+                if backup:
+                    _swap(backup, dest)
+                else:
+                    os.remove(dest)
+            except OSError:
+                failed.append(dest)
+        if failed:
+            # Some files are the imported ones and could not be put back.
+            # This computer's settings must not trade on that mix: practice
+            # mode (best effort) until the owner has looked.
+            _force_dry_run(os.path.join(home(), "config.json"))
+            raise ImportIncomplete(
+                "the import stopped part-way and some files could not be put "
+                "back as they were (" + ", ".join(
+                    os.path.basename(p) for p in failed[:5]) + "). The agent "
+                "here is on hold and in practice mode: restart it, check its "
+                "positions, then import the move file again.") from exc
+        _discard(b for _d, b in done if b)
+        if isinstance(exc, TransferError) or not isinstance(exc, Exception):
+            raise
+        raise TransferError(
+            "a file could not be replaced (" + str(exc)[:120] + "), so "
+            "nothing was imported and this computer's setup is unchanged. "
+            "Close anything that may have it open and try again.") from exc
+    _discard(b for _d, b in done if b)
+
+
+def _force_dry_run(cfg_path):
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        if isinstance(cfg, dict) and cfg.get("dry_run") is not True:
+            cfg["dry_run"] = True
+            tmp = cfg_path + _STAGE_SUFFIX
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+            _swap(tmp, cfg_path)
+    except Exception:
+        pass

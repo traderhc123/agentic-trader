@@ -210,7 +210,7 @@ def test_save_reaches_the_disk_before_it_replaces_the_file(home, monkeypatch):
     assert order.index("fsync") < order.index("replace:state.json")
     assert order.index("replace:state.json") < order.index("replace:state.json.bak")
     assert _read(agent.STATE_PATH) == _GOOD == _read(agent.STATE_PATH + ".bak")
-    assert not os.path.exists(agent.STATE_PATH + ".tmp")
+    assert not [n for n in os.listdir(home) if n.endswith(".tmp")]
 
 
 def test_a_failed_backup_write_does_not_fail_the_save(home, monkeypatch):
@@ -663,8 +663,7 @@ def test_a_save_the_disk_refused_keeps_the_old_file_and_its_backup(home, monkeyp
         agent._save(agent.STATE_PATH, {"seen": [], "positions": {}},
                     private=True, backup=True)
     assert _read(agent.STATE_PATH) == _GOOD == _read(agent.STATE_PATH + ".bak")
-    assert not os.path.exists(agent.STATE_PATH + ".tmp")
-    assert not os.path.exists(agent.STATE_PATH + ".bak.tmp")
+    assert not [n for n in os.listdir(home) if n.endswith(".tmp")]
 
 
 def test_a_filesystem_without_fsync_can_still_save(home, monkeypatch):
