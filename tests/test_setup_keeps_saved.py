@@ -15,7 +15,8 @@ import pytest
 
 import agent
 
-REAL = {"option_id": "abc", "qty": 2, "live": True}
+REAL = {"option_id": "abc", "qty": 2, "live": True, "acct": "alpaca:live"}
+UNTAGGED = {"option_id": "old", "qty": 1, "live": True}  # pre-tag row
 DRY = {"option_id": "dry", "qty": 1, "dry": True}
 
 
@@ -143,3 +144,70 @@ def test_choosing_the_saved_broker_asks_nothing(home, monkeypatch, capsys):
                               broker="2", state=state)
     assert cfg["broker"] == "alpaca"
     assert not any(p.startswith("Switch to") for p in asked)
+
+
+# ── each row's own broker (acct tag), not the saved one ──────────────────────
+
+def _real_at(acct):
+    return {**REAL, "acct": acct}
+
+
+def test_rows_already_at_the_picked_broker_ask_nothing(home, monkeypatch, capsys):
+    # saved Alpaca, but the open row is a Robinhood row (left from an
+    # earlier switch): switching to Robinhood is what lets the agent manage
+    # it again — no warning, and Enter must not keep Alpaca
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("robinhood:abc")}}
+    cfg, asked, set_up, out = _drive(home, monkeypatch, capsys,
+                                     {**BASE, "broker": "alpaca"},
+                                     broker="1", state=state)
+    assert cfg["broker"] == "robinhood" and set_up == ["robinhood"]
+    assert not any(p.startswith("Switch to") for p in asked)
+    assert "WARNING" not in out
+
+
+def test_mixed_rows_warn_only_about_the_ones_left_behind(home, monkeypatch, capsys):
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:live"),
+                           "AAPL|2026-11-21|250.0|P": _real_at("robinhood:abc")}}
+    cfg, asked, set_up, out = _drive(home, monkeypatch, capsys,
+                                     {**BASE, "broker": "alpaca"},
+                                     broker="1", switch="", state=state)
+    assert cfg["broker"] == "alpaca" and set_up == ["alpaca"]
+    assert "1 real position open at Alpaca" in out
+    assert "NVDA" in out and "AAPL" not in out
+    assert "open at Robinhood" not in out
+
+
+def test_each_row_is_named_at_its_own_broker(home, monkeypatch, capsys):
+    # fresh config (no broker saved = Robinhood) with moomoo rows left in
+    # the ledger: the warning names moomoo, not Robinhood
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("moomoo:real")}}
+    cfg, asked, set_up, out = _drive(home, monkeypatch, capsys,
+                                     {"source": "agenthc"},
+                                     broker="2", switch="y", state=state)
+    assert cfg["broker"] == "alpaca" and set_up == ["alpaca"]
+    assert "1 real position open at moomoo" in out
+    assert "open at Robinhood" not in out
+    assert "in the moomoo app" in out
+
+
+def test_a_fresh_config_picking_the_rows_broker_asks_nothing(home, monkeypatch,
+                                                              capsys):
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:paper")}}
+    cfg, asked, set_up, _ = _drive(home, monkeypatch, capsys,
+                                   {"source": "agenthc"}, broker="2", state=state)
+    assert cfg["broker"] == "alpaca" and set_up == ["alpaca"]
+    assert not any(p.startswith("Switch to") for p in asked)
+
+
+def test_untagged_rows_are_not_promised_unsold(home, monkeypatch, capsys):
+    # a row with no acct tag gets the new account's tag on the first read,
+    # so the agent may try to sell it there: the warning must not say it
+    # won't
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": dict(UNTAGGED)}}
+    cfg, asked, set_up, out = _drive(home, monkeypatch, capsys,
+                                     {**BASE, "broker": "alpaca"},
+                                     broker="1", switch="", state=state)
+    assert cfg["broker"] == "alpaca" and set_up == ["alpaca"]
+    assert "1 real position open at Alpaca" in out
+    assert "will NOT sell" not in out
+    assert "may try to sell it at Robinhood, where it is not held" in out

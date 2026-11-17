@@ -5799,29 +5799,50 @@ def _expiry_setting(arg, default):
 # ── commands ─────────────────────────────────────────────────────────────────
 
 def _confirm_broker_switch(cfg, saved_bc):
-    """Terminal setup: True to go ahead with the broker just picked. A real
-    position the ledger holds was opened at the saved broker, and the agent
-    never sells a real row opened in another broker account
-    (_check_before_exit: "blocked") — so a switch while any are open warns
-    and asks first. Enter (or anything but y) keeps the saved broker."""
+    """Terminal setup: True to go ahead with the broker just picked. The
+    agent never sells a real row whose account tag names another broker
+    account (_check_before_exit: "blocked"), so a switch away from the
+    broker a real row was opened at warns and asks first. Each row's broker
+    is the one its acct tag names; a row with no tag (from before rows were
+    tagged) counts as the saved broker's — the agent tags such a row with
+    the account it trades on its first read, so after a switch it may try
+    to sell it where it isn't held. Rows at the newly picked broker don't
+    warn. Enter (or anything but y) keeps the saved broker."""
     old = {"2": "alpaca", "3": "moomoo"}.get(saved_bc, "robinhood")
-    if cfg.get("broker") == old:
+    new = cfg.get("broker")
+    if new == old:
         return True
-    real = _real_positions(_load(STATE_PATH, {}) or {})
-    if not real:
+    rows = (_load(STATE_PATH, {}) or {}).get("positions")
+    rows = rows if isinstance(rows, dict) else {}
+    stranded = {}  # broker -> ([tagged keys], [untagged keys])
+    for k in _real_positions({"positions": rows}):
+        acct = str((rows.get(k) or {}).get("acct") or "")
+        at = acct.split(":", 1)[0] if acct else old
+        if at != new:
+            stranded.setdefault(at, ([], []))[0 if acct else 1].append(k)
+    if not stranded:
         return True
-    n = len(real)
-    one = n == 1
-    was = _BROKER_NAMES.get(old, old)
-    now = _BROKER_NAMES.get(cfg["broker"], cfg["broker"])
-    print(f"\nWARNING: you have {n} real position{'' if one else 's'} open at "
-          f"{was}: {', '.join(_contract_label(k) for k in real)}.")
-    print(f"After switching to {now} the agent will NOT sell "
-          f"{'it' if one else 'them'} — sell {'it' if one else 'them'} "
-          f"yourself in the {was} app.")
+    now = _BROKER_NAMES.get(new, new)
+    for at, (tagged, untagged) in stranded.items():
+        was = _BROKER_NAMES.get(at, at)
+        for keys in (tagged, untagged):
+            if not keys:
+                continue
+            one = len(keys) == 1
+            it = "it" if one else "them"
+            print(f"\nWARNING: you have {len(keys)} real position"
+                  f"{'' if one else 's'} open at {was}: "
+                  f"{', '.join(_contract_label(k) for k in keys)}.")
+            if keys is tagged:
+                what = f"the agent will NOT sell {it}"
+            else:
+                what = (f"the agent may try to sell {it} at {now}, where "
+                        f"{'it is' if one else 'they are'} not held")
+            print(f"After switching to {now} {what} — sell {it} yourself "
+                  f"in the {was} app.")
     ok = input(f"Switch to {now} anyway? [y/N]: ").strip().lower() == "y"
     if not ok:
-        print(f"Keeping {was}.")
+        print(f"Keeping {_BROKER_NAMES.get(old, old)}.")
     return ok
 
 
