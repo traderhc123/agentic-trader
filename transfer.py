@@ -72,6 +72,22 @@ CYCLE_IDLE = threading.Event()
 CYCLE_IDLE.set()
 
 
+def _was_live(cfg, root):
+    """Did the moved setup run live: a saved live mode or — never chosen —
+    real trades in what was just imported (agent._has_live_history), as
+    the agent itself reads those settings."""
+    import agent
+    if not agent._dry_run_unset(cfg):
+        return not cfg["dry_run"]
+    try:
+        with open(os.path.join(root, "state.json"), encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    return agent._has_live_history(state if isinstance(state, dict) else {},
+                                   os.path.join(root, "trades.jsonl"))
+
+
 def home():
     return os.path.expanduser(os.getenv("AGENT_HOME", "~/.agentic-trader"))
 
@@ -261,7 +277,7 @@ def import_bundle(blob, passphrase, replace=False):
     cfg_path = os.path.join(root, "config.json")
     with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
-    was_live = not cfg.get("dry_run")
+    was_live = _was_live(cfg, root)
     cfg["dry_run"] = True
     tmp = cfg_path + ".import-tmp"
     with open(tmp, "w", encoding="utf-8") as f:

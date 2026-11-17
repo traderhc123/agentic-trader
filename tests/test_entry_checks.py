@@ -303,7 +303,7 @@ def test_row_facts_never_raise_and_drop_what_is_not_data():
         def get(self, *a):
             raise RuntimeError("no")
     assert agent._row_facts({"action": "x"}, Angry()) == {"action": "x"}
-    rec = agent._row_facts({"action": "x"}, None, "daily_cap", params={
+    rec = agent._row_facts({"action": "x"}, {"dry_run": False}, "daily_cap", params={
         "cap": 2, "flag": True, "deep": {"a": 1}, "none": None, 5: "five"},
         code=None, sent=None)
     assert rec["ui"] == {"mode": "live", "check": "daily_cap",

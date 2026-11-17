@@ -1647,18 +1647,20 @@ def _dry_run_unset(cfg):
     return (cfg or {}).get("dry_run") is None
 
 
-def _has_live_history(state=None):
+def _has_live_history(state=None, trades_path=None):
     """True when this setup has already traded with real orders: a real
     entry/exit row in trades.jsonl, or a real position in the ledger. A log
     that can't be read counts as no history — the reading that can only
-    ever keep an unchosen mode in practice."""
+    ever keep an unchosen mode in practice. trades_path: another setup's
+    log (a moved setup, transfer.py) instead of this one's."""
     if state is None:
         state = _load(STATE_PATH, {}) or {}
-    if _real_positions(state):
+    if isinstance(state, dict) and _real_positions(state):
         return True
     real = ("entry", "exit", "ledger_adopt")
     try:
-        with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
+        with open(trades_path or TRADES_PATH, encoding="utf-8",
+                  errors="replace") as f:
             for line in f:
                 if '"dry": false' not in line and '"dry":false' not in line:
                     continue
@@ -1671,8 +1673,18 @@ def _has_live_history(state=None):
                     return True
     except OSError:
         pass
-    return any(t.get("action") in real and t.get("dry") is False
-               for t in _unwritten_rows())
+    return trades_path is None and any(
+        t.get("action") in real and t.get("dry") is False
+        for t in _unwritten_rows())
+
+
+# The mode _settle_dry_run decided for this run when the settings never
+# chose one, and whether "could not save the mode" was already printed. A
+# config.json that can't be written keeps coming back without the key; the
+# run keeps its first decision instead of working it out again from a
+# history that may read differently later (a trade log unreadable at start,
+# readable now, must not turn practice into live).
+_SETTLED_DRY = {"dry": None, "warned": False}
 
 
 def _is_dry(cfg, state=None):
@@ -1681,9 +1693,12 @@ def _is_dry(cfg, state=None):
     chosen: practice, unless this setup has already placed real orders
     (_has_live_history) — that setup keeps the live mode it has been
     running in, and the agent saves `dry_run: false` for it on start
-    (_settle_dry_run). Never chosen never becomes live by itself."""
+    (_settle_dry_run). Once this run has settled it, that decision stands
+    (_SETTLED_DRY). Never chosen never becomes live by itself."""
     if not _dry_run_unset(cfg):
         return bool(cfg["dry_run"])
+    if _SETTLED_DRY["dry"] is not None:
+        return _SETTLED_DRY["dry"]
     return not _has_live_history(state)
 
 
@@ -1708,6 +1723,7 @@ def _settle_dry_run(cfg, state=None):
     if not _dry_run_unset(cfg):
         return cfg
     dry = _is_dry(cfg, state)
+    _SETTLED_DRY["dry"] = dry  # kept for the run, saved or not
     wrote = []
 
     def change(c):
@@ -1716,9 +1732,11 @@ def _settle_dry_run(cfg, state=None):
             wrote.append(True)
     try:
         saved = update_config(change)
-    except OSError as exc:  # ConfigUnreadable / ConfigDamaged
-        print(f"could not save the mode to config.json ({str(exc)[:120]}) — "
-              f"running in {'PRACTICE' if dry else 'LIVE'} anyway")
+    except OSError as exc:  # ConfigUnreadable / ConfigDamaged / read-only
+        if not _SETTLED_DRY["warned"]:  # once per run, not every loop
+            _SETTLED_DRY["warned"] = True
+            print(f"could not save the mode to config.json ({str(exc)[:120]}) "
+                  f"— running in {'PRACTICE' if dry else 'LIVE'} anyway")
         return {**cfg, "dry_run": dry}
     if not wrote:  # chosen meanwhile (the dashboard): that choice stands
         return {**cfg, "dry_run": bool(saved["dry_run"])}

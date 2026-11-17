@@ -202,3 +202,73 @@ def test_v2_start_never_chosen_with_live_history_needs_the_confirmation(
     r = c.post("/api/v2/agent/start", {"confirm": r["preview"]["token"]})
     assert r["ok"] is True and starting == [("start", webui.APP_PORT)]
     assert read_cfg(home)["dry_run"] is False
+
+
+# ── review fixups ───────────────────────────────────────────────────────────
+
+def test_unwritable_config_keeps_the_first_decision_for_the_run(
+        home, no_policy, quiet, monkeypatch, capsys):
+    """REGRESSION: config.json readable but not writable, so the key is never
+    saved and every loop reloads a config without it. The trade log can't be
+    read at start (no history: practice); later it can and holds a live row.
+    The next loop must still be practice — never practice -> live by
+    itself — and "could not save the mode" is printed once, not every loop."""
+    _write(home, UNSET)
+    (home / "trades.jsonl").mkdir()  # can't be read as a file at start
+
+    def read_only(change, if_damaged=None):
+        raise PermissionError("config.json is read-only")
+    monkeypatch.setattr(agent, "update_config", read_only)
+    state = {"positions": {}}
+    cfg = agent._load(agent.CONFIG_PATH)
+    cfg = agent._settle_dry_run(cfg, state)                # cmd_run start
+    assert cfg["dry_run"] is True
+    (home / "trades.jsonl").rmdir()
+    _write(home, UNSET, [LIVE_ROW])                       # readable now: live
+    for _ in range(2):                                    # the run loop
+        cfg = agent._load(agent.CONFIG_PATH, cfg) or cfg
+        assert agent._dry_run_unset(cfg)                  # still not saved
+        cfg = agent._settle_dry_run(cfg, state)
+        assert cfg["dry_run"] is True
+    keyless = agent._load(agent.CONFIG_PATH)
+    assert agent._is_dry(keyless) is True and agent._mode(keyless) == "practice"
+    assert _entry(keyless) == []                          # no real order
+    assert capsys.readouterr().out.count("could not save the mode") == 1
+    assert "dry_run" not in _disk(home)
+
+
+def test_tests_never_read_the_real_agent_home():
+    """REGRESSION: tests without the `home` fixture logged rows into the real
+    ~/.agentic-trader/trades.jsonl, and a never-chosen mode read that file's
+    live rows, so results depended on the machine and the test order."""
+    import os
+    real = os.path.expanduser("~/.agentic-trader")
+    for p in (agent.HOME, agent.CONFIG_PATH, agent.STATE_PATH,
+              agent.TRADES_PATH, os.environ.get("AGENT_HOME", real)):
+        assert not os.path.abspath(p).startswith(os.path.abspath(real))
+    assert agent._is_dry({}) is True and agent._mode(None) == "practice"
+
+
+def test_safety_note_and_move_report_the_mode_the_agent_trades_in(
+        home, tmp_path, monkeypatch):
+    """The wizard's "Safety saved" note and a moved setup's was_live read
+    a never-chosen mode as the agent does (_is_dry), not with a default of
+    their own."""
+    import transfer
+    cfg = {**UNSET, "max_entries_per_day": 3}
+    assert "DRY-RUN" in webui._restore_notes(cfg)["safety"]
+    _write(home, cfg, [LIVE_ROW])
+    assert "LIVE" in webui._restore_notes(cfg)["safety"]
+
+    def move(rows):
+        old, new = tmp_path / f"old{len(rows)}", tmp_path / f"new{len(rows)}"
+        old.mkdir()
+        (old / "config.json").write_text(json.dumps(UNSET), encoding="utf-8")
+        (old / "trades.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        monkeypatch.setenv("AGENT_HOME", str(old))
+        blob = transfer.export_bundle("correct horse battery")
+        monkeypatch.setenv("AGENT_HOME", str(new))
+        return transfer.import_bundle(blob, "correct horse battery")
+    assert move([PRACTICE_ROW])["was_live"] is False   # never traded live
+    assert move([PRACTICE_ROW, LIVE_ROW])["was_live"] is True

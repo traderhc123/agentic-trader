@@ -111,7 +111,7 @@ export interface Status {
   agent: Agent;
   /** what NEW trades use; pausing never changes it */
   mode: "live" | "practice";
-  /** false: the settings never said (dry_run is missing), and the agent treats that as live */
+  /** false: the settings never said (dry_run is missing) — practice unless this setup already traded live; the agent saves it on start */
   mode_explicit: boolean;
   pause: Pause;
   real_positions: number;

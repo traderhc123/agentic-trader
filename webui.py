@@ -3308,8 +3308,9 @@ def _restore_notes(cfg, acceptance=None):
         if cfg.get("other_sizing_mode"):
             notes["sizing"] += " · shadow book " + _book_note("other_")
     if cfg.get("max_entries_per_day") is not None:
+        import agent as A  # the mode the agent trades in (A._is_dry)
         notes["safety"] = (
-            f"Safety saved: {'DRY-RUN' if cfg.get('dry_run', True) else 'LIVE'}"
+            f"Safety saved: {'DRY-RUN' if A._is_dry(cfg) else 'LIVE'}"
             f" · max {cfg.get('max_entries_per_day')} entries/day")
     return notes
 
@@ -4311,7 +4312,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         bp = A._buying_power(mod, cl, cfg)
         return {"known": bp is not None, "buying_power": bp,
                 "warning": A._cash_warning(cfg, bp),
-                "dry_run": bool(cfg.get("dry_run"))}
+                "dry_run": A._is_dry(cfg)}
 
     def broker_connect(_h, data):
         return _broker_connect(data, save)
