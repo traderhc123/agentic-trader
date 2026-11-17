@@ -304,3 +304,83 @@ def test_wallet_setup_says_low_when_only_the_fee_reserve_is_missing(
     cfg = lightning_wallet.wallet_setup({})
     assert cfg["lnbits_admin_key"] == "k"
     assert "Balance looks low" in capsys.readouterr().out
+
+
+# ── review fixups ──────────────────────────────────────────────────────────
+
+def test_key_balance_notice_reaches_the_dashboard_of_a_key_user():
+    """A key user with no Discord/ntfy/Telegram still sees 'top up your key'
+    on the dashboard; other pass notices stay hidden with a key."""
+    import view_model as vm
+    cfg = {"source": "agenthc", "agenthc_api_key": "k"}
+    signals = {"pass": {"kind": "subscription", "status": "active"},
+               "entry_access": False}
+    state = {"pass_notice": agenthc.KEY_BALANCE_EMPTY_TEXT}
+    note = vm._pass_notice(cfg, state, signals)
+    assert note and note["code"] == "pass" and "Top up your key" in note["text"]
+    # read with entry access since: the notice is no longer true
+    assert vm._pass_notice(cfg, state, {**signals, "entry_access": True}) is None
+    # a prepaid-pass lapse notice is still not shown to a key user
+    assert vm._pass_notice(cfg, {"pass_notice": agenthc.PASS_RUN_OUT_TEXT},
+                           signals) is None
+
+
+def _doctor_wallet(monkeypatch, bal, day=50_000):
+    import agent
+
+    class W:
+        def balance_sats(self):
+            return bal
+    monkeypatch.setattr(agent, "wallet_from_cfg", lambda cfg: W())
+    monkeypatch.setattr(agent, "_day_pass_price", lambda: (50.0, day))
+    got = []
+    agent._feed_access_check({"lnbits_url": "https://w", "lnbits_admin_key": "x"},
+                             {}, lambda *a, **k: got.append(a))
+    return got[0]
+
+
+def test_doctor_wallet_funded_counts_the_lnbits_fee_reserve(monkeypatch):
+    # exactly one day-pass: LNbits would refuse it ("You must reserve ...")
+    cid, ok, label, detail = _doctor_wallet(monkeypatch, 50_000)[:4]
+    assert not ok and "below one" in detail and "fee reserve" in detail
+    cid, ok, label, detail = _doctor_wallet(monkeypatch, 50_500)[:4]
+    assert ok and "~1 more market day" in detail
+    # two passes' price is not two passes once each needs its reserve
+    assert "~1 more market day" in _doctor_wallet(monkeypatch, 100_000)[3]
+
+
+def test_funding_hint_suggests_the_day_pass_plus_the_fee_reserve(monkeypatch):
+    import webui
+    monkeypatch.setattr(agenthc, "_price_cache", {"at": float("inf"),
+                                                  "usd": {1: 50.0, 5: 225.0},
+                                                  "sats": {1: 50_000, 5: 225_000}})
+    monkeypatch.setattr(webui, "_btc_usd", lambda: 100_000.0)
+    q = webui._fund_quote(0)
+    assert q["day_pass_sats"] == 50_000
+    assert q["suggested_sats"] == 50_500
+    # funding the suggested amount passes the agent's own low-balance test
+    assert q["suggested_sats"] >= 50_000 + lightning_wallet.fee_reserve_sats(50_000)
+    assert webui._fund_quote(0, invoice_cap=50_200)["suggested_sats"] == 50_200
+
+
+def test_entries_refused_while_an_overdue_invoice_cant_be_checked(clock):
+    """A wallet day-pass ends before the close and the only prepaid pass is
+    an invoice past its lifetime AgentHC hasn't answered for: the renewal
+    treats it as unknown (buys nothing), and entries are refused (it may
+    never take over, and no exit signal would arrive)."""
+    from test_daypass_payments import _et, _running
+    close_ts = _et(16, 0).timestamp()
+    now = clock.time()
+    cfg = {"feed_pass_pending": {"token": TOK}}
+    state = {**_running(_et(12, 0)), "pass_status": {agenthc._token_id(TOK): {
+        "status": "pending", "first_seen": now - 70 * 60, "checked": now - 69 * 60}}}
+    assert agenthc._prepaid_may_take_over(cfg, state) is True      # no purchase
+    assert agenthc.entry_cover(cfg, state, close_ts)[0] is False
+    # an old time-only "unpaid": same
+    state["pass_status"][agenthc._token_id(TOK)] = {
+        "status": "unpaid", "first_seen": now - 5 * 3600, "checked": now - 4 * 3600}
+    assert agenthc._prepaid_may_take_over(cfg, state) is True
+    assert agenthc.entry_cover(cfg, state, close_ts)[0] is False
+    # a pass never checked yet still counts as taking over (by design)
+    state["pass_status"] = {}
+    assert agenthc.entry_cover(cfg, state, close_ts)[0] is True

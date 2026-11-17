@@ -874,12 +874,20 @@ def _wallet_over_exits_only(cfg, state, save_state):
     return poll(cfg, state, save_state, _retried=True)
 
 
-def _prepaid_may_take_over(cfg, state):
+def _prepaid_may_take_over(cfg, state, entries=False):
     """A prepaid pass that may give entries once the wallet day-pass ends:
     one with signal days left as last checked, or one the agent has not
     been able to check (a pass the owner just bought in the dashboard has
-    no status here until the agent asks AgentHC about it). No request."""
+    no status here until the agent asks AgentHC about it). No request.
+    `entries` (entry_cover): only a pass never checked yet counts as not
+    known; one whose saved status went stale (an invoice past its lifetime
+    AgentHC hasn't answered for, an old "unpaid") counts by that saved
+    status, so new entries are refused rather than allowed on a guess. The
+    renewal keeps treating it as unknown: the wallet never pays on one."""
     cache = (state or {}).get("pass_status") or {}
+    if entries:
+        return any(((cache.get(_token_id(t)) or {}).get("status")
+                    in (None, "active")) for t in _pass_tokens(cfg))
     return any(_known_status(cfg, cache.get(_token_id(t)), t) in (None, "active")
                for t in _pass_tokens(cfg))
 
@@ -902,7 +910,7 @@ def entry_cover(cfg, state, close_ts):
     if cfg.get("agenthc_api_key") or not _live_daypass(state):
         return True, None
     until = float((state.get("l402") or {}).get("expires_at") or 0)
-    if until >= close_ts or _prepaid_may_take_over(cfg, state):
+    if until >= close_ts or _prepaid_may_take_over(cfg, state, entries=True):
         return True, until
     return False, until
 
