@@ -87,9 +87,10 @@ An order request that gets no clear answer (a timeout, a dropped
 connection, a gateway error) may have reached the broker. An adapter must
 never answer that by placing the order again, and must not let the error
 escape execute() either — the agent leaves an event whose handling raised
-unseen and hands it back on the next poll. Robinhood and Alpaca send every
-order under an id derived from its signal, look the order up, adopt it when
-it is there, and otherwise remember it in state["unconfirmed_orders"]: a buy
+unseen and hands it back on the next poll. Robinhood, Alpaca and moomoo send
+every order (moomoo: every buy, as its remark) under an id derived from its
+signal, look the order up, adopt it when it is there, and otherwise remember
+it in state["unconfirmed_orders"]: a buy
 is reported (broker_events.report(..., placed=True)) and not sent again; a
 sell is retried only once that is safe (order_guard.py). Their reconcile()
 hook, called once per loop, keeps looking for such a buy; one found later
