@@ -482,12 +482,16 @@ def _expires_today(expiry):
 
 
 # OpenD's words for "the request may have gone out, but no answer came back"
-# (moomoo-api common/err.py and open_context_base.py: a request timeout,
-# the connection lost or closed mid-request, an answer that couldn't be
-# read). Anything else OpenD returns is its own answer: a rejection.
+# (moomoo-api common/err.py and open_context_base.py): a request timeout
+# ("Timeout", "PacketErr.Timeout", "Abnormal event timeout"), the request
+# failed by name ("Disconnect", "Invalid", "SendFail", with or without
+# "PacketErr."), the connection lost or closed, an answer that couldn't be
+# read ("Packet data error"). Only the SDK's own strings: a real rejection
+# that merely mentions "abnormal" or "packet" stays a rejection.
 _NO_ANSWER_RX = re.compile(
-    r"time\s*out|timed\s*out|disconnect|connection\s+(lost|closed)|"
-    r"not\s+connected|send\s*fail|abnormal|packet|^\s*invalid\s*$", re.I)
+    r"^\s*(PacketErr\.)?(Timeout|Invalid|Disconnect|SendFail)\s*$|"
+    r"time\s*out|timed\s*out|connection\s+(lost|closed)|not\s+connected|"
+    r"packet\s+data\s+error", re.I)
 
 
 class _Unconfirmed(Exception):
@@ -498,6 +502,27 @@ class _Unconfirmed(Exception):
     def __init__(self, why, qty):
         super().__init__(why)
         self.qty = qty
+
+
+class _BuyFailed(Exception):
+    """place_order failed for a buy with some other text. Usually OpenD's
+    own rejection, but the SDK returns any error it hit reading the answer
+    (an answer that couldn't be decoded) the same way: the caller looks the
+    order up once by its remark before calling it rejected."""
+
+    def __init__(self, why, qty):
+        super().__init__(why)
+        self.qty = qty
+
+
+def _sell_unanswered(why):
+    """A sell got no clear answer. Not a rejection, and nothing to note: the
+    retry re-reads the holdings less working sells (_sell_holding), so a
+    sell that did reach moomoo is never sold again."""
+    print(f"  ORDER UNCLEAR: no answer from OpenD to the sell order ({why})")
+    broker_events.report(
+        "exit_failed", f"moomoo didn't answer the sell order ({str(why)[:200]}); "
+        "the agent re-checks your holdings before retrying")
 
 
 def _account(cfg):
@@ -575,9 +600,15 @@ def _order(cfg, sdk, code, side, qty, price, effect=None, contract=None,
         except Exception as exc:
             if side == "buy":  # sent, maybe; never answered
                 raise _Unconfirmed(f"{type(exc).__name__}: {exc}", int(qty)) from exc
-            raise
-        if ret != sdk.RET_OK and side == "buy" and _NO_ANSWER_RX.search(str(data)):
-            raise _Unconfirmed(str(data)[:200], int(qty))
+            _sell_unanswered(f"{type(exc).__name__}: {exc}")
+            return None
+        if ret != sdk.RET_OK and _NO_ANSWER_RX.search(str(data)):
+            if side == "buy":
+                raise _Unconfirmed(str(data)[:200], int(qty))
+            _sell_unanswered(data)
+            return None
+        if ret != sdk.RET_OK and side == "buy" and remark:
+            raise _BuyFailed(str(data)[:200], int(qty))
         if ret != sdk.RET_OK:
             print(f"  ORDER FAILED: {data}")
             broker_events.report(_fail_kind(side),
@@ -589,7 +620,7 @@ def _order(cfg, sdk, code, side, qty, price, effect=None, contract=None,
             oid = "submitted"
         print(f"  moomoo order {side} x{qty} {code} @ ${price:.2f} -> {oid}")
         return order_guard.OrderId(oid, qty)
-    except _Unconfirmed:
+    except (_Unconfirmed, _BuyFailed):
         raise
     except Exception as exc:
         print(f"  ORDER FAILED: {exc}")
@@ -698,6 +729,21 @@ def execute(cl, cfg, event, state):
                 + " It will NOT send this buy again. Check your moomoo app: if "
                 "the order is there, the agent finds it on its own and manages "
                 "the position; if it isn't, this trade was missed.", placed=True)
+            return False
+        except _BuyFailed as exc:
+            # usually OpenD turning it down; but an answer the SDK couldn't
+            # decode comes back the same way: look once before saying so
+            qty = exc.qty if isinstance(exc.qty, int) else qty
+            found = _order_by_remark(cfg, sdk, code, "buy", key, qty=qty,
+                                     fresh=True)
+            if found:
+                print(f"  OpenD reported an error for the buy order ({exc}), "
+                      "but the order is there — using it")
+                return _adopt_order(state, pos_key, event.get("event_id"), code,
+                                    contract, found, qty)
+            print(f"  ORDER FAILED: {exc}")
+            broker_events.report("order_failed",
+                                 f"moomoo rejected the buy order: {exc}")
             return False
         if oid:
             qty = getattr(oid, "qty", qty)
@@ -879,13 +925,16 @@ def _confirm_sell(cfg, sdk, oid, qty):
 # ── buys whose request got no clear answer (order_guard) ───────────────────
 
 
-def _order_by_remark(cfg, sdk, code, side, remark, qty=None, fresh=False):
+def _order_by_remark(cfg, sdk, code, side, remark, qty=None, fresh=False,
+                     since=None):
     """Today's order on `code` that the agent sent under `remark` (its
     order_guard.order_key), as a dict; False when moomoo lists none; None
     when the order list can't be read. Only an order matching the code, the
     side, the remark (and `qty` when given) counts: an order the owner
     placed in the app never carries the agent's remark. fresh: ask moomoo
-    itself (rate-limited), not OpenD's cache of the orders it sent."""
+    itself (rate-limited), not OpenD's cache of the orders it sent.
+    since (epoch seconds): the order may be older than today — the order
+    history from the day before that on is searched too."""
     if not remark or not str(code or "").startswith("US."):
         return None
     ctx = None
@@ -900,8 +949,20 @@ def _order_by_remark(cfg, sdk, code, side, remark, qty=None, fresh=False):
                                              refresh_cache=False)
         if ret != sdk.RET_OK or data is None:
             return None
-        for i in range(len(data)):
-            row = data.iloc[i]
+        tables = [data]
+        if since is not None:
+            # today's list ends at the trading day; a buy sent on an earlier
+            # day is only in the history (dates generously: the day before)
+            day = datetime.fromtimestamp(float(since) - 86400,
+                                         ZoneInfo("America/New_York")).date()
+            ret, past = _fresh_query(sdk, ctx.history_order_list_query,
+                                     code=code, trd_env=env,
+                                     start=f"{day.isoformat()} 00:00:00")
+            if ret != sdk.RET_OK or past is None:
+                return None
+            tables.append(past)
+        rows = [t.iloc[i] for t in tables for i in range(len(t))]
+        for row in rows:
             if str(row.get("remark") or "") != str(remark):
                 continue
             if str(row.get("code")) != code:
@@ -974,6 +1035,17 @@ def _adopt_order(state, pos_key, event_id, code, contract, order, asked):
     return True
 
 
+def _before_today(ts):
+    """Epoch `ts` falls on an earlier US/Eastern day than now (or can't be
+    read): moomoo's list of today's orders no longer has an order sent then."""
+    try:
+        tz = ZoneInfo("America/New_York")
+        return (datetime.fromtimestamp(float(ts), tz).date()
+                < datetime.now(tz).date())
+    except (TypeError, ValueError, OverflowError, OSError):
+        return True
+
+
 def _settle_unconfirmed(cfg, sdk, state, pos_key):
     """Look up a buy whose request got no clear answer (order_guard).
     "clear": nothing is waiting (any more); "adopted": it is at moomoo and
@@ -999,6 +1071,15 @@ def _settle_unconfirmed(cfg, sdk, state, pos_key):
     if found is False:
         if order_guard.age(unc) < order_guard.BUY_KEEP_S:
             return "unknown"  # not there now; it may still show up late
+        if _before_today(unc.get("at")):
+            # before forgetting it: a buy sent on an earlier day (the list
+            # unreadable since) is in the order history, not today's list
+            found = _order_by_remark(cfg, sdk, unc.get("option_id"), "buy",
+                                     unc.get("key"), qty=asked or None,
+                                     fresh=True, since=unc.get("at"))
+            if found is None:
+                return "unknown"
+    if found is False:
         order_guard.drop(state, pos_key)
         return "clear"
     order_guard.drop(state, pos_key)

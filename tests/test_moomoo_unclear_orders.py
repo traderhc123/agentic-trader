@@ -55,6 +55,8 @@ class FakeOpenD:
         self.book = []        # the orders that reached moomoo
         self.orders_ok = True  # can order_list_query be read?
         self.queries = []
+        self.reply = None     # place_order's failure text ("reject"/"timeout")
+        self.history = []     # orders of earlier days (history_order_list_query)
 
     def OpenSecTradeContext(self, **kw):
         sdk = self
@@ -63,7 +65,7 @@ class FakeOpenD:
             def place_order(self, **kw):
                 sdk.sent.append(kw)
                 if sdk.mode == "reject":
-                    return -1, "insufficient buying power"
+                    return -1, sdk.reply or "insufficient buying power"
                 oid = f"mm-{len(sdk.book) + 1}"
                 sdk.book.append({
                     "order_id": oid, "code": kw["code"],
@@ -71,7 +73,7 @@ class FakeOpenD:
                     "qty": float(kw["qty"]), "dealt_qty": 0.0,
                     "order_status": sdk.status, "remark": kw.get("remark", "")})
                 if sdk.mode == "timeout":
-                    return -1, "Timeout"
+                    return -1, sdk.reply or "Timeout"
                 if sdk.mode == "raise":
                     raise ConnectionError("OpenD connection dropped")
                 return sdk.RET_OK, _DF([{"order_id": oid}])
@@ -87,6 +89,13 @@ class FakeOpenD:
                     rows = [o for o in rows
                             if o["order_status"] not in moomoo._MM_DONE]
                 return sdk.RET_OK, _DF(rows)
+
+            def history_order_list_query(self, **kw):
+                sdk.queries.append(("history", kw))
+                if not sdk.orders_ok:
+                    return -1, "disconnected"
+                return sdk.RET_OK, _DF([o for o in sdk.history
+                                        if o["code"] == kw.get("code")])
 
             def position_list_query(self, **kw):
                 return sdk.RET_OK, _DF([{"code": CODE, "qty": float(sdk.held)}]
@@ -295,3 +304,143 @@ def test_unclear_sell_is_not_noted(opend, reports):
         is False
     assert order_guard.unconfirmed(state) == {}
     assert "remark" not in opend.sent[0]
+
+
+# ── review fixups: which failures are "no answer", a decode error, sells,
+#    and an unclear buy from an earlier day ──────────────────────────────────
+
+
+def _list_unreadable_after_send(opend):
+    real = opend.OpenSecTradeContext
+
+    def ctx(**kw):
+        c = real(**kw)
+        if opend.sent:
+            opend.orders_ok = False
+        return c
+    opend.OpenSecTradeContext = ctx
+
+
+@pytest.mark.parametrize("reply", [
+    "Timeout", "PacketErr.Timeout", "Abnormal event timeout", "Invalid",
+    "PacketErr.Invalid", "Disconnect", "SendFail", "Packet data error",
+    "Connection lost", "Not connected"])
+def test_every_sdk_no_answer_text_is_tracked_not_rejected(opend, reports, reply):
+    # moomoo-api's own strings for a request that may have gone out
+    opend.mode, opend.reply = "timeout", reply
+    _list_unreadable_after_send(opend)
+    state = {"positions": {}}
+    assert moomoo.execute(None, CFG, _ev(), state) is False
+    assert order_guard.get(state, KEY), reply
+    assert len(opend.sent) == 1
+    assert "rejected" not in reports[-1][1]
+
+
+@pytest.mark.parametrize("reply", [
+    "abnormal price: the limit price deviates too far from the market",
+    "order packet refused: account restricted"])
+def test_a_rejection_that_mentions_abnormal_or_packet_stays_a_rejection(
+        opend, reports, reply):
+    opend.mode, opend.reply = "reject", reply
+    state = {"positions": {}}
+    assert moomoo.execute(None, CFG, _ev(), state) is False
+    assert order_guard.unconfirmed(state) == {}
+    assert reports[-1][0] == "order_failed"
+    assert "rejected" in reports[-1][1] and not reports[-1][2].get("placed")
+
+
+def test_buy_whose_answer_couldnt_be_decoded_is_looked_up_and_adopted(
+        opend, reports):
+    # the order reached moomoo, but the SDK failed decoding OpenD's answer:
+    # it returns (RET_ERROR, str(exception)), text no rule can recognise
+    opend.mode = "timeout"
+    opend.reply = "Error parsing message with type 'Trd_PlaceOrder.Response'"
+    state = {"positions": {}}
+    assert moomoo.execute(None, CFG, _ev(), state) is True
+    assert state["positions"][KEY]["order_ids"] == ["mm-1"]
+    assert len(opend.sent) == 1
+    assert not any("rejected" in m for _k, m, _kw in reports)
+
+
+def test_buy_rejection_not_listed_is_still_reported_rejected(opend, reports):
+    opend.mode, opend.reply = "reject", "insufficient buying power"
+    state = {"positions": {}}
+    assert moomoo.execute(None, CFG, _ev(), state) is False
+    assert state["positions"] == {} and order_guard.unconfirmed(state) == {}
+    assert reports[-1][1] == "moomoo rejected the buy order: insufficient buying power"
+
+
+@pytest.mark.parametrize("mode", ["timeout", "raise"])
+def test_unanswered_sell_says_no_answer_not_rejected(opend, reports, mode):
+    opend.mode, opend.held = mode, 2
+    state = {"positions": {KEY: {"option_id": CODE, "qty": 2}}}
+    assert moomoo.execute(None, CFG, _ev(event="EXITED", event_id="x1"),
+                          state) is False
+    assert state["positions"][KEY]["qty"] == 2
+    kind, msg, _kw = reports[-1]
+    assert kind == "exit_failed"
+    assert "didn't answer the sell order" in msg and "rejected" not in msg
+    assert "re-checks your holdings" in msg
+    assert order_guard.unconfirmed(state) == {}
+
+
+def _yesterday_evening():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/New_York"))
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.timestamp() - 3600
+
+
+def test_unclear_buy_from_an_earlier_day_is_found_in_the_order_history(
+        opend, reports, monkeypatch):
+    # the order list stayed unreadable past the trading day: today's list
+    # no longer has the order, the history does
+    monkeypatch.setattr(order_guard, "GIVE_UP_S", 7 * 86400)
+    state = {"positions": {}}
+    order_guard.note(state, KEY, "buy", "the-remark", 2, CODE,
+                     event_id="e1", contract="SPY")
+    state[order_guard.STATE_KEY][KEY]["at"] = _yesterday_evening()
+    opend.history.append({"order_id": "mm-old", "code": CODE,
+                          "trd_side": "TrdSide.BUY", "qty": 2.0, "dealt_qty": 2.0,
+                          "order_status": "FILLED_ALL", "remark": "the-remark"})
+    moomoo.reconcile(moomoo.client(CFG), CFG, state, lambda s: None)
+    assert state["positions"][KEY]["order_ids"] == ["mm-old"]
+    assert state["positions"][KEY]["qty"] == 2
+    assert order_guard.unconfirmed(state) == {}
+    assert opend.sent == []
+
+
+def test_earlier_day_buy_is_kept_while_the_history_cant_be_read(
+        opend, reports, monkeypatch):
+    monkeypatch.setattr(order_guard, "GIVE_UP_S", 7 * 86400)
+    state = {"positions": {}}
+    order_guard.note(state, KEY, "buy", "the-remark", 2, CODE,
+                     event_id="e1", contract="SPY")
+    state[order_guard.STATE_KEY][KEY]["at"] = _yesterday_evening()
+    real = opend.OpenSecTradeContext
+
+    def ctx(**kw):
+        c = real(**kw)
+        c.history_order_list_query = lambda **kw: (-1, "disconnected")
+        return c
+    opend.OpenSecTradeContext = ctx
+    moomoo.reconcile(moomoo.client(CFG), CFG, state, lambda s: None)
+    assert order_guard.get(state, KEY), "dropped without checking the history"
+    assert state["positions"] == {}
+    # ...and a new signal on the contract still isn't bought on top of it
+    assert moomoo.execute(None, CFG, _ev(event_id="e2"), state) is False
+    assert opend.sent == []
+
+
+def test_same_day_unclear_buy_is_dropped_without_a_history_query(
+        opend, reports, monkeypatch):
+    monkeypatch.setattr(moomoo, "_before_today", lambda ts: False)
+    state = {"positions": {}}
+    order_guard.note(state, KEY, "buy", "the-remark", 2, CODE,
+                     event_id="e1", contract="SPY")
+    state[order_guard.STATE_KEY][KEY]["at"] = (
+        time.time() - order_guard.BUY_KEEP_S - 5)
+    moomoo.reconcile(moomoo.client(CFG), CFG, state, lambda s: None)
+    assert order_guard.unconfirmed(state) == {} and state["positions"] == {}
+    assert not any(isinstance(q, tuple) for q in opend.queries)
