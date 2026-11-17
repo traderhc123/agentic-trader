@@ -751,7 +751,7 @@ export function answerWhy(which: Which, a: Answer, s: Status): string {
       return `Today's closed trades have lost about ${usd(lost)}${s.limits.max_daily_loss != null ? `, at or over your ${usd(s.limits.max_daily_loss, 0)} daily loss limit` : ""}. Nothing new until tomorrow; this never sells anything.`;
     }
     case "position_cap_reached":
-      return `You hold ${plural(real + prac, "position")}, the most you allow at once (${s.limits.max_positions}). New trades wait until one is sold.`;
+      return `You hold ${plural(s.mode === "live" ? real : prac, s.mode === "live" ? "real position" : "practice position")}, the most you allow at once (${s.limits.max_positions}). New trades wait until one is sold.`;
     case "market_closed":
       return "The market is closed for today.";
     case "no_signal_access":

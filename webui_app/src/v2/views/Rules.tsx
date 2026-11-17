@@ -119,12 +119,21 @@ const LIMIT_LABEL: Record<LimitKey, string> = {
   max_entries_per_day: "New trades per day",
   max_daily_loss_usd: "Daily loss limit",
   max_open_positions: "Open positions at once",
+  max_contracts_per_trade: "Most contracts in one trade",
 };
 
 function LimitRow({ page, k, exp, now }: { page: Page; k: LimitKey; exp: string; now: ReactNode }) {
   const v = page.settings.view;
   const L = page.s.limits;
-  const saved: number | null = v ? (v.limits[k] ?? (k === "max_daily_loss_usd" ? null : v.limits.defaults[k as "max_entries_per_day"])) : k === "max_entries_per_day" ? L.cap : k === "max_open_positions" ? L.max_positions : L.max_daily_loss;
+  const shown =
+    k === "max_entries_per_day"
+      ? L.cap
+      : k === "max_open_positions"
+        ? L.max_positions
+        : k === "max_contracts_per_trade"
+          ? L.trade_size.main.max_contracts
+          : L.max_daily_loss;
+  const saved: number | null = v ? (v.limits[k] ?? (k === "max_daily_loss_usd" ? null : (v.limits.defaults[k as "max_entries_per_day"] ?? null))) : shown;
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [err, setErr] = useState("");
@@ -155,7 +164,8 @@ function LimitRow({ page, k, exp, now }: { page: Page; k: LimitKey; exp: string;
     if (a.kind === "review") setDraft({ payload, preview: a.preview });
     else setErr(a.kind === "error" ? a.error : a.note);
   };
-  const ctx = { mainUsd: L.trade_size.main.usd, open: L.open_positions.real + L.open_positions.practice };
+  // positions count toward the limit in the mode they belong to (agent._open_in_mode)
+  const ctx = { mainUsd: L.trade_size.main.usd, open: page.s.mode === "live" ? L.open_positions.real : L.open_positions.practice };
   const dir = parsed.ok ? riskOf(k, saved, parsed.value) : "neutral";
   return (
     <div className="setrow" data-row={k}>
@@ -889,7 +899,10 @@ export function RulesView({ page }: { page: Page }) {
   const used = live ? L.used_today.real : L.used_today.practice;
   const lost = live ? L.realised_loss_today.real : L.realised_loss_today.practice;
   const unmeasured = live ? L.unmeasured_exits_today.real : L.unmeasured_exits_today.practice;
-  const n = L.open_positions.real + L.open_positions.practice;
+  // the open-positions limit counts this mode's positions only
+  const n = live ? L.open_positions.real : L.open_positions.practice;
+  const cap = L.trade_size.main.max_contracts;
+  const mc = L.trade_size.main.contracts;
   const mu = L.trade_size.main.usd;
   const ou = L.trade_size.other.usd;
   const perTrade = mu != null && ou != null ? Math.max(mu, ou) : null;
@@ -946,7 +959,12 @@ export function RulesView({ page }: { page: Page }) {
             </>
           }
         />
-        <LimitRow page={page} k="max_open_positions" exp="The most positions held at the same time, real and practice counted together." now={`${count(n)} open now${L.positions_reached ? ", limit reached" : ""}`} />
+        <LimitRow
+          page={page}
+          k="max_open_positions"
+          exp="The most positions held at the same time. Real positions count when LIVE, practice ones in Practice."
+          now={`${count(n)} ${live ? "real" : "practice"} open now${L.positions_reached ? ", limit reached" : ""}`}
+        />
       </section>
       <section className={`panel ${page.stale ? "stale" : ""}`}>
         <div className="ph">
@@ -954,6 +972,12 @@ export function RulesView({ page }: { page: Page }) {
         </div>
         <SizeRow page={page} book="main" hints={hints("main")} />
         <SizeRow page={page} book="other" hints={hints("other")} />
+        <LimitRow
+          page={page}
+          k="max_contracts_per_trade"
+          exp="Every trade is cut to this many contracts, whatever its size: a dollar budget, a share of the account or a contract count."
+          now={cap != null && mc != null && mc > cap ? `Your main pick size is ${plural(mc, "contract")}: each trade buys ${count(cap)}` : ""}
+        />
       </section>
       <section className={`panel ${page.stale ? "stale" : ""}`}>
         <div className="ph">
