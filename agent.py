@@ -3368,12 +3368,15 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # this a feed could accumulate unbounded open positions across days.
         pos_cap = int(cfg.get("max_open_positions", 10))
         if len(state.get("positions", {})) >= pos_cap:
-            msg = (f"SKIPPED {contract}: max open positions reached "
-                   f"({pos_cap}) — close positions or raise max_open_positions")
+            how = (f"{pos_cap} open now, real and practice together. "
+                   "To allow more, say 'set positions N' in the dashboard "
+                   "chat, or raise Open positions at once in the settings")
+            msg = f"SKIPPED {contract}: max open positions reached ({pos_cap}) — {how}"
             print(msg)
             _log_trade(_row_facts(
                 {"action": "skip_position_cap", "book": book,
-                 "event_id": ev["event_id"], "contract": contract}, cfg,
+                 "event_id": ev["event_id"], "contract": contract,
+                 "reason": how}, cfg,
                 "position_cap", params={"max_open": pos_cap}))
             return msg
         # Max daily loss (opt-in): once today's estimated realized loss reaches
@@ -5842,7 +5845,7 @@ def cmd_setup():
     cfg["dry_run"] = dry != "n"
     raw = input("Max new entries per day (hard cap) [5]: ").strip()
     cfg["max_entries_per_day"] = int(raw) if raw.isdigit() else 5
-    cfg.setdefault("max_open_positions", 10)
+    _ask_position_cap(cfg)
     cfg.setdefault("max_event_age_s", 300)
     cfg = notifications_setup(cfg)
     cfg = llm_policy.setup(cfg)
@@ -5938,11 +5941,36 @@ def set_book_sizing(cfg, book, mode, value):
     return True, ""
 
 
+# Most positions open at once (low, high). The entry gate's default when
+# none was ever set is 10. Shared by the chat command, the setup wizards and
+# the /v2 settings page.
+POSITION_CAP_DEFAULT = 10
+POSITION_CAP_RANGE = (1, 1000)
+
+
 def set_position_cap(cfg, val):
-    """Most positions open at once, both books together (not saved): one
-    whole number of 1 or more, checked by the caller. Shared by the chat
-    command 'set positions N' and the dashboard's settings page."""
+    """Most positions open at once, both books together. Sets the value in
+    `cfg`; the caller saves it. One whole number in POSITION_CAP_RANGE,
+    checked by the caller. Shared by the chat command 'set positions N',
+    the setup wizards and the dashboard's settings page."""
     cfg["max_open_positions"] = val
+
+
+def _ask_position_cap(cfg):
+    """The terminal setup's question for the most positions open at once.
+    Enter (or an answer that is not a whole number in range) keeps what is
+    set; never set before: the gate's default."""
+    cur = cfg.get("max_open_positions")
+    if not isinstance(cur, int) or isinstance(cur, bool):
+        cur = POSITION_CAP_DEFAULT
+    lo, hi = POSITION_CAP_RANGE
+    raw = input(f"Max positions open at once, real and practice together "
+                f"(hard cap, {lo}-{hi}) [{cur}]: ").strip()
+    val = int(raw) if raw.isdigit() else None
+    if val is not None and not lo <= val <= hi:
+        print(f"Must be {lo} to {hi}: keeping {cur}.")
+        val = None
+    set_position_cap(cfg, val if val is not None else cur)
 
 
 # A chat command must match its whole grammar. A question, extra words, or
@@ -6056,6 +6084,29 @@ def _command_whole(t, name):
     """_command_number, for a count: whole numbers only, no $ or %."""
     val = _command_number(t, name, unit="")
     return int(val) if val is not None and val == int(val) else None
+
+
+# 'set positions N' and the other ways owners write it. Each is still a
+# whole command ("set max open positions 20"), never a sentence.
+_POSITION_CAP_COMMANDS = ("set positions", "set max positions",
+                          "set open positions", "set max open positions",
+                          "set position cap", "set open trades",
+                          "set max open trades")
+
+
+def _position_cap_command(t, cfg):
+    """(handled, reply) for any of _POSITION_CAP_COMMANDS."""
+    lo, hi = POSITION_CAP_RANGE
+    val = next((v for v in (_command_whole(t, name)
+                            for name in _POSITION_CAP_COMMANDS)
+                if v is not None), None)
+    if val is None or not lo <= val <= hi:
+        return True, (f"{_NOTHING_CHANGED}Positions open at once must be a "
+                      f"whole number from {lo} to {hi}. Usage: set positions 20")
+    set_position_cap(cfg, val)
+    _save(CONFIG_PATH, cfg, private=True)
+    return True, (f"Open positions at once set to {val} (real and practice "
+                  "counted together).")
 
 
 def _rule_command(t, cfg, text=None):
@@ -6380,14 +6431,10 @@ def _command(t, cfg, text):
             return True, _NOTHING_CHANGED + "Usage: set cap 3"
         cfg["max_entries_per_day"] = val
         _save(CONFIG_PATH, cfg, private=True)
-        return True, f"Daily entry cap set to {val}."
-    if t.startswith("set positions"):
-        val = _command_whole(t, "set positions")
-        if val is None or val < 1:
-            return True, _NOTHING_CHANGED + "Usage: set positions 5"
-        set_position_cap(cfg, val)
-        _save(CONFIG_PATH, cfg, private=True)
-        return True, f"Max concurrent open positions set to {val}."
+        return True, (f"Daily entry cap set to {val} (new trades per day). "
+                      "For positions held at once, say: set positions N.")
+    if t.startswith(_POSITION_CAP_COMMANDS):
+        return _position_cap_command(t, cfg)
     if t == "autopay cap" or t.startswith("set autopay cap"):
         return _autopay_cap_command(t, cfg)
     if t.startswith("set max loss"):
