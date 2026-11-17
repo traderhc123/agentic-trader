@@ -5751,6 +5751,33 @@ def _expiry_setting(arg, default):
 
 # ── commands ─────────────────────────────────────────────────────────────────
 
+def _confirm_broker_switch(cfg, saved_bc):
+    """Terminal setup: True to go ahead with the broker just picked. A real
+    position the ledger holds was opened at the saved broker, and the agent
+    never sells a real row opened in another broker account
+    (_check_before_exit: "blocked") — so a switch while any are open warns
+    and asks first. Enter (or anything but y) keeps the saved broker."""
+    old = {"2": "alpaca", "3": "moomoo"}.get(saved_bc, "robinhood")
+    if cfg.get("broker") == old:
+        return True
+    real = _real_positions(_load(STATE_PATH, {}) or {})
+    if not real:
+        return True
+    n = len(real)
+    one = n == 1
+    was = _BROKER_NAMES.get(old, old)
+    now = _BROKER_NAMES.get(cfg["broker"], cfg["broker"])
+    print(f"\nWARNING: you have {n} real position{'' if one else 's'} open at "
+          f"{was}: {', '.join(_contract_label(k) for k in real)}.")
+    print(f"After switching to {now} the agent will NOT sell "
+          f"{'it' if one else 'them'} — sell {'it' if one else 'them'} "
+          f"yourself in the {was} app.")
+    ok = input(f"Switch to {now} anyway? [y/N]: ").strip().lower() == "y"
+    if not ok:
+        print(f"Keeping {was}.")
+    return ok
+
+
 def cmd_setup():
     require_consent_or_exit()
     cfg = _load(CONFIG_PATH, {}) or {}
@@ -5771,8 +5798,13 @@ def cmd_setup():
     print("  1) Robinhood Agentic account (OAuth)")
     print("  2) Alpaca — paper or live (API keys; paper = zero real dollars)")
     print("  3) moomoo — paper or live (needs their OpenD gateway running)")
-    bc = input("Choose [1-3, default 1]: ").strip() or "1"
+    # Enter keeps the broker that is saved (re-running setup to change a key
+    # must not switch an Alpaca or moomoo owner to Robinhood)
+    saved_bc = {"alpaca": "2", "moomoo": "3"}.get(str(cfg.get("broker")), "1")
+    bc = input(f"Choose [1-3, default {saved_bc}]: ").strip() or saved_bc
     cfg["broker"] = {"2": "alpaca", "3": "moomoo"}.get(bc, "robinhood")
+    if not _confirm_broker_switch(cfg, saved_bc):
+        cfg["broker"] = {"2": "alpaca", "3": "moomoo"}.get(saved_bc, "robinhood")
     cfg = BROKERS[cfg["broker"]].setup(cfg)
 
     print("\n== Step 3/4: Position sizing ==")
