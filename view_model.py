@@ -1587,7 +1587,8 @@ def _pass(cfg, state, now):
         for token in tokens:
             rec = cache.get(hc._token_id(token))
             rec = rec if isinstance(rec, dict) else {}
-            statuses.add(rec.get("status"))
+            # None while hc.poll can't rely on it either (hc._known_status)
+            statuses.add(hc._known_status(cfg, rec, token, now.timestamp()))
             if rec.get("status") in hc._USABLE and (
                     best is None or (rec.get("status") == "active"
                                      and best.get("status") != "active")):
