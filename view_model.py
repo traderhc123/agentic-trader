@@ -1592,7 +1592,8 @@ def _pass(cfg, state, now):
         for token in tokens:
             rec = cache.get(hc._token_id(token))
             rec = rec if isinstance(rec, dict) else {}
-            statuses.add(rec.get("status"))
+            # None while hc.poll can't rely on it either (hc._known_status)
+            statuses.add(hc._known_status(cfg, rec, token, now.timestamp()))
             if rec.get("status") in hc._USABLE and (
                     best is None or (rec.get("status") == "active"
                                      and best.get("status") != "active")):
@@ -1835,8 +1836,19 @@ def _pass_notice(cfg, state, signals=None):
             and (not isinstance(p, dict) or p.get("kind") == "day_pass")):
         return {"level": "warn", "code": "pass", "text": text}
     if isinstance(p, dict):
-        if signals.get("entry_access") is True \
-                or p.get("kind") in ("subscription", "not_needed"):
+        if signals.get("entry_access") is True:
+            return None
+        if p.get("kind") == "subscription":
+            # the one pass notice that is about the key itself: its balance
+            # can't pay for today (hc.poll; cleared on the next entry read)
+            try:
+                from sources import agenthc_day_trade_ideas as hc
+                if text == _text(hc.KEY_BALANCE_EMPTY_TEXT):
+                    return {"level": "warn", "code": "pass", "text": text}
+            except Exception:
+                pass
+            return None
+        if p.get("kind") == "not_needed":
             return None
         if (p.get("auto_pay") and cfg.get("lnbits_url")
                 and p.get("status") != "exits_only"

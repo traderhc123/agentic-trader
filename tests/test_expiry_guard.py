@@ -574,9 +574,9 @@ def test_robinhood_reconcile_reprices_a_stale_guard_sell(monkeypatch):
     monkeypatch.setattr(robinhood.time, "sleep", lambda s: None)
     monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: False)
     monkeypatch.setattr(robinhood, "_before_close", lambda now=None, cfg=None: True)
+    reads = iter([("confirmed", 0), ("cancelled", 0)])   # dead once cancelled
+    monkeypatch.setattr(robinhood, "_order_status", lambda rh_, a, oid: next(reads))
     rh = FakeRH({
-        "get_option_orders": _mcp({"data": {"results": [
-            {"id": "o-1", "state": "confirmed", "processed_quantity": "0"}]}}),
         "cancel_option_order": _mcp({"ok": True}),
         "get_option_quotes": _mcp({"data": {"results": [{"bid_price": "0.80"}]}}),
         "place_option_order": _mcp({"data": {"id": "o-2"}}),
