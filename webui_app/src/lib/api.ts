@@ -252,5 +252,6 @@ export interface WizardState {
   dry_run?: boolean | null;
   max_entries_per_day?: number | null;
   max_open_positions?: number | null;
+  max_contracts_per_trade?: number | null;
   max_daily_loss_usd?: number | null;
 }

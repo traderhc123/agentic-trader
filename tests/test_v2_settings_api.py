@@ -210,6 +210,35 @@ def test_positions_same_as_the_chat_command(home, app):
     assert out["max_open_positions"] == 6
 
 
+def test_max_contracts_same_as_the_chat_command_and_classic_safety(home, app):
+    start = {**BASE, "max_contracts_per_trade": 10}
+    write_cfg(home, start)
+    c = app(lambda: {"mode": "DRY-RUN", "fields": {}}, lambda: [],
+            agent._apply_command, lambda: agent._load(agent.CONFIG_PATH, {}))
+    out = same_effect(
+        home, start,
+        lambda: c.post("/api/command", {"text": "set max contracts 40"}),
+        lambda: c.confirmed("/api/v2/settings/limits",
+                            {"max_contracts_per_trade": 40}))
+    assert out["max_contracts_per_trade"] == 40
+    out = same_effect(
+        home, start,
+        lambda: c.post("/api/safety", {"max_contracts": "40", "seeded": True}),
+        lambda: c.confirmed("/api/v2/settings/limits",
+                            {"max_contracts_per_trade": 40}))
+    assert out["max_contracts_per_trade"] == 40
+    # raising it is reviewed as raising the risk; out of range is refused
+    write_cfg(home, start)
+    first = c.post("/api/v2/settings/limits", {"max_contracts_per_trade": 40})
+    (ch,) = first["preview"]["changes"]
+    assert ch["key"] == "max_contracts_per_trade"
+    assert ch["direction"] == "raises_risk"
+    assert (ch["saved_now"], ch["new"]) == (10, 40)
+    for bad in (0, 1001, 2.5):
+        r = c.post("/api/v2/settings/limits", {"max_contracts_per_trade": bad})
+        assert r["ok"] is False and read_cfg(home) == start
+
+
 def test_rules_same_as_classic_safety(home, app):
     write_cfg(home, BASE)
     c = app()
@@ -759,7 +788,9 @@ def test_going_live_needs_the_preview_the_token_and_the_tick(home, app):
     assert p["buying_power"] == 1234.5 and p["real_positions"] == 2
     assert p["trade_size"]["main"] == {"mode": "budget", "value": 500.0}
     assert p["limits"] == {"max_entries_per_day": 3, "max_daily_loss_usd": 200.0,
-                           "max_open_positions": 6}
+                           "max_open_positions": 6,
+                           # reviewed before LIVE: every trade is cut to it
+                           "max_contracts_per_trade": 100}
     assert read_cfg(home)["dry_run"] is True
     # confirmed but not ticked: nothing changes, and the token still works
     r2 = c.post("/api/v2/command", {**data, "confirm": p["token"]})

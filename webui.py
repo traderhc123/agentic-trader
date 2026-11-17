@@ -1012,9 +1012,12 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div>
    <div class="field"><label for="sf-cap">Max new entries per day</label>
     <input type="number" id="sf-cap" value="5" min="1"></div>
-   <div class="field"><label for="sf-pos">Open positions at once (most held at the same time,
-    real and practice together)</label>
+   <div class="field"><label for="sf-pos">Open positions at once (most held at the same time;
+    real and practice are counted separately)</label>
     <input type="number" id="sf-pos" value="10" min="1" max="1000"></div>
+   <div class="field"><label for="sf-maxc">Most contracts in one trade (every trade is cut to this,
+    whatever the budget)</label>
+    <input type="number" id="sf-maxc" value="100" min="1" max="1000"></div>
    <div class="field"><label for="sf-maxloss">Max daily loss in $ (optional, blank/0 = off) — once today's estimated
     realized loss reaches this, no new entries until tomorrow; exits still run</label>
     <input type="number" id="sf-maxloss" placeholder="e.g. 300" min="0"></div>
@@ -1448,10 +1451,12 @@ async function boot(){
   SF={dry:(typeof st.dry_run==='boolean')?st.dry_run:null,
       cap:st.max_entries_per_day==null?null:String(st.max_entries_per_day),
       pos:st.max_open_positions==null?null:String(st.max_open_positions),
+      maxc:st.max_contracts_per_trade==null?null:String(st.max_contracts_per_trade),
       loss:st.max_daily_loss_usd>0?String(st.max_daily_loss_usd):''};
   if(SF.dry!==null){document.getElementById('sf-dry').checked=SF.dry;sfDryChanged();}
   if(SF.cap!==null)document.getElementById('sf-cap').value=SF.cap;
   if(SF.pos!==null)document.getElementById('sf-pos').value=SF.pos;
+  if(SF.maxc!==null)document.getElementById('sf-maxc').value=SF.maxc;
   if(SF.loss)document.getElementById('sf-maxloss').value=SF.loss;
   cur=Math.min(maxUnlocked,STEPS.length-1);render();booted=true;
   loadBrokers();
@@ -1727,10 +1732,11 @@ async function doSizing(){
     :'<span class="err">'+esc(r.error)+'</span>';
   if(r.ok)done('s-sizing');
 }
-let SF={dry:null,cap:null,pos:null,loss:''};
+let SF={dry:null,cap:null,pos:null,maxc:null,loss:''};
 async function doSafety(){
   const dry=document.getElementById('sf-dry').checked,cap=document.getElementById('sf-cap').value;
   const pos=document.getElementById('sf-pos').value;
+  const maxc=document.getElementById('sf-maxc').value;
   let loss=document.getElementById('sf-maxloss').value;
   if(!String(loss).trim()&&SF.loss)loss='0';  // you cleared a limit that was set: off
   const body={};
@@ -1738,6 +1744,8 @@ async function doSafety(){
   if(SF.dry===null||dry!==SF.dry)body.dry=dry;
   if(SF.cap===null||String(cap)!==SF.cap)body.cap=cap;
   if(SF.pos===null||String(pos)!==SF.pos)body.positions=pos;
+  // never set: the default (100) is shown, and sent only when you change it
+  if(String(maxc)!==(SF.maxc===null?'100':SF.maxc))body.max_contracts=maxc;
   const r=await api('/api/safety',{...body,seeded:booted,
     max_loss:loss,
     discord:document.getElementById('nt-discord').value,
@@ -1747,7 +1755,9 @@ async function doSafety(){
     policy:document.getElementById('pol-text').value,
     anthropic_key:document.getElementById('pol-key').value});
   if(r.ok){done('s-safety');
-    SF={dry:dry,cap:String(cap),pos:String(pos),loss:(Number(loss)>0)?String(loss):''};
+    SF={dry:dry,cap:String(cap),pos:String(pos),
+        maxc:('max_contracts' in body)?String(maxc):SF.maxc,
+        loss:(Number(loss)>0)?String(loss):''};
     document.getElementById('done-body').innerHTML=
      '<p class="ok">Setup complete — pick where your agent should live.</p>'+
      '<details><summary class="muted">…or start it from a terminal instead</summary>'+
@@ -3398,22 +3408,46 @@ def _apply_entry_cap(cfg, raw_cap, seeded):
         cfg["max_entries_per_day"] = 5
 
 
-def _position_cap_value(raw):
-    """(value, error) for the Safety form's "Open positions at once".
-    Blank or not sent: (None, "") = keep what is set."""
-    import agent as A
+def _whole_form_value(raw, lo, hi, label):
+    """(value, error) for a whole-number field of the Safety form. Blank or
+    not sent: (None, "") = keep what is set."""
     raw = str(raw if raw is not None else "").strip()
     if not raw:
         return None, ""
-    lo, hi = A.POSITION_CAP_RANGE
     try:
         val = float(raw)
+        val = int(val) if val == int(val) else None
     except (TypeError, ValueError, OverflowError):
         val = None
-    if val is None or val != int(val) or not lo <= val <= hi:
-        return None, (f"Open positions at once must be a whole number from "
-                      f"{lo} to {hi}. Nothing was changed.")
-    return int(val), ""
+    if val is None or not lo <= val <= hi:
+        return None, (f"{label} must be a whole number from {lo} to {hi}. "
+                      "Nothing was changed.")
+    return val, ""
+
+
+def _position_cap_value(raw):
+    """(value, error) for the Safety form's "Open positions at once"."""
+    import agent as A
+    return _whole_form_value(raw, *A.POSITION_CAP_RANGE, "Open positions at once")
+
+
+def _contract_cap_value(raw):
+    """(value, error) for the Safety form's "Most contracts in one trade"."""
+    import agent as A
+    return _whole_form_value(raw, *A.CONTRACT_CAP_RANGE,
+                             "Most contracts in one trade")
+
+
+def _apply_contract_cap(cfg, val, seeded):
+    """Max contracts per trade from a checked form value. None: keep what
+    is set. Only a form filled in from the current settings (`seeded`) may
+    RAISE it, as for the other caps."""
+    import agent as A
+    if val is None:
+        return
+    if seeded is not True and val > A.saved_contract_cap(cfg):
+        return
+    A.set_contract_cap(cfg, val)
 
 
 def _apply_position_cap(cfg, val, seeded):
@@ -3596,7 +3630,8 @@ def _v2_text(v, name, longest=500):
 # ignores what is outside; /v2 refuses it and says the range.
 _V2_LIMIT_RANGES = {"max_entries_per_day": (1, 1000),
                     "max_daily_loss_usd": (0, 1_000_000_000),  # 0 = no limit
-                    "max_open_positions": (1, 1000)}  # = agent.POSITION_CAP_RANGE
+                    "max_open_positions": (1, 1000),  # = agent.POSITION_CAP_RANGE
+                    "max_contracts_per_trade": (1, 1000)}  # = agent.CONTRACT_CAP_RANGE
 # trade size: mode -> (low, high, whole number, name); budget and percent
 # must be more than `low`, contracts at least `low`
 _V2_SIZE_RANGES = {"budget": (0, 10_000_000, False, "dollars per trade"),
@@ -3999,6 +4034,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                         else None),
             "max_entries_per_day": cfg.get("max_entries_per_day"),
             "max_open_positions": cfg.get("max_open_positions"),
+            "max_contracts_per_trade": cfg.get("max_contracts_per_trade"),
             "max_daily_loss_usd": cfg.get("max_daily_loss_usd"),
         }
 
@@ -4627,6 +4663,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         positions, perr = _position_cap_value(data.get("positions"))
         if perr:
             return {"ok": False, "error": perr}
+        max_contracts, perr = _contract_cap_value(data.get("max_contracts"))
+        if perr:
+            return {"ok": False, "error": perr}
         # Mode and cap change only when the form sends them (it sends what
         # the owner changed). Left out, they stay as they are — saving a
         # ticker rule must never switch the mode or reset the cap. Never
@@ -4637,6 +4676,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             cfg["dry_run"] = True
         _apply_entry_cap(cfg, data.get("cap"), data.get("seeded"))
         _apply_position_cap(cfg, positions, data.get("seeded"))
+        _apply_contract_cap(cfg, max_contracts, data.get("seeded"))
         _apply_daily_loss(cfg, data.get("max_loss"))
         cfg.setdefault("max_event_age_s", 300)
         import rules
@@ -5055,7 +5095,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "max_entries_per_day": cfg.get("max_entries_per_day"),
                 "max_daily_loss_usd": cfg.get("max_daily_loss_usd"),
                 "max_open_positions": cfg.get("max_open_positions"),
-                "defaults": {"max_entries_per_day": 5, "max_open_positions": 10},
+                "max_contracts_per_trade": cfg.get("max_contracts_per_trade"),
+                "defaults": {"max_entries_per_day": 5, "max_open_positions": 10,
+                             "max_contracts_per_trade": A.CONTRACT_CAP_DEFAULT},
                 "allowed": _V2_LIMIT_RANGES,
             },
             "rules": {**{k: cfg.get(k) for k in rule_keys},
@@ -5246,6 +5288,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             A.set_position_cap(new, _v2_number(
                 p["max_open_positions"], "max_open_positions",
                 *_V2_LIMIT_RANGES["max_open_positions"], whole=True))
+        if "max_contracts_per_trade" in p:
+            A.set_contract_cap(new, _v2_number(
+                p["max_contracts_per_trade"], "max_contracts_per_trade",
+                *_V2_LIMIT_RANGES["max_contracts_per_trade"], whole=True))
         if "expiry_sell_et" in p:
             # the chat's "expiry guard off|HH:MM", by the same check and
             # into the same key (agent._expiry_setting)
@@ -5288,7 +5334,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         for key, label, default, unlimited in (
                 ("max_entries_per_day", "New trades per day", 5, False),
                 ("max_daily_loss_usd", "Daily loss limit", None, True),
-                ("max_open_positions", "Positions open at once", 10, False)):
+                ("max_open_positions", "Positions open at once", 10, False),
+                ("max_contracts_per_trade", "Most contracts in one trade",
+                 A.CONTRACT_CAP_DEFAULT, False)):
             if key in p and cfg.get(key, default) != new.get(key, default):
                 changes.append(_change(
                     key, label, cfg.get(key, default), new.get(key, default),
@@ -5299,12 +5347,14 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     @_v2
     def v2_limits(data):
         """POST /api/v2/settings/limits: trade size per book, new trades per
-        day, daily loss limit, positions open at once, the expiry-day sell
+        day, daily loss limit, positions open at once, the most contracts in
+        one trade (max_contracts_per_trade), the expiry-day sell
         time (the chat's "expiry guard") and the no-signal sell time (the
         chat's "no-signal sell"). Partial: only the keys sent change. Never
         touches Practice/LIVE or the pause."""
         p = _v2_payload(data, ("trade_size", "max_entries_per_day",
                                "max_daily_loss_usd", "max_open_positions",
+                               "max_contracts_per_trade",
                                "expiry_sell_et", "no_signal_sell_et"))
         if not p:
             raise _Invalid("Send at least one limit. Nothing was changed.")
@@ -5663,7 +5713,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                            "other": _book_size(cfg, "other_")},
             "limits": {"max_entries_per_day": cfg.get("max_entries_per_day", 5),
                        "max_daily_loss_usd": cfg.get("max_daily_loss_usd"),
-                       "max_open_positions": cfg.get("max_open_positions", 10)},
+                       "max_open_positions": cfg.get("max_open_positions", 10),
+                       "max_contracts_per_trade": cfg.get(
+                           "max_contracts_per_trade", A.CONTRACT_CAP_DEFAULT)},
             "real_positions": s.get("real_positions"),
             "cash_low": (lim.get("cash") or {}).get("low"),
         }
@@ -6884,7 +6936,7 @@ _V2_ASK_SYSTEM = (
     "change any setting: this box only answers. For control, tell the user "
     "where it is on their dashboard: Pause / Resume and Practice / LIVE in "
     "the bar at the top; trade size, daily limits, the most positions open "
-    "at once, the expiry-day sell time "
+    "at once, the most contracts in one trade, the expiry-day sell time "
     "and which signals to take in Rules & limits; the signal source, signal "
     "days and the payment wallet in Signals & pass; the broker, AI helper, "
     "alerts, start at login, stopping or starting the agent and code changes "
@@ -6930,6 +6982,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "set contracts N, set percent N, set other budget|contracts|"
                 "percent N, other sizing same, other trades on|off, "
                 "set positions N (most positions open at once), "
+                "set max contracts N (most contracts one trade buys), "
                 "set cap N (new trades per day), stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N, set autopay cap N|auto). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
