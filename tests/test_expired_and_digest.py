@@ -214,3 +214,13 @@ def test_digest_dates_a_close_found_in_the_account_by_its_fill(home, monkeypatch
              "closed_at": "2026-11-16T20:00:00+00:00"}])
     sent, _ = _digest(monkeypatch, datetime(2026, 11, 17, 21, 30, tzinfo=timezone.utc))
     assert "0 entries, 2 exits" in sent[0]
+
+
+def test_digest_counts_an_expired_exit_on_the_day_it_was_booked(home, monkeypatch):
+    # Friday's digest (16:20 ET) went out before the expiry could be pruned;
+    # Monday's prune writes the row dated at Friday's close. Monday's digest
+    # counts it (by ts), else no digest ever would.
+    _write([{"ts": "2026-11-16T14:00:00+00:00", "action": "exit",
+             "cause": "expired", "closed_at": EXP_CLOSE_UTC}])
+    sent, _ = _digest(monkeypatch, datetime(2026, 11, 16, 21, 30, tzinfo=timezone.utc))
+    assert "0 entries, 1 exits" in sent[0]

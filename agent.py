@@ -1583,6 +1583,10 @@ def _et_day_log_rows(day):
     """Every trade-log row whose event happened on the ET market day `day`
     (closed_at for a close found in the account, else ts — as the
     dashboard's _row_day), oldest first, then the rows not written yet.
+    An expired-unsold exit (cause "expired") goes by ts, the day the prune
+    booked it: its closed_at is the expiry close, whose digest went out
+    before the prune could run (it runs once the expiry date has passed),
+    so by closed_at no digest would ever count it.
     Full-file scan, like _todays_log_rows: a busy day's skip rows must not
     push its trades out of a tail read. A row of that ET day carries that
     UTC date or the next one."""
@@ -1605,7 +1609,8 @@ def _et_day_log_rows(day):
     rows += _unwritten_rows()
     out = []
     for t in rows:
-        for k in ("closed_at", "ts"):
+        keys = ("ts",) if t.get("cause") == "expired" else ("closed_at", "ts")
+        for k in keys:
             v = t.get(k)
             got = _et_day(v) if isinstance(v, str) else ""
             if got:
