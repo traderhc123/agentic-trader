@@ -1,6 +1,12 @@
 """Expired-position ledger pruning (agent._prune_expired_positions)."""
 
+import pytest
+
 from agent import _prune_expired_positions
+
+# a pruned row that still held contracts is booked in the trade log
+# (tests/test_expired_and_digest.py): never in the real AGENT_HOME
+pytestmark = pytest.mark.usefixtures("home")
 
 
 def _state(*keys):

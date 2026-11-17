@@ -2097,7 +2097,7 @@ _DASH_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
      <p id="prop-expl"></p><p id="prop-warn" class="prop-warn"></p>
      <pre id="prop-diff" class="diff" tabindex="0" aria-label="Proposed code diff"></pre>
      <div class="btnrow">
-      <button class="btn-primary" onclick="propApply()">Apply &amp; restart</button>
+      <button class="btn-primary" id="prop-apply" onclick="propApply()">Apply &amp; restart</button>
       <button class="back" onclick="propReject()">Reject</button>
       <span class="muted">Nothing changes until you apply.</span>
       <span id="prop-msg" role="status" aria-live="polite"></span>
@@ -2356,9 +2356,10 @@ async function refresh(){
       $('t-feed-s').textContent='signal source';$('tile-feed').classList.remove('bad');}
     try{
       const p=await api('/api/proposal');const panel=$('p-proposal');
-      if(p.pending){panel.style.display='';
+      if(p.pending){panel.style.display='';propSha=p.diff_sha256||'';
         $('prop-expl').textContent=p.explanation;
-        $('prop-warn').textContent=(p.warnings||[]).join('  ');
+        $('prop-warn').textContent=(p.warnings||[]).concat(p.truncated?['This change is too large to show in full, so it can\\'t be applied: Reject it and ask for a smaller change.']:[]).join('  ');
+        $('prop-apply').disabled=!!p.truncated||!propSha;
         $('prop-diff').innerHTML=String(p.diff||'').split('\\n').map(l=>{
           const c=l.charAt(0);
           const k=(l.startsWith('+++')||l.startsWith('---')||c==='@')?'h':c==='+'?'a':c==='-'?'d':'';
@@ -2395,9 +2396,11 @@ async function refresh(){
     }).join(''):'<li class="empty">Nothing yet — signals and the agent\\'s decisions show up here</li>';
   }catch(e){badMode('Agent unreachable','unreachable');}
 }
+let propSha='';
 async function propApply(){
   $('prop-msg').textContent='applying…';
-  const r=await api('/api/proposal/apply',{});
+  // only the change this panel shows (the server refuses any other)
+  const r=await api('/api/proposal/apply',{diff_sha256:propSha});
   $('prop-msg').textContent=r.reply;
 }
 async function propReject(){await api('/api/proposal/reject',{});refresh();}
@@ -2819,7 +2822,8 @@ def _fund_quote(sats, invoice_cap=0):
     product). The day pass's USD price is AgentHC's own (hc.day_pass_price,
     the built-in fallback when the server can't say); its sats are the
     server's figure when it sent one, else that USD at the live BTC price.
-    suggested_sats is the day pass clamped to the instance's per-invoice cap
+    suggested_sats is the day pass plus LNbits' routing-fee reserve (it
+    refuses a payment without it), clamped to the instance's per-invoice cap
     when one is known. {ok: False} when no live price is available (the
     funding box just omits the hint)."""
     from sources import agenthc_day_trade_ideas as hc
@@ -2830,7 +2834,9 @@ def _fund_quote(sats, invoice_cap=0):
                 "day_pass_usd": day["usd"]}
     usd = sats * usd_per_btc / 1e8
     day_sats = day["sats"] or int(-(-day["usd"] / usd_per_btc * 1e8 // 100) * 100)  # ceil→100
-    suggested = min(day_sats, invoice_cap) if invoice_cap else day_sats
+    from lightning_wallet import fee_reserve_sats
+    need = day_sats + fee_reserve_sats(day_sats)
+    suggested = min(need, invoice_cap) if invoice_cap else need
     return {"ok": True, "btc_usd": round(usd_per_btc, 2),
             "usd": round(usd, 2),
             "day_pass_usd": day["usd"],
@@ -4442,12 +4448,26 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         return {"pending": True, "explanation": p.get("explanation", ""),
                 "warnings": p.get("warnings", []),
                 "diff": self_edit.shown_diff(p),
-                # the diff above is cut: /v2 says so and never applies it
-                "truncated": self_edit.diff_truncated(p)}
+                # the diff above is cut: no Apply ever applies it
+                "truncated": self_edit.diff_truncated(p),
+                # what the classic page posts back: Apply only this change
+                "diff_sha256": self_edit.diff_sha256(p)}
 
-    def proposal_apply(_h, _data):
+    def proposal_apply(_h, data):
+        """POST /api/proposal/apply [{diff_sha256}]. apply_and_restart
+        always refuses a cut diff or one made against older code; with the
+        sha the page was shown (GET /api/proposal), no other change either.
+        A sha that is sent must be one: never read as "no sha"."""
+        import re as _re
         import self_edit
-        ok, msg = self_edit.apply_and_restart(restart=get_status is not None)
+        sha = None
+        if isinstance(data, dict) and "diff_sha256" in data:
+            sha = data["diff_sha256"]
+            if not (isinstance(sha, str) and _re.fullmatch(r"[0-9a-f]{64}", sha)):
+                return {"ok": False, "reply": "diff_sha256 must be the sha256 "
+                        "of the change you reviewed — nothing was applied"}
+        ok, msg = self_edit.apply_and_restart(restart=get_status is not None,
+                                              expect_sha256=sha)
         return {"ok": ok, "reply": msg}
 
     def proposal_reject(_h, _data):
