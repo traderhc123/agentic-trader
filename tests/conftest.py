@@ -32,6 +32,7 @@ def _no_pass_price_ask(monkeypatch):
     from sources import agenthc_day_trade_ideas as hc
     monkeypatch.setattr(hc, "_price_cache",
                         {"at": float("inf"), "usd": None, "sats": None})
+    monkeypatch.setattr(hc, "_live_btc_usd", lambda: 0.0)   # the auto cap's BTC price
 
 
 @pytest.fixture(autouse=True)

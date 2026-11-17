@@ -450,7 +450,7 @@ def test_pasting_a_different_wallet_key_keeps_the_old_one_on_file(home):
     assert cfg["lnbits_url"] == "https://my.lnbits.example"
     assert cfg["lnbits_admin_key"] == "newkey" * 6
     assert "lnbits_wallet_page" not in cfg             # that was the old wallet's page
-    assert cfg["max_autopay_sats"] == 30_000
+    assert cfg["max_autopay_sats"] == "auto"
     files = _old_wallet_files(home)
     assert len(files) == 1
     with open(os.path.join(str(home), files[0]), encoding="utf-8") as f:

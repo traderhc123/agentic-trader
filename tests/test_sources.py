@@ -246,6 +246,33 @@ def test_agenthc_402_respects_autopay_cap(monkeypatch):
                       "day_pass_recurring": True}, {}, lambda s: None)
 
 
+@pytest.mark.parametrize("sats, paid", [(70_000, False), (60_000, True)])
+def test_agenthc_402_auto_cap_follows_the_servers_day_price(monkeypatch, sats, paid):
+    """Default cap ("auto"): AgentHC's 1-day sats (55,600) + 10% → 62,000.
+    A 60,000-sat pass is paid; a 70,000-sat one is refused, naming the cap
+    and how to raise it."""
+    monkeypatch.setattr(agenthc, "_price_cache", {"at": float("inf"),
+                        "usd": {1: 50.0, 5: 225.0}, "sats": {1: 55_600, 5: 250_000}})
+    wallet = FakeWallet()
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: wallet)
+    resp = FakeResp({"payment": {"payment_request": _invoice(sats),
+                                 "macaroon": "MAC", "amount_sats": sats}}, status=402)
+    monkeypatch.setattr(agenthc.requests, "get", lambda *a, **kw: resp)
+    cfg = {"max_autopay_sats": 30_000, "day_pass_recurring": True}   # old default = auto
+    if paid:
+        try:
+            agenthc.poll(cfg, {}, lambda s: None)
+        except Exception:
+            pass
+        assert wallet.paid == [_invoice(sats)]
+    else:
+        with pytest.raises(RuntimeError) as exc:
+            agenthc.poll(cfg, {}, lambda s: None)
+        assert "auto-pay cap for one pass (62,000 sats)" in str(exc.value)
+        assert "set autopay cap 77000" in str(exc.value)
+        assert wallet.paid == []
+
+
 def test_agenthc_402_without_wallet_is_actionable(monkeypatch):
     monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: None)
     resp = FakeResp({"payment": {}}, status=402)

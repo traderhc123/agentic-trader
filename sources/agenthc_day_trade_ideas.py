@@ -235,6 +235,104 @@ def usd_words(v):
     return f"${v:,.0f}" if v == int(v) else f"${v:,.2f}"
 
 
+# ── auto-pay caps ────────────────────────────────────────────────────────────
+# max_autopay_sats (per invoice) and max_autopay_sats_per_day default to
+# "auto": AgentHC's own 1-day price in sats + 10% (BTC can move between the
+# quote and the invoice), rounded up to 1,000 sats, never above
+# AUTOPAY_AUTO_CEILING_SATS. A number the owner saved is used exactly as is
+# (no ceiling). 30000, the fixed default setup used to write, counts as
+# auto. With no price from AgentHC the cap is AUTOPAY_FALLBACK_SATS (fails
+# safe). autopay_caps() is the ONE place a cap is read.
+AUTOPAY_AUTO = "auto"
+AUTOPAY_FALLBACK_SATS = 30_000
+AUTOPAY_AUTO_CEILING_SATS = 150_000
+_AUTOPAY_MARGIN = 1.10
+
+
+def _plus_margin_k(sats):
+    """sats + 10%, rounded up to 1,000 (rounded to 6 places first, so float
+    noise like 55000.000000000004 doesn't add a thousand)."""
+    n = -(-round(float(sats) * _AUTOPAY_MARGIN, 6) // 1)
+    return int(-(-n // 1000) * 1000)
+
+
+def _live_btc_usd():
+    """USD per BTC (the dashboard's 5-minute cached quote), 0.0 if none."""
+    try:
+        import webui
+        return float(webui._btc_usd() or 0.0)
+    except Exception:
+        return 0.0
+
+
+def owner_autopay_cap(value):
+    """The owner's fixed cap from a saved max_autopay_sats(_per_day), or
+    None for auto: missing, "auto", the old default 30000, or anything that
+    isn't a whole number of sats (0 or more)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        v = value.strip().replace(",", "").replace("_", "")
+        if not v.isdigit():
+            return None
+        value = int(v)
+    if not isinstance(value, (int, float)) or value < 0 or value != int(value):
+        return None
+    n = int(value)
+    return None if n == AUTOPAY_FALLBACK_SATS else n
+
+
+def auto_autopay_cap():
+    """{"sats": n, "basis": "server_sats" | "server_usd" | "fallback"}: the
+    auto cap now. server_sats = AgentHC's 1-day sats + 10%; server_usd = its
+    USD day price at the live BTC price + 10% (it sent no sats); fallback =
+    AUTOPAY_FALLBACK_SATS (no price from AgentHC, or no BTC price)."""
+    day = day_pass_price()
+    base, basis = None, "fallback"
+    if day.get("sats"):
+        base, basis = float(day["sats"]), "server_sats"
+    elif day.get("from_server"):
+        btc = _live_btc_usd()
+        if btc > 0:
+            base, basis = float(day["usd"]) / btc * 1e8, "server_usd"
+    if base is None or base <= 0:
+        return {"sats": AUTOPAY_FALLBACK_SATS, "basis": "fallback"}
+    sats = _plus_margin_k(base)
+    return {"sats": min(sats, AUTOPAY_AUTO_CEILING_SATS), "basis": basis}
+
+
+def autopay_caps(cfg):
+    """The auto-pay caps in force: {"per_invoice": n, "per_day": n,
+    "per_invoice_auto": bool, "per_day_auto": bool, "auto_basis": str |
+    None}. per_day defaults to the per-invoice cap (one pass a day)."""
+    inv = owner_autopay_cap(cfg.get("max_autopay_sats"))
+    day = owner_autopay_cap(cfg.get("max_autopay_sats_per_day"))
+    auto = auto_autopay_cap() if inv is None else None
+    per_invoice = inv if inv is not None else auto["sats"]
+    return {"per_invoice": per_invoice,
+            "per_day": day if day is not None else per_invoice,
+            "per_invoice_auto": inv is None, "per_day_auto": day is None,
+            "auto_basis": auto["basis"] if auto else None}
+
+
+def autopay_cap_words(cfg, caps=None):
+    """"Auto: follows AgentHC's day price (now ≈ 61,000 sats)" or "Fixed:
+    60,000 sats" — the per-invoice cap, for the owner."""
+    caps = caps or autopay_caps(cfg)
+    n = caps["per_invoice"]
+    if not caps["per_invoice_auto"]:
+        return f"Fixed: {n:,} sats"
+    if caps["auto_basis"] == "fallback":
+        return (f"Auto: follows AgentHC's day price (now {n:,} sats: "
+                "AgentHC's price isn't known yet)")
+    return f"Auto: follows AgentHC's day price (now ≈ {n:,} sats)"
+
+
+AUTOPAY_HOW_TO_SET = ("say 'set autopay cap 80000' on the dashboard for a "
+                      "fixed number, or 'set autopay cap auto' to follow "
+                      "AgentHC's price (max_autopay_sats in config.json)")
+
+
 def pass_options():
     """Pass sizes (signal days) the server sells right now, e.g. [1, 5];
     [] when every size is paused (the node is refilling); None if it can't
@@ -873,7 +971,7 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
         if time.time() < float(state.get("daypass_retry_at") or 0):
             return False  # the last try failed (already reported): wait a bit
         spent = _autopay_spent_today(state, now)
-        cap = _daily_autopay_cap(cfg)
+        cap = autopay_caps(cfg)["per_day"]
         if spent["sats"] >= cap:
             day = now.strftime("%Y-%m-%d")
             if state.get("autopay_cap_notified") != day:
@@ -939,7 +1037,8 @@ def _no_receipt_stop(cfg, state, save_state):
 def _one_pass_a_day(cfg):
     """True unless the owner chose to allow more than one wallet day-pass a
     day by setting max_autopay_sats_per_day (never with a prepaid pass)."""
-    return bool(_pass_tokens(cfg)) or cfg.get("max_autopay_sats_per_day") is None
+    return (bool(_pass_tokens(cfg))
+            or owner_autopay_cap(cfg.get("max_autopay_sats_per_day")) is None)
 
 
 def _next_buy_time(cfg, now):
@@ -964,15 +1063,27 @@ def _next_buy_time(cfg, now):
 
 
 def _daily_autopay_cap(cfg):
-    """Total sats the agent may auto-pay per market day. Defaults to ONE
-    invoice's worth (max_autopay_sats): a healthy feed never needs a second
-    pass the same day, so a second purchase means something is wrong (e.g.
-    the server keeps rejecting a valid pass) — without this cap the agent
-    would re-buy on every poll and drain the wallet. Counted from the
-    amounts in the invoices themselves; only payments that went through, or
-    whose outcome is still unknown, count."""
-    per_invoice = int(cfg.get("max_autopay_sats", 30_000))
-    return int(cfg.get("max_autopay_sats_per_day", per_invoice))
+    """Total sats the agent may auto-pay per market day (autopay_caps).
+    Defaults to ONE invoice's worth (the per-invoice cap): a healthy feed
+    never needs a second pass the same day, so a second purchase means
+    something is wrong (e.g. the server keeps rejecting a valid pass) —
+    without this cap the agent would re-buy on every poll and drain the
+    wallet. Counted from the amounts in the invoices themselves; only
+    payments that went through, or whose outcome is still unknown, count."""
+    return autopay_caps(cfg)["per_day"]
+
+
+def autopay_refusal_text(amount, cfg, caps=None):
+    """Why a day-pass invoice above the per-invoice cap was not paid: the
+    cap in force now and how to raise it."""
+    caps = caps or autopay_caps(cfg)
+    need = _plus_margin_k(amount)
+    return (f"The day-pass costs {amount:,} sats, which is more than your "
+            f"auto-pay cap for one pass ({caps['per_invoice']:,} sats), so "
+            "the agent did not pay. Nothing was paid. Your cap now: "
+            f"{autopay_cap_words(cfg, caps)}. If that price is right, raise "
+            f"it: say 'set autopay cap {need}' on the dashboard (or set "
+            f"max_autopay_sats to {need} in config.json).")
 
 
 def _record_paid_day(state, day):
@@ -1249,15 +1360,12 @@ def _pay_day_pass(cfg, state, body, save_state, running_until=None):
         raise InvoiceRefused(
             "The feed sent a Lightning invoice that is not the one its "
             "day-pass belongs to, so the agent did not pay it. Nothing was paid.")
-    cap = int(cfg.get("max_autopay_sats", 30_000))
+    caps = autopay_caps(cfg)
+    cap = caps["per_invoice"]
     if amount > cap:
-        raise InvoiceRefused(
-            f"The day-pass costs {amount:,} sats, which is more than your "
-            f"auto-pay cap for one pass ({cap:,} sats), so the agent did not "
-            "pay. Nothing was paid. If that price is right, raise "
-            "max_autopay_sats in config.json.")
+        raise InvoiceRefused(autopay_refusal_text(amount, cfg, caps))
     spent = _autopay_spent_today(state)
-    daily_cap = _daily_autopay_cap(cfg)
+    daily_cap = caps["per_day"]
     if spent["sats"] + amount > daily_cap:
         raise InvoiceRefused(
             f"A day-pass ({amount:,} sats) would take today's spending over "

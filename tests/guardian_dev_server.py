@@ -164,7 +164,9 @@ def _settings(tab):
                     "source_site": None,
                     "wallet": {"site": "demo.lnbits.com" if cfg.get("lnbits_url") else None,
                                "warning": None, "page_on_file": bool(cfg.get("lnbits_url")),
-                               "autopay_cap_sats": 30000, "invoice_cap_sats": None,
+                               "autopay_cap_sats": 61000, "autopay_cap_auto": True,
+                               "autopay_cap_words": "Auto: follows AgentHC's day price (now ≈ 61,000 sats)",
+                               "invoice_cap_sats": None,
                                "new_site": "demo.lnbits.com", "new_warning": None},
                     "api_key": {"set": False, "last4": None}, "pass_on_file": True,
                     # the fixture's invoice is never paid: it stays waiting

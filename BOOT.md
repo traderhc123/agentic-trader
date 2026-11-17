@@ -137,8 +137,11 @@ This walks through, in order:
      agent controls buys a ~$50 day-pass each market day (only with
      "Recurring day-pass" ON). The one-click wallet is on demo.lnbits.com, a
      public test server — keep only a few days of passes there. Safety caps:
-     `max_autopay_sats` per invoice, and one day-pass a day (more only if
-     the owner sets `max_autopay_sats_per_day`).
+     `max_autopay_sats` per invoice (default `"auto"`: AgentHC's day price
+     in sats + 10%, at most 150,000; the owner can fix a number with
+     `set autopay cap N` or go back with `set autopay cap auto`), and one
+     day-pass a day (more only if the owner sets
+     `max_autopay_sats_per_day`).
    - **Premium API key**: registers a free key
      (`POST https://api.traderhc.com/api/v1/agents/register`), then upgrade to
      Premium with sats (`https://api.traderhc.com/docs`,
@@ -202,7 +205,7 @@ watched several days of activity and explicitly ask to go live.
 | Symptom | Cause / fix |
 |---|---|
 | `403 feed_not_live` | Feed isn't publishing yet — agent idles and keeps polling; normal |
-| `402` loops / "exceeds your auto-pay cap" | Day-pass price above `max_autopay_sats` — raise it in config.json if the price is legitimate |
+| `402` loops / "more than your auto-pay cap" | Day-pass price above the cap in force (the refusal names it; `autopay cap` shows it) — if the price is legitimate the owner raises it with `set autopay cap N` (or `max_autopay_sats` in config.json) |
 | `WalletError: payment failed` | Wallet balance too low — `python agent.py fund <sats>` and pay the invoice |
 | `403 terms_acceptance_required` | Agent auto-accepts and retries; if it loops, run setup again |
 | `403 tier_required` | AgentHC key is FREE tier — upgrade to Premium (`/docs`) or switch to the day-pass |

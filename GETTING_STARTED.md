@@ -249,7 +249,9 @@ docker run -d --name agentic-trader --restart on-failure -v agentic-trader-data:
 - **Day-pass spend cap** (only if you chose the Advanced wallet auto-pay): at
   most one day-pass per day, bought only on a market day (from 8:30 AM ET
   until the close) — a misbehaving paywall can't drain the wallet. Set
-  `max_autopay_sats_per_day` only if you want to allow more than one.
+  `max_autopay_sats_per_day` only if you want to allow more than one. Each
+  pass is capped by `max_autopay_sats` (default auto: AgentHC's day price
+  + 10%, at most 150,000 sats; `set autopay cap N|auto` on the dashboard).
 - **Main pick only by default**: the AgentHC feed follows the single daily
   high-conviction pick unless you opt into "other trades" (the wider journal,
   several entries a day) during setup — or later via

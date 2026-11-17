@@ -874,6 +874,7 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
        wallet automatically (never above your auto-pay cap). OFF = it never
        spends without you.</span>
       </div>
+      <p id="autopay-cap" class="muted" style="display:none;font-size:var(--fs-sm)"></p>
       <div id="fund-qr" class="qr" style="display:none"></div>
       <pre id="bolt11" class="bolt" style="display:none" tabindex="0" aria-label="Lightning invoice"></pre>
       <p id="fund-open" style="display:none">
@@ -1532,6 +1533,12 @@ function showWallet(page,label){
   // (clamped to the instance's per-invoice cap when known) — unless the
   // user already typed an amount.
   api('/api/wallet/quote?sats=0').then(function(r){
+    const ac=document.getElementById('autopay-cap');
+    if(ac&&r&&r.autopay_cap_words){
+      ac.textContent='Auto-pay cap per day-pass: '+r.autopay_cap_words+'. '
+        +(r.autopay_cap_auto?'For a fixed number say "set autopay cap 80000" on the dashboard.'
+          :'Say "set autopay cap auto" on the dashboard to follow AgentHC’s price.');
+      ac.style.display='';}
     if(r&&r.ok&&r.suggested_sats&&!satsEdited)
       document.getElementById('fund-sats').value=r.suggested_sats;
     updateQuote();
@@ -3207,7 +3214,7 @@ def _wallet_create(cfg, save, data, switching=None):
         cfg.pop("lnbits_wallet_page", None)   # never show the old wallet's page
         if page:
             cfg["lnbits_wallet_page"] = page
-        cfg.setdefault("max_autopay_sats", 30_000)
+        cfg.setdefault("max_autopay_sats", "auto")
         save()
     out = {"ok": True, "page": page, "warning": lightning_wallet.demo_warning(url)}
     if had:
@@ -3238,7 +3245,7 @@ def _use_pasted_wallet(cfg, url, new_key):
         cfg.pop("lnbits_wallet_page", None)  # the old wallet's page
     cfg["lnbits_url"] = url
     cfg["lnbits_admin_key"] = new_key
-    cfg.setdefault("max_autopay_sats", 30_000)
+    cfg.setdefault("max_autopay_sats", "auto")
     return ""
 
 
@@ -4451,8 +4458,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                         or ["0"])[0])
         except ValueError:
             sats = 0
-        return _fund_quote(max(0, sats),
-                           int(cfg.get("lnbits_max_invoice_sats") or 0))
+        from sources import agenthc_day_trade_ideas as hc
+        caps = hc.autopay_caps(cfg)
+        return {**_fund_quote(max(0, sats),
+                              int(cfg.get("lnbits_max_invoice_sats") or 0)),
+                "autopay_cap_sats": caps["per_invoice"],
+                "autopay_cap_auto": caps["per_invoice_auto"],
+                "autopay_cap_words": hc.autopay_cap_words(cfg, caps)}
 
     def wallet_recurring(_h, data):
         # Recurring day-pass consent: ON = the agent may auto-pay each day's
@@ -5032,16 +5044,19 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         through POST /api/v2/wallet/page), the caps; and where a new wallet
         would be made."""
         import lightning_wallet
+        from sources import agenthc_day_trade_ideas as hc
         url = str(cfg.get("lnbits_url") or "")
         new = str(lightning_wallet.DEFAULT_LNBITS or "")
-        cap = cfg.get("max_autopay_sats")
+        caps = hc.autopay_caps(cfg)
         inv = cfg.get("lnbits_max_invoice_sats")
         whole = lambda v: (int(v) if isinstance(v, (int, float))  # noqa: E731
                            and not isinstance(v, bool) and v > 0 else None)
         return {"site": _host_only(url) if url else None,
                 "warning": lightning_wallet.demo_warning(url) or None,
                 "page_on_file": bool(cfg.get("lnbits_wallet_page")),
-                "autopay_cap_sats": whole(cap),
+                "autopay_cap_sats": caps["per_invoice"],
+                "autopay_cap_auto": caps["per_invoice_auto"],
+                "autopay_cap_words": hc.autopay_cap_words(cfg, caps),
                 "invoice_cap_sats": whole(inv),
                 "new_site": _host_only(new) if new else None,
                 "new_warning": lightning_wallet.demo_warning(new) or None}
@@ -5550,14 +5565,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             if was == p["on"]:
                 return {"ok": True, "saved": False,
                         "note": "Nothing to change: that is your setting already."}
-            cap = cfg.get("max_autopay_sats")
+            from sources import agenthc_day_trade_ideas as hc
+            caps = hc.autopay_caps(cfg)
             wait = _two_step("recurring", p, data, [_change(
                 "day_pass_recurring", "Buy a day-pass automatically", was,
                 p["on"], "raises_risk" if p["on"] else "lowers_risk")], [
-                ("Each payment is capped at "
-                 f"{int(cap):,} sats." if isinstance(cap, (int, float))
-                 and not isinstance(cap, bool) else
-                 "Each payment is capped by your wallet's auto-pay limit.")
+                (f"Each payment is capped at {caps['per_invoice']:,} sats "
+                 f"({hc.autopay_cap_words(cfg, caps)}).")
                 if p["on"] else "Signal days you already bought are kept.",
                 "It does not switch between Practice and LIVE.",
                 does_not_trade])
@@ -6106,16 +6120,15 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             sats = _v2_number(p.get("sats"), "sats", 1000, cap or 100_000_000,
                               whole=True)
             p = {"sats": sats}
-            auto = cfg.get("max_autopay_sats")
+            from sources import agenthc_day_trade_ideas as hc
+            auto = hc.autopay_caps(cfg)["per_invoice"]
             wait = _two_step("wallet_fund", p, data, [_change(
                 "wallet_fund", "Add to the agent's wallet", None, sats,
                 "neutral")], [
                 "Nothing is paid yet: the next step shows a Lightning invoice, "
                 "and nothing is paid until you pay it from your own wallet app.",
                 ("The agent spends from this wallet only on day-passes, each "
-                 f"capped at {int(auto):,} sats." if isinstance(auto, (int, float))
-                 and not isinstance(auto, bool) else
-                 "The agent spends from this wallet only on day-passes."),
+                 f"capped at {auto:,} sats."),
                 "It does not switch between Practice and LIVE.", does_not_trade])
         if wait:
             return wait
@@ -6834,7 +6847,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "exact command (pause, resume, dry on/off, set budget N, "
                 "set contracts N, set percent N, set other budget|contracts|"
                 "percent N, other sizing same, other trades on|off, set positions N, "
-                "set cap N, stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N). Never give investment advice; you may "
+                "set cap N, stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N, set autopay cap N|auto). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
             support.scrub(

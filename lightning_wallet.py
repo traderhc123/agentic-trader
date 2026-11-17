@@ -275,7 +275,7 @@ def wallet_setup(cfg):
         cfg.pop("lnbits_wallet_page", None)
         if page:
             cfg["lnbits_wallet_page"] = page
-        cfg.setdefault("max_autopay_sats", 30_000)
+        cfg.setdefault("max_autopay_sats", "auto")
         print(f"Wallet created on {url} ✓ (custodial hosted wallet — the agent "
               "keeps only spending money here)")
         warn = demo_warning(url)
@@ -324,9 +324,18 @@ def wallet_setup(cfg):
         if raw.isdigit() and int(raw) > 0:
             print_funding_invoice(wallet, int(raw))
     # Safety cap: the agent will never auto-pay an invoice above this.
-    cfg.setdefault("max_autopay_sats", 30_000)
-    print(f"Auto-pay safety cap: {cfg['max_autopay_sats']:,} sats per invoice "
-          "(edit max_autopay_sats in config.json to change).")
+    # "auto" follows AgentHC's day price (sources/agenthc_day_trade_ideas
+    # autopay_caps); a number the owner saves is used as is.
+    cfg.setdefault("max_autopay_sats", "auto")
+    try:
+        from sources.agenthc_day_trade_ideas import autopay_cap_words
+        words = autopay_cap_words(cfg)
+    except Exception:
+        words = str(cfg["max_autopay_sats"])
+    print(f"Auto-pay safety cap per invoice: {words}.")
+    print("  Set a fixed number with max_autopay_sats in config.json (or say "
+          "'set autopay cap 80000' on the dashboard); \"auto\" (or 'set "
+          "autopay cap auto') follows AgentHC's price again.")
     return cfg
 
 

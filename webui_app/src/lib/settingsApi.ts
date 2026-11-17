@@ -395,8 +395,12 @@ export interface WalletView {
   warning: string | null;
   /** a wallet page link is on file (open it with POST /api/v2/wallet/page) */
   page_on_file: boolean;
-  /** the most one day-pass payment may cost; null: not set */
+  /** the most one day-pass payment may cost (the cap in force); null: not known */
   autopay_cap_sats: number | null;
+  /** the cap follows AgentHC's day price (+10%); false: a number the owner set */
+  autopay_cap_auto?: boolean;
+  /** "Auto: follows AgentHC's day price (now ≈ 61,000 sats)" / "Fixed: 60,000 sats" */
+  autopay_cap_words?: string;
   /** the wallet's largest invoice, when it has said; null: not known */
   invoice_cap_sats: number | null;
   /** where a new wallet would be made, and its test-server warning */
@@ -408,8 +412,14 @@ export interface WalletView {
 /** day_pass_usd: AgentHC's price for one day-pass (the built-in one when it can't say);
  *  older agents leave it out. */
 export type WalletQuote =
-  | { ok: true; btc_usd: number; usd: number; day_pass_usd?: number; day_passes: number; day_pass_sats: number; suggested_sats: number; invoice_cap: number | null }
-  | { ok: false; error: string; day_pass_usd?: number };
+  | ({ ok: true; btc_usd: number; usd: number; day_pass_usd?: number; day_passes: number; day_pass_sats: number; suggested_sats: number; invoice_cap: number | null } & AutopayCap)
+  | ({ ok: false; error: string; day_pass_usd?: number } & AutopayCap);
+/** The wallet's auto-pay cap, as /api/wallet/quote reports it (older agents leave it out). */
+export interface AutopayCap {
+  autopay_cap_sats?: number;
+  autopay_cap_auto?: boolean;
+  autopay_cap_words?: string;
+}
 
 /** POST /api/v2/wallet/fund, confirmed: the invoice to pay into the agent's wallet. */
 export interface FundInvoice {

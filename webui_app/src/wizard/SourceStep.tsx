@@ -386,6 +386,7 @@ function AgentWallet({ dayUsd }: { dayUsd: number }) {
   const [sats, setSats] = useState("75000");
   const satsEdited = useRef(false);
   const [quote, setQuote] = useState("");
+  const [capWords, setCapWords] = useState<{ words: string; auto: boolean } | null>(null);
   const [note, setNote] = useState("");
   const [inv, setInv] = useState<{ bolt11: string; qr?: number[][] | null } | null>(null);
   const [bal, setBal] = useState<number | null>(null);
@@ -447,6 +448,7 @@ function AgentWallet({ dayUsd }: { dayUsd: number }) {
     if (!made) return;
     api("/api/wallet/quote?sats=0")
       .then((r) => {
+        if (r && typeof r.autopay_cap_words === "string") setCapWords({ words: r.autopay_cap_words, auto: !!r.autopay_cap_auto });
         let s = sats;
         if (r && r.ok && r.suggested_sats && !satsEdited.current) {
           s = String(r.suggested_sats);
@@ -611,6 +613,14 @@ function AgentWallet({ dayUsd }: { dayUsd: number }) {
               spends without you.
             </span>
           </div>
+          {capWords && (
+            <p className="m-0 text-xs text-muted">
+              Auto-pay cap per day-pass: {capWords.words}.{" "}
+              {capWords.auto
+                ? "For a fixed number, say “set autopay cap 80000” on the dashboard."
+                : "Say “set autopay cap auto” on the dashboard to follow AgentHC's price again."}
+            </p>
+          )}
           {inv && (
             <div className="flex gap-4 max-sm:flex-col max-sm:items-center">
               <QR matrix={inv.qr} />

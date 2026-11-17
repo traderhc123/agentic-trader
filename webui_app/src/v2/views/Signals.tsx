@@ -491,6 +491,17 @@ function WalletPanel({ page, open }: { page: Page; open: (o: Open) => void }) {
           </button>
         }
       />
+      {w?.autopay_cap_words && (
+        <Row
+          label="Auto-pay cap"
+          exp={`The most the wallet pays for one day-pass. ${
+            w.autopay_cap_auto
+              ? "For a fixed number, say “set autopay cap 80000” in the chat."
+              : "Say “set autopay cap auto” in the chat to follow AgentHC's day price again."
+          }`}
+          val={<span className="tag tag-plain">{w.autopay_cap_words}</span>}
+        />
+      )}
       <Row
         label="Buys a day-pass by itself"
         exp={
