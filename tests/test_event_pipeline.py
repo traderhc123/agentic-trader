@@ -186,7 +186,7 @@ def test_stale_event_skipped_and_logged(home, broker, no_policy):
 def test_policy_veto_blocks_and_logs(home, broker, monkeypatch):
     import llm_policy
     monkeypatch.setattr(llm_policy, "evaluate",
-                        lambda cfg, ev, log: {"act": False, "reason": "skip puts"})
+                        lambda cfg, ev, log, **kw: {"act": False, "reason": "skip puts"})
     out = agent.handle_event(make_event(type="P"), {}, {"positions": {}},
                              broker, object(), lambda s: None)
     assert out.startswith("POLICY VETO")

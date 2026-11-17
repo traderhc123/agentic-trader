@@ -90,7 +90,7 @@ def no_policy(monkeypatch):
     import llm_policy
     monkeypatch.setattr(
         llm_policy, "evaluate",
-        lambda cfg, ev, log: {"act": True, "reason": "test: mechanical"})
+        lambda cfg, ev, log, **kw: {"act": True, "reason": "test: mechanical"})
 
 
 @pytest.fixture(autouse=True)

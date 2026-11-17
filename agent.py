@@ -918,22 +918,37 @@ def _recent_trades(limit=50):
     return (rows + _unwritten_rows())[-limit:]
 
 
-def _trades_today():
+def _trades_today(strict=False):
     """Today's trade-log rows, oldest first (UTC day, like the entry cap).
-    A close found in the account counts on the day its sale filled."""
+    A close found in the account counts on the day its sale filled.
+    Full-file scan, like the entry cap: skip rows can't push today's exits
+    out of a tail (the loss-streak rule is built from these). strict: see
+    _todays_log_rows."""
     today = datetime.now(timezone.utc).date().isoformat()
-    return [t for t in _recent_trades(500)
+    return [t for t in _todays_log_rows(today, strict)
             if str(t.get("closed_at") or t.get("ts", "")).startswith(today)]
 
 
-def _todays_log_rows(today):
-    """Every trade-log row that mentions `today` (full-file scan), then the
-    rows this run could not write yet — so an unwritable log can't make
-    today's entries or losses disappear from the limits."""
+class TradeLogUnreadable(OSError):
+    """trades.jsonl exists but can't be read, so today's entries and losses
+    can't be counted (_todays_log_rows strict=True)."""
+
+
+def _todays_log_rows(today, strict=False):
+    """Every trade-log row that mentions `today` (a date, or a tuple of
+    dates; full-file scan), then the rows this run could not write yet — so
+    an unwritable log can't make today's entries or losses disappear from
+    the limits.
+
+    No log yet is an empty day. A log that exists but can't be read
+    (permissions, a lock) yields nothing — or, strict=True, raises
+    TradeLogUnreadable: the entry limits must not read it as "no entries,
+    no losses today" and let an order past a cap that was already hit."""
+    days = (today,) if isinstance(today, str) else tuple(today)
     try:
         with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
             for line in f:
-                if today not in line:
+                if not any(d in line for d in days):
                     continue
                 try:
                     t = json.loads(line)
@@ -941,12 +956,15 @@ def _todays_log_rows(today):
                     continue
                 if isinstance(t, dict):
                     yield t
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        if strict:
+            raise TradeLogUnreadable(str(exc)) from exc
     yield from _unwritten_rows()
 
 
-def _entries_today(dry=False):
+def _entries_today(dry=False, strict=False):
     """Count today's entries by scanning the FULL trade log.
 
     Deliberately not a tail read: every skip/veto also appends a log line, so
@@ -956,10 +974,12 @@ def _entries_today(dry=False):
     Real-money rows only by default. dry=True counts the dry-run (practice)
     rows instead: the two books never mix, so practice entries can't use up
     the real cap (handle_event passes the mode the agent is in).
+    strict: raise TradeLogUnreadable rather than count an unreadable log
+    as zero (_todays_log_rows).
     """
     today = datetime.now(timezone.utc).date().isoformat()
     count = 0
-    for t in _todays_log_rows(today):
+    for t in _todays_log_rows(today, strict):
         if (t.get("action") == "entry" and bool(t.get("dry")) == bool(dry)
                 and str(t.get("ts", "")).startswith(today)):
             count += 1
@@ -976,7 +996,7 @@ def _counted_before(t):
         return False
 
 
-def _est_pnl_today(dry=False):
+def _est_pnl_today(dry=False, strict=False):
     """Today's estimated realized P&L (USD) from the trade log's exit records.
 
     An ESTIMATE: brokers don't report fill prices back to the agent, so each
@@ -985,10 +1005,11 @@ def _est_pnl_today(dry=False):
     Exits with no estimate at all count as 0 (see `unmeasured`). Full-log
     scan for the same reason as _entries_today, and like it real-money rows
     only (dry=True: the dry-run rows instead) — a practice gain must never
-    offset a real loss against max_daily_loss_usd."""
+    offset a real loss against max_daily_loss_usd. strict: as for
+    _entries_today."""
     today = datetime.now(timezone.utc).date().isoformat()
     total, unmeasured = 0.0, 0
-    for t in _todays_log_rows(today):
+    for t in _todays_log_rows(today, strict):
         # a close found in the account counts on the day it filled
         day = str(t.get("closed_at") or t.get("ts", ""))
         if (t.get("action") != "exit" or bool(t.get("dry")) != bool(dry)
@@ -1010,6 +1031,46 @@ def _et_day(ts):
     if d.tzinfo is None:
         d = d.replace(tzinfo=timezone.utc)
     return d.astimezone(MARKET_TZ).date().isoformat()
+
+
+_POLICY_ROWS_SHOWN = 50
+
+
+def _policy_view(dry, strict=False):
+    """What the AI policy check is shown about today: (rows, context).
+
+    rows: today's entry and exit rows (ET market day; a close found in the
+    account counts on the day it filled) of the mode the agent is in only,
+    oldest first, from a FULL-file scan like the entry cap — a tail of the
+    log would let skip/veto rows push today's entries out of view, and a
+    per-day limit in policy.md would then let one more order through.
+    context: the time now (ET), the mode, and the day's counts worked out
+    here, so the model need not count the rows itself. strict: as for
+    _entries_today."""
+    import rules
+    from datetime import timedelta
+    now = _et_now()
+    today = now.date().isoformat()
+    # an ET day's rows carry that UTC date or the next one
+    next_utc = (now.date() + timedelta(days=1)).isoformat()
+    rows = [t for t in _todays_log_rows((today, next_utc), strict)
+            if t.get("action") in ("entry", "exit")
+            and bool(t.get("dry")) == bool(dry)
+            and _et_day(t.get("closed_at") or t.get("ts", "")) == today]
+    results = rules.exit_results(rows)
+    measured = [v for v in results if v is not None]
+    context = {
+        "now_et": now.strftime("%Y-%m-%d %H:%M ET (%A)"),
+        "mode": "practice" if dry else "live",
+        "entries_today": sum(1 for t in rows if t.get("action") == "entry"),
+        "positions_closed_today": len(results),
+        "losing_positions_today": sum(1 for v in measured if v < 0),
+        "losses_in_a_row": rules.loss_streak(rows),
+        "est_realized_pnl_today_usd": round(sum(measured), 2),
+        "rows_shown": min(len(rows), _POLICY_ROWS_SHOWN),
+        "rows_today": len(rows),
+    }
+    return _rows_without_facts(rows[-_POLICY_ROWS_SHOWN:]), context
 
 
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -1903,6 +1964,37 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
                 "dashboard activity log.)")
 
 
+def _log_unreadable_skip(cfg, state, save_state, ev, book, contract, why, exc):
+    """An entry skipped because the trade log can't be read (handle_event):
+    a row the dashboard lists (kept in memory if the log can't be written
+    either) and a high-priority alert at most once a day. Never raises."""
+    try:
+        rec = {"action": "skip_log_unreadable", "book": book,
+               "event_id": ev.get("event_id"), "contract": contract,
+               "reason": f"{why} ({str(exc)[:150]})"}
+        if cfg.get("dry_run"):
+            rec["dry"] = True
+        _log_trade(_row_facts(rec, cfg, "daily_cap"))
+        today = datetime.now(timezone.utc).date().isoformat()
+        sent = state.setdefault("problem_notified", {})
+        if sent.get("skip_log_unreadable") == today:
+            return
+        sent["skip_log_unreadable"] = today
+        try:
+            save_state(state)
+        except Exception:
+            pass
+        notify(cfg, f"⚠️ agentic-trader: entry NOT placed ({contract}) — your "
+                    f"trade log ({TRADES_PATH}) can't be read, so the daily "
+                    "entry cap, max daily loss and loss-streak rule can't be "
+                    "checked. New entries are skipped until it can be read; "
+                    "exits still run. Check the file's permissions, or close "
+                    "whatever has it open.\n(No more alerts about this today.)",
+               priority="high")
+    except Exception:
+        pass
+
+
 def _log_adopted_buys(cfg, state, save_state, broker, client):
     """Log the buys an adapter found at the broker after all — orders whose
     request got no clear answer, so their signal was recorded as handled
@@ -2102,7 +2194,8 @@ def _problems_today():
     """Today's 'trade didn't happen' rows, grouped for the dashboard."""
     import broker_events
     today = datetime.now(timezone.utc).date().isoformat()
-    kinds = (set(broker_events.KINDS) | {"skip_stale", "skip_sizing", "skip_ai_needed"}
+    kinds = (set(broker_events.KINDS) | {"skip_stale", "skip_sizing", "skip_ai_needed",
+                                         "skip_log_unreadable"}
              | _OWN_SKIPS)
     out = {}
     for t in _recent_trades(300):
@@ -3355,8 +3448,26 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # Counted from the rows of the mode the agent is in: real trades
         # when live, practice trades in dry-run — never one against the other.
         dry_mode = bool(cfg.get("dry_run"))
+        # Today's entries and losses come from the trade log. A log that
+        # exists but can't be read is not "nothing today": no new entries
+        # until it can be read (fail closed). Exits never get here.
+        try:
+            n_today = _entries_today(dry_mode, strict=True)
+            pnl_today, _unmeasured = _est_pnl_today(dry_mode, strict=True)
+            today_rows = [t for t in _trades_today(strict=True)
+                          if bool(t.get("dry")) == dry_mode]
+            policy_rows, policy_ctx = _policy_view(dry_mode, strict=True)
+        except TradeLogUnreadable as exc:
+            why = ("the trade log can't be read, so the daily entry cap, max "
+                   "daily loss and loss-streak rule can't be checked — no new "
+                   "entries until it can be read (exits still run)")
+            msg = f"SKIPPED {contract}: {why}"
+            print(msg + f" [{str(exc)[:150]}]")
+            _log_unreadable_skip(cfg, state, save_state, ev, book, contract,
+                                 why, exc)
+            return msg
         cap = int(cfg.get("max_entries_per_day", 5))
-        if _entries_today(dry_mode) >= cap:
+        if n_today >= cap:
             msg = f"SKIPPED {contract}: daily entry cap reached ({cap})"
             print(msg)
             _log_trade(_row_facts(
@@ -3384,7 +3495,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # the limit, stop opening positions. Exits are never blocked.
         loss_cap = float(cfg.get("max_daily_loss_usd") or 0)
         if loss_cap > 0:
-            pnl, _unmeasured = _est_pnl_today(dry_mode)
+            pnl = pnl_today
             if -pnl >= loss_cap:
                 msg = (f"SKIPPED {contract}: max daily loss reached "
                        f"(est. ${-pnl:,.0f} of ${loss_cap:,.0f}) — no new "
@@ -3399,8 +3510,6 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # Built-in rules (plain settings, no AI): tickers, calls/puts, min
         # strike, no 0DTE, stop after a losing streak.
         import rules
-        today_rows = [t for t in _trades_today()
-                      if bool(t.get("dry")) == dry_mode]
         ok, why = rules.check(cfg, ev, today_rows)
         if not ok:
             msg = f"SKIPPED {contract}: {why} (your rules)"
@@ -3411,8 +3520,9 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 **_rule_facts(cfg, ev, today_rows)))
             return msg
         # The user's own policy, applied by the LLM policy brain (veto-only).
-        verdict = llm_policy.evaluate(
-            cfg, ev, _rows_without_facts(_recent_trades(20)))
+        # Shown today's entries and exits of this mode from the whole log,
+        # the time now and the day's counts (_policy_view).
+        verdict = llm_policy.evaluate(cfg, ev, policy_rows, context=policy_ctx)
         if not verdict["act"] and verdict.get("ai_problem"):
             # NOT the owner's rules saying no: the AI that checks them is
             # missing or failing, so every entry is being skipped. Log it as

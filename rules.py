@@ -11,8 +11,9 @@ Config keys (all optional; unset = rule off):
     rule_sides          "calls" | "puts" | "both"
     rule_min_strike     10              skip strikes below this (e.g. penny names)
     rule_skip_0dte      true            skip contracts expiring the same day
-    rule_loss_streak    2               after N losing exits in a row today,
-                                        no new entries until tomorrow
+    rule_loss_streak    2               after N losing trades in a row today,
+                                        no new entries until tomorrow (a
+                                        position sold in pieces is one trade)
 """
 import re
 from datetime import datetime
@@ -46,18 +47,52 @@ def _num(value, cast=float):
         return 0
 
 
-def loss_streak(trades):
-    """Losing exits in a row at the end of `trades` (today's log, oldest
-    first). Exits with no P&L estimate are ignored; a win or breakeven
-    resets the count."""
-    n = 0
+def exit_results(trades):
+    """One estimated P&L (USD) per closed-or-closing position in `trades`
+    (log rows, oldest first), in the order each was last sold; None when
+    no row of it carried an estimate.
+
+    A position sold in pieces logs several exit rows: a partial fill and
+    the remainder the agent re-sells, or a partial close in the broker app
+    followed by the agent's exit. Rows marked "partial" leave the position
+    open, so the next exit row of the same contract (and book) is the same
+    position: its P&L is added to that one result, never counted as a
+    second trade. An entry row in that contract starts a new position. A
+    partly sold position counts at once with what it has lost so far."""
+    results, open_ = [], {}
     for t in trades:
-        if t.get("action") != "exit" or t.get("est_pnl_usd") is None:
+        key = (bool(t.get("dry")), t.get("contract"))
+        if t.get("action") == "entry":
+            open_.pop(key, None)  # a new position: its exits are its own
+        if t.get("action") != "exit":
             continue
-        try:
-            n = n + 1 if float(t["est_pnl_usd"]) < 0 else 0
-        except (TypeError, ValueError):
+        r = open_.pop(key, None)
+        if r is None:
+            r = [None]
+        else:  # moves to where this position was last sold (by identity:
+            # two results can hold the same number)
+            del results[next(i for i, x in enumerate(results) if x is r)]
+        v = t.get("est_pnl_usd")
+        if v is not None and not isinstance(v, bool):
+            try:
+                r[0] = (r[0] or 0.0) + float(v)
+            except (TypeError, ValueError):
+                pass
+        results.append(r)
+        if t.get("partial"):
+            open_[key] = r
+    return [r[0] for r in results]
+
+
+def loss_streak(trades):
+    """Losing positions in a row at the end of `trades` (today's log, oldest
+    first). A position sold in pieces is one result (exit_results). Exits
+    with no P&L estimate are ignored; a win or breakeven resets the count."""
+    n = 0
+    for v in exit_results(trades):
+        if v is None:
             continue
+        n = n + 1 if v < 0 else 0
     return n
 
 
