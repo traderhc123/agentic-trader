@@ -125,6 +125,9 @@ _ROW_CODES = ("past_expiry_guard", "exit_already_arrived",
               "rule_not_in_list", "rule_skip_list", "rule_side",
               "rule_min_strike", "rule_0dte", "rule_loss_streak",
               "expiry_guard", "exit_remainder", "closed_outside",
+              # a contract that expired still held: booked as an exit with
+              # no order (agent._expired_exit_row)
+              "expired_unsold",
               # the no-signal sell (agent.signal_loss_tick) and the two
               # entries it and a short wallet day-pass skip
               "signal_loss", "after_signal_loss_sell", "pass_wont_cover",
@@ -456,7 +459,8 @@ _DOC = {
     "Status.as_of": "server time of this snapshot",
     "Status.mode": "what NEW trades use; pausing never changes it",
     "Status.mode_explicit": "false: the settings never said (dry_run is "
-                            "missing), and the agent treats that as live",
+                            "missing) — practice unless this setup already "
+                            "traded live; the agent saves it on start",
     "Status.real_positions_managed": "are the real positions being sold on "
                                      "their exit signal / at expiry right now",
     "Status.unmanaged_reason": "why not, for the first real position that isn't",
@@ -1666,7 +1670,7 @@ def _exit_loss(cfg, state, now, blocked=False, acct=None):
 # the account, a re-sold remainder, the ledger check, the no-signal sell):
 # not signals
 _OWN_EVENT_IDS = ("expiry-guard|", "outside|", "ledger|", "exit-rest|",
-                  "no-signal|")
+                  "no-signal|", "expired|")
 
 
 def _last_signal(rows, rt):
@@ -2024,7 +2028,7 @@ def build_status(cfg, state, rows, runtime=None, now=None,
     answering = bool(running and beat is not None and (
         (now - beat).total_seconds() - (wait or 0.0) <= A.EXPIRY_WAKE_GAP_S))
 
-    mode = A._mode(cfg)
+    mode = A._mode(cfg, state)
     hold = rt.get("hold") if rt.get("hold") in (
         "state_hold", "handoff_hold", "restarting") else None
     entries_paused = A._paused(cfg)

@@ -2097,7 +2097,7 @@ _DASH_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
      <p id="prop-expl"></p><p id="prop-warn" class="prop-warn"></p>
      <pre id="prop-diff" class="diff" tabindex="0" aria-label="Proposed code diff"></pre>
      <div class="btnrow">
-      <button class="btn-primary" onclick="propApply()">Apply &amp; restart</button>
+      <button class="btn-primary" id="prop-apply" onclick="propApply()">Apply &amp; restart</button>
       <button class="back" onclick="propReject()">Reject</button>
       <span class="muted">Nothing changes until you apply.</span>
       <span id="prop-msg" role="status" aria-live="polite"></span>
@@ -2356,9 +2356,10 @@ async function refresh(){
       $('t-feed-s').textContent='signal source';$('tile-feed').classList.remove('bad');}
     try{
       const p=await api('/api/proposal');const panel=$('p-proposal');
-      if(p.pending){panel.style.display='';
+      if(p.pending){panel.style.display='';propSha=p.diff_sha256||'';
         $('prop-expl').textContent=p.explanation;
-        $('prop-warn').textContent=(p.warnings||[]).join('  ');
+        $('prop-warn').textContent=(p.warnings||[]).concat(p.truncated?['This change is too large to show in full, so it can\\'t be applied: Reject it and ask for a smaller change.']:[]).join('  ');
+        $('prop-apply').disabled=!!p.truncated||!propSha;
         $('prop-diff').innerHTML=String(p.diff||'').split('\\n').map(l=>{
           const c=l.charAt(0);
           const k=(l.startsWith('+++')||l.startsWith('---')||c==='@')?'h':c==='+'?'a':c==='-'?'d':'';
@@ -2395,9 +2396,11 @@ async function refresh(){
     }).join(''):'<li class="empty">Nothing yet — signals and the agent\\'s decisions show up here</li>';
   }catch(e){badMode('Agent unreachable','unreachable');}
 }
+let propSha='';
 async function propApply(){
   $('prop-msg').textContent='applying…';
-  const r=await api('/api/proposal/apply',{});
+  // only the change this panel shows (the server refuses any other)
+  const r=await api('/api/proposal/apply',{diff_sha256:propSha});
   $('prop-msg').textContent=r.reply;
 }
 async function propReject(){await api('/api/proposal/reject',{});refresh();}
@@ -3321,8 +3324,9 @@ def _restore_notes(cfg, acceptance=None):
         if cfg.get("other_sizing_mode"):
             notes["sizing"] += " · shadow book " + _book_note("other_")
     if cfg.get("max_entries_per_day") is not None:
+        import agent as A  # the mode the agent trades in (A._is_dry)
         notes["safety"] = (
-            f"Safety saved: {'DRY-RUN' if cfg.get('dry_run', True) else 'LIVE'}"
+            f"Safety saved: {'DRY-RUN' if A._is_dry(cfg) else 'LIVE'}"
             f" · max {cfg.get('max_entries_per_day')} entries/day")
     return notes
 
@@ -4363,7 +4367,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         bp = A._buying_power(mod, cl, cfg)
         return {"known": bp is not None, "buying_power": bp,
                 "warning": A._cash_warning(cfg, bp),
-                "dry_run": bool(cfg.get("dry_run"))}
+                "dry_run": A._is_dry(cfg)}
 
     def broker_connect(_h, data):
         return _broker_connect(data, save)
@@ -4458,12 +4462,26 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         return {"pending": True, "explanation": p.get("explanation", ""),
                 "warnings": p.get("warnings", []),
                 "diff": self_edit.shown_diff(p),
-                # the diff above is cut: /v2 says so and never applies it
-                "truncated": self_edit.diff_truncated(p)}
+                # the diff above is cut: no Apply ever applies it
+                "truncated": self_edit.diff_truncated(p),
+                # what the classic page posts back: Apply only this change
+                "diff_sha256": self_edit.diff_sha256(p)}
 
-    def proposal_apply(_h, _data):
+    def proposal_apply(_h, data):
+        """POST /api/proposal/apply [{diff_sha256}]. apply_and_restart
+        always refuses a cut diff or one made against older code; with the
+        sha the page was shown (GET /api/proposal), no other change either.
+        A sha that is sent must be one: never read as "no sha"."""
+        import re as _re
         import self_edit
-        ok, msg = self_edit.apply_and_restart(restart=get_status is not None)
+        sha = None
+        if isinstance(data, dict) and "diff_sha256" in data:
+            sha = data["diff_sha256"]
+            if not (isinstance(sha, str) and _re.fullmatch(r"[0-9a-f]{64}", sha)):
+                return {"ok": False, "reply": "diff_sha256 must be the sha256 "
+                        "of the change you reviewed — nothing was applied"}
+        ok, msg = self_edit.apply_and_restart(restart=get_status is not None,
+                                              expect_sha256=sha)
         return {"ok": ok, "reply": msg}
 
     def proposal_reject(_h, _data):
@@ -5063,6 +5081,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         refused = _start_refused()
         if refused:
             return {"ok": False, "error": refused}
+        if A._dry_run_unset(cfg):
+            # practice or live never chosen (Safety step not saved): the
+            # mode the agent will trade in is saved before it starts —
+            # practice, unless this setup already traded live
+            cfg["dry_run"] = A._settle_dry_run(cfg)["dry_run"]
         save()
         import keep_running
         auto_note = ""

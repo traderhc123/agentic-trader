@@ -549,28 +549,36 @@ def _app_port():
         return 8721
 
 
+def _review_problem(prop, expect_sha256=None):
+    """"" when the proposal may be applied as reviewed; else why not (it is
+    left waiting). expect_sha256 None: no sha to hold it to."""
+    if diff_truncated(prop):
+        return ("this change is too large to review in the dashboard — "
+                "nothing was applied; reject it and ask for a smaller change")
+    if expect_sha256 is not None and diff_sha256(prop) != expect_sha256:
+        return ("the proposal waiting is not the one you reviewed — nothing "
+                "was applied; review it again")
+    problem = base_problem(prop)
+    if problem:
+        return f"{problem} — nothing was applied; reject it and ask again"
+    return ""
+
+
 def apply_and_restart(restart=True, expect_sha256=None):
     """Apply the pending proposal: backup -> write -> compile-check ->
     import-check -> rollback on failure -> restart. Returns (ok, message).
     expect_sha256: apply only the proposal whose whole diff has this sha256
-    (diff_sha256), the one the owner reviewed, and only if all of it was
-    shown and it was made against the files as they are now (base_problem);
-    any other is left as it is."""
+    (diff_sha256), the one the owner reviewed; any other is left as it is.
+    With or without it, a change is applied only if all of its diff was
+    shown (diff_truncated) and it was made against the files as they are
+    now (base_problem): the classic Apply (no sha) is held to that too."""
     prop = current()
     if not prop:
         return False, "no pending proposal"
     if expect_sha256 is not None:
-        if diff_truncated(prop):
-            return False, ("this change is too large to review in the "
-                           "dashboard — nothing was applied; reject it and ask "
-                           "for a smaller change")
-        if diff_sha256(prop) != expect_sha256:
-            return False, ("the proposal waiting is not the one you reviewed — "
-                           "nothing was applied; review it again")
-        problem = base_problem(prop)
+        problem = _review_problem(prop, expect_sha256)
         if problem:
-            return False, (f"{problem} — nothing was applied; reject it and "
-                           "ask again")
+            return False, problem
 
     # Re-validate paths at apply time — never trust the stored proposal file.
     repo_real = os.path.realpath(_repo())
@@ -595,6 +603,12 @@ def apply_and_restart(restart=True, expect_sha256=None):
         if problem:
             reject()
             return False, f"apply refused: {problem} (proposal discarded)"
+    if expect_sha256 is None:
+        # the classic Apply: after the path checks above (an illegal
+        # proposal is still thrown away), the same review rules as /v2
+        problem = _review_problem(prop)
+        if problem:
+            return False, problem
 
     backup_dir = os.path.join(_home(), "backups",
                               time.strftime("%Y%m%d-%H%M%S", time.gmtime()))

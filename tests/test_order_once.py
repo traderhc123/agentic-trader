@@ -166,7 +166,8 @@ class FakeAlpaca:
                    for o in self.orders if symbol in (None, o["symbol"]))
 
 
-ALP_CFG = {"broker": "alpaca", "alpaca_key_id": "k", "alpaca_secret": "s",
+# a live setup: never-chosen modes are practice now (audit PR1)
+ALP_CFG = {"dry_run": False, "broker": "alpaca", "alpaca_key_id": "k", "alpaca_secret": "s",
            "sizing_mode": "budget", "budget_per_trade_usd": 500,
            "max_entries_per_day": 5, "position_sync": False}
 
@@ -479,7 +480,8 @@ class FakeRobinhood:
                    for o in self.orders)
 
 
-RH_CFG = {"broker": "robinhood", "robinhood_account": "A1", "sizing_mode": "budget",
+# a live setup: never-chosen modes are practice now (audit PR1)
+RH_CFG = {"dry_run": False, "broker": "robinhood", "robinhood_account": "A1", "sizing_mode": "budget",
           "budget_per_trade_usd": 500, "max_entries_per_day": 5,
           "position_sync": False}
 

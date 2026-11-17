@@ -994,22 +994,39 @@ def _recent_trades(limit=50):
     return (rows + _unwritten_rows())[-limit:]
 
 
-def _trades_today():
+def _trades_today(strict=False):
     """Today's trade-log rows, oldest first (UTC day, like the entry cap).
-    A close found in the account counts on the day its sale filled."""
+    A close found in the account counts on the day its sale filled.
+    Full-file scan, like the entry cap: skip rows can't push today's exits
+    out of a tail (the loss-streak rule is built from these). strict: see
+    _todays_log_rows."""
     today = datetime.now(timezone.utc).date().isoformat()
-    return [t for t in _recent_trades(500)
+    return [t for t in _todays_log_rows(today, strict)
             if str(t.get("closed_at") or t.get("ts", "")).startswith(today)]
 
 
-def _todays_log_rows(today):
-    """Every trade-log row that mentions `today` (full-file scan), then the
-    rows this run could not write yet — so an unwritable log can't make
-    today's entries or losses disappear from the limits."""
+class TradeLogUnreadable(OSError):
+    """trades.jsonl exists but can't be read, so today's entries and losses
+    can't be counted (_todays_log_rows strict=True)."""
+
+
+def _todays_log_rows(today, strict=False):
+    """Every trade-log row that mentions `today` (a date, or a tuple of
+    strings — a row mentioning any of them; full-file scan; this is only a
+    cheap pre-filter, callers check the row's fields), then the rows this
+    run could not write yet — so
+    an unwritable log can't make today's entries or losses disappear from
+    the limits.
+
+    No log yet is an empty day. A log that exists but can't be read
+    (permissions, a lock) yields nothing — or, strict=True, raises
+    TradeLogUnreadable: the entry limits must not read it as "no entries,
+    no losses today" and let an order past a cap that was already hit."""
+    days = (today,) if isinstance(today, str) else tuple(today)
     try:
         with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
             for line in f:
-                if today not in line:
+                if not any(d in line for d in days):
                     continue
                 try:
                     t = json.loads(line)
@@ -1017,12 +1034,15 @@ def _todays_log_rows(today):
                     continue
                 if isinstance(t, dict):
                     yield t
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        if strict:
+            raise TradeLogUnreadable(str(exc)) from exc
     yield from _unwritten_rows()
 
 
-def _entries_today(dry=False):
+def _entries_today(dry=False, strict=False):
     """Count today's entries by scanning the FULL trade log.
 
     Deliberately not a tail read: every skip/veto also appends a log line, so
@@ -1032,10 +1052,12 @@ def _entries_today(dry=False):
     Real-money rows only by default. dry=True counts the dry-run (practice)
     rows instead: the two books never mix, so practice entries can't use up
     the real cap (handle_event passes the mode the agent is in).
+    strict: raise TradeLogUnreadable rather than count an unreadable log
+    as zero (_todays_log_rows).
     """
     today = datetime.now(timezone.utc).date().isoformat()
     count = 0
-    for t in _todays_log_rows(today):
+    for t in _todays_log_rows(today, strict):
         if (t.get("action") == "entry" and bool(t.get("dry")) == bool(dry)
                 and str(t.get("ts", "")).startswith(today)):
             count += 1
@@ -1052,7 +1074,7 @@ def _counted_before(t):
         return False
 
 
-def _est_pnl_today(dry=False):
+def _est_pnl_today(dry=False, strict=False):
     """Today's estimated realized P&L (USD) from the trade log's exit records.
 
     An ESTIMATE: brokers don't report fill prices back to the agent, so each
@@ -1061,10 +1083,11 @@ def _est_pnl_today(dry=False):
     Exits with no estimate at all count as 0 (see `unmeasured`). Full-log
     scan for the same reason as _entries_today, and like it real-money rows
     only (dry=True: the dry-run rows instead) — a practice gain must never
-    offset a real loss against max_daily_loss_usd."""
+    offset a real loss against max_daily_loss_usd. strict: as for
+    _entries_today."""
     today = datetime.now(timezone.utc).date().isoformat()
     total, unmeasured = 0.0, 0
-    for t in _todays_log_rows(today):
+    for t in _todays_log_rows(today, strict):
         # a close found in the account counts on the day it filled
         day = str(t.get("closed_at") or t.get("ts", ""))
         if (t.get("action") != "exit" or bool(t.get("dry")) != bool(dry)
@@ -1086,6 +1109,61 @@ def _et_day(ts):
     if d.tzinfo is None:
         d = d.replace(tzinfo=timezone.utc)
     return d.astimezone(MARKET_TZ).date().isoformat()
+
+
+_POLICY_ROWS_SHOWN = 50
+_POLICY_EARLIER_SHOWN = 20
+
+
+def _policy_view(dry, strict=False):
+    """What the AI policy check is shown: (rows, context).
+
+    rows: today's entry and exit rows (ET market day; a close found in the
+    account counts on the day it filled) of the mode the agent is in only,
+    oldest first, from a FULL-file scan like the entry cap — a tail of the
+    log would let skip/veto rows push today's entries out of view, and a
+    per-day limit in policy.md would then let one more order through.
+    context: the time now (ET), the mode, and the day's counts worked out
+    here, so the model need not count the rows itself; and "earlier": the
+    last _POLICY_EARLIER_SHOWN entry and exit rows of this mode from BEFORE
+    today (same scan, so skip rows can't crowd them out either) — written
+    rules that span days (a losing streak across days, "not a ticker I lost
+    on yesterday", a weekly cap) need them, as they had in the old last-20
+    window. strict: as for _entries_today."""
+    import collections
+    import rules
+    now = _et_now()
+    today = now.date().isoformat()
+    rows = []
+    earlier = collections.deque(maxlen=_POLICY_EARLIER_SHOWN)
+    # one pass over the whole log; the substrings are only a cheap pre-filter
+    for t in _todays_log_rows(('"entry"', '"exit"'), strict):
+        if (t.get("action") not in ("entry", "exit")
+                or bool(t.get("dry")) != bool(dry)):
+            continue
+        day = _et_day(t.get("closed_at") or t.get("ts", ""))
+        if day == today:
+            rows.append(t)
+        elif day and day < today:
+            earlier.append(t)
+    earlier = list(earlier)
+    results = rules.exit_results(rows)
+    measured = [v for v in results if v is not None]
+    context = {
+        "now_et": now.strftime("%Y-%m-%d %H:%M ET (%A)"),
+        "mode": "practice" if dry else "live",
+        "entries_today": sum(1 for t in rows if t.get("action") == "entry"),
+        "positions_closed_today": len(results),
+        "losing_positions_today": sum(1 for v in measured if v < 0),
+        "losses_in_a_row": rules.loss_streak(rows),
+        # the same streak carried back through the earlier rows shown
+        "losses_in_a_row_with_earlier": rules.loss_streak(earlier + rows),
+        "est_realized_pnl_today_usd": round(sum(measured), 2),
+        "rows_shown": min(len(rows), _POLICY_ROWS_SHOWN),
+        "rows_today": len(rows),
+        "earlier": _rows_without_facts(earlier),
+    }
+    return _rows_without_facts(rows[-_POLICY_ROWS_SHOWN:]), context
 
 
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -1523,24 +1601,92 @@ def _prune_expired_positions(cfg, state, save_state):
     contract can't be exited anymore, so the row is pure staleness.
     Bookkeeping only — places no orders. The notify matters: expiry without
     an exit usually means the premium was lost, so check the account.
+
+    A row that still held contracts is booked as an exit (cause "expired",
+    _expired_exit_row): the expiry guard leaves a no-bid loser to expire,
+    and without that row the worst losses were missing from P&L, Results
+    and the history. Closed-outside records (_prune_tombstones) were booked
+    when they closed and get no row.
     """
     today = _et_now().date().isoformat()
-    dropped, told = [], set()
+    dropped, told, booked = [], set(), {}
     for key in list(state.get("positions", {})):
         if _expired(key, today):
             row = state["positions"].pop(key)
             dropped.append(key)
             if isinstance(row, dict) and row.get("expired_alerted"):
                 told.add(key)  # the expiry check already alerted (once each)
+            rec = _expired_exit_row(cfg, key, row)
+            if rec is not None:
+                booked[key] = rec
     if _prune_tombstones(state, today) or dropped:
-        save_state(state)
+        # Saved before the rows are logged (as _close_outside): a crash in
+        # between can't book them twice. A save that FAILS is raised after
+        # the rows: the drop is already applied in memory and reaches disk
+        # with the next save, so skipping the rows would lose the losses.
+        save_failed = _save_error(save_state, state)
         for key in dropped:
+            rec = booked.get(key)
+            if rec is not None and not _logged_event(rec["event_id"]):
+                _log_trade(rec)
             msg = (f"pruned expired position {key} — expired without an exit "
                    f"event; check your broker account")
+            if rec is not None and rec.get("est_pnl_usd") is not None:
+                msg += (f" (counted as a loss of ${-rec['est_pnl_usd']:,.2f}, "
+                        "an estimate)")
             print(msg)
             if key not in told:
                 notify(cfg, f"agentic-trader: {msg}")
+        if save_failed is not None:
+            raise save_failed
     return dropped
+
+
+def _expired_exit_row(cfg, key, row):
+    """The trade-log exit row for a ledger row that expired still holding
+    contracts, or None (nothing left to book: no contracts, or an exit row
+    already counted them — exit_logged).
+
+    No sale happened, so the estimate is a total loss of what was paid:
+    -(entry_mark x qty x 100). Without an entry quote it is logged with no
+    estimate and counts as unmeasured. Dated (closed_at) at the expiry
+    day's close: that is when it was lost, and the daily loss limit and
+    the losing-streak rule count it on that day, not on the day this prune
+    runs — it must not block the next day's entries. Its book is the row's
+    own (`dry`), never the mode the agent is in now."""
+    if not isinstance(row, dict):
+        return None
+    held = _int0(row.get("qty"))
+    qty = held - min(held, _int0(row.get("exit_logged")))
+    if qty < 1:
+        return None
+    dry = bool(row.get("dry"))
+    rec = {"action": "exit", "cause": "expired",
+           "event_id": f"expired|{key}|{row.get('opened_event') or ''}",
+           "contract": _contract_of(key), "dry": dry, "qty": qty}
+    try:
+        rec["closed_at"] = _iso_at(_close_epoch(cfg, key.split("|")[1]))
+    except (ValueError, OverflowError, OSError):
+        pass  # no day to put it on: unmeasured, never counted on today
+    entry = _float0(row.get("entry_mark"))
+    if "closed_at" in rec and 0 < entry < float("inf"):
+        rec["est_pnl_usd"] = round(-entry * qty * 100, 2)
+        rec["reason"] = (f"Expired without a sale — counted as a total loss "
+                         f"of the ${entry:.2f} entry quote (estimate)")
+    else:
+        rec["reason"] = ("Expired without a sale — no entry quote was "
+                         "recorded, so the loss isn't measured")
+    facts = {"code": "expired_unsold", "sent": False, "qty": qty}
+    acct = row.get("acct")
+    if not dry and isinstance(acct, str) and ":" in acct:
+        facts["paper"] = acct.endswith(":paper")  # as _trade_facts
+    return _row_facts(rec, cfg, **facts)
+
+
+def _logged_event(event_id):
+    """True when the trade log already has a row with this event_id
+    (full-file scan, plus the rows not written yet)."""
+    return any(t.get("event_id") == event_id for t in _todays_log_rows(event_id))
 
 
 def _expired(key, today):
@@ -1574,8 +1720,7 @@ def _maybe_daily_digest(cfg, state, save_state):
         return
     if state.get("last_digest_day") == day:
         return
-    today_utc = datetime.now(timezone.utc).date().isoformat()
-    todays = [t for t in _recent_trades(300) if str(t.get("ts", "")).startswith(today_utc)]
+    todays = _et_day_log_rows(day)
     entries = sum(1 for t in todays if t.get("action") == "entry")
     exits = sum(1 for t in todays if t.get("action") == "exit")
     vetoes = sum(1 for t in todays if t.get("action") == "policy_veto")
@@ -1586,6 +1731,47 @@ def _maybe_daily_digest(cfg, state, save_state):
                  f"Open positions: {', '.join(open_pos)}"))
     state["last_digest_day"] = day
     save_state(state)
+
+
+def _et_day_log_rows(day):
+    """Every trade-log row whose event happened on the ET market day `day`
+    (closed_at for a close found in the account, else ts — as the
+    dashboard's _row_day), oldest first, then the rows not written yet.
+    An expired-unsold exit (cause "expired") goes by ts, the day the prune
+    booked it: its closed_at is the expiry close, whose digest went out
+    before the prune could run (it runs once the expiry date has passed),
+    so by closed_at no digest would ever count it.
+    Full-file scan, like _todays_log_rows: a busy day's skip rows must not
+    push its trades out of a tail read. A row of that ET day carries that
+    UTC date or the next one."""
+    from datetime import timedelta
+    nxt = (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)).date().isoformat()
+    rows = []
+    try:
+        with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if day not in line and nxt not in line:
+                    continue
+                try:
+                    t = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(t, dict):
+                    rows.append(t)
+    except OSError:
+        pass
+    rows += _unwritten_rows()
+    out = []
+    for t in rows:
+        keys = ("ts",) if t.get("cause") == "expired" else ("closed_at", "ts")
+        for k in keys:
+            v = t.get(k)
+            got = _et_day(v) if isinstance(v, str) else ""
+            if got:
+                if got == day:
+                    out.append(t)
+                break
+    return out
 
 
 def _disclaimer_text():
@@ -1714,7 +1900,116 @@ def _dry_run_keeps_selling_real_positions(cfg):
 def _dry_run_holds_real_sells(cfg):
     """True when the agent is in dry-run and dry-run stops it from selling
     real positions too (only when the decision above is flipped)."""
-    return bool(cfg.get("dry_run")) and not _dry_run_keeps_selling_real_positions(cfg)
+    return _is_dry(cfg) and not _dry_run_keeps_selling_real_positions(cfg)
+
+
+def _dry_run_unset(cfg):
+    """True when the settings never chose practice or live (no `dry_run`,
+    or null): the Safety step was never saved."""
+    return (cfg or {}).get("dry_run") is None
+
+
+def _has_live_history(state=None, trades_path=None):
+    """True when this setup has already traded with real orders: a real
+    entry/exit row in trades.jsonl, or a real position in the ledger. A log
+    that can't be read counts as no history — the reading that can only
+    ever keep an unchosen mode in practice. trades_path: another setup's
+    log (a moved setup, transfer.py) instead of this one's."""
+    if state is None:
+        state = _load(STATE_PATH, {}) or {}
+    if isinstance(state, dict) and _real_positions(state):
+        return True
+    real = ("entry", "exit", "ledger_adopt")
+    try:
+        with open(trades_path or TRADES_PATH, encoding="utf-8",
+                  errors="replace") as f:
+            for line in f:
+                if '"dry": false' not in line and '"dry":false' not in line:
+                    continue
+                try:
+                    t = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(t, dict) and t.get("action") in real
+                        and t.get("dry") is False):
+                    return True
+    except OSError:
+        pass
+    return trades_path is None and any(
+        t.get("action") in real and t.get("dry") is False
+        for t in _unwritten_rows())
+
+
+# The mode _settle_dry_run decided for this run when the settings never
+# chose one, and whether "could not save the mode" was already printed. A
+# config.json that can't be written keeps coming back without the key; the
+# run keeps its first decision instead of working it out again from a
+# history that may read differently later (a trade log unreadable at start,
+# readable now, must not turn practice into live).
+_SETTLED_DRY = {"dry": None, "warned": False}
+
+
+def _is_dry(cfg, state=None):
+    """The mode the agent trades in — handle_event, doctor, status and the
+    dashboard all read it from here. A saved `dry_run` decides. Never
+    chosen: practice, unless this setup has already placed real orders
+    (_has_live_history) — that setup keeps the live mode it has been
+    running in, and the agent saves `dry_run: false` for it on start
+    (_settle_dry_run). Once this run has settled it, that decision stands
+    (_SETTLED_DRY). Never chosen never becomes live by itself."""
+    if not _dry_run_unset(cfg):
+        return bool(cfg["dry_run"])
+    if _SETTLED_DRY["dry"] is not None:
+        return _SETTLED_DRY["dry"]
+    return not _has_live_history(state)
+
+
+DRY_RUN_UNSET_PRACTICE_NOTE = (
+    "agentic-trader: practice or live was never chosen in your settings, so "
+    "the agent runs in PRACTICE (dry-run: no real orders) and saved that. "
+    "To place real orders, choose Live in the Safety settings or say 'go live'.")
+DRY_RUN_UNSET_LIVE_NOTE = (
+    "agentic-trader: practice or live was never chosen in your settings. This "
+    "setup has already placed real orders, so it stays LIVE as before and "
+    "saved that (dry_run: false). To stop placing real orders, choose "
+    "Practice in the Safety settings or say 'dry on'.")
+
+
+def _settle_dry_run(cfg, state=None):
+    """Write the mode the agent runs in when the settings never chose one,
+    so config.json, doctor and handle_event can't disagree: practice for a
+    setup with no real trades, live (and the owner is told once) for one
+    that has traded live. Returns the config to run with; a config.json
+    that can't be written right now leaves it unsaved (the mode is the same
+    either way: _is_dry)."""
+    if not _dry_run_unset(cfg):
+        return cfg
+    dry = _is_dry(cfg, state)
+    _SETTLED_DRY["dry"] = dry  # kept for the run, saved or not
+    wrote = []
+
+    def change(c):
+        if _dry_run_unset(c):
+            c["dry_run"] = dry
+            wrote.append(True)
+    try:
+        saved = update_config(change)
+    except OSError as exc:  # ConfigUnreadable / ConfigDamaged / read-only
+        if not _SETTLED_DRY["warned"]:  # once per run, not every loop
+            _SETTLED_DRY["warned"] = True
+            print(f"could not save the mode to config.json ({str(exc)[:120]}) "
+                  f"— running in {'PRACTICE' if dry else 'LIVE'} anyway")
+        return {**cfg, "dry_run": dry}
+    if not wrote:  # chosen meanwhile (the dashboard): that choice stands
+        return {**cfg, "dry_run": bool(saved["dry_run"])}
+    cfg = {**cfg, "dry_run": dry}
+    note = DRY_RUN_UNSET_PRACTICE_NOTE if dry else DRY_RUN_UNSET_LIVE_NOTE
+    print(note)
+    try:
+        notify(cfg, note, priority="high")
+    except Exception:
+        pass
+    return cfg
 
 
 def _opened_live(row):
@@ -1803,20 +2098,20 @@ def _mode_label(cfg, state):
     """The mode as the startup line and notification show it. In dry-run
     with real positions open, "no orders" would be untrue: those are still
     sold (_dry_run_keeps_selling_real_positions)."""
-    if not cfg.get("dry_run"):
+    if not _is_dry(cfg, state):
         return "LIVE"
     if _real_positions(state) and _dry_run_keeps_selling_real_positions(cfg):
         return "DRY-RUN (no new trades; real positions still get sold)"
     return "DRY-RUN (no orders)"
 
 
-def _mode(cfg):
+def _mode(cfg, state=None):
     """"practice" (dry-run: new trades are only recorded) or "live" (new
     trades are real orders) — the one place the dashboard's view-model and
     the trade log's mode stamp read it from. It is what handle_event does
-    with the same settings: only a true `dry_run` is practice, so settings
-    that never said are live."""
-    return "practice" if (cfg or {}).get("dry_run") else "live"
+    with the same settings (_is_dry): settings that never said are practice
+    unless this setup has already traded live."""
+    return "practice" if _is_dry(cfg, state) else "live"
 
 
 def _paused(cfg):
@@ -2031,6 +2326,46 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
                 "dashboard activity log.)")
 
 
+# The latest skip_log_unreadable rows, also kept in memory: while the log
+# can't be read the dashboard can't read them back from it (_problems_today).
+_UNREADABLE_SKIPS = []
+_UNREADABLE_SKIPS_KEPT = 50
+
+
+def _log_unreadable_skip(cfg, state, save_state, ev, book, contract, why, exc):
+    """An entry skipped because the trade log can't be read (handle_event):
+    a row in the log, also kept in memory so the dashboard's problems list
+    shows it DURING the outage (_problems_today), and a high-priority alert
+    at most once a day. Never raises."""
+    try:
+        rec = {"action": "skip_log_unreadable", "book": book,
+               "event_id": ev.get("event_id"), "contract": contract,
+               "reason": f"{why} ({str(exc)[:150]})"}
+        if cfg.get("dry_run"):
+            rec["dry"] = True
+        _log_trade(_row_facts(rec, cfg, "daily_cap"))
+        _UNREADABLE_SKIPS.append(rec)
+        del _UNREADABLE_SKIPS[:-_UNREADABLE_SKIPS_KEPT]
+        today = datetime.now(timezone.utc).date().isoformat()
+        sent = state.setdefault("problem_notified", {})
+        if sent.get("skip_log_unreadable") == today:
+            return
+        sent["skip_log_unreadable"] = today
+        try:
+            save_state(state)
+        except Exception:
+            pass
+        notify(cfg, f"⚠️ agentic-trader: entry NOT placed ({contract}) — your "
+                    f"trade log ({TRADES_PATH}) can't be read, so the daily "
+                    "entry cap, max daily loss and loss-streak rule can't be "
+                    "checked. New entries are skipped until it can be read; "
+                    "exits still run. Check the file's permissions, or close "
+                    "whatever has it open.\n(No more alerts about this today.)",
+               priority="high")
+    except Exception:
+        pass
+
+
 def _log_adopted_buys(cfg, state, save_state, broker, client):
     """Log the buys an adapter found at the broker after all — orders whose
     request got no clear answer, so their signal was recorded as handled
@@ -2230,10 +2565,19 @@ def _problems_today():
     """Today's 'trade didn't happen' rows, grouped for the dashboard."""
     import broker_events
     today = datetime.now(timezone.utc).date().isoformat()
-    kinds = (set(broker_events.KINDS) | {"skip_stale", "skip_sizing", "skip_ai_needed"}
+    kinds = (set(broker_events.KINDS) | {"skip_stale", "skip_sizing", "skip_ai_needed",
+                                         "skip_log_unreadable"}
              | _OWN_SKIPS)
     out = {}
-    for t in _recent_trades(300):
+    rows = _recent_trades(300)
+    # while the log can't be read, its skip_log_unreadable rows only exist
+    # in memory (_log_unreadable_skip); once it can, they're on file too
+    on_file = {(t.get("action"), t.get("event_id"), t.get("ts")) for t in rows}
+    extra = [t for t in _UNREADABLE_SKIPS
+             if (t.get("action"), t.get("event_id"), t.get("ts")) not in on_file]
+    if extra:
+        rows = sorted(rows + extra, key=lambda t: str(t.get("ts", "")))
+    for t in rows:
         if t.get("action") not in kinds or not str(t.get("ts", "")).startswith(today):
             continue
         p = out.setdefault(t["action"], {"kind": t["action"], "count": 0})
@@ -3387,6 +3731,11 @@ def _rows_without_facts(rows):
 @_order_in_flight
 def handle_event(ev, cfg, state, broker, client, save_state):
     """Run one new event through the safety pipeline. Returns a log line or None."""
+    if _dry_run_unset(cfg):
+        # never chosen: the mode doctor and the dashboard report (_is_dry) —
+        # practice unless this setup has already traded live. Before, a
+        # missing key read as live here while doctor said DRY-RUN.
+        cfg = {**cfg, "dry_run": _is_dry(cfg, state)}
     contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
     book = "main" if str(ev.get("track", "main")) == "main" else "shadow"
 
@@ -3489,8 +3838,26 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # Counted from the rows of the mode the agent is in: real trades
         # when live, practice trades in dry-run — never one against the other.
         dry_mode = bool(cfg.get("dry_run"))
+        # Today's entries and losses come from the trade log. A log that
+        # exists but can't be read is not "nothing today": no new entries
+        # until it can be read (fail closed). Exits never get here.
+        try:
+            n_today = _entries_today(dry_mode, strict=True)
+            pnl_today, _unmeasured = _est_pnl_today(dry_mode, strict=True)
+            today_rows = [t for t in _trades_today(strict=True)
+                          if bool(t.get("dry")) == dry_mode]
+            policy_rows, policy_ctx = _policy_view(dry_mode, strict=True)
+        except TradeLogUnreadable as exc:
+            why = ("the trade log can't be read, so the daily entry cap, max "
+                   "daily loss and loss-streak rule can't be checked — no new "
+                   "entries until it can be read (exits still run)")
+            msg = f"SKIPPED {contract}: {why}"
+            print(msg + f" [{str(exc)[:150]}]")
+            _log_unreadable_skip(cfg, state, save_state, ev, book, contract,
+                                 why, exc)
+            return msg
         cap = int(cfg.get("max_entries_per_day", 5))
-        n_today = _entries_today(dry_mode)
+        # n_today was read strictly above (fail closed on an unreadable log).
         if not dry_mode:  # a real buy still settling may become an entry
             n_today += len(_buys_settling(
                 state, datetime.now(timezone.utc).date().isoformat()))
@@ -3531,7 +3898,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # the limit, stop opening positions. Exits are never blocked.
         loss_cap = float(cfg.get("max_daily_loss_usd") or 0)
         if loss_cap > 0:
-            pnl, _unmeasured = _est_pnl_today(dry_mode)
+            pnl = pnl_today
             if -pnl >= loss_cap:
                 msg = (f"SKIPPED {contract}: max daily loss reached "
                        f"(est. ${-pnl:,.0f} of ${loss_cap:,.0f}) — no new "
@@ -3546,8 +3913,6 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # Built-in rules (plain settings, no AI): tickers, calls/puts, min
         # strike, no 0DTE, stop after a losing streak.
         import rules
-        today_rows = [t for t in _trades_today()
-                      if bool(t.get("dry")) == dry_mode]
         ok, why = rules.check(cfg, ev, today_rows)
         if not ok:
             msg = f"SKIPPED {contract}: {why} (your rules)"
@@ -3558,8 +3923,9 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 **_rule_facts(cfg, ev, today_rows)))
             return msg
         # The user's own policy, applied by the LLM policy brain (veto-only).
-        verdict = llm_policy.evaluate(
-            cfg, ev, _rows_without_facts(_recent_trades(20)))
+        # Shown today's entries and exits of this mode from the whole log,
+        # the time now and the day's counts (_policy_view).
+        verdict = llm_policy.evaluate(cfg, ev, policy_rows, context=policy_ctx)
         if not verdict["act"] and verdict.get("ai_problem"):
             # NOT the owner's rules saying no: the AI that checks them is
             # missing or failing, so every entry is being skipped. Log it as
@@ -5952,6 +6318,54 @@ def _expiry_setting(arg, default):
 
 # ── commands ─────────────────────────────────────────────────────────────────
 
+def _confirm_broker_switch(cfg, saved_bc):
+    """Terminal setup: True to go ahead with the broker just picked. The
+    agent never sells a real row whose account tag names another broker
+    account (_check_before_exit: "blocked"), so a switch away from the
+    broker a real row was opened at warns and asks first. Each row's broker
+    is the one its acct tag names; a row with no tag (from before rows were
+    tagged) counts as the saved broker's — the agent tags such a row with
+    the account it trades on its first read, so after a switch it may try
+    to sell it where it isn't held. Rows at the newly picked broker don't
+    warn. Enter (or anything but y) keeps the saved broker."""
+    old = {"2": "alpaca", "3": "moomoo"}.get(saved_bc, "robinhood")
+    new = cfg.get("broker")
+    if new == old:
+        return True
+    rows = (_load(STATE_PATH, {}) or {}).get("positions")
+    rows = rows if isinstance(rows, dict) else {}
+    stranded = {}  # broker -> ([tagged keys], [untagged keys])
+    for k in _real_positions({"positions": rows}):
+        acct = str((rows.get(k) or {}).get("acct") or "")
+        at = acct.split(":", 1)[0] if acct else old
+        if at != new:
+            stranded.setdefault(at, ([], []))[0 if acct else 1].append(k)
+    if not stranded:
+        return True
+    now = _BROKER_NAMES.get(new, new)
+    for at, (tagged, untagged) in stranded.items():
+        was = _BROKER_NAMES.get(at, at)
+        for keys in (tagged, untagged):
+            if not keys:
+                continue
+            one = len(keys) == 1
+            it = "it" if one else "them"
+            print(f"\nWARNING: you have {len(keys)} real position"
+                  f"{'' if one else 's'} open at {was}: "
+                  f"{', '.join(_contract_label(k) for k in keys)}.")
+            if keys is tagged:
+                what = f"the agent will NOT sell {it}"
+            else:
+                what = (f"the agent may try to sell {it} at {now}, where "
+                        f"{'it is' if one else 'they are'} not held")
+            print(f"After switching to {now} {what} — sell {it} yourself "
+                  f"in the {was} app.")
+    ok = input(f"Switch to {now} anyway? [y/N]: ").strip().lower() == "y"
+    if not ok:
+        print(f"Keeping {_BROKER_NAMES.get(old, old)}.")
+    return ok
+
+
 def cmd_setup():
     require_consent_or_exit()
     cfg = _load(CONFIG_PATH, {}) or {}
@@ -5977,6 +6391,8 @@ def cmd_setup():
     saved_bc = {"alpaca": "2", "moomoo": "3"}.get(str(cfg.get("broker")), "1")
     bc = input(f"Choose [1-3, default {saved_bc}]: ").strip() or saved_bc
     cfg["broker"] = {"2": "alpaca", "3": "moomoo"}.get(bc, "robinhood")
+    if not _confirm_broker_switch(cfg, saved_bc):
+        cfg["broker"] = {"2": "alpaca", "3": "moomoo"}.get(saved_bc, "robinhood")
     cfg = BROKERS[cfg["broker"]].setup(cfg)
 
     _ask_sizing(cfg)
@@ -6886,9 +7302,9 @@ def _command(t, cfg, text):
         return True, "Self-edit OFF."
     if t == "status":
         st = _load(STATE_PATH, {"positions": {}})
-        note = _dry_run_note(cfg, st) if cfg.get("dry_run") else ""
-        dry = bool(cfg.get("dry_run"))  # each mode counts its own trades
-        return True, (f"{'DRY-RUN' if cfg.get('dry_run') else 'LIVE'} · "
+        dry = _is_dry(cfg, st)  # each mode counts its own trades
+        note = _dry_run_note(cfg, st) if dry else ""
+        return True, (f"{'DRY-RUN' if dry else 'LIVE'} · "
                       + ("ON HOLD (being moved to a server: no orders at "
                          "all) · " if _handed_off() else
                          "ON HOLD (memory file was damaged: no orders at "
@@ -7103,6 +7519,9 @@ def cmd_run(app_window=False):
     # sets the damaged file aside, alerts, and pauses if memory may be missing
     _state_startup(cfg, state, state_info)
     _seen_ids(state)  # brings an older version's list up to date
+    # practice or live never chosen: saved now, so config.json, doctor and
+    # every order agree (_settle_dry_run)
+    cfg = _settle_dry_run(cfg, state)
     if llm_policy.entries_blocked(cfg):
         if state.get("positions"):
             print("WARNING: " + llm_policy.BLOCKED_MSG + " Starting anyway so "
@@ -7157,7 +7576,7 @@ def cmd_run(app_window=False):
         st = _load(STATE_PATH, {"positions": {}})
         feed_note = _feed_schedule_note(c, source)
         return {
-            "mode": "DRY-RUN" if c.get("dry_run") else "LIVE",
+            "mode": "DRY-RUN" if _is_dry(c, st) else "LIVE",
             # also on a full hold: a damaged state.json (the dashboard then
             # offers Resume, which is what ends it) or a hand-off to a
             # server (Resume answers why not). "hold": the dashboard then
@@ -7176,7 +7595,7 @@ def cmd_run(app_window=False):
                 **({"feed access": _feed_access(c, st)}
                    if c.get("source") == "agenthc" else {}),
                 "sizing": _sizing_desc(c),
-                "entries today": (f"{_entries_today(bool(c.get('dry_run')))} / cap "
+                "entries today": (f"{_entries_today(_is_dry(c, st))} / cap "
                                   f"{c.get('max_entries_per_day', 5)}"),
                 "policy brain": ("blocked" if llm_policy.entries_blocked(c)
                                  else "on" if llm_policy.enabled(c) else "off"),
@@ -7306,7 +7725,7 @@ def cmd_run(app_window=False):
         mode += ", ON HOLD — no orders at all until you press Resume"
     elif _paused(cfg):  # saved in config.json: still paused after a restart
         mode += ", PAUSED — no new entries until you press Resume"
-    if cfg.get("dry_run") and _dry_run_note(cfg, state):
+    if _is_dry(cfg, state) and _dry_run_note(cfg, state):
         print("Dry-run with real positions open. " + _dry_run_note(cfg, state))
     print(f"Heartbeat started [{mode}]: source={cfg['source']}, "
           f"{_sizing_desc(cfg)}, policy brain "
@@ -7365,6 +7784,7 @@ def cmd_run(app_window=False):
             beat["saved"] = now_beat
             _save_heartbeat(state, save_state, now_beat)
         cfg = _load(CONFIG_PATH, cfg) or cfg  # dashboard edits apply live
+        cfg = _settle_dry_run(cfg, state)  # a mode removed by hand: saved again
         _RUN_CFG["cfg"] = cfg
         awake.apply(cfg)  # same thread every time (Windows needs that)
         if time.time() - dash["at"] > DASH_CHECK_EVERY_S:
@@ -7683,13 +8103,13 @@ def cmd_status():
     print(f"broker           : {broker_name}{detail}"
           f"{'' if broker_ready(cfg) else ' — NOT CONFIGURED'}")
     print(f"contracts/trade  : {cfg.get('contracts_per_trade', 'unset')}")
-    print(f"mode             : {'DRY-RUN' if cfg.get('dry_run') else 'LIVE'}"
+    print(f"mode             : {'DRY-RUN' if _is_dry(cfg, state) else 'LIVE'}"
           + (" · ON HOLD (memory file was damaged: no orders at all until "
              "you press Resume)" if _state_hold() is not None else
              " · PAUSED (no new entries; exits still run)" if _paused(cfg) else ""))
     print(f"policy brain     : {'ON (' + llm_policy.policy_path() + ')' if llm_policy.enabled(cfg) else 'off'}")
     print(f"daily entry cap  : {cfg.get('max_entries_per_day', 5)}")
-    print(f"entries today    : {_entries_today(bool(cfg.get('dry_run')))}")
+    print(f"entries today    : {_entries_today(_is_dry(cfg, state))}")
     print(f"open positions   : {list(state.get('positions', {})) or 'none'}")
 
 
@@ -7890,7 +8310,7 @@ def doctor_checks():
             cl = None
         bp = _buying_power(mod, cl, cfg)
         warn = _cash_warning(cfg, bp)
-        dry = bool(cfg.get("dry_run"))
+        dry = _is_dry(cfg, state)
         check("buying_power", dry or not warn, "Broker buying power",
               ("couldn't read it" if bp is None else f"${bp:,.2f}")
               + (f" — {warn}" if warn else "")
@@ -7973,11 +8393,15 @@ def cmd_doctor(as_json=False):
     --json: machine-readable, for an assistant deciding whether setup is done."""
     checks, cfg = doctor_checks()
     failed = [c for c in checks if not c["ok"]]
-    mode = ("DRY-RUN" if cfg.get("dry_run", True) else "LIVE")
+    # the mode handle_event trades in (_is_dry), never a default of its own
+    dry = _is_dry(cfg)
+    unset = _dry_run_unset(cfg)
+    mode = "DRY-RUN" if dry else "LIVE"
     if as_json:
         print(json.dumps({
             "ready": not failed,
             "mode": mode,
+            "mode_chosen": not unset,
             "checks": checks,
             "owner_steps": [c["fix"] for c in failed if c["who"] == "owner"],
             "agent_steps": [c["fix"] for c in failed if c["who"] == "agent"],
@@ -7996,9 +8420,14 @@ def cmd_doctor(as_json=False):
         warn = demo_warning(cfg.get("lnbits_url"))
         if warn:
             print(f"  ⚠️  Wallet host: {warn}")
-    if "dry_run" not in cfg:
-        desc = "not set — setup defaults to DRY-RUN"
-    elif cfg["dry_run"]:
+    if unset and dry:
+        desc = ("DRY-RUN (never chosen — the agent starts in practice and "
+                "saves it)")
+    elif unset:
+        desc = ("LIVE ORDERS (never chosen — this setup has already placed "
+                "real orders, so it stays live; saved as dry_run: false when "
+                "the agent starts)")
+    elif dry:
         desc = "DRY-RUN (safe — logs what it WOULD do)"
     else:
         desc = "LIVE ORDERS"

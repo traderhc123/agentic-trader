@@ -106,7 +106,7 @@ def test_handle_event_skips_and_logs(home, broker, monkeypatch):
 
 def test_handle_event_trades_when_rules_pass_without_ai(home, broker, no_policy):
     state = {"positions": {}, "seen": []}
-    cfg = {"rule_tickers": ["SPY"], "rule_sides": "calls"}
+    cfg = {"rule_tickers": ["SPY"], "rule_sides": "calls", "dry_run": False}
     out = agent.handle_event(make_event(), cfg, state, broker, object(), lambda s: None)
     assert out and out.startswith("ENTRY") and broker.calls
 
@@ -114,7 +114,7 @@ def test_handle_event_trades_when_rules_pass_without_ai(home, broker, no_policy)
 def test_loss_streak_stops_entries_today(home, broker, no_policy):
     for p in (-10, -20):
         agent._log_trade({"action": "exit", "contract": "x", "est_pnl_usd": p})
-    out = agent.handle_event(make_event(), {"rule_loss_streak": 2},
+    out = agent.handle_event(make_event(), {"rule_loss_streak": 2, "dry_run": False},
                              {"positions": {}, "seen": []}, broker, object(),
                              lambda s: None)
     assert "losing exit" in out and broker.calls == []

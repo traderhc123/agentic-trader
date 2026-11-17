@@ -1102,10 +1102,19 @@ function Blotter({
 function ProposalPanel({ p, onDone }: { p: Proposal; onDone: () => void }) {
   const [msg, setMsg] = useState("");
   const lines = String(p.diff || "").split("\n");
+  // Apply is tied to the diff shown here: the server applies only the change
+  // with this sha256, and never one whose diff was cut.
+  const sha = p.diff_sha256 || "";
+  const blocked = !!p.truncated || !sha;
   return (
     <Panel title="Proposed code change: review before it applies" tone="warn" bodyClass="space-y-3 p-4">
       <p className="m-0 text-sm text-fg2">{p.explanation}</p>
       {!!p.warnings?.length && <p className="m-0 text-xs text-warn">{p.warnings.join("  ")}</p>}
+      {p.truncated && (
+        <p className="m-0 text-xs text-warn">
+          This change is too large to show in full, so it can't be applied: Reject it and ask for a smaller change.
+        </p>
+      )}
       <pre
         tabIndex={0}
         aria-label="Proposed code diff"
@@ -1133,9 +1142,10 @@ function ProposalPanel({ p, onDone }: { p: Proposal; onDone: () => void }) {
       <div className="flex flex-wrap items-center gap-2">
         <Button
           variant="primary"
+          disabled={blocked}
           onClick={async () => {
             setMsg("Applying…");
-            const r = await api<{ reply: string }>("/api/proposal/apply", {});
+            const r = await api<{ reply: string }>("/api/proposal/apply", { diff_sha256: sha });
             setMsg(r.reply);
           }}
         >

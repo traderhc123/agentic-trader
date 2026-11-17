@@ -84,6 +84,22 @@ class ImportIncomplete(TransferError):
     be put back: the folder holds a mix of the two setups."""
 
 
+def _was_live(cfg, root):
+    """Did the moved setup run live: a saved live mode or — never chosen —
+    real trades in what was just imported (agent._has_live_history), as
+    the agent itself reads those settings."""
+    import agent
+    if not agent._dry_run_unset(cfg):
+        return not cfg["dry_run"]
+    try:
+        with open(os.path.join(root, "state.json"), encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    return agent._has_live_history(state if isinstance(state, dict) else {},
+                                   os.path.join(root, "trades.jsonl"))
+
+
 def home():
     return os.path.expanduser(os.getenv("AGENT_HOME", "~/.agentic-trader"))
 
@@ -264,7 +280,7 @@ def import_bundle(blob, passphrase, replace=False):
         raise TransferError("the move file's settings are damaged")
     if not isinstance(cfg, dict):
         raise TransferError("the move file's settings are damaged")
-    was_live = not cfg.get("dry_run")
+    moved_cfg = dict(cfg)   # as saved there: was_live reads it below
     cfg["dry_run"] = True
 
     root = home()
@@ -310,6 +326,13 @@ def import_bundle(blob, passphrase, replace=False):
                 pass  # stays in practice mode (safe); the copy is kept
         raise
     _discard([kept] if kept else [])
+    # Read only now, from what was just installed (its state.json and
+    # trades.jsonl), as the agent itself reads those settings. The move is
+    # done by then: a reading that fails only drops the "go live again" note.
+    try:
+        was_live = _was_live(moved_cfg, root)
+    except Exception:
+        was_live = False
     resume_here()  # a fresh import is meant to run here
     return {"files": len(members), "created_at": manifest.get("created_at"),
             "from_os": manifest.get("from_os"), "was_live": was_live,
