@@ -205,7 +205,8 @@ class AlpacaAPI:
         return _Resp(404, {})
 
 
-ALP = {"broker": "alpaca", "alpaca_key_id": "k", "alpaca_secret": "s",
+# a live setup: never-chosen modes are practice now (audit PR1)
+ALP = {"dry_run": False, "broker": "alpaca", "alpaca_key_id": "k", "alpaca_secret": "s",
        "contracts_per_trade": 3}
 
 
@@ -466,7 +467,8 @@ class RH:
         return {"content": []}
 
 
-RH_CFG = {"robinhood_account": "A1"}
+# a live setup: never-chosen modes are practice now (audit PR1)
+RH_CFG = {"dry_run": False, "robinhood_account": "A1"}
 
 
 def _rh_sell(rh, qty=3):
@@ -746,7 +748,8 @@ class MM:
         return Q()
 
 
-MM_CFG = {"broker": "moomoo", "moomoo_paper": True, "contracts_per_trade": 3}
+# a live setup: never-chosen modes are practice now (audit PR1)
+MM_CFG = {"dry_run": False, "broker": "moomoo", "moomoo_paper": True, "contracts_per_trade": 3}
 
 
 def _mm_sell(monkeypatch, sdk, qty=3, ev=None):
@@ -1355,7 +1358,8 @@ class RobinhoodFront:
 _FRONTS = {"alpaca": (AlpacaFront, alpaca, dict(ALP)),
            "moomoo": (MoomooFront, moomoo, dict(MM_CFG)),
            "robinhood": (RobinhoodFront, robinhood,
-                         {"broker": "robinhood", "robinhood_account": "A1",
+                         {"dry_run": False, "broker": "robinhood",
+                          "robinhood_account": "A1",
                           "contracts_per_trade": 3})}
 
 

@@ -72,6 +72,24 @@ def _no_read_schedule_left_over(monkeypatch):
     monkeypatch.setattr(webui, "_UPDATE_MEMO", {})  # the update check's answer
 
 
+@pytest.fixture(autouse=True)
+def _no_real_agent_home(tmp_path_factory, monkeypatch):
+    """A test without `home` still gets a throwaway agent home: a test that
+    logs a row must not write it into the real ~/.agentic-trader, and what
+    the agent reads from there (the live trade history behind a mode that
+    was never chosen, agent._is_dry) must not depend on the machine or on
+    the tests that ran before. `home` repoints the same paths again. Also
+    forgets the mode a previous test's run settled (agent._SETTLED_DRY)."""
+    h = tmp_path_factory.mktemp("default-agent-home")
+    monkeypatch.setenv("AGENT_HOME", str(h))
+    monkeypatch.setattr(agent, "HOME", str(h))
+    monkeypatch.setattr(agent, "ACCEPTANCE_PATH", str(h / "acceptance.json"))
+    monkeypatch.setattr(agent, "CONFIG_PATH", str(h / "config.json"))
+    monkeypatch.setattr(agent, "STATE_PATH", str(h / "state.json"))
+    monkeypatch.setattr(agent, "TRADES_PATH", str(h / "trades.jsonl"))
+    monkeypatch.setattr(agent, "_SETTLED_DRY", {"dry": None, "warned": False})
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """Isolated AGENT_HOME; yields its path."""

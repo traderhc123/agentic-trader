@@ -459,7 +459,8 @@ _DOC = {
     "Status.as_of": "server time of this snapshot",
     "Status.mode": "what NEW trades use; pausing never changes it",
     "Status.mode_explicit": "false: the settings never said (dry_run is "
-                            "missing), and the agent treats that as live",
+                            "missing) — practice unless this setup already "
+                            "traded live; the agent saves it on start",
     "Status.real_positions_managed": "are the real positions being sold on "
                                      "their exit signal / at expiry right now",
     "Status.unmanaged_reason": "why not, for the first real position that isn't",
@@ -2027,7 +2028,7 @@ def build_status(cfg, state, rows, runtime=None, now=None,
     answering = bool(running and beat is not None and (
         (now - beat).total_seconds() - (wait or 0.0) <= A.EXPIRY_WAKE_GAP_S))
 
-    mode = A._mode(cfg)
+    mode = A._mode(cfg, state)
     hold = rt.get("hold") if rt.get("hold") in (
         "state_hold", "handoff_hold", "restarting") else None
     entries_paused = A._paused(cfg)

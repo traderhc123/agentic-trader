@@ -44,7 +44,8 @@ class SilentBroker:
         return False
 
 
-CFG = {"max_entries_per_day": 5}
+# a live setup: never-chosen modes are practice now (audit PR1)
+CFG = {"dry_run": False, "max_entries_per_day": 5}
 
 
 def test_rejected_order_is_logged_with_fix_and_notified_once(home, no_policy, notes):
