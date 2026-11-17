@@ -2135,10 +2135,12 @@ def _parse_events(body):
 def setup(cfg):
     print("\n-- AgentHC Agentic Day Trade Ideas (sats-based access) --")
     print("Which trade signals?")
-    print("  1) Main pick only — one high-conviction day trade (default)")
+    print("  1) Main pick only — one high-conviction day trade")
     print("  2) Main pick + \"other trades\" — AgentHC's wider journal;")
     print("     several entries a day (your daily cap + budget still apply)")
-    scope = input("Choose [1/2, default 1]: ").strip() or "1"
+    # re-running setup keeps what is saved on Enter
+    saved = "2" if cfg.get("include_other_trades") else "1"
+    scope = input(f"Choose [1/2, default {saved}]: ").strip() or saved
     cfg["include_other_trades"] = scope == "2"
     print(f"  1) Lightning day-pass — the agent pays "
           f"~{usd_words(day_pass_price()['usd'])}/day in sats from its")

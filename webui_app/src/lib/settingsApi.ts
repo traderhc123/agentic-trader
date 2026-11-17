@@ -37,9 +37,11 @@ export interface SettingsView {
     /** null or 0: no daily loss limit */
     max_daily_loss_usd: number | null;
     max_open_positions: number | null;
-    defaults: { max_entries_per_day: number; max_open_positions: number };
+    /** the most contracts one trade buys; null: never set (the default applies) */
+    max_contracts_per_trade?: number | null;
+    defaults: { max_entries_per_day: number; max_open_positions: number; max_contracts_per_trade?: number };
     /** [low, high] each limit accepts */
-    allowed: Record<"max_entries_per_day" | "max_daily_loss_usd" | "max_open_positions", [number, number]>;
+    allowed: Partial<Record<"max_entries_per_day" | "max_daily_loss_usd" | "max_open_positions" | "max_contracts_per_trade", [number, number]>>;
   };
   rules: {
     /** as saved: a list (or, from older versions, text); null when never set */
@@ -176,7 +178,7 @@ export interface Preview {
   buying_power?: number | null;
   buying_power_at?: string | null;
   trade_size?: { main: SizeSpec | null; other: SizeSpec | null };
-  limits?: { max_entries_per_day: number | null; max_daily_loss_usd: number | null; max_open_positions: number | null };
+  limits?: { max_entries_per_day: number | null; max_daily_loss_usd: number | null; max_open_positions: number | null; max_contracts_per_trade?: number | null };
   real_positions?: number | null;
   cash_low?: boolean | null;
   /** stop / move: the real positions nobody sells here afterwards; null: not known */

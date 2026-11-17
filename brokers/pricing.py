@@ -12,6 +12,8 @@ $0.05 or $0.01 — a price a nickel-tick class rejects, which would leave an
 expiring position unsold.
 """
 
+import math
+
 
 def _tick_down(cents):
     step = 10 if cents >= 300 else 5
@@ -53,6 +55,48 @@ def exit_qty(pos, event):
     if isinstance(cap, int) and not isinstance(cap, bool) and 1 <= cap < qty:
         return cap
     return qty
+
+
+# The most contracts one trade buys when max_contracts_per_trade was never
+# set (the same number as agent.CONTRACT_CAP_DEFAULT).
+CONTRACT_CAP_DEFAULT = 100
+
+
+def contract_cap(cfg):
+    """max_contracts_per_trade as the adapters read it: never set = the
+    default. (A value that is not a whole number raises, as it always did.)"""
+    v = cfg.get("max_contracts_per_trade")
+    return CONTRACT_CAP_DEFAULT if v is None else int(v)
+
+
+def capped(cfg, qty, note):
+    """(qty, note) after max_contracts_per_trade. When the cap cuts the
+    order the note says so, with the size the sizing asked for, so a capped
+    trade never looks like a full one."""
+    cap = contract_cap(cfg)
+    if qty <= cap:
+        return qty, note
+    if cap < 1:
+        return 0, f"{note} — max contracts per trade is {cap} — skipped"
+    return cap, (f"{note} — capped at {cap} by max contracts per trade "
+                 "(change it with: set max contracts N)")
+
+
+def budget_qty(budget, price):
+    """Whole contracts a dollar budget buys at a per-share price. Floored
+    with a tiny tolerance: in floating point a $0.07 option costs
+    7.000000000000001 per contract, so budget // (price * 100) bought 99
+    with a $700 budget (and skipped a $7 one). The tolerance is far below a
+    cent, so it never buys a contract the budget can't pay for."""
+    return int(math.floor(budget / (price * 100) + 1e-9))
+
+
+def fixed_count(cfg):
+    """(qty, note) for sizing_mode "contracts": contracts_per_trade (at
+    least 1), then the cap."""
+    n = max(1, int(cfg.get("contracts_per_trade", 1)))
+    return capped(cfg, n, "fixed contract count" if n <= contract_cap(cfg)
+                  else f"fixed contract count ({n})")
 
 
 def quote_number(obj, key):
