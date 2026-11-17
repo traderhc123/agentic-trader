@@ -382,9 +382,11 @@ DASH_LINK = ('  <a class="btn btn-ghost" href="/v2" title="A redesigned dashboar
              'You can come back here at any time.">Try the new dashboard</a>\n')
 # sha256 of _DASH_HTML at origin/main 2c19c0c, plus the open-positions fix
 # (the Activity row for skip_position_cap shows its reason: how to raise
-# the limit). #83 changed the classic page's polling; c73dfc2's was
-# 5df4ddc7…, 2c19c0c's af9f3d4c…
-DASH_AT_MAIN = "47f240026b7657491814dd9c075fe7996ac4abc42621782f247b41726ca6fd2b"
+# the limit), plus audit PR9 (the code-change panel posts the diff_sha256
+# it showed and disables Apply on a cut diff). #83 changed the classic
+# page's polling; c73dfc2's was 5df4ddc7…, 2c19c0c's af9f3d4c…, d6c8740's
+# 47f24002…
+DASH_AT_MAIN = "73a1e91cdb4509a631f998684b9f5bc756eb4404b415a123b503a7d7e2444da0"
 
 
 def test_the_classic_page_only_gains_the_one_link():
