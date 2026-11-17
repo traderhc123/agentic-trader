@@ -383,7 +383,14 @@ def test_unwritable_trade_log_cannot_bypass_the_daily_cap(home, monkeypatch, no_
     unwritable every entry looked like the day's first."""
     sent = []
     monkeypatch.setattr(agent, "notify", lambda cfg, msg, **k: sent.append(msg))
-    (home / "trades.jsonl").mkdir()  # appending to a folder fails on every OS
+    # A full disk / read-only file: writing fails, reading still works. (A
+    # log that can't be READ either skips entries outright —
+    # tests/test_entry_limits_fail_closed.py.)
+    real_append = agent._append_trade_rows
+
+    def disk_full(path, rows):
+        raise OSError(28, "No space left on device", path)
+    monkeypatch.setattr(agent, "_append_trade_rows", disk_full)
     cfg = {"dry_run": False, "max_entries_per_day": 1}
     state = {"positions": {}}
     b = _QuotedBroker([2.00, 1.00])
@@ -409,7 +416,7 @@ def test_unwritable_trade_log_cannot_bypass_the_daily_cap(home, monkeypatch, no_
 
     # once the log can be written again, the rows held in memory are written
     # first, in order, and nothing is counted twice
-    (home / "trades.jsonl").rmdir()
+    monkeypatch.setattr(agent, "_append_trade_rows", real_append)
     agent._log_trade({"action": "skip_rule", "contract": "z"})
     with open(agent.TRADES_PATH, encoding="utf-8") as f:
         written = [json.loads(x)["action"] for x in f]

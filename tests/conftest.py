@@ -52,6 +52,8 @@ def _no_state_hold_left_over(monkeypatch):
     import webui
     monkeypatch.setitem(agent._STATE_HELD, "on", False)
     monkeypatch.setitem(webui.CONTROLS, "replaced", False)
+    # the in-memory "trade log can't be read" skip rows (_problems_today)
+    monkeypatch.setattr(agent, "_UNREADABLE_SKIPS", [])
 
 
 @pytest.fixture(autouse=True)
@@ -90,7 +92,7 @@ def no_policy(monkeypatch):
     import llm_policy
     monkeypatch.setattr(
         llm_policy, "evaluate",
-        lambda cfg, ev, log: {"act": True, "reason": "test: mechanical"})
+        lambda cfg, ev, log, **kw: {"act": True, "reason": "test: mechanical"})
 
 
 @pytest.fixture(autouse=True)
