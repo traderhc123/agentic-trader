@@ -8,7 +8,8 @@ plain sell can open a short). The adapters use this module so that can't
 happen:
 
   * order_key(): the id sent with every order (Alpaca client_order_id,
-    Robinhood ref_id). It is derived from the signal, so the same signal
+    Robinhood ref_id, moomoo buy remark — moomoo doesn't refuse a repeat
+    itself: the adapter looks the remark up before every buy). It is derived from the signal, so the same signal
     always sends the same id and the broker can turn a repeat down — even
     after the agent lost its memory (killed mid-order). A sell that got a
     clear answer (accepted or refused) is over: the next sell for that

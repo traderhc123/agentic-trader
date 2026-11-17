@@ -2822,7 +2822,8 @@ def _fund_quote(sats, invoice_cap=0):
     product). The day pass's USD price is AgentHC's own (hc.day_pass_price,
     the built-in fallback when the server can't say); its sats are the
     server's figure when it sent one, else that USD at the live BTC price.
-    suggested_sats is the day pass clamped to the instance's per-invoice cap
+    suggested_sats is the day pass plus LNbits' routing-fee reserve (it
+    refuses a payment without it), clamped to the instance's per-invoice cap
     when one is known. {ok: False} when no live price is available (the
     funding box just omits the hint)."""
     from sources import agenthc_day_trade_ideas as hc
@@ -2833,7 +2834,9 @@ def _fund_quote(sats, invoice_cap=0):
                 "day_pass_usd": day["usd"]}
     usd = sats * usd_per_btc / 1e8
     day_sats = day["sats"] or int(-(-day["usd"] / usd_per_btc * 1e8 // 100) * 100)  # ceil→100
-    suggested = min(day_sats, invoice_cap) if invoice_cap else day_sats
+    from lightning_wallet import fee_reserve_sats
+    need = day_sats + fee_reserve_sats(day_sats)
+    suggested = min(need, invoice_cap) if invoice_cap else need
     return {"ok": True, "btc_usd": round(usd_per_btc, 2),
             "usd": round(usd, 2),
             "day_pass_usd": day["usd"],
