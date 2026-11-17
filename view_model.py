@@ -125,6 +125,9 @@ _ROW_CODES = ("past_expiry_guard", "exit_already_arrived",
               "rule_not_in_list", "rule_skip_list", "rule_side",
               "rule_min_strike", "rule_0dte", "rule_loss_streak",
               "expiry_guard", "exit_remainder", "closed_outside",
+              # a contract that expired still held: booked as an exit with
+              # no order (agent._expired_exit_row)
+              "expired_unsold",
               # the no-signal sell (agent.signal_loss_tick) and the two
               # entries it and a short wallet day-pass skip
               "signal_loss", "after_signal_loss_sell", "pass_wont_cover",
@@ -1666,7 +1669,7 @@ def _exit_loss(cfg, state, now, blocked=False, acct=None):
 # the account, a re-sold remainder, the ledger check, the no-signal sell):
 # not signals
 _OWN_EVENT_IDS = ("expiry-guard|", "outside|", "ledger|", "exit-rest|",
-                  "no-signal|")
+                  "no-signal|", "expired|")
 
 
 def _last_signal(rows, rt):

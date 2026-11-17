@@ -1571,24 +1571,92 @@ def _prune_expired_positions(cfg, state, save_state):
     contract can't be exited anymore, so the row is pure staleness.
     Bookkeeping only — places no orders. The notify matters: expiry without
     an exit usually means the premium was lost, so check the account.
+
+    A row that still held contracts is booked as an exit (cause "expired",
+    _expired_exit_row): the expiry guard leaves a no-bid loser to expire,
+    and without that row the worst losses were missing from P&L, Results
+    and the history. Closed-outside records (_prune_tombstones) were booked
+    when they closed and get no row.
     """
     today = _et_now().date().isoformat()
-    dropped, told = [], set()
+    dropped, told, booked = [], set(), {}
     for key in list(state.get("positions", {})):
         if _expired(key, today):
             row = state["positions"].pop(key)
             dropped.append(key)
             if isinstance(row, dict) and row.get("expired_alerted"):
                 told.add(key)  # the expiry check already alerted (once each)
+            rec = _expired_exit_row(cfg, key, row)
+            if rec is not None:
+                booked[key] = rec
     if _prune_tombstones(state, today) or dropped:
-        save_state(state)
+        # Saved before the rows are logged (as _close_outside): a crash in
+        # between can't book them twice. A save that FAILS is raised after
+        # the rows: the drop is already applied in memory and reaches disk
+        # with the next save, so skipping the rows would lose the losses.
+        save_failed = _save_error(save_state, state)
         for key in dropped:
+            rec = booked.get(key)
+            if rec is not None and not _logged_event(rec["event_id"]):
+                _log_trade(rec)
             msg = (f"pruned expired position {key} — expired without an exit "
                    f"event; check your broker account")
+            if rec is not None and rec.get("est_pnl_usd") is not None:
+                msg += (f" (counted as a loss of ${-rec['est_pnl_usd']:,.2f}, "
+                        "an estimate)")
             print(msg)
             if key not in told:
                 notify(cfg, f"agentic-trader: {msg}")
+        if save_failed is not None:
+            raise save_failed
     return dropped
+
+
+def _expired_exit_row(cfg, key, row):
+    """The trade-log exit row for a ledger row that expired still holding
+    contracts, or None (nothing left to book: no contracts, or an exit row
+    already counted them — exit_logged).
+
+    No sale happened, so the estimate is a total loss of what was paid:
+    -(entry_mark x qty x 100). Without an entry quote it is logged with no
+    estimate and counts as unmeasured. Dated (closed_at) at the expiry
+    day's close: that is when it was lost, and the daily loss limit and
+    the losing-streak rule count it on that day, not on the day this prune
+    runs — it must not block the next day's entries. Its book is the row's
+    own (`dry`), never the mode the agent is in now."""
+    if not isinstance(row, dict):
+        return None
+    held = _int0(row.get("qty"))
+    qty = held - min(held, _int0(row.get("exit_logged")))
+    if qty < 1:
+        return None
+    dry = bool(row.get("dry"))
+    rec = {"action": "exit", "cause": "expired",
+           "event_id": f"expired|{key}|{row.get('opened_event') or ''}",
+           "contract": _contract_of(key), "dry": dry, "qty": qty}
+    try:
+        rec["closed_at"] = _iso_at(_close_epoch(cfg, key.split("|")[1]))
+    except (ValueError, OverflowError, OSError):
+        pass  # no day to put it on: unmeasured, never counted on today
+    entry = _float0(row.get("entry_mark"))
+    if "closed_at" in rec and 0 < entry < float("inf"):
+        rec["est_pnl_usd"] = round(-entry * qty * 100, 2)
+        rec["reason"] = (f"Expired without a sale — counted as a total loss "
+                         f"of the ${entry:.2f} entry quote (estimate)")
+    else:
+        rec["reason"] = ("Expired without a sale — no entry quote was "
+                         "recorded, so the loss isn't measured")
+    facts = {"code": "expired_unsold", "sent": False, "qty": qty}
+    acct = row.get("acct")
+    if not dry and isinstance(acct, str) and ":" in acct:
+        facts["paper"] = acct.endswith(":paper")  # as _trade_facts
+    return _row_facts(rec, cfg, **facts)
+
+
+def _logged_event(event_id):
+    """True when the trade log already has a row with this event_id
+    (full-file scan, plus the rows not written yet)."""
+    return any(t.get("event_id") == event_id for t in _todays_log_rows(event_id))
 
 
 def _expired(key, today):
@@ -1622,8 +1690,7 @@ def _maybe_daily_digest(cfg, state, save_state):
         return
     if state.get("last_digest_day") == day:
         return
-    today_utc = datetime.now(timezone.utc).date().isoformat()
-    todays = [t for t in _recent_trades(300) if str(t.get("ts", "")).startswith(today_utc)]
+    todays = _et_day_log_rows(day)
     entries = sum(1 for t in todays if t.get("action") == "entry")
     exits = sum(1 for t in todays if t.get("action") == "exit")
     vetoes = sum(1 for t in todays if t.get("action") == "policy_veto")
@@ -1634,6 +1701,47 @@ def _maybe_daily_digest(cfg, state, save_state):
                  f"Open positions: {', '.join(open_pos)}"))
     state["last_digest_day"] = day
     save_state(state)
+
+
+def _et_day_log_rows(day):
+    """Every trade-log row whose event happened on the ET market day `day`
+    (closed_at for a close found in the account, else ts — as the
+    dashboard's _row_day), oldest first, then the rows not written yet.
+    An expired-unsold exit (cause "expired") goes by ts, the day the prune
+    booked it: its closed_at is the expiry close, whose digest went out
+    before the prune could run (it runs once the expiry date has passed),
+    so by closed_at no digest would ever count it.
+    Full-file scan, like _todays_log_rows: a busy day's skip rows must not
+    push its trades out of a tail read. A row of that ET day carries that
+    UTC date or the next one."""
+    from datetime import timedelta
+    nxt = (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)).date().isoformat()
+    rows = []
+    try:
+        with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if day not in line and nxt not in line:
+                    continue
+                try:
+                    t = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(t, dict):
+                    rows.append(t)
+    except OSError:
+        pass
+    rows += _unwritten_rows()
+    out = []
+    for t in rows:
+        keys = ("ts",) if t.get("cause") == "expired" else ("closed_at", "ts")
+        for k in keys:
+            v = t.get(k)
+            got = _et_day(v) if isinstance(v, str) else ""
+            if got:
+                if got == day:
+                    out.append(t)
+                break
+    return out
 
 
 def _disclaimer_text():
