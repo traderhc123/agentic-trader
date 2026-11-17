@@ -776,7 +776,8 @@ def test_w4_paused_loop_still_reconciles_checks_and_exits(
 def test_w4_not_paused_the_same_loop_takes_the_entry(home, monkeypatch, no_policy):
     monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
     far = "2099-12-18"
-    calls, _b, saved = _one_loop(home, monkeypatch, {}, {"seen": [], "positions": {}},
+    calls, _b, saved = _one_loop(home, monkeypatch, {"dry_run": False},
+                                 {"seen": [], "positions": {}},
                                  [make_event(ticker="QQQ", expiry=far, event_id="e-1")])
     assert ("order", "ENTERED", "QQQ") in calls
     assert f"QQQ|{far}|752.0|C" in saved["positions"]

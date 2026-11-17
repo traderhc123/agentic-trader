@@ -292,7 +292,7 @@ def test_recent_trades_skips_unreadable_lines(home, broker, no_policy):
     assert [t["action"] for t in agent._recent_trades(50)] == [
         "exit", "skip_budget", "exit"]
     assert [p["kind"] for p in agent._problems_today()] == ["skip_budget"]
-    out = agent.handle_event(make_event(), {"rule_loss_streak": 2},
+    out = agent.handle_event(make_event(), {"rule_loss_streak": 2, "dry_run": False},
                              {"positions": {}}, broker, object(), lambda s: None)
     assert out and "losing exit" in out
     assert broker.calls == []

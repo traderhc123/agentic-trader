@@ -686,7 +686,8 @@ def test_entry_records_the_contract_for_the_ledger_check(home, monkeypatch, no_p
     ev = {"event": "ENTERED", "ticker": "RIVN", "expiry": "2026-11-13", "strike": 13.5,
           "type": "C", "event_id": "e-1"}
     b = Buys()
-    agent.handle_event(ev, {"broker": "fake"}, st, b, Client(), lambda s: None)
+    agent.handle_event(ev, {"broker": "fake", "dry_run": False}, st, b, Client(),
+                       lambda s: None)
     rec = st["agent_bought"][U1]
     assert rec["key"] == LATER and rec["order_ids"] == ["b-1"] and rec["exited"] is False
     assert rec["buy_ids"] == ["b-1"]

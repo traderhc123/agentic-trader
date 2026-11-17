@@ -2007,7 +2007,7 @@ def build_status(cfg, state, rows, runtime=None, now=None,
     answering = bool(running and beat is not None and (
         (now - beat).total_seconds() - (wait or 0.0) <= A.EXPIRY_WAKE_GAP_S))
 
-    mode = A._mode(cfg)
+    mode = A._mode(cfg, state)
     hold = rt.get("hold") if rt.get("hold") in (
         "state_hold", "handoff_hold", "restarting") else None
     entries_paused = A._paused(cfg)

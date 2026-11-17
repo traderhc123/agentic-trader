@@ -285,13 +285,15 @@ def test_a_buy_still_working_at_the_broker_is_not_filled(home, no_policy):
 
 
 def test_mode_stamp_is_the_engines_own_reading_of_the_settings(home, no_policy):
-    """Settings that never chose a mode trade for real today; the stamp and
-    the view-model say what the engine does, not what a default would."""
-    run(make_event(), {}, broker=StubBroker(), client=object())
+    """Settings that never chose a mode are practice (audit PR1: they traded
+    for real while doctor said DRY-RUN); the stamp and the view-model say
+    what the engine does, not what a default would."""
+    b = StubBroker()
+    run(make_event(), {}, broker=b, client=object())
     e = last(home)
-    assert e["dry"] is False and e["ui"]["mode"] == "live"
-    assert agent._mode({}) == "live" and agent._mode(None) == "live"
-    assert agent._mode({"dry_run": True}) == "practice"
+    assert b.calls == [] and e["dry"] is True and e["ui"]["mode"] == "practice"
+    assert agent._mode({}) == "practice" and agent._mode(None) == "practice"
+    assert agent._mode({"dry_run": False}) == "live"
 
 
 # ── recording can't break or change anything ────────────────────────────────

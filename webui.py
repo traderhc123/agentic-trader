@@ -4805,6 +4805,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         refused = _start_refused()
         if refused:
             return {"ok": False, "error": refused}
+        if A._dry_run_unset(cfg):
+            # practice or live never chosen (Safety step not saved): the
+            # mode the agent will trade in is saved before it starts —
+            # practice, unless this setup already traded live
+            cfg["dry_run"] = A._settle_dry_run(cfg)["dry_run"]
         save()
         import keep_running
         auto_note = ""

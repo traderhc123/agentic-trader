@@ -138,7 +138,10 @@ def run_loop(home, monkeypatch, state, polls, clock=None, steps=(), broker=None,
     monkeypatch.setitem(webui.CONTROLS, "stop", False)
     monkeypatch.setattr(agent, "_sleep_unless_stopped", sleep)
     (home / "config.json").write_text(
-        json.dumps({"source": "stub", "broker": "stub", **(config or {})}),
+        # live unless a test says otherwise (a mode never chosen is
+        # practice: audit PR1)
+        json.dumps({"source": "stub", "broker": "stub", "dry_run": False,
+                    **(config or {})}),
         encoding="utf-8")
     (home / "state.json").write_text(json.dumps(state), encoding="utf-8")
     agent.cmd_run()

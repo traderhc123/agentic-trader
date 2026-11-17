@@ -1638,7 +1638,98 @@ def _dry_run_keeps_selling_real_positions(cfg):
 def _dry_run_holds_real_sells(cfg):
     """True when the agent is in dry-run and dry-run stops it from selling
     real positions too (only when the decision above is flipped)."""
-    return bool(cfg.get("dry_run")) and not _dry_run_keeps_selling_real_positions(cfg)
+    return _is_dry(cfg) and not _dry_run_keeps_selling_real_positions(cfg)
+
+
+def _dry_run_unset(cfg):
+    """True when the settings never chose practice or live (no `dry_run`,
+    or null): the Safety step was never saved."""
+    return (cfg or {}).get("dry_run") is None
+
+
+def _has_live_history(state=None):
+    """True when this setup has already traded with real orders: a real
+    entry/exit row in trades.jsonl, or a real position in the ledger. A log
+    that can't be read counts as no history — the reading that can only
+    ever keep an unchosen mode in practice."""
+    if state is None:
+        state = _load(STATE_PATH, {}) or {}
+    if _real_positions(state):
+        return True
+    real = ("entry", "exit", "ledger_adopt")
+    try:
+        with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"dry": false' not in line and '"dry":false' not in line:
+                    continue
+                try:
+                    t = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(t, dict) and t.get("action") in real
+                        and t.get("dry") is False):
+                    return True
+    except OSError:
+        pass
+    return any(t.get("action") in real and t.get("dry") is False
+               for t in _unwritten_rows())
+
+
+def _is_dry(cfg, state=None):
+    """The mode the agent trades in — handle_event, doctor, status and the
+    dashboard all read it from here. A saved `dry_run` decides. Never
+    chosen: practice, unless this setup has already placed real orders
+    (_has_live_history) — that setup keeps the live mode it has been
+    running in, and the agent saves `dry_run: false` for it on start
+    (_settle_dry_run). Never chosen never becomes live by itself."""
+    if not _dry_run_unset(cfg):
+        return bool(cfg["dry_run"])
+    return not _has_live_history(state)
+
+
+DRY_RUN_UNSET_PRACTICE_NOTE = (
+    "agentic-trader: practice or live was never chosen in your settings, so "
+    "the agent runs in PRACTICE (dry-run: no real orders) and saved that. "
+    "To place real orders, choose Live in the Safety settings or say 'go live'.")
+DRY_RUN_UNSET_LIVE_NOTE = (
+    "agentic-trader: practice or live was never chosen in your settings. This "
+    "setup has already placed real orders, so it stays LIVE as before and "
+    "saved that (dry_run: false). To stop placing real orders, choose "
+    "Practice in the Safety settings or say 'dry on'.")
+
+
+def _settle_dry_run(cfg, state=None):
+    """Write the mode the agent runs in when the settings never chose one,
+    so config.json, doctor and handle_event can't disagree: practice for a
+    setup with no real trades, live (and the owner is told once) for one
+    that has traded live. Returns the config to run with; a config.json
+    that can't be written right now leaves it unsaved (the mode is the same
+    either way: _is_dry)."""
+    if not _dry_run_unset(cfg):
+        return cfg
+    dry = _is_dry(cfg, state)
+    wrote = []
+
+    def change(c):
+        if _dry_run_unset(c):
+            c["dry_run"] = dry
+            wrote.append(True)
+    try:
+        saved = update_config(change)
+    except OSError as exc:  # ConfigUnreadable / ConfigDamaged
+        print(f"could not save the mode to config.json ({str(exc)[:120]}) — "
+              f"running in {'PRACTICE' if dry else 'LIVE'} anyway")
+        return {**cfg, "dry_run": dry}
+    if not wrote:  # chosen meanwhile (the dashboard): that choice stands
+        return {**cfg, "dry_run": bool(saved["dry_run"])}
+    cfg = {**cfg, "dry_run": dry}
+    note = DRY_RUN_UNSET_PRACTICE_NOTE if dry else DRY_RUN_UNSET_LIVE_NOTE
+    print(note)
+    try:
+        notify(cfg, note, priority="high")
+    except Exception:
+        pass
+    return cfg
 
 
 def _opened_live(row):
@@ -1692,20 +1783,20 @@ def _mode_label(cfg, state):
     """The mode as the startup line and notification show it. In dry-run
     with real positions open, "no orders" would be untrue: those are still
     sold (_dry_run_keeps_selling_real_positions)."""
-    if not cfg.get("dry_run"):
+    if not _is_dry(cfg, state):
         return "LIVE"
     if _real_positions(state) and _dry_run_keeps_selling_real_positions(cfg):
         return "DRY-RUN (no new trades; real positions still get sold)"
     return "DRY-RUN (no orders)"
 
 
-def _mode(cfg):
+def _mode(cfg, state=None):
     """"practice" (dry-run: new trades are only recorded) or "live" (new
     trades are real orders) — the one place the dashboard's view-model and
     the trade log's mode stamp read it from. It is what handle_event does
-    with the same settings: only a true `dry_run` is practice, so settings
-    that never said are live."""
-    return "practice" if (cfg or {}).get("dry_run") else "live"
+    with the same settings (_is_dry): settings that never said are practice
+    unless this setup has already traded live."""
+    return "practice" if _is_dry(cfg, state) else "live"
 
 
 def _paused(cfg):
@@ -3259,6 +3350,11 @@ def _rows_without_facts(rows):
 @_order_in_flight
 def handle_event(ev, cfg, state, broker, client, save_state):
     """Run one new event through the safety pipeline. Returns a log line or None."""
+    if _dry_run_unset(cfg):
+        # never chosen: the mode doctor and the dashboard report (_is_dry) —
+        # practice unless this setup has already traded live. Before, a
+        # missing key read as live here while doctor said DRY-RUN.
+        cfg = {**cfg, "dry_run": _is_dry(cfg, state)}
     contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
     book = "main" if str(ev.get("track", "main")) == "main" else "shadow"
 
@@ -6475,9 +6571,9 @@ def _command(t, cfg, text):
         return True, "Self-edit OFF."
     if t == "status":
         st = _load(STATE_PATH, {"positions": {}})
-        note = _dry_run_note(cfg, st) if cfg.get("dry_run") else ""
-        dry = bool(cfg.get("dry_run"))  # each mode counts its own trades
-        return True, (f"{'DRY-RUN' if cfg.get('dry_run') else 'LIVE'} · "
+        dry = _is_dry(cfg, st)  # each mode counts its own trades
+        note = _dry_run_note(cfg, st) if dry else ""
+        return True, (f"{'DRY-RUN' if dry else 'LIVE'} · "
                       + ("ON HOLD (being moved to a server: no orders at "
                          "all) · " if _handed_off() else
                          "ON HOLD (memory file was damaged: no orders at "
@@ -6692,6 +6788,9 @@ def cmd_run(app_window=False):
     # sets the damaged file aside, alerts, and pauses if memory may be missing
     _state_startup(cfg, state, state_info)
     _seen_ids(state)  # brings an older version's list up to date
+    # practice or live never chosen: saved now, so config.json, doctor and
+    # every order agree (_settle_dry_run)
+    cfg = _settle_dry_run(cfg, state)
     if llm_policy.entries_blocked(cfg):
         if state.get("positions"):
             print("WARNING: " + llm_policy.BLOCKED_MSG + " Starting anyway so "
@@ -6746,7 +6845,7 @@ def cmd_run(app_window=False):
         st = _load(STATE_PATH, {"positions": {}})
         feed_note = _feed_schedule_note(c, source)
         return {
-            "mode": "DRY-RUN" if c.get("dry_run") else "LIVE",
+            "mode": "DRY-RUN" if _is_dry(c, st) else "LIVE",
             # also on a full hold: a damaged state.json (the dashboard then
             # offers Resume, which is what ends it) or a hand-off to a
             # server (Resume answers why not). "hold": the dashboard then
@@ -6765,7 +6864,7 @@ def cmd_run(app_window=False):
                 **({"feed access": _feed_access(c, st)}
                    if c.get("source") == "agenthc" else {}),
                 "sizing": _sizing_desc(c),
-                "entries today": (f"{_entries_today(bool(c.get('dry_run')))} / cap "
+                "entries today": (f"{_entries_today(_is_dry(c, st))} / cap "
                                   f"{c.get('max_entries_per_day', 5)}"),
                 "policy brain": ("blocked" if llm_policy.entries_blocked(c)
                                  else "on" if llm_policy.enabled(c) else "off"),
@@ -6895,7 +6994,7 @@ def cmd_run(app_window=False):
         mode += ", ON HOLD — no orders at all until you press Resume"
     elif _paused(cfg):  # saved in config.json: still paused after a restart
         mode += ", PAUSED — no new entries until you press Resume"
-    if cfg.get("dry_run") and _dry_run_note(cfg, state):
+    if _is_dry(cfg, state) and _dry_run_note(cfg, state):
         print("Dry-run with real positions open. " + _dry_run_note(cfg, state))
     print(f"Heartbeat started [{mode}]: source={cfg['source']}, "
           f"{_sizing_desc(cfg)}, policy brain "
@@ -6954,6 +7053,7 @@ def cmd_run(app_window=False):
             beat["saved"] = now_beat
             _save_heartbeat(state, save_state, now_beat)
         cfg = _load(CONFIG_PATH, cfg) or cfg  # dashboard edits apply live
+        cfg = _settle_dry_run(cfg, state)  # a mode removed by hand: saved again
         _RUN_CFG["cfg"] = cfg
         awake.apply(cfg)  # same thread every time (Windows needs that)
         if time.time() - dash["at"] > DASH_CHECK_EVERY_S:
@@ -7272,13 +7372,13 @@ def cmd_status():
     print(f"broker           : {broker_name}{detail}"
           f"{'' if broker_ready(cfg) else ' — NOT CONFIGURED'}")
     print(f"contracts/trade  : {cfg.get('contracts_per_trade', 'unset')}")
-    print(f"mode             : {'DRY-RUN' if cfg.get('dry_run') else 'LIVE'}"
+    print(f"mode             : {'DRY-RUN' if _is_dry(cfg, state) else 'LIVE'}"
           + (" · ON HOLD (memory file was damaged: no orders at all until "
              "you press Resume)" if _state_hold() is not None else
              " · PAUSED (no new entries; exits still run)" if _paused(cfg) else ""))
     print(f"policy brain     : {'ON (' + llm_policy.policy_path() + ')' if llm_policy.enabled(cfg) else 'off'}")
     print(f"daily entry cap  : {cfg.get('max_entries_per_day', 5)}")
-    print(f"entries today    : {_entries_today(bool(cfg.get('dry_run')))}")
+    print(f"entries today    : {_entries_today(_is_dry(cfg, state))}")
     print(f"open positions   : {list(state.get('positions', {})) or 'none'}")
 
 
@@ -7479,7 +7579,7 @@ def doctor_checks():
             cl = None
         bp = _buying_power(mod, cl, cfg)
         warn = _cash_warning(cfg, bp)
-        dry = bool(cfg.get("dry_run"))
+        dry = _is_dry(cfg, state)
         check("buying_power", dry or not warn, "Broker buying power",
               ("couldn't read it" if bp is None else f"${bp:,.2f}")
               + (f" — {warn}" if warn else "")
@@ -7558,11 +7658,15 @@ def cmd_doctor(as_json=False):
     --json: machine-readable, for an assistant deciding whether setup is done."""
     checks, cfg = doctor_checks()
     failed = [c for c in checks if not c["ok"]]
-    mode = ("DRY-RUN" if cfg.get("dry_run", True) else "LIVE")
+    # the mode handle_event trades in (_is_dry), never a default of its own
+    dry = _is_dry(cfg)
+    unset = _dry_run_unset(cfg)
+    mode = "DRY-RUN" if dry else "LIVE"
     if as_json:
         print(json.dumps({
             "ready": not failed,
             "mode": mode,
+            "mode_chosen": not unset,
             "checks": checks,
             "owner_steps": [c["fix"] for c in failed if c["who"] == "owner"],
             "agent_steps": [c["fix"] for c in failed if c["who"] == "agent"],
@@ -7581,9 +7685,14 @@ def cmd_doctor(as_json=False):
         warn = demo_warning(cfg.get("lnbits_url"))
         if warn:
             print(f"  ⚠️  Wallet host: {warn}")
-    if "dry_run" not in cfg:
-        desc = "not set — setup defaults to DRY-RUN"
-    elif cfg["dry_run"]:
+    if unset and dry:
+        desc = ("DRY-RUN (never chosen — the agent starts in practice and "
+                "saves it)")
+    elif unset:
+        desc = ("LIVE ORDERS (never chosen — this setup has already placed "
+                "real orders, so it stays live; saved as dry_run: false when "
+                "the agent starts)")
+    elif dry:
         desc = "DRY-RUN (safe — logs what it WOULD do)"
     else:
         desc = "LIVE ORDERS"

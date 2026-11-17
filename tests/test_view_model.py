@@ -152,12 +152,17 @@ def test_live():
     assert s["signals"]["pass"]["kind"] == "subscription"
 
 
-def test_mode_is_live_when_the_settings_never_said():
-    """One definition, the engine's: only a true dry_run is practice."""
+def test_mode_when_the_settings_never_said(home):
+    """One definition, the engine's (agent._is_dry): a mode never chosen is
+    practice, unless this setup has already traded live (audit PR1: it was
+    live, while doctor said DRY-RUN)."""
     cfg = {k: v for k, v in CFG.items() if k != "dry_run"}
     s = build(cfg=cfg)
+    assert s["mode"] == "practice" and s["mode_explicit"] is False
+    assert agent._mode(cfg) == "practice" and agent._mode({"dry_run": 1}) == "practice"
+    s = build(cfg=cfg, st=state(**{SPY: real_pos()}))  # it has traded live
     assert s["mode"] == "live" and s["mode_explicit"] is False
-    assert agent._mode(cfg) == "live" and agent._mode({"dry_run": 1}) == "practice"
+    assert agent._mode({"dry_run": False}) == "live"
 
 
 def test_entries_only_pause_keeps_exits_running():
