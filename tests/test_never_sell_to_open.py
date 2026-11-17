@@ -554,7 +554,8 @@ def test_robinhood_place_refuses_bad_quantities(qty):
 def test_robinhood_replaced_sell_is_capped_at_what_is_held(monkeypatch):
     """reconcile() re-places an expiry-guard sell: the same check applies."""
     rh = RH(held=1)
-    monkeypatch.setattr(robinhood, "_order_status", lambda rh, a, o: ("confirmed", 0))
+    reads = iter([("confirmed", 0), ("cancelled", 0)])   # dead once cancelled
+    monkeypatch.setattr(robinhood, "_order_status", lambda rh, a, o: next(reads))
     monkeypatch.setattr(robinhood, "_cancel_order", lambda rh, a, o: True)
     st = {"positions": {KEY: {"option_id": RH_ID, "qty": 3, "pending": {
         "order_id": "o-old", "side": "sell", "requested": 3, "filled": 0,

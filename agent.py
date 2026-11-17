@@ -1718,6 +1718,31 @@ def _open_in_mode(state, dry_mode):
     return sum(1 for r in rows if _opened_live(r) != bool(dry_mode))
 
 
+def _buys_settling(state, today=None):
+    """Real buy orders whose outcome is still open (brokers/order_guard: no
+    clear answer, or a cancel Alpaca hadn't finished) and that have no
+    ledger row yet. Each may still fill, so it holds its slot under the
+    open-position cap — and, when sent `today` (UTC date) as a new entry,
+    under the daily entry cap — until it settles. (A re-placed order's
+    entry is in the trade log already: it isn't counted twice.)"""
+    try:
+        rows = (state or {}).get("positions") or {}
+        out = []
+        for key, rec in order_guard.unconfirmed(state or {}).items():
+            if not isinstance(rec, dict) or rec.get("side") != "buy" or key in rows:
+                continue
+            if today is not None:
+                if rec.get("replaces"):
+                    continue
+                sent = datetime.fromtimestamp(_float0(rec.get("at")), timezone.utc)
+                if sent.date().isoformat() != today:
+                    continue
+            out.append(key)
+        return out
+    except Exception:
+        return []
+
+
 def _dry_run_note(cfg, state):
     """What dry-run means for the real positions that are open now, in the
     owner's words ("" when there are none)."""
@@ -3435,7 +3460,11 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # when live, practice trades in dry-run — never one against the other.
         dry_mode = bool(cfg.get("dry_run"))
         cap = int(cfg.get("max_entries_per_day", 5))
-        if _entries_today(dry_mode) >= cap:
+        n_today = _entries_today(dry_mode)
+        if not dry_mode:  # a real buy still settling may become an entry
+            n_today += len(_buys_settling(
+                state, datetime.now(timezone.utc).date().isoformat()))
+        if n_today >= cap:
             msg = f"SKIPPED {contract}: daily entry cap reached ({cap})"
             print(msg)
             _log_trade(_row_facts(
@@ -3450,10 +3479,14 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # going live never blocks real trades.
         pos_cap = int(cfg.get("max_open_positions", 10))
         n_open = _open_in_mode(state, dry_mode)
-        if n_open >= pos_cap:
+        settling = 0 if dry_mode else len(_buys_settling(state))
+        if n_open + settling >= pos_cap:
             how = (f"{n_open} {'practice' if dry_mode else 'real'} "
-                   f"position{'' if n_open == 1 else 's'} open now (real and "
-                   "practice are counted separately). "
+                   f"position{'' if n_open == 1 else 's'} open now"
+                   + (f", plus {settling} buy order"
+                      f"{'' if settling == 1 else 's'} still settling at your "
+                      "broker (it may fill)" if settling else "")
+                   + " (real and practice are counted separately). "
                    "To allow more, say 'set positions N' in the dashboard "
                    "chat, or raise Open positions at once in the settings")
             msg = f"SKIPPED {contract}: max open positions reached ({pos_cap}) — {how}"
