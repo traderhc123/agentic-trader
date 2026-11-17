@@ -1765,6 +1765,16 @@ def _real_positions(state):
             if _opened_live(r)]
 
 
+def _open_in_mode(state, dry_mode):
+    """Positions open that count toward max_open_positions in this mode:
+    the real ones when live, the practice ones in dry-run — the way the
+    daily cap counts trades. A row that says neither way counts as real
+    (_opened_live), so real exposure is never under-counted."""
+    rows = (state or {}).get("positions")
+    rows = rows.values() if isinstance(rows, dict) else ()
+    return sum(1 for r in rows if _opened_live(r) != bool(dry_mode))
+
+
 def _dry_run_note(cfg, state):
     """What dry-run means for the real positions that are open now, in the
     owner's words ("" when there are none)."""
@@ -1848,6 +1858,32 @@ def _pause_note(cfg, state):
             "feed: the pause uses no signal day.")
 
 
+def _dry_size(cfg, event, broker, client):
+    """(qty, note) for a practice entry: what a live entry would buy now,
+    from the broker's read-only size_preview (the same sizing and quote the
+    live buy uses), so practice books the size live would. Only a fixed
+    contract count can be booked without a price: a budget (or % of the
+    account, already turned into a budget) that can't be priced is a skip,
+    as it is live, never contracts_per_trade."""
+    from brokers.pricing import fixed_count
+    why = "no broker connection to price it"
+    if broker is not None and client is not None:
+        try:
+            preview = getattr(broker, "size_preview", None)
+            if preview is not None:
+                return preview(client, cfg, event)
+            # an adapter without size_preview: the older read-only pair
+            option_id = broker.resolve_instrument(client, event)
+            if option_id:
+                return broker.size_contracts(client, cfg, option_id)
+            why = "couldn't look up the contract"
+        except Exception as exc:
+            why = f"couldn't price it: {str(exc)[:100] or type(exc).__name__}"
+    if str(cfg.get("sizing_mode", "contracts")) in ("budget", "percent"):
+        return 0, f"no quote available for budget sizing ({why}) — skipped"
+    return fixed_count(cfg)
+
+
 def _execute_dry(cfg, event, state, broker=None, client=None, on_skip=None):
     """Dry-run bookkeeping: identical position tracking, zero orders.
 
@@ -1858,16 +1894,7 @@ def _execute_dry(cfg, event, state, broker=None, client=None, on_skip=None):
                f"{'CALL' if event['type'] == 'C' else 'PUT'}"
     pos_key = f"{event['ticker']}|{event['expiry']}|{event['strike']}|{event['type']}"
     if event["event"] == "ENTERED" and pos_key not in state["positions"]:
-        qty = min(max(1, int(cfg.get("contracts_per_trade", 1))),
-                  int(cfg.get("max_contracts_per_trade", 100)))
-        note = "fixed contract count"
-        if broker is not None and client is not None:
-            try:  # read-only: resolve + quote so budget sizing previews accurately
-                option_id = broker.resolve_instrument(client, event)
-                if option_id:
-                    qty, note = broker.size_contracts(client, cfg, option_id)
-            except Exception:
-                pass
+        qty, note = _dry_size(cfg, event, broker, client)
         if qty < 1:
             print(f"[DRY-RUN] would SKIP {contract}: {note}")
             if on_skip is not None:
@@ -3469,10 +3496,15 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             return msg
         # Concurrent-exposure cap: the daily cap resets every day, so without
         # this a feed could accumulate unbounded open positions across days.
+        # Counted like the daily cap: real positions when live, practice
+        # ones in dry-run (_open_in_mode), so practice left open from before
+        # going live never blocks real trades.
         pos_cap = int(cfg.get("max_open_positions", 10))
-        n_open = len(state.get("positions", {}))
+        n_open = _open_in_mode(state, dry_mode)
         if n_open >= pos_cap:
-            how = (f"{n_open} open now, real and practice together. "
+            how = (f"{n_open} {'practice' if dry_mode else 'real'} "
+                   f"position{'' if n_open == 1 else 's'} open now (real and "
+                   "practice are counted separately). "
                    "To allow more, say 'set positions N' in the dashboard "
                    "chat, or raise Open positions at once in the settings")
             msg = f"SKIPPED {contract}: max open positions reached ({pos_cap}) — {how}"
@@ -3581,6 +3613,21 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                             event_id=ev["event_id"], dry=dry, book=book,
                             check="trade_size")
             return msg
+    if (ev["event"] == "ENTERED" and existing is not None
+            and not cfg.get("dry_run") and not _opened_live(existing)):
+        # A practice position in this same contract, left open from
+        # dry-run: the ledger has one row per contract, so the real buy
+        # can't be placed next to it. Say so, never skip it silently.
+        why = ("a practice (dry-run) position in this contract is still "
+               "open, so the agent did not buy it for real. Close your "
+               "practice positions (or let their exit signals close them) "
+               "to take signals in this contract live")
+        msg = f"SKIPPED {contract}: {why}"
+        print(msg)
+        _report_problem(cfg, state, save_state, "broker_no_order", contract,
+                        why, event_id=ev["event_id"], book=book,
+                        check="broker_order", code="practice_row_held")
+        return msg
     if ev["event"] == "EXITED" and existing and not dry:
         if (existing.get("pending") or {}).get("side") == "sell":
             print(f"EXITED {contract}: the agent's sell is already working — "
@@ -5874,81 +5921,20 @@ def cmd_setup():
     print("  1) Robinhood Agentic account (OAuth)")
     print("  2) Alpaca — paper or live (API keys; paper = zero real dollars)")
     print("  3) moomoo — paper or live (needs their OpenD gateway running)")
-    bc = input("Choose [1-3, default 1]: ").strip() or "1"
+    # Enter keeps the broker that is saved (re-running setup to change a key
+    # must not switch an Alpaca or moomoo owner to Robinhood)
+    saved_bc = {"alpaca": "2", "moomoo": "3"}.get(str(cfg.get("broker")), "1")
+    bc = input(f"Choose [1-3, default {saved_bc}]: ").strip() or saved_bc
     cfg["broker"] = {"2": "alpaca", "3": "moomoo"}.get(bc, "robinhood")
     cfg = BROKERS[cfg["broker"]].setup(cfg)
 
-    print("\n== Step 3/4: Position sizing ==")
-    print(SIZING_NOTICE)
-    print("\n  1) Dollar budget per trade — buys as many contracts as fit;")
-    print("     skips the trade if even one contract exceeds the budget")
-    print("  2) Fixed number of contracts per trade")
-    print("  3) Percent of account value per trade (re-read at each entry)")
-    mode = input("Choose [1-3, default 1]: ").strip() or "1"
-    if mode == "3":
-        cfg["sizing_mode"] = "percent"
-        while True:
-            raw = input("Percent of account per trade (e.g. 2): ").strip().rstrip("%")
-            try:
-                p = float(raw)
-                if 0 < p <= 100:
-                    break
-            except ValueError:
-                pass
-            print("Enter a percent between 0 and 100.")
-        cfg["percent_per_trade"] = p
-        cfg.setdefault("contracts_per_trade", 1)
-    elif mode == "2":
-        cfg["sizing_mode"] = "contracts"
-        while True:
-            raw = input("Contracts per trade [1]: ").strip() or "1"
-            try:
-                n = int(raw)
-                if n >= 1:
-                    break
-            except ValueError:
-                pass
-            print("Enter a positive integer.")
-        cfg["contracts_per_trade"] = n
-    else:
-        cfg["sizing_mode"] = "budget"
-        while True:
-            raw = input("Budget per trade in USD (e.g. 500): ").strip()
-            try:
-                b = float(raw)
-                if b > 0:
-                    break
-            except ValueError:
-                pass
-            print("Enter a positive dollar amount.")
-        cfg["budget_per_trade_usd"] = b
-        cfg.setdefault("contracts_per_trade", 1)  # dry-run fallback estimate
-    # 100 (was 25 through v2026-07): still a guard against a penny option
-    # ballooning one budget-mode trade into a lot too large to exit into thin
-    # quotes, without capping cheap contracts to a fraction of the budget.
-    cfg.setdefault("max_contracts_per_trade", 100)
-
-    if cfg.get("include_other_trades"):
-        print("\nYour source includes the \"other trades\" (shadow) journal. Size")
-        print("those separately from the main pick?")
-        print("  0) Same as the main pick (default)  1) Dollar budget")
-        print("  2) Fixed contracts  3) Percent of account")
-        omode = {"1": "budget", "2": "contracts", "3": "percent"}.get(
-            input("Choose [0-3, default 0]: ").strip(), "")
-        if omode:
-            raw = input({"budget": "Other-trades budget in USD: ",
-                         "contracts": "Other-trades contracts per trade: ",
-                         "percent": "Other-trades percent of account: "}[omode])
-            ok, err = set_book_sizing(cfg, "other", omode, raw)
-            if not ok:
-                print(f"{err} — other trades will use the main sizing.")
+    _ask_sizing(cfg)
 
     print("\n== Step 4/4: Safety rails & extras ==")
     dry = input("Start in DRY-RUN mode (log actions, place NO orders — "
                 "recommended for the first days)? [Y/n]: ").strip().lower()
     cfg["dry_run"] = dry != "n"
-    raw = input("Max new entries per day (hard cap) [5]: ").strip()
-    cfg["max_entries_per_day"] = int(raw) if raw.isdigit() else 5
+    _ask_daily_cap(cfg)
     _ask_position_cap(cfg)
     cfg.setdefault("max_event_age_s", 300)
     cfg = notifications_setup(cfg)
@@ -5962,6 +5948,97 @@ def cmd_setup():
     print("Start the heartbeat with: python agent.py run")
 
 
+def _ask_sizing(cfg):
+    """The terminal setup's sizing step: the main pick, max contracts per
+    trade and the "other trades" book. Every Enter keeps what is saved."""
+    print("\n== Step 3/4: Position sizing ==")
+    print(SIZING_NOTICE)
+    print("\n  1) Dollar budget per trade — buys as many contracts as fit;")
+    print("     skips the trade if even one contract exceeds the budget")
+    print("  2) Fixed number of contracts per trade")
+    print("  3) Percent of account value per trade (re-read at each entry)")
+    # Re-running setup (to change a broker key, say) must not reset what is
+    # saved: every Enter below keeps the saved value.
+    mode_key = {"budget": "1", "contracts": "2", "percent": "3"}
+    # a config with a contract count and no mode trades a fixed count (the
+    # brokers' default), so that is what Enter keeps
+    saved = mode_key.get(str(cfg.get("sizing_mode") or (
+        "contracts" if cfg.get("contracts_per_trade") else "")), "1")
+    mode = input(f"Choose [1-3, default {saved}]: ").strip() or saved
+    if mode == "3":
+        cfg["sizing_mode"] = "percent"
+        cur = _saved_amount(cfg, "percent_per_trade", 100)
+        while True:
+            raw = (input("Percent of account per trade "
+                         + (f"[{_amount_text(cur)}]" if cur else "(e.g. 2)") + ": ")
+                   .strip().rstrip("%") or (f"{_amount_text(cur)}" if cur else ""))
+            try:
+                p = float(raw)
+                if 0 < p <= 100:
+                    break
+            except ValueError:
+                pass
+            print("Enter a percent between 0 and 100.")
+        cfg["percent_per_trade"] = p
+        cfg.setdefault("contracts_per_trade", 1)
+    elif mode == "2":
+        cfg["sizing_mode"] = "contracts"
+        cur = int(_saved_amount(cfg, "contracts_per_trade") or 1)
+        while True:
+            raw = input(f"Contracts per trade [{cur}]: ").strip() or str(cur)
+            try:
+                n = int(raw)
+                if n >= 1:
+                    break
+            except ValueError:
+                pass
+            print("Enter a positive integer.")
+        cfg["contracts_per_trade"] = n
+    else:
+        cfg["sizing_mode"] = "budget"
+        cur = _saved_amount(cfg, "budget_per_trade_usd")
+        while True:
+            raw = (input("Budget per trade in USD "
+                         + (f"[{_amount_text(cur)}]" if cur else "(e.g. 500)") + ": ").strip()
+                   or (f"{_amount_text(cur)}" if cur else ""))
+            try:
+                b = float(raw)
+                if b > 0:
+                    break
+            except ValueError:
+                pass
+            print("Enter a positive dollar amount.")
+        cfg["budget_per_trade_usd"] = b
+        cfg.setdefault("contracts_per_trade", 1)
+    # 100 (was 25 through v2026-07): still a guard against a penny option
+    # ballooning one budget-mode trade into a lot too large to exit into thin
+    # quotes, without capping cheap contracts to a fraction of the budget.
+    _ask_contract_cap(cfg)
+
+    if cfg.get("include_other_trades"):
+        print("\nYour source includes the \"other trades\" (shadow) journal. Size")
+        print("those separately from the main pick?")
+        print("  0) Same as the main pick  1) Dollar budget")
+        print("  2) Fixed contracts  3) Percent of account")
+        osaved = str(cfg.get("other_sizing_mode") or "")
+        odefault = mode_key.get(osaved, "0")
+        pick = input(f"Choose [0-3, default {odefault}]: ").strip() or odefault
+        omode = {"1": "budget", "2": "contracts", "3": "percent"}.get(pick, "")
+        if pick == "0":
+            set_book_sizing(cfg, "other", "same", None)
+        elif omode:
+            cur = (_saved_amount(cfg, f"other_{_BOOK_VALUE_KEY[omode]}")
+                   if omode == osaved else None)
+            raw = input({"budget": "Other-trades budget in USD",
+                         "contracts": "Other-trades contracts per trade",
+                         "percent": "Other-trades percent of account"}[omode]
+                        + (f" [{_amount_text(cur)}]" if cur else "") + ": ").strip()
+            ok, err = set_book_sizing(cfg, "other", omode,
+                                      raw or (f"{_amount_text(cur)}" if cur else ""))
+            if not ok:
+                print(f"{err} — other trades keep the sizing they had.")
+
+
 def _feed_access(cfg, state):
     try:
         from sources import agenthc_day_trade_ideas as hc
@@ -5973,15 +6050,24 @@ def _feed_access(cfg, state):
 
 
 def _book_desc(cfg, prefix=""):
-    """One book's sizing in words; prefix "" = main pick, "other_" = shadow."""
+    """One book's sizing in words; prefix "" = main pick, "other_" = shadow.
+    Says when max contracts per trade limits it: a size the cap cuts must
+    never read as the size that is bought."""
     mode = str(cfg.get(f"{prefix}sizing_mode") or "contracts")
+    cap = saved_contract_cap(cfg, prefix)
+    most = (f", at most {cap} contract{'' if cap == 1 else 's'}"
+            if cap < CONTRACT_CAP_DEFAULT else "")
     if mode == "budget":
         return (f"${float(cfg.get(f'{prefix}budget_per_trade_usd', 0) or 0):,.0f}"
-                "/trade budget")
+                "/trade budget" + most)
     if mode == "percent":
         return (f"{float(cfg.get(f'{prefix}percent_per_trade', 0) or 0):g}%"
-                " of account/trade")
-    return f"{int(cfg.get(f'{prefix}contracts_per_trade', 1) or 1)} contract(s)/trade"
+                " of account/trade" + most)
+    n = int(cfg.get(f'{prefix}contracts_per_trade', 1) or 1)
+    if n > cap:
+        return (f"{n} contract(s)/trade — capped at {cap} per trade by max "
+                "contracts per trade")
+    return f"{n} contract(s)/trade"
 
 
 def shadow_sizing_unused(cfg):
@@ -6041,7 +6127,7 @@ def set_book_sizing(cfg, book, mode, value):
     cfg[f"{prefix}{_BOOK_VALUE_KEY[mode]}"] = val
     if book == "main":
         cfg.setdefault("contracts_per_trade", 1)
-    cfg.setdefault("max_contracts_per_trade", 100)
+    cfg.setdefault("max_contracts_per_trade", CONTRACT_CAP_DEFAULT)
     return True, ""
 
 
@@ -6082,13 +6168,135 @@ def _ask_position_cap(cfg):
     set; never set before: the gate's default."""
     cur = saved_position_cap(cfg)
     lo, hi = POSITION_CAP_RANGE
-    raw = input(f"Max positions open at once, real and practice together "
-                f"(hard cap, {lo}-{hi}) [{cur}]: ").strip()
+    raw = input(f"Max positions open at once (hard cap; real and practice "
+                f"are counted separately, {lo}-{hi}) [{cur}]: ").strip()
     val = int(raw) if raw.isdigit() else None
     if val is not None and not lo <= val <= hi:
         print(f"Must be {lo} to {hi}: keeping {cur}.")
         val = None
     set_position_cap(cfg, val if val is not None else cur)
+
+
+# Most contracts one trade buys (low, high): budget, percent and fixed-count
+# sizing are all cut to it (brokers/pricing.capped). Never set: 100 (25
+# through v2026-07). Shared by the chat command 'set max contracts N', the
+# setup wizards and the /v2 settings page.
+CONTRACT_CAP_DEFAULT = 100
+CONTRACT_CAP_RANGE = (1, 1000)
+
+
+def set_contract_cap(cfg, val):
+    """Most contracts one trade buys. Sets the value in `cfg`; the caller
+    saves it. One whole number in CONTRACT_CAP_RANGE, checked by the
+    caller. Applies to both books (an "other trades" cap of their own,
+    other_max_contracts_per_trade, is kept and still applies to them)."""
+    cfg["max_contracts_per_trade"] = val
+
+
+def saved_contract_cap(cfg, prefix=""):
+    """Max contracts per trade as saved, as a whole number; never set (or
+    unreadable): the default. prefix "other_": the "other trades" book,
+    which uses its own cap when one is saved."""
+    cur = cfg.get(f"{prefix}max_contracts_per_trade") if prefix else None
+    if cur in (None, ""):
+        cur = cfg.get("max_contracts_per_trade")
+    if cur is None or isinstance(cur, bool):
+        return CONTRACT_CAP_DEFAULT
+    try:
+        val = float(cur)
+        if val == int(val) and val >= 0:
+            return int(val)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return CONTRACT_CAP_DEFAULT
+
+
+def _cap_note(cfg):
+    """What max contracts per trade does to the main pick's size now, for a
+    reply ("" when it doesn't limit it)."""
+    cap = saved_contract_cap(cfg)
+    mode = str(cfg.get("sizing_mode") or "contracts")
+    raise_it = " To change it, say: set max contracts N."
+    if mode == "contracts":
+        n = int(_saved_amount(cfg, "contracts_per_trade") or 1)
+        if n > cap:
+            return (f" Each trade is capped at {cap} contract"
+                    f"{'' if cap == 1 else 's'} by max contracts per trade, so "
+                    f"{cap} are bought, not {n}." + raise_it)
+        return ""
+    if cap < CONTRACT_CAP_DEFAULT:
+        return (f" No trade buys more than {cap} contract"
+                f"{'' if cap == 1 else 's'} (max contracts per trade), "
+                "whatever the budget." + raise_it)
+    return ""
+
+
+def _amount_text(v):
+    """A saved amount as the terminal setup shows it and saves it back on
+    Enter, every digit kept (f"{v:g}" keeps 6: a $12,345.67 budget came
+    back as $12,345.70, $1,234,567 as $1,234,570)."""
+    v = float(v)
+    return str(int(v)) if v == int(v) else repr(v)
+
+
+def _saved_amount(cfg, key, most=None):
+    """A saved positive number (a size), or None when it isn't one (or is
+    above `most`)."""
+    v = cfg.get(key)
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        val = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not 0 < val < float("inf") or (most is not None and val > most):
+        return None
+    return val
+
+
+def _ask_whole(prompt, cur, lo, hi):
+    """A whole number from lo to hi from the terminal; Enter, or an answer
+    out of range, keeps `cur`."""
+    raw = input(f"{prompt} ({lo}-{hi}) [{cur}]: ").strip()
+    val = int(raw) if raw.isdigit() else None
+    if val is not None and not lo <= val <= hi:
+        print(f"Must be {lo} to {hi}: keeping {cur}.")
+        val = None
+    return val if val is not None else cur
+
+
+def _ask_contract_cap(cfg):
+    """The terminal setup's question for the most contracts one trade buys.
+    Enter keeps what is set; never set before: the default."""
+    cur = saved_contract_cap(cfg)
+    val = _ask_whole("Most contracts one trade may buy (hard cap)", cur,
+                     *CONTRACT_CAP_RANGE)
+    set_contract_cap(cfg, val)
+    note = _cap_note(cfg).strip()
+    if note:
+        print(note)
+
+
+# New trades per day (low, high), as on the /v2 settings page.
+DAILY_CAP_DEFAULT = 5
+DAILY_CAP_RANGE = (1, 1000)
+
+
+def _ask_daily_cap(cfg):
+    """The terminal setup's question for new trades per day. Enter keeps
+    what is set; never set before (or saved as 0): 5. 0 is refused (it
+    would skip every entry)."""
+    cur = cfg.get("max_entries_per_day")
+    try:
+        cur = int(cur) if cur is not None and not isinstance(cur, bool) else None
+    except (TypeError, ValueError, OverflowError):
+        cur = None
+    if cur is None or cur < DAILY_CAP_RANGE[0]:
+        # never set, or a 0 the old terminal setup saved (it skips every
+        # entry, and typing it is refused): Enter gives the default
+        cur = DAILY_CAP_DEFAULT
+    cfg["max_entries_per_day"] = _ask_whole("Max new entries per day (hard cap)",
+                                            cur, *DAILY_CAP_RANGE)
 
 
 # A chat command must match its whole grammar. A question, extra words, or
@@ -6224,7 +6432,46 @@ def _position_cap_command(t, cfg):
     set_position_cap(cfg, val)
     _save(CONFIG_PATH, cfg, private=True)
     return True, (f"Open positions at once set to {val} (real and practice "
-                  "counted together).")
+                  "positions are counted separately).")
+
+
+# 'set max contracts N' and the other ways owners write it: the most
+# contracts one trade buys. Checked before 'set contracts' (the size), so
+# "set contracts cap 50" is never read as a size.
+_CONTRACT_CAP_COMMANDS = ("set max contracts per trade", "set max contracts",
+                          "set contract cap", "set contracts cap",
+                          "set contract limit", "set contracts limit",
+                          "set max_contracts_per_trade",
+                          "max contracts per trade", "max contracts")
+# 'set contracts N' (the size of a fixed-count trade), also written so
+_CONTRACTS_COMMANDS = ("set contracts per trade", "set contract per trade",
+                       "set contracts", "set contract")
+
+
+def _contract_cap_command(t, cfg):
+    """(handled, reply) for any of _CONTRACT_CAP_COMMANDS, and 'max
+    contracts' alone (shows it)."""
+    lo, hi = CONTRACT_CAP_RANGE
+    if t in ("max contracts", "contract cap", "max contracts per trade"):
+        cap = saved_contract_cap(cfg)
+        return True, (f"Max contracts per trade: {cap}. Trade size now: "
+                      f"{_sizing_desc(cfg)}. To change it: set max contracts N "
+                      f"({lo} to {hi}).")
+    val = next((v for v in (_command_whole(t, name)
+                            for name in _CONTRACT_CAP_COMMANDS)
+                if v is not None), None)
+    if val is None or not lo <= val <= hi:
+        return True, (f"{_NOTHING_CHANGED}Max contracts per trade must be a "
+                      f"whole number from {lo} to {hi}. Usage: set max "
+                      "contracts 50")
+    set_contract_cap(cfg, val)
+    _save(CONFIG_PATH, cfg, private=True)
+    own = cfg.get("other_max_contracts_per_trade")
+    return True, (f"Max contracts per trade set to {val}: no trade buys more "
+                  f"than {val} contract{'' if val == 1 else 's'}. Trade size "
+                  f"now: {_sizing_desc(cfg)}."
+                  + (f" 'Other trades' keep their own cap of {own}."
+                     if own not in (None, "") else ""))
 
 
 def _rule_command(t, cfg, text=None):
@@ -6333,7 +6580,8 @@ def _apply_command(text):
 # commands that change nothing (a trailing "?" is fine: "status?")
 _SHOW_COMMANDS = ("status", "rules", "my rules", "show rules", "autostart",
                   "start at login", "expiry guard", "expiry alert",
-                  "autopay cap")
+                  "autopay cap", "max contracts", "contract cap",
+                  "max contracts per trade")
 
 
 def _autopay_cap_command(t, cfg):
@@ -6484,7 +6732,8 @@ def _command(t, cfg, text):
         cfg["sizing_mode"] = "budget"
         cfg["budget_per_trade_usd"] = val
         _save(CONFIG_PATH, cfg, private=True)
-        return True, f"Per-trade budget set to ${val:,.0f} (your decision — see DISCLAIMER.md)."
+        return True, (f"Per-trade budget set to ${val:,.0f} (your decision — see "
+                      f"DISCLAIMER.md).{_cap_note(cfg)}")
     if t.startswith("set other budget"):
         val = _command_number(t, "set other budget")
         if val is None or val <= 0:
@@ -6503,7 +6752,7 @@ def _command(t, cfg, text):
         cfg["other_sizing_mode"] = "contracts"
         cfg["other_contracts_per_trade"] = val
         _save(CONFIG_PATH, cfg, private=True)
-        return True, (f"'Other trades' sizing set to {val} contract(s)/trade — "
+        return True, (f"'Other trades' sizing set to {_book_desc(cfg, 'other_')} — "
                       "main pick keeps its own sizing.")
     if t.startswith("set percent") or t.startswith("set other percent"):
         book = "other" if t.startswith("set other") else "main"
@@ -6520,16 +6769,22 @@ def _command(t, cfg, text):
         return True, (f"{who} sizing set to {_book_desc(cfg, 'other_' if book == 'other' else '')}"
                       " — sized from your account value at each entry "
                       "(your decision — see DISCLAIMER.md).")
-    if t.startswith("set contracts"):
-        val = _command_number(t, "set contracts", unit="")
+    if t.startswith(_CONTRACT_CAP_COMMANDS) or t == "contract cap":
+        return _contract_cap_command(t, cfg)
+    if t.startswith("set contract"):
+        val = next((v for v in (_command_number(t, name, unit="")
+                                for name in _CONTRACTS_COMMANDS)
+                    if v is not None), None)
         if val is None:
-            return True, _NOTHING_CHANGED + "Usage: set contracts 1"
+            return True, (_NOTHING_CHANGED + "Usage: set contracts 1   (the "
+                          "most contracts one trade may buy: set max contracts N)")
         ok, err = set_book_sizing(cfg, "main", "contracts", val)
         if not ok:
             return True, (f"{_NOTHING_CHANGED}{err[0].upper()}{err[1:]}. "
                           "Usage: set contracts 1")
         _save(CONFIG_PATH, cfg, private=True)
-        return True, f"Main pick sizing set to {_book_desc(cfg)}."
+        return True, (f"Main pick sizing set to {int(val)} contract(s)/trade."
+                      f"{_cap_note(cfg)}")
     if t in ("other trades on", "other trades off"):
         if cfg.get("source", "agenthc") != "agenthc":
             return True, "That setting is for the AgentHC signal source only."
@@ -7732,6 +7987,8 @@ def cmd_setup_from(path, as_json=False):
                 print("\nMode: DRY-RUN — no real orders. Only the owner can "
                       "go live (`dry off` in the dashboard).")
             print(f"Trade size now: {report.get('sizing', '?')}")
+            for w in report.get("warnings") or ():
+                print(f"  ⚠ {w}")
             if report["owner_steps"]:
                 print("\nStill needs the OWNER:")
                 for s_ in report["owner_steps"]:
