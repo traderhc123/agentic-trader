@@ -227,6 +227,8 @@ def _size(cfg, occ):
 
 _CONFIRM_TRIES = 3
 _CONFIRM_WAIT_S = 5.0
+_CANCEL_RECHECKS = 2      # a buy still cancelling after the cancel: re-read
+_CANCEL_RECHECK_S = 1.0   # ...this often, then reconcile settles it
 
 
 class _Unconfirmed(Exception):
@@ -520,6 +522,8 @@ def _settle_unconfirmed(cfg, state, pos_key):
             side == "buy" and order_guard.age(unc) > order_guard.GIVE_UP_S):
         order_guard.drop(state, pos_key)  # nothing left it could change
         return "clear"
+    if side == "buy" and unc.get("order_id"):
+        return _settle_cancelling_buy(cfg, state, pos_key, unc, contract)
     found = _order_by_key(cfg, unc.get("key"))
     if found is None:
         return "unknown"
@@ -542,6 +546,11 @@ def _settle_unconfirmed(cfg, state, pos_key):
     if side == "sell":
         pos["sell_seq"] = order_guard.sell_seq(pos) + 1
         _book_sale(state, pos_key, pos, oid, filled, qty, contract)
+    elif filled is None:
+        # cancelled but not dead yet: it may still fill
+        _await_cancel(state, pos_key, oid, qty, unc.get("option_id"), contract,
+                      unc.get("event_id"), replaces=unc.get("replaces"))
+        return "unknown"
     elif filled < 1:
         print(f"  it never filled — no position recorded ({contract})")
         broker_events.report("entry_unfilled",
@@ -557,12 +566,61 @@ def _settle_unconfirmed(cfg, state, pos_key):
     return "adopted"
 
 
+def _await_cancel(state, pos_key, oid, qty, option_id, contract, event_id,
+                  replaces=None):
+    """A buy order Alpaca agreed to cancel isn't dead yet (pending_cancel,
+    still working): it may still fill. Kept as an unconfirmed buy under its
+    order id, so reconcile settles it once Alpaca says filled or dead, and
+    no other buy of the contract goes out meanwhile."""
+    order_guard.note(state, pos_key, "buy", None, qty, option_id,
+                     event_id=event_id, contract=contract, order_id=str(oid),
+                     replaces=replaces or None)
+    print(f"  the buy order for {contract} ({oid}) is cancelling but isn't "
+          "cancelled yet — it may still fill; checking it again every loop")
+    broker_events.report(
+        "order_failed",
+        f"the buy order for {qty}x {contract} didn't fill in time, and Alpaca "
+        "hasn't finished cancelling it, so it may still fill. The agent checks "
+        "it every loop: if it fills, the agent takes over the position and "
+        f"manages it. It won't buy {contract} again until then.", placed=True)
+
+
+def _settle_cancelling_buy(cfg, state, pos_key, unc, contract):
+    """Settle a buy left by _await_cancel: "unknown" until Alpaca says it
+    is filled or dead; then the ledger gets what it filled ("adopted"), or
+    nothing ("clear")."""
+    oid = str(unc["order_id"])
+    status, filled = _order_state(cfg, oid)
+    if status == "filled":
+        filled = filled or int(unc.get("qty") or 0)
+    elif status not in _DONE:
+        return "unknown"  # still cancelling, or unreadable: it may fill
+    order_guard.drop(state, pos_key)
+    if filled < 1:
+        print(f"  the cancelled buy order for {contract} ({oid}) never filled "
+              "— no position recorded")
+        broker_events.report("entry_unfilled",
+                             f"the buy order for {contract} was cancelled "
+                             "before anything filled")
+        return "clear"
+    print(f"  the cancelled buy order for {contract} ({oid}) filled {filled}x "
+          "after all — the agent manages it")
+    state["positions"][pos_key] = {"option_id": unc.get("option_id"),
+                                   "qty": filled,
+                                   "opened_event": unc.get("event_id")}
+    _stamp_order(state["positions"][pos_key], oid)
+    # the agent logs it as the entry it is and tells the owner
+    order_guard.adopted_buy(state, pos_key, unc, oid)
+    return "adopted"
+
+
 def reconcile(cl, cfg, state, save_state):
     """Called by the agent once per loop, before new events: looks again
-    for buy orders whose request got no clear answer. One that is at Alpaca
-    after all becomes the position it bought. (An unconfirmed sell is
-    settled by its exit's own retry in execute, so the sale is logged as
-    that exit.) No network call unless such an order is waiting."""
+    for buy orders whose request got no clear answer, or whose cancel
+    hadn't finished. One that is at Alpaca after all becomes the position
+    it bought. (An unconfirmed sell is settled by its exit's own retry in
+    execute, so the sale is logged as that exit.) No network call unless
+    such an order is waiting."""
     cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
     changed = False
     for pos_key in list(order_guard.unconfirmed(state)):
@@ -570,7 +628,8 @@ def reconcile(cl, cfg, state, save_state):
         if (unc and unc.get("side") == "sell"
                 and pos_key in state.get("positions", {})):
             continue
-        if _settle_unconfirmed(cfg, state, pos_key) != "unknown":
+        if (_settle_unconfirmed(cfg, state, pos_key) != "unknown"
+                or order_guard.get(state, pos_key) is not unc):
             changed = True
     if changed:
         save_state(state)
@@ -620,7 +679,11 @@ def _confirm_fill(cfg, oid, qty, side="buy"):
 
     Less than qty only when the order is known to be dead: a sell reported
     as unfilled is sold again on the next poll, and if the first one fills
-    after all, a plain sell on a flat account can open a short."""
+    after all, a plain sell on a flat account can open a short.
+
+    None (buys only): Alpaca accepted the cancel but the order still isn't
+    dead after a few more reads (pending_cancel): it may still fill, so the
+    caller keeps it for reconcile (_await_cancel) instead of booking 0."""
     if oid == "submitted":
         return qty
     for _ in range(_CONFIRM_TRIES):
@@ -641,6 +704,21 @@ def _confirm_fill(cfg, oid, qty, side="buy"):
         cancelled, status, filled = False, "", 0
     if status == "filled":
         return filled or qty
+    if side == "buy" and cancelled and status and status not in _DONE:
+        # Alpaca took the cancel but the order isn't dead yet
+        # (pending_cancel...): it can still fill. Look a little longer, then
+        # leave it to reconcile (None) — never "never filled" while it may.
+        for _ in range(_CANCEL_RECHECKS):
+            time.sleep(_CANCEL_RECHECK_S)
+            again, got = _order_state(cfg, oid)
+            if again:
+                status, filled = again, max(filled, got)
+            if status == "filled" or status in _DONE:
+                break
+        if status == "filled":
+            return filled or qty
+        if status not in _DONE:
+            return None
     if status in _DONE or (cancelled and status):
         print(f"  order didn't fill in "
               f"{_CONFIRM_TRIES * _CONFIRM_WAIT_S:.0f}s — cancelled; "
@@ -695,6 +773,11 @@ def execute(cl, cfg, event, state):
         if oid:
             _remember_order(state, oid)
             filled = _confirm_fill(cfg, oid, getattr(oid, "qty", qty))
+            if filled is None:
+                # cancelled but not dead yet: reconcile settles it
+                _await_cancel(state, pos_key, oid, getattr(oid, "qty", qty), occ,
+                              contract, event.get("event_id"))
+                return False
             if filled < 1:
                 print(f"  entry never filled — no position recorded ({contract})")
                 broker_events.report("entry_unfilled",

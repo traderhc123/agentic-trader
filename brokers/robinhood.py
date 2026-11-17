@@ -952,33 +952,59 @@ def reconcile(rh, cfg, state, save_state):
         if st in _FILLED:
             _finalize_pending(state, pos_key, pend["filled"] or pend["requested"])
             changed = True
-        elif st in _DEAD:
+        elif st in _DEAD and not pend.get("cancelling"):
             _finalize_pending(state, pos_key, pend["filled"])
             changed = True
         elif st is None:
             if expired:  # unfindable for 30 min — settle with what we saw fill
                 _finalize_pending(state, pos_key, pend["filled"])
                 changed = True
-        else:  # order is working
-            if pend.get("reprice"):
-                # an expiry-guard sell the market moved away from: re-place
-                # it at a fresh marketable price, until the close
-                convert = (time.time() - pend.get("placed_at", 0) >= _REPRICE_AFTER_S
-                           and _before_close(cfg=cfg))
+        else:  # order is working (or dead from a cancel sent to re-place it)
+            if st in _DEAD:
+                # the cancel sent on an earlier cycle has taken effect: the
+                # re-placement it was for goes out now, if still wanted
+                st2 = st
+                if (expired or pend.get("exit_cancel") or (
+                        pend.get("reprice") and not _before_close(cfg=cfg))):
+                    _finalize_pending(state, pos_key, pend["filled"])
+                    changed = True
+                    continue
             else:
-                convert = pend.get("was_limit") and not _in_opening_blackout()
-            if not (convert or expired):
-                continue
-            if not _cancel_order(rh, account, pend["order_id"]):
-                continue  # cancel refused (may be mid-fill) — re-poll next cycle
-            time.sleep(2)  # let the cancel settle; catch a fill-vs-cancel race
-            st2, filled2 = _order_status(rh, account, pend["order_id"])
-            pend["filled"] = max(pend["filled"], filled2)
+                if pend.get("reprice"):
+                    # an expiry-guard sell the market moved away from:
+                    # re-place it at a fresh marketable price, until the close
+                    convert = (time.time() - pend.get("placed_at", 0)
+                               >= _REPRICE_AFTER_S and _before_close(cfg=cfg))
+                else:
+                    # (a buy an exit signal is cancelling is never re-placed)
+                    convert = (pend.get("was_limit") and not pend.get("exit_cancel")
+                               and not _in_opening_blackout())
+                if not (convert or expired):
+                    continue
+                if not _cancel_order(rh, account, pend["order_id"]):
+                    continue  # cancel refused (may be mid-fill) — re-poll next cycle
+                time.sleep(2)  # let the cancel settle; catch a fill-vs-cancel race
+                st2, filled2 = _order_status(rh, account, pend["order_id"])
+                pend["filled"] = max(pend["filled"], filled2)
             remaining = pend["requested"] - pend["filled"]
-            if st2 in _FILLED or remaining <= 0 or expired:
+            if st2 in _FILLED or remaining <= 0:
                 _finalize_pending(state, pos_key,
                                   pend["filled"] or (pend["requested"]
                                                      if st2 in _FILLED else 0))
+                changed = True
+                continue
+            if st2 not in _DEAD:
+                # the cancel was taken but the order isn't dead yet (or its
+                # state can't be read): it may still fill. Nothing is
+                # re-placed or settled on top of it — re-checked next cycle.
+                pend["cancelling"] = True
+                print(f"  {pend['side']} order {pend['order_id']} is cancelling "
+                      f"but not cancelled yet ({st2 or 'state unreadable'}) — "
+                      f"checking again next cycle ({pos_key})")
+                changed = True
+                continue
+            if expired:
+                _finalize_pending(state, pos_key, pend["filled"])
                 changed = True
                 continue
             # A cancelled order that filled nothing leaves no fill to tell
@@ -1140,13 +1166,26 @@ def execute(rh, cfg, event, state):
         if pend and pend["side"] == "buy":
             # Fast exit while the entry is still working: cancel the buy
             # first so a late fill can never leave an orphaned long.
-            _cancel_order(rh, cfg.get("robinhood_account", ""),
-                          pend["order_id"])
-            time.sleep(2)
-            _, filled = _order_status(rh, cfg.get("robinhood_account", ""),
-                                      pend["order_id"])
+            account = cfg.get("robinhood_account", "")
+            pend["exit_cancel"] = True  # reconcile never re-places this buy
+            cancel_taken = _cancel_order(rh, account, pend["order_id"])
+            if cancel_taken:
+                time.sleep(2)  # let the cancel settle
+            st, filled = _order_status(rh, account, pend["order_id"])
+            pend["filled"] = max(filled, pend.get("filled", 0))
+            if st not in _FILLED and st not in _DEAD:
+                # the cancel was refused or hasn't taken effect (or the order
+                # can't be read): the buy may still fill. The row stays and
+                # the exit stays owed — retried until the buy is done, then
+                # it sells whatever filled.
+                raise RuntimeError(
+                    f"the buy order for {contract} isn't filled or cancelled "
+                    f"yet ({st or 'state unreadable'}; cancel "
+                    f"{'requested' if cancel_taken else 'not accepted'}) — its "
+                    "exit waits until the buy is done")
             _finalize_pending(state, pos_key,
-                              max(filled, pend.get("filled", 0)),
+                              pend["filled"] or (pend["requested"]
+                                                 if st in _FILLED else 0),
                               report_unfilled=False)  # signal exited first
             pos = state["positions"].get(pos_key)
             if not pos:
