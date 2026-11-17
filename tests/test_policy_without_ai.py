@@ -186,7 +186,7 @@ def test_ai_problem_veto_alerts_once_per_day(home, monkeypatch):
     from conftest import make_event
     sent = []
     monkeypatch.setattr(agent, "notify", lambda cfg, msg: sent.append(msg))
-    monkeypatch.setattr(llm_policy, "evaluate", lambda c, e, l: {
+    monkeypatch.setattr(llm_policy, "evaluate", lambda c, e, l, **kw: {
         "act": False, "ai_problem": True, "reason": "AI key invalid/missing"})
     state = {"positions": {}}
     for i in range(3):
@@ -200,7 +200,7 @@ def test_rule_veto_does_not_alert(home, monkeypatch):
     from conftest import make_event
     sent = []
     monkeypatch.setattr(agent, "notify", lambda cfg, msg: sent.append(msg))
-    monkeypatch.setattr(llm_policy, "evaluate", lambda c, e, l: {
+    monkeypatch.setattr(llm_policy, "evaluate", lambda c, e, l, **kw: {
         "act": False, "reason": "rule: skip puts"})
     agent.handle_event(make_event(), {}, {"positions": {}}, None, None, lambda s: None)
     assert sent == []

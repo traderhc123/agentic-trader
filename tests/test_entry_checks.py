@@ -154,12 +154,12 @@ def test_your_rules_say_which_rule(home, no_policy):
 
 def test_written_rules_veto_and_ai_needed(home, monkeypatch):
     import llm_policy
-    monkeypatch.setattr(llm_policy, "evaluate", lambda c, e, log: {
+    monkeypatch.setattr(llm_policy, "evaluate", lambda c, e, log, **kw: {
         "act": False, "reason": "earnings week"})
     run(make_event(), {"dry_run": False})
     assert stopped(home, "policy_veto") == {"mode": "live",
                                             "check": "written_rules"}
-    monkeypatch.setattr(llm_policy, "evaluate", lambda c, e, log: {
+    monkeypatch.setattr(llm_policy, "evaluate", lambda c, e, log, **kw: {
         "act": False, "ai_problem": True, "reason": "no AI model connected"})
     run(make_event(event_id="t2"), {"dry_run": True})
     assert stopped(home, "skip_ai_needed") == {"mode": "practice",
@@ -317,11 +317,13 @@ def test_row_facts_never_raise_and_drop_what_is_not_data():
 def test_the_ai_policy_check_is_shown_the_rows_as_they_always_were(
         home, monkeypatch):
     """The trade log goes into the AI policy prompt: a new key there could
-    change a verdict. The rows it gets carry none."""
+    change a verdict. The rows it gets carry none. (It is shown today's
+    entries and exits of the current mode — agent._policy_view — so the
+    paused skip row is not among them.)"""
     import llm_policy
     shown = []
 
-    def evaluate(cfg, ev, log):
+    def evaluate(cfg, ev, log, **kw):
         shown.append(log)
         return {"act": True, "reason": "ok"}
     monkeypatch.setattr(llm_policy, "evaluate", evaluate)
@@ -331,9 +333,9 @@ def test_the_ai_policy_check_is_shown_the_rows_as_they_always_were(
     on_disk = rows(home)
     assert all("ui" in r for r in on_disk)
     assert shown[-1] == [{k: v for k, v in r.items() if k != "ui"}
-                         for r in on_disk[:2]]
+                         for r in on_disk[1:2]]
     assert not any("ui" in r for log in shown for r in log)
-    assert set(shown[-1][1]) == {"action", "event_id", "contract", "dry",
+    assert set(shown[-1][0]) == {"action", "event_id", "contract", "dry",
                                  "reason", "ts"}
 
 

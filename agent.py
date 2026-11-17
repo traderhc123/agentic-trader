@@ -45,6 +45,7 @@ is a registered investment adviser). See Section 3 of DISCLAIMER.md.
 
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -746,6 +747,12 @@ def _stale(ev, cfg):
     listed the first time it read the feed): that one is never bought.
     EXITED events are never stale-blocked (closing an open position is
     always right).
+
+    The age is measured with the source's clock when it sends one
+    (clock_skew_s: this computer's clock minus the source's, in seconds):
+    a PC clock that runs fast must not make every fresh entry "old", nor a
+    slow one let old entries through. A fast clock is corrected by
+    _CLOCK_SKEW_MAX_S at most.
     """
     if ev.get("event") != "ENTERED":
         return False
@@ -757,7 +764,19 @@ def _stale(ev, cfg):
         age = (datetime.now(timezone.utc) - occurred).total_seconds()
     except ValueError:
         return False
-    return age > float(cfg.get("max_event_age_s", 300))
+    return age - _clock_skew(ev) > float(cfg.get("max_event_age_s", 300))
+
+
+_CLOCK_SKEW_MAX_S = 600
+
+
+def _clock_skew(ev):
+    """The event's clock_skew_s (0 when it has none), at most _CLOCK_SKEW_MAX_S."""
+    skew = ev.get("clock_skew_s")
+    if (isinstance(skew, bool) or not isinstance(skew, (int, float))
+            or not math.isfinite(skew)):
+        return 0.0
+    return min(float(skew), _CLOCK_SKEW_MAX_S)
 
 
 # When this run started receiving each track ("main" / "other"). A stale
@@ -781,6 +800,33 @@ def note_watching(cfg, now=None, access=True):
         _WATCH_SINCE.setdefault("other", now)
     else:
         _WATCH_SINCE.pop("other", None)  # switched off: restart the clock if back on
+
+
+def _other_trades_off(cfg):
+    """AgentHC source, "other trades" off: only main-pick entries are taken."""
+    return (cfg.get("source", "agenthc") == "agenthc"
+            and not cfg.get("include_other_trades"))
+
+
+def _not_for_this_book(ev, state):
+    """With other trades off: an other-trades ENTERED, or an other-trades
+    EXITED for a contract the ledger doesn't hold as an other-trades
+    position (held from the main pick, by a row that doesn't say, or not
+    at all)."""
+    if str(ev.get("track", "main")) == "main":
+        return False
+    if ev.get("event") == "ENTERED":
+        return True
+    if ev.get("event") != "EXITED":
+        return False
+    key = (f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
+           if _valid_event(ev) else None)
+    row = (state.get("positions") or {}).get(key) if key else None
+    fn = getattr(SOURCES.get("agenthc"), "held_as_other", None)
+    try:
+        return not (fn is not None and fn(row))
+    except Exception:
+        return True
 
 
 def _backlog(ev):
@@ -918,22 +964,39 @@ def _recent_trades(limit=50):
     return (rows + _unwritten_rows())[-limit:]
 
 
-def _trades_today():
+def _trades_today(strict=False):
     """Today's trade-log rows, oldest first (UTC day, like the entry cap).
-    A close found in the account counts on the day its sale filled."""
+    A close found in the account counts on the day its sale filled.
+    Full-file scan, like the entry cap: skip rows can't push today's exits
+    out of a tail (the loss-streak rule is built from these). strict: see
+    _todays_log_rows."""
     today = datetime.now(timezone.utc).date().isoformat()
-    return [t for t in _recent_trades(500)
+    return [t for t in _todays_log_rows(today, strict)
             if str(t.get("closed_at") or t.get("ts", "")).startswith(today)]
 
 
-def _todays_log_rows(today):
-    """Every trade-log row that mentions `today` (full-file scan), then the
-    rows this run could not write yet — so an unwritable log can't make
-    today's entries or losses disappear from the limits."""
+class TradeLogUnreadable(OSError):
+    """trades.jsonl exists but can't be read, so today's entries and losses
+    can't be counted (_todays_log_rows strict=True)."""
+
+
+def _todays_log_rows(today, strict=False):
+    """Every trade-log row that mentions `today` (a date, or a tuple of
+    strings — a row mentioning any of them; full-file scan; this is only a
+    cheap pre-filter, callers check the row's fields), then the rows this
+    run could not write yet — so
+    an unwritable log can't make today's entries or losses disappear from
+    the limits.
+
+    No log yet is an empty day. A log that exists but can't be read
+    (permissions, a lock) yields nothing — or, strict=True, raises
+    TradeLogUnreadable: the entry limits must not read it as "no entries,
+    no losses today" and let an order past a cap that was already hit."""
+    days = (today,) if isinstance(today, str) else tuple(today)
     try:
         with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
             for line in f:
-                if today not in line:
+                if not any(d in line for d in days):
                     continue
                 try:
                     t = json.loads(line)
@@ -941,12 +1004,15 @@ def _todays_log_rows(today):
                     continue
                 if isinstance(t, dict):
                     yield t
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        if strict:
+            raise TradeLogUnreadable(str(exc)) from exc
     yield from _unwritten_rows()
 
 
-def _entries_today(dry=False):
+def _entries_today(dry=False, strict=False):
     """Count today's entries by scanning the FULL trade log.
 
     Deliberately not a tail read: every skip/veto also appends a log line, so
@@ -956,10 +1022,12 @@ def _entries_today(dry=False):
     Real-money rows only by default. dry=True counts the dry-run (practice)
     rows instead: the two books never mix, so practice entries can't use up
     the real cap (handle_event passes the mode the agent is in).
+    strict: raise TradeLogUnreadable rather than count an unreadable log
+    as zero (_todays_log_rows).
     """
     today = datetime.now(timezone.utc).date().isoformat()
     count = 0
-    for t in _todays_log_rows(today):
+    for t in _todays_log_rows(today, strict):
         if (t.get("action") == "entry" and bool(t.get("dry")) == bool(dry)
                 and str(t.get("ts", "")).startswith(today)):
             count += 1
@@ -976,7 +1044,7 @@ def _counted_before(t):
         return False
 
 
-def _est_pnl_today(dry=False):
+def _est_pnl_today(dry=False, strict=False):
     """Today's estimated realized P&L (USD) from the trade log's exit records.
 
     An ESTIMATE: brokers don't report fill prices back to the agent, so each
@@ -985,10 +1053,11 @@ def _est_pnl_today(dry=False):
     Exits with no estimate at all count as 0 (see `unmeasured`). Full-log
     scan for the same reason as _entries_today, and like it real-money rows
     only (dry=True: the dry-run rows instead) — a practice gain must never
-    offset a real loss against max_daily_loss_usd."""
+    offset a real loss against max_daily_loss_usd. strict: as for
+    _entries_today."""
     today = datetime.now(timezone.utc).date().isoformat()
     total, unmeasured = 0.0, 0
-    for t in _todays_log_rows(today):
+    for t in _todays_log_rows(today, strict):
         # a close found in the account counts on the day it filled
         day = str(t.get("closed_at") or t.get("ts", ""))
         if (t.get("action") != "exit" or bool(t.get("dry")) != bool(dry)
@@ -1010,6 +1079,61 @@ def _et_day(ts):
     if d.tzinfo is None:
         d = d.replace(tzinfo=timezone.utc)
     return d.astimezone(MARKET_TZ).date().isoformat()
+
+
+_POLICY_ROWS_SHOWN = 50
+_POLICY_EARLIER_SHOWN = 20
+
+
+def _policy_view(dry, strict=False):
+    """What the AI policy check is shown: (rows, context).
+
+    rows: today's entry and exit rows (ET market day; a close found in the
+    account counts on the day it filled) of the mode the agent is in only,
+    oldest first, from a FULL-file scan like the entry cap — a tail of the
+    log would let skip/veto rows push today's entries out of view, and a
+    per-day limit in policy.md would then let one more order through.
+    context: the time now (ET), the mode, and the day's counts worked out
+    here, so the model need not count the rows itself; and "earlier": the
+    last _POLICY_EARLIER_SHOWN entry and exit rows of this mode from BEFORE
+    today (same scan, so skip rows can't crowd them out either) — written
+    rules that span days (a losing streak across days, "not a ticker I lost
+    on yesterday", a weekly cap) need them, as they had in the old last-20
+    window. strict: as for _entries_today."""
+    import collections
+    import rules
+    now = _et_now()
+    today = now.date().isoformat()
+    rows = []
+    earlier = collections.deque(maxlen=_POLICY_EARLIER_SHOWN)
+    # one pass over the whole log; the substrings are only a cheap pre-filter
+    for t in _todays_log_rows(('"entry"', '"exit"'), strict):
+        if (t.get("action") not in ("entry", "exit")
+                or bool(t.get("dry")) != bool(dry)):
+            continue
+        day = _et_day(t.get("closed_at") or t.get("ts", ""))
+        if day == today:
+            rows.append(t)
+        elif day and day < today:
+            earlier.append(t)
+    earlier = list(earlier)
+    results = rules.exit_results(rows)
+    measured = [v for v in results if v is not None]
+    context = {
+        "now_et": now.strftime("%Y-%m-%d %H:%M ET (%A)"),
+        "mode": "practice" if dry else "live",
+        "entries_today": sum(1 for t in rows if t.get("action") == "entry"),
+        "positions_closed_today": len(results),
+        "losing_positions_today": sum(1 for v in measured if v < 0),
+        "losses_in_a_row": rules.loss_streak(rows),
+        # the same streak carried back through the earlier rows shown
+        "losses_in_a_row_with_earlier": rules.loss_streak(earlier + rows),
+        "est_realized_pnl_today_usd": round(sum(measured), 2),
+        "rows_shown": min(len(rows), _POLICY_ROWS_SHOWN),
+        "rows_today": len(rows),
+        "earlier": _rows_without_facts(earlier),
+    }
+    return _rows_without_facts(rows[-_POLICY_ROWS_SHOWN:]), context
 
 
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -1780,6 +1904,31 @@ def _open_in_mode(state, dry_mode):
     return sum(1 for r in rows if _opened_live(r) != bool(dry_mode))
 
 
+def _buys_settling(state, today=None):
+    """Real buy orders whose outcome is still open (brokers/order_guard: no
+    clear answer, or a cancel Alpaca hadn't finished) and that have no
+    ledger row yet. Each may still fill, so it holds its slot under the
+    open-position cap — and, when sent `today` (UTC date) as a new entry,
+    under the daily entry cap — until it settles. (A re-placed order's
+    entry is in the trade log already: it isn't counted twice.)"""
+    try:
+        rows = (state or {}).get("positions") or {}
+        out = []
+        for key, rec in order_guard.unconfirmed(state or {}).items():
+            if not isinstance(rec, dict) or rec.get("side") != "buy" or key in rows:
+                continue
+            if today is not None:
+                if rec.get("replaces"):
+                    continue
+                sent = datetime.fromtimestamp(_float0(rec.get("at")), timezone.utc)
+                if sent.date().isoformat() != today:
+                    continue
+            out.append(key)
+        return out
+    except Exception:
+        return []
+
+
 def _dry_run_note(cfg, state):
     """What dry-run means for the real positions that are open now, in the
     owner's words ("" when there are none)."""
@@ -2038,6 +2187,46 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
                 "dashboard activity log.)")
 
 
+# The latest skip_log_unreadable rows, also kept in memory: while the log
+# can't be read the dashboard can't read them back from it (_problems_today).
+_UNREADABLE_SKIPS = []
+_UNREADABLE_SKIPS_KEPT = 50
+
+
+def _log_unreadable_skip(cfg, state, save_state, ev, book, contract, why, exc):
+    """An entry skipped because the trade log can't be read (handle_event):
+    a row in the log, also kept in memory so the dashboard's problems list
+    shows it DURING the outage (_problems_today), and a high-priority alert
+    at most once a day. Never raises."""
+    try:
+        rec = {"action": "skip_log_unreadable", "book": book,
+               "event_id": ev.get("event_id"), "contract": contract,
+               "reason": f"{why} ({str(exc)[:150]})"}
+        if cfg.get("dry_run"):
+            rec["dry"] = True
+        _log_trade(_row_facts(rec, cfg, "daily_cap"))
+        _UNREADABLE_SKIPS.append(rec)
+        del _UNREADABLE_SKIPS[:-_UNREADABLE_SKIPS_KEPT]
+        today = datetime.now(timezone.utc).date().isoformat()
+        sent = state.setdefault("problem_notified", {})
+        if sent.get("skip_log_unreadable") == today:
+            return
+        sent["skip_log_unreadable"] = today
+        try:
+            save_state(state)
+        except Exception:
+            pass
+        notify(cfg, f"⚠️ agentic-trader: entry NOT placed ({contract}) — your "
+                    f"trade log ({TRADES_PATH}) can't be read, so the daily "
+                    "entry cap, max daily loss and loss-streak rule can't be "
+                    "checked. New entries are skipped until it can be read; "
+                    "exits still run. Check the file's permissions, or close "
+                    "whatever has it open.\n(No more alerts about this today.)",
+               priority="high")
+    except Exception:
+        pass
+
+
 def _log_adopted_buys(cfg, state, save_state, broker, client):
     """Log the buys an adapter found at the broker after all — orders whose
     request got no clear answer, so their signal was recorded as handled
@@ -2237,10 +2426,19 @@ def _problems_today():
     """Today's 'trade didn't happen' rows, grouped for the dashboard."""
     import broker_events
     today = datetime.now(timezone.utc).date().isoformat()
-    kinds = (set(broker_events.KINDS) | {"skip_stale", "skip_sizing", "skip_ai_needed"}
+    kinds = (set(broker_events.KINDS) | {"skip_stale", "skip_sizing", "skip_ai_needed",
+                                         "skip_log_unreadable"}
              | _OWN_SKIPS)
     out = {}
-    for t in _recent_trades(300):
+    rows = _recent_trades(300)
+    # while the log can't be read, its skip_log_unreadable rows only exist
+    # in memory (_log_unreadable_skip); once it can, they're on file too
+    on_file = {(t.get("action"), t.get("event_id"), t.get("ts")) for t in rows}
+    extra = [t for t in _UNREADABLE_SKIPS
+             if (t.get("action"), t.get("event_id"), t.get("ts")) not in on_file]
+    if extra:
+        rows = sorted(rows + extra, key=lambda t: str(t.get("ts", "")))
+    for t in rows:
         if t.get("action") not in kinds or not str(t.get("ts", "")).startswith(today):
             continue
         p = out.setdefault(t["action"], {"kind": t["action"], "count": 0})
@@ -3410,9 +3608,15 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         msg = f"SKIPPED stale ENTERED ({contract}) — older than " \
               f"{int(cfg.get('max_event_age_s', 300))}s"
         print(msg)
+        # a fast clock is corrected only up to _CLOCK_SKEW_MAX_S: past that
+        # the clock, not a sleep, may be why
+        hint = ("computer asleep or offline?"
+                if _clock_skew(ev) < _CLOCK_SKEW_MAX_S else
+                f"this computer's clock is {_CLOCK_SKEW_MAX_S // 60}+ min fast — "
+                "turn on automatic time sync")
         _report_problem(cfg, state, save_state, "skip_stale", contract,
                         f"signal was {int(cfg.get('max_event_age_s', 300))}s+ old "
-                        "when the agent saw it (computer asleep or offline?)",
+                        f"when the agent saw it ({hint})",
                         event_id=ev["event_id"], book=book, check="signal_fresh",
                         params={"max_age_s": int(cfg.get("max_event_age_s", 300))})
         return msg
@@ -3490,8 +3694,30 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # Counted from the rows of the mode the agent is in: real trades
         # when live, practice trades in dry-run — never one against the other.
         dry_mode = bool(cfg.get("dry_run"))
+        # Today's entries and losses come from the trade log. A log that
+        # exists but can't be read is not "nothing today": no new entries
+        # until it can be read (fail closed). Exits never get here.
+        try:
+            n_today = _entries_today(dry_mode, strict=True)
+            pnl_today, _unmeasured = _est_pnl_today(dry_mode, strict=True)
+            today_rows = [t for t in _trades_today(strict=True)
+                          if bool(t.get("dry")) == dry_mode]
+            policy_rows, policy_ctx = _policy_view(dry_mode, strict=True)
+        except TradeLogUnreadable as exc:
+            why = ("the trade log can't be read, so the daily entry cap, max "
+                   "daily loss and loss-streak rule can't be checked — no new "
+                   "entries until it can be read (exits still run)")
+            msg = f"SKIPPED {contract}: {why}"
+            print(msg + f" [{str(exc)[:150]}]")
+            _log_unreadable_skip(cfg, state, save_state, ev, book, contract,
+                                 why, exc)
+            return msg
         cap = int(cfg.get("max_entries_per_day", 5))
-        if _entries_today(dry_mode) >= cap:
+        # n_today was read strictly above (fail closed on an unreadable log).
+        if not dry_mode:  # a real buy still settling may become an entry
+            n_today += len(_buys_settling(
+                state, datetime.now(timezone.utc).date().isoformat()))
+        if n_today >= cap:
             msg = f"SKIPPED {contract}: daily entry cap reached ({cap})"
             print(msg)
             _log_trade(_row_facts(
@@ -3506,10 +3732,14 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # going live never blocks real trades.
         pos_cap = int(cfg.get("max_open_positions", 10))
         n_open = _open_in_mode(state, dry_mode)
-        if n_open >= pos_cap:
+        settling = 0 if dry_mode else len(_buys_settling(state))
+        if n_open + settling >= pos_cap:
             how = (f"{n_open} {'practice' if dry_mode else 'real'} "
-                   f"position{'' if n_open == 1 else 's'} open now (real and "
-                   "practice are counted separately). "
+                   f"position{'' if n_open == 1 else 's'} open now"
+                   + (f", plus {settling} buy order"
+                      f"{'' if settling == 1 else 's'} still settling at your "
+                      "broker (it may fill)" if settling else "")
+                   + " (real and practice are counted separately). "
                    "To allow more, say 'set positions N' in the dashboard "
                    "chat, or raise Open positions at once in the settings")
             msg = f"SKIPPED {contract}: max open positions reached ({pos_cap}) — {how}"
@@ -3524,7 +3754,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # the limit, stop opening positions. Exits are never blocked.
         loss_cap = float(cfg.get("max_daily_loss_usd") or 0)
         if loss_cap > 0:
-            pnl, _unmeasured = _est_pnl_today(dry_mode)
+            pnl = pnl_today
             if -pnl >= loss_cap:
                 msg = (f"SKIPPED {contract}: max daily loss reached "
                        f"(est. ${-pnl:,.0f} of ${loss_cap:,.0f}) — no new "
@@ -3539,8 +3769,6 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # Built-in rules (plain settings, no AI): tickers, calls/puts, min
         # strike, no 0DTE, stop after a losing streak.
         import rules
-        today_rows = [t for t in _trades_today()
-                      if bool(t.get("dry")) == dry_mode]
         ok, why = rules.check(cfg, ev, today_rows)
         if not ok:
             msg = f"SKIPPED {contract}: {why} (your rules)"
@@ -3551,8 +3779,9 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 **_rule_facts(cfg, ev, today_rows)))
             return msg
         # The user's own policy, applied by the LLM policy brain (veto-only).
-        verdict = llm_policy.evaluate(
-            cfg, ev, _rows_without_facts(_recent_trades(20)))
+        # Shown today's entries and exits of this mode from the whole log,
+        # the time now and the day's counts (_policy_view).
+        verdict = llm_policy.evaluate(cfg, ev, policy_rows, context=policy_ctx)
         if not verdict["act"] and verdict.get("ai_problem"):
             # NOT the owner's rules saying no: the AI that checks them is
             # missing or failing, so every entry is being skipped. Log it as
@@ -4011,7 +4240,29 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
     # only the agent's own exits may cap or reprice a sell
     new = [_from_feed(ev) for ev in events
            if ev.get("event_id") not in seen and ev.get("event_id") not in owed_ids]
-    known = list(events) + owed
+    off = _other_trades_off(cfg)
+    if off:
+        # The AgentHC source reads every track while the agent still holds
+        # an "other trades" position (its exit must reach it), but the
+        # owner turned other trades off: their entries are not taken, and
+        # their exits reach only a position opened from other trades — the
+        # shadow book often trades the main pick's contract and exits at
+        # another time, and must never sell the main position (positions
+        # are keyed by contract alone). Remembered, so they aren't looked
+        # at again.
+        dropped = [ev for ev in new if ev.get("event_id")
+                   and _not_for_this_book(ev, state)]
+        for ev in dropped:
+            seen.add(ev["event_id"])
+            _mark_seen(state, ev["event_id"], listed)
+        if dropped:
+            print(f"ignored {len(dropped)} \"other trades\" signal(s): "
+                  "other trades are off")
+            new = [ev for ev in new if ev.get("event_id") not in seen]
+            save_state(state)
+    # with other trades off, a shadow-book exit doesn't end a main entry
+    known = [ev for ev in events
+             if not off or str(ev.get("track", "main")) == "main"] + owed
     batch = (owed + [ev for ev in new if ev.get("event") == "EXITED"]
              + [ev for ev in new if ev.get("event") != "EXITED"])
     for ev in batch:
@@ -4033,6 +4284,11 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
         except Exception as exc:
             error = exc
         if opens and key in state["positions"]:
+            row = state["positions"][key]
+            if isinstance(row, dict):
+                # which signals its exit comes with (the AgentHC source keeps
+                # reading that track while it's held)
+                row.setdefault("track", str(ev.get("track", "main")))
             # A new position: an exit still owed for this contract is older
             # than it (or the entry wouldn't have been bought) — it was for
             # an earlier position and must never sell this one.
@@ -4411,6 +4667,8 @@ _SIGNAL_LOSS_WHY = {
     "feed_error": "the signal feed can't be read",
     "feed_not_live": "the signal feed can't be read",
     "feed_refused": "the signal feed is refusing the agent",
+    "feed_gap": ("the agent was away long enough that an exit signal may "
+                 "have scrolled out of the signal feed"),
 }
 # what the owner can do about it (none: the agent keeps trying)
 _BUY_DAYS = "buy signal days (dashboard → Settings → Signal source)"
@@ -4544,10 +4802,20 @@ def _signal_loss_acct(cfg, broker=None, client=None):
 
 def _signal_loss_rows(state):
     """[(key, row)] ledger rows that hold contracts or have an order
-    working, of every expiry."""
+    working, of every expiry. While the loss is a feed_gap (an exit may
+    have scrolled out of the feed while the agent was away), only the rows
+    held then that are still held (state["feed_gap"]["keys"], kept by the
+    AgentHC source): positions bought since get their exits normally."""
     rows = state.get("positions")
-    return [(k, r) for k, r in (list(rows.items()) if isinstance(rows, dict) else ())
-            if isinstance(r, dict) and (_int0(r.get("qty")) >= 1 or r.get("pending"))]
+    out = [(k, r) for k, r in (list(rows.items()) if isinstance(rows, dict) else ())
+           if isinstance(r, dict) and (_int0(r.get("qty")) >= 1 or r.get("pending"))]
+    rec = state.get("signal_loss")
+    if isinstance(rec, dict) and rec.get("cause") == "feed_gap":
+        gap = state.get("feed_gap")
+        keys = set(k for k in ((gap.get("keys") or ()) if isinstance(gap, dict)
+                               else ()) if isinstance(k, str))
+        out = [(k, r) for k, r in out if k in keys]
+    return out
 
 
 def _clock_et(ts, now_et):
@@ -6798,7 +7066,9 @@ def _command(t, cfg, text):
         return True, ("Now getting the main pick + \"other trades\" (shadow book) "
                       "signals, sized with: " + _sizing_desc(cfg) + "."
                       if cfg["include_other_trades"] else
-                      "Now getting the main pick only — no \"other trades\" signals.")
+                      "Now getting the main pick only — no new \"other trades\" "
+                      "entries. Other trades it already holds still get their "
+                      "exit signals.")
     if t in ("other sizing same", "clear other sizing"):
         set_book_sizing(cfg, "other", "same", None)
         _save(CONFIG_PATH, cfg, private=True)
@@ -7900,9 +8170,13 @@ def _feed_access_check(cfg, state, check):
         try:
             bal = wallet.balance_sats()
             from sources.agenthc_day_trade_ideas import usd_words
+            from lightning_wallet import fee_reserve_sats
             day_usd, day = _day_pass_price()
-            check("feed_access", bal >= day, "Wallet funded",
-                  f"{bal:,} sats ({'~' + str(bal // day) + ' more market day(s)' if bal >= day else f'below one ~{usd_words(day_usd)} day-pass (~{day:,} sats)'})",
+            # LNbits refuses a payment unless the wallet also holds its
+            # routing-fee reserve ("You must reserve at least ...")
+            need = day + fee_reserve_sats(day)
+            check("feed_access", bal >= need, "Wallet funded",
+                  f"{bal:,} sats ({'~' + str(bal // need) + ' more market day(s)' if bal >= need else f'below one ~{usd_words(day_usd)} day-pass (~{day:,} sats + ~{need - day:,} sats LNbits fee reserve)'})",
                   "python agent.py fund 100000   (the OWNER pays the invoice)",
                   who="owner")
         except WalletError as exc:
