@@ -126,6 +126,71 @@ def test_alpaca_pending_cancel_partial_fill_is_adopted(home, no_policy, notes,
     assert [r["action"] for r in _log(home)] == ["order_failed", "entry"]
 
 
+
+def _other_buy():
+    return make_event(strike=753.0, event_id="other-1")
+
+
+@pytest.mark.parametrize("cap_key", ["max_open_positions", "max_entries_per_day"])
+def test_alpaca_pending_cancel_buy_holds_its_cap_slot(home, no_policy, notes,
+                                                      monkeypatch, cap_key):
+    """A buy still cancelling isn't a ledger row or an entry row yet, but it
+    may fill: with a cap of 1 it holds the slot, so a buy of another
+    contract can't take it and leave the account over the cap once the
+    first one fills late."""
+    api = SlowCancelAlpaca(monkeypatch)
+    state = {"positions": {}, "seen": []}
+    feed = Feed(alpaca, alpaca.client(ALP_CFG), dict(ALP_CFG, **{cap_key: 1}), state)
+    feed.poll(make_event())
+    assert order_guard.get(state, KEY)["order_id"] == "a-1"
+    feed.poll(_other_buy())
+    assert len(api.posts) == 1, "a second buy went out past the cap"
+    skip = {"max_open_positions": "skip_position_cap",
+            "max_entries_per_day": "skip_daily_cap"}[cap_key]
+    assert _log(home)[-1]["action"] == skip
+    # once it settles unfilled the slot is free again
+    api.orders[0]["status"] = "canceled"
+    feed.poll(make_event(strike=753.0, event_id="other-2"))
+    assert len(api.posts) == 2
+
+
+def test_practice_cap_ignores_a_real_buy_still_settling(home):
+    state = {"positions": {}}
+    order_guard.note(state, KEY, "buy", None, 2, OPT, order_id="a-1")
+    assert agent._buys_settling(state) == [KEY]
+    state["positions"][KEY] = {"qty": 0, "option_id": OPT}  # Robinhood-style row
+    assert agent._buys_settling(state) == []
+
+
+def _aged_cancelling_note(state):
+    rec = order_guard.note(state, KEY, "buy", None, 2, OPT, order_id="a-1",
+                           contract="SPY 2026-07-10 $752 CALL", event_id="test-1")
+    rec["at"] = time.time() - order_guard.GIVE_UP_S - 60
+    return rec
+
+
+def test_alpaca_cancelling_buy_past_give_up_is_still_read(monkeypatch):
+    """Past GIVE_UP_S a cancelling buy with an order id is read once more:
+    a late fill is still taken over, not dropped unmanaged."""
+    state = {"positions": {}}
+    _aged_cancelling_note(state)
+    monkeypatch.setattr(alpaca, "_order_state", lambda cfg, oid: ("filled", 2))
+    assert alpaca._settle_unconfirmed({}, state, KEY) == "adopted"
+    assert state["positions"][KEY]["qty"] == 2
+
+
+def test_alpaca_cancelling_buy_given_up_is_never_silent(monkeypatch):
+    state = {"positions": {}}
+    _aged_cancelling_note(state)
+    monkeypatch.setattr(alpaca, "_order_state", lambda cfg, oid: ("", 0))
+    broker_events.begin()
+    assert alpaca._settle_unconfirmed({}, state, KEY) == "clear"
+    events = broker_events.drain()
+    assert order_guard.get(state, KEY) is None and state["positions"] == {}
+    assert [e["kind"] for e in events] == ["order_failed"]
+    assert "check your alpaca dashboard" in events[0]["message"].lower()
+
+
 _REAL_CONFIRM_FILL = alpaca._confirm_fill
 
 
@@ -153,6 +218,20 @@ def test_alpaca_buy_cancel_that_lands_on_a_recheck_settles(monkeypatch):
     assert _confirm(monkeypatch, [("pending_cancel", 0), ("canceled", 1)])[0] == 1
     assert _confirm(monkeypatch, [("pending_cancel", 0), ("", 0),
                                   ("filled", 2)])[0] == 2
+
+
+def test_alpaca_buy_whose_cancel_is_refused_while_working_is_unknown(monkeypatch):
+    """Alpaca refused the cancel (422) and the order still works: it may
+    fill or die, so reconcile settles it — the full qty is not booked (a
+    ledger row with nothing behind it if it dies)."""
+    got, events = _confirm(monkeypatch, [("pending_cancel", 0)], delete_status=422)
+    assert got is None and events == []
+    got, _ = _confirm(monkeypatch, [("accepted", 0), ("canceled", 0)],
+                      delete_status=422)
+    assert got == 0
+    # unreadable after a refused cancel: the optimistic fallback, said aloud
+    got, events = _confirm(monkeypatch, [("", 0)], delete_status=422)
+    assert got == 2 and [e["kind"] for e in events] == ["order_failed"]
 
 
 def test_alpaca_sell_pending_cancel_is_unchanged(monkeypatch):
