@@ -1269,14 +1269,24 @@ class MoomooFront(MM):
                                                   "order_status": "FILLED_ALL",
                                                   "dealt_qty": o["qty"]}]
                     return sdk.RET_OK, _DF(rows)
-                return sdk.RET_OK, _DF([
+                rows = [
                     {"code": s, "order_id": f"owner-{s}", "order_status": "SUBMITTED",
                      "trd_side": "TrdSide.SELL", "qty": float(n), "dealt_qty": 0.0}
-                    for s, n in sdk.acct.resting.items() if n])
+                    for s, n in sdk.acct.resting.items() if n]
+                if kw.get("code"):  # one contract's orders: the filled ones too
+                    rows = [r for r in rows if r["code"] == kw["code"]] + [
+                        {"code": o["sym"], "order_id": o["id"],
+                         "order_status": "FILLED_ALL",
+                         "trd_side": "TrdSide." + o["side"].upper(),
+                         "qty": float(o["qty"]), "dealt_qty": float(o["qty"]),
+                         "remark": o.get("remark", "")}
+                        for o in sdk.acct.orders if o["sym"] == kw["code"]]
+                return sdk.RET_OK, _DF(rows)
 
             def place_order(self, **kw):
                 oid = sdk.acct.order(kw["code"], "buy" if kw["trd_side"] == "BUY"
                                      else "sell", kw["qty"])
+                sdk.acct.orders[-1]["remark"] = kw.get("remark") or ""
                 if sdk.lose_next:  # the order went in; the answer is lost
                     sdk.lose_next = False
                     raise ConnectionError("OpenD connection dropped")
