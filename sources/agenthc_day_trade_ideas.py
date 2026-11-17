@@ -802,8 +802,12 @@ def _token_status(state, token):
 #   - "other trades" switched off while the agent still held one: reading
 #     track=main never listed its EXITED, so it rode to the expiry guard.
 #     The agent reads track=all while its ledger (or the exits it still
-#     owes) holds anything not opened from the main pick; the agent drops
-#     new other-trades ENTERED events itself (agent._handle_feed_events).
+#     owes) holds something known to come from other trades (a row that
+#     doesn't say counts as the main pick); the agent drops other-trades
+#     ENTERED events itself, and their EXITED events unless the ledger row
+#     for that contract is itself an other-trades one
+#     (agent._handle_feed_events) — a shadow-book exit never sells a main
+#     position.
 #   - 20 events of track=all are a few hours of the shadow book: an exit
 #     published before a sleep or restart fell out of the window. Reads of
 #     track=all, and the first read after a gap, ask for FEED_LIMIT_MAX.
@@ -830,12 +834,22 @@ def _row_track(row):
     return None
 
 
+def held_as_other(row):
+    """True for a ledger row known to come from "other trades". A row that
+    doesn't say (a practice row of an older version, a row the ledger check
+    rebuilt without its opening event) counts as the main pick: with other
+    trades off it never switches reads to every track, and no other-trades
+    exit is let through for it — as before tracks were remembered."""
+    track = _row_track(row) if isinstance(row, dict) else None
+    return track is not None and track != "main"
+
+
 def _holds_other_track(state):
-    """The ledger, or the exits still owed, hold something that is not
-    known to come from the main pick (a row that doesn't say counts)."""
+    """The ledger, or the exits still owed, hold something known to come
+    from other trades (held_as_other)."""
     rows = (state or {}).get("positions")
     for row in (rows.values() if isinstance(rows, dict) else ()):
-        if isinstance(row, dict) and _row_track(row) != "main":
+        if held_as_other(row):
             return True
     owed = (state or {}).get("exits_to_retry")
     for ev in (owed if isinstance(owed, list) else ()):
@@ -875,6 +889,19 @@ def _epoch(value):
     return t.timestamp()
 
 
+def _id_track(event_id):
+    """The track in an AgentHC event id (non-main ids end in "|<track>")."""
+    parts = str(event_id).split("|")
+    return parts[6] if len(parts) >= 7 and parts[6] else "main"
+
+
+def _opened_mark(row):
+    """What tells this position apart from a later one under the same
+    contract: the event that opened it, else when (None: a practice row,
+    which says neither)."""
+    return row.get("opened_event") or row.get("opened_at") or None
+
+
 def _check_window(cfg, state, save_state, body, params, events):
     """After a good read: remember it, and keep the no-signal sell armed
     while an exit may have fallen out of the feed's window.
@@ -882,10 +909,14 @@ def _check_window(cfg, state, save_state, body, params, events):
     A full window (as many events as asked for) whose oldest event is newer
     than the last good read may have dropped events in between — an exit
     for a position held now among them. (With no earlier read on record:
-    a full window that lists nothing the agent has handled.) What the
-    ledger holds then is kept in state["feed_gap"]; while any of it is
-    still held, this read counts as one without exit access (cause
-    "feed_gap"): the owner is warned and, if no exit comes, it is sold at
+    a full window that lists nothing the agent has handled, judged only
+    by the tracks it has handled events of: the first read of every track
+    after reading the main pick only is no gap by itself.) What the
+    ledger holds then is kept in state["feed_gap"] (each row with the
+    event or time it was opened: a position bought again later under the
+    same contract is not one of them); while any of it is still held, this
+    read counts as one without exit access (cause "feed_gap"): the owner
+    is warned and, if no exit comes, those rows — only those — are sold at
     the no-signal sell time (agent.signal_loss_tick). Never raises."""
     try:
         raw = body.get("events") if isinstance(body, dict) else None
@@ -904,9 +935,15 @@ def _check_window(cfg, state, save_state, body, params, events):
             else:
                 seen = set(i for i in (state.get("seen") or ())
                            if isinstance(i, str))
-                lost = not any(e["event_id"] in seen for e in events)
+                tracks = {_id_track(i) for i in seen}
+                alike = [e for e in events
+                         if not tracks or str(e.get("track", "main")) in tracks]
+                lost = bool(alike) and not any(e["event_id"] in seen
+                                               for e in alike)
             if lost:
-                state["feed_gap"] = {"since": time.time(), "keys": held}
+                state["feed_gap"] = {"since": time.time(), "keys": held,
+                                     "opened": {k: _opened_mark(rows[k])
+                                                for k in held}}
                 save_state(state)
                 text = ("agentic-trader: your agent was away long enough that "
                         "AgentHC published more signals than one read lists, so "
@@ -922,7 +959,11 @@ def _check_window(cfg, state, save_state, body, params, events):
         state["feed_read"] = {"local": time.time(), "server": server_now}
         gap = state.get("feed_gap")
         if isinstance(gap, dict):
-            still = [k for k in (gap.get("keys") or ()) if k in (rows or {})]
+            marks = gap.get("opened") if isinstance(gap.get("opened"), dict) else {}
+            # still held, and the same position (not one bought again since)
+            still = [k for k in (gap.get("keys") or ())
+                     if isinstance((rows or {}).get(k), dict)
+                     and _opened_mark(rows[k]) == marks.get(k)]
             if still:
                 _LAST_POLL.update(exits=False, why="feed_gap")
                 if still != gap.get("keys"):

@@ -808,6 +808,27 @@ def _other_trades_off(cfg):
             and not cfg.get("include_other_trades"))
 
 
+def _not_for_this_book(ev, state):
+    """With other trades off: an other-trades ENTERED, or an other-trades
+    EXITED for a contract the ledger doesn't hold as an other-trades
+    position (held from the main pick, by a row that doesn't say, or not
+    at all)."""
+    if str(ev.get("track", "main")) == "main":
+        return False
+    if ev.get("event") == "ENTERED":
+        return True
+    if ev.get("event") != "EXITED":
+        return False
+    key = (f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
+           if _valid_event(ev) else None)
+    row = (state.get("positions") or {}).get(key) if key else None
+    fn = getattr(SOURCES.get("agenthc"), "held_as_other", None)
+    try:
+        return not (fn is not None and fn(row))
+    except Exception:
+        return True
+
+
 def _backlog(ev):
     """True when the signal happened before this run was watching its track."""
     if ev.get("age_unknown") and not ev.get("occurred_at"):
@@ -3887,22 +3908,29 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
     # only the agent's own exits may cap or reprice a sell
     new = [_from_feed(ev) for ev in events
            if ev.get("event_id") not in seen and ev.get("event_id") not in owed_ids]
-    if _other_trades_off(cfg):
+    off = _other_trades_off(cfg)
+    if off:
         # The AgentHC source reads every track while the agent still holds
         # an "other trades" position (its exit must reach it), but the
-        # owner turned other trades off: their new entries are not taken.
-        # Remembered, so they aren't looked at again.
-        dropped = [ev for ev in new if ev.get("event") == "ENTERED"
-                   and str(ev.get("track", "main")) != "main" and ev.get("event_id")]
+        # owner turned other trades off: their entries are not taken, and
+        # their exits reach only a position opened from other trades — the
+        # shadow book often trades the main pick's contract and exits at
+        # another time, and must never sell the main position (positions
+        # are keyed by contract alone). Remembered, so they aren't looked
+        # at again.
+        dropped = [ev for ev in new if ev.get("event_id")
+                   and _not_for_this_book(ev, state)]
         for ev in dropped:
             seen.add(ev["event_id"])
             _mark_seen(state, ev["event_id"], listed)
         if dropped:
-            print(f"ignored {len(dropped)} \"other trades\" entry signal(s): "
+            print(f"ignored {len(dropped)} \"other trades\" signal(s): "
                   "other trades are off")
             new = [ev for ev in new if ev.get("event_id") not in seen]
             save_state(state)
-    known = list(events) + owed
+    # with other trades off, a shadow-book exit doesn't end a main entry
+    known = [ev for ev in events
+             if not off or str(ev.get("track", "main")) == "main"] + owed
     batch = (owed + [ev for ev in new if ev.get("event") == "EXITED"]
              + [ev for ev in new if ev.get("event") != "EXITED"])
     for ev in batch:
@@ -4442,10 +4470,20 @@ def _signal_loss_acct(cfg, broker=None, client=None):
 
 def _signal_loss_rows(state):
     """[(key, row)] ledger rows that hold contracts or have an order
-    working, of every expiry."""
+    working, of every expiry. While the loss is a feed_gap (an exit may
+    have scrolled out of the feed while the agent was away), only the rows
+    held then that are still held (state["feed_gap"]["keys"], kept by the
+    AgentHC source): positions bought since get their exits normally."""
     rows = state.get("positions")
-    return [(k, r) for k, r in (list(rows.items()) if isinstance(rows, dict) else ())
-            if isinstance(r, dict) and (_int0(r.get("qty")) >= 1 or r.get("pending"))]
+    out = [(k, r) for k, r in (list(rows.items()) if isinstance(rows, dict) else ())
+           if isinstance(r, dict) and (_int0(r.get("qty")) >= 1 or r.get("pending"))]
+    rec = state.get("signal_loss")
+    if isinstance(rec, dict) and rec.get("cause") == "feed_gap":
+        gap = state.get("feed_gap")
+        keys = set(k for k in ((gap.get("keys") or ()) if isinstance(gap, dict)
+                               else ()) if isinstance(k, str))
+        out = [(k, r) for k, r in out if k in keys]
+    return out
 
 
 def _clock_et(ts, now_et):

@@ -154,13 +154,76 @@ def test_track_follows_what_the_ledger_holds(monkeypatch):
     main_id = f"ENTERED|SPY|{FAR}|752.0|C|2026-11-17T15:00:00+00:00"
     assert p({"positions": {"a": {"opened_event": main_id, "qty": 1}}}) == "main"
     assert p({"positions": {"a": {"track": "main", "qty": 1}}}) == "main"
-    # a live row from other trades (id ends in |other), a stamped row, an
-    # exit still owed for one, and a row that doesn't say: read every track
+    # a live row from other trades (id ends in |other), a stamped row, and
+    # an exit still owed for one: read every track
     assert p({"positions": {"a": {"opened_event": main_id + "|other"}}}) == "all"
     assert p({"positions": {"a": {"track": "other"}}}) == "all"
     assert p({"positions": {}, "exits_to_retry": [{"event": "EXITED", "track": "other"}]}) == "all"
-    assert p({"positions": {"a": {"option_id": "dry", "qty": 1, "dry": True}}}) == "all"
+    # a row that doesn't say (a practice row of an older version, a rebuilt
+    # row with no opening event) counts as the main pick: main only
+    assert p({"positions": {"a": {"option_id": "dry", "qty": 1, "dry": True}}}) == "main"
+    assert p({"positions": {"a": {"option_id": "x", "qty": 1, "opened_event": None}}}) == "main"
     assert hc._feed_params({"include_other_trades": True}, {"positions": {}})["track"] == "all"
+
+
+def test_other_trades_off_shadow_exit_never_sells_the_main_position(home, monkeypatch, no_policy, told):
+    # review: with other trades off the agent reads every track while it
+    # holds an other-trades row; a shadow-book EXITED for the contract the
+    # MAIN pick holds (positions are keyed by contract alone) sold it
+    cfg, state = _setup(monkeypatch)
+    b, srv = StubBroker(), Server()
+    t0 = datetime.now(timezone.utc) - timedelta(minutes=1)
+    srv.lines.append(ev("ENTERED", "SPY", 700.0, "main", t0))
+    srv.lines.append(ev("ENTERED", "WULF", 15.0, "other", t0 + timedelta(seconds=1)))
+    _loop(cfg, state, b, srv, monkeypatch)
+    spy, wulf = f"SPY|{FAR}|700.0|C", f"WULF|{FAR}|15.0|C"
+    assert spy in state["positions"] and wulf in state["positions"]
+    cfg["include_other_trades"] = False
+    srv.lines.append(ev("EXITED", "SPY", 700.0, "other", t0 + timedelta(seconds=30)))
+    srv.lines.append(ev("EXITED", "WULF", 15.0, "other", t0 + timedelta(seconds=40)))
+    _loop(cfg, state, b, srv, monkeypatch)
+    assert srv.asked[-1]["track"] == "all"
+    assert spy in state["positions"]               # the shadow exit isn't its exit
+    assert wulf not in state["positions"]          # the held other trade's is
+    assert [c["ticker"] for c in b.calls].count("SPY") == 1
+    shadow = next(e["event_id"] for e in hc._parse_events({"events": srv.lines})
+                  if e["ticker"] == "SPY" and e["event"] == "EXITED")
+    assert shadow in state["seen"]                 # not looked at again
+    # the main pick's own exit still sells it
+    srv.lines.append(ev("EXITED", "SPY", 700.0, "main", t0 + timedelta(seconds=50)))
+    _loop(cfg, state, b, srv, monkeypatch)
+    assert spy not in state["positions"]
+
+
+def test_other_trades_off_untracked_row_reads_main_and_ignores_shadow_exit(home, monkeypatch, no_policy, told):
+    # a practice row of an older version says neither track nor opening
+    # event: it counts as the main pick (reads stay track=main, limit 20
+    # once read recently) and a shadow-book exit for its contract is not
+    # its exit
+    cfg, state = _setup(monkeypatch, other=False)
+    cfg["dry_run"] = True
+    key = f"SPY|{FAR}|700.0|C"
+    state["positions"][key] = {"option_id": "dry", "qty": 1, "dry": True}
+    state["feed_read"] = {"local": time.time() - 10, "server": None}
+    assert hc._feed_params(cfg, state) == {"limit": hc.FEED_LIMIT, "track": "main"}
+    t0 = datetime.now(timezone.utc) - timedelta(seconds=30)
+    events = hc._parse_events({"events": [ev("EXITED", "SPY", 700.0, "other", t0)]})
+    agent._handle_feed_events(events, cfg, state, StubBroker(), None, lambda s: None)
+    assert key in state["positions"]
+
+
+def test_other_trades_off_shadow_exit_does_not_skip_a_main_entry(home, monkeypatch, no_policy, told):
+    # review: other-track exits were "known" exits, so a main ENTERED was
+    # skipped as already over because the shadow book exited the contract
+    cfg, state = _setup(monkeypatch, other=False)
+    t0 = datetime.now(timezone.utc) - timedelta(seconds=40)
+    events = hc._parse_events({"events": [
+        ev("EXITED", "SPY", 700.0, "other", t0 + timedelta(seconds=20)),
+        ev("ENTERED", "SPY", 700.0, "main", t0)]})
+    b = StubBroker()
+    agent._handle_feed_events(events, cfg, state, b, None, lambda s: None)
+    assert f"SPY|{FAR}|700.0|C" in state["positions"]
+    assert [c["ticker"] for c in b.calls] == ["SPY"]
 
 
 # ── the window ───────────────────────────────────────────────────────────────
@@ -256,6 +319,50 @@ def test_no_previous_read_full_window_with_nothing_seen_is_a_gap(home, monkeypat
     state2["seen"] = [oldest]
     _loop(cfg2, state2, StubBroker(), srv, monkeypatch)
     assert hc.had_exit_access() is True and "feed_gap" not in state2
+
+
+def test_first_read_of_every_track_is_no_gap_by_itself(home, monkeypatch, no_policy, told):
+    # review: the first read after the upgrade has no record of the last
+    # read; the agent's seen ids are main-pick ones (it read track=main),
+    # and the newest MAX events of every track may list no main event at
+    # all: that is no sign anything was missed
+    cfg, state = _setup(monkeypatch, other=False)
+    b, srv = StubBroker(), Server()
+    t0 = datetime.now(timezone.utc) - timedelta(minutes=30)
+    old_main = ev("ENTERED", "QQQ", 600.0, "main", t0 - timedelta(hours=1))
+    srv.lines.append(old_main)
+    _flood(srv, t0, MAX + 5)
+    state["seen"] = [hc._parse_events({"events": [old_main]})[0]["event_id"]]
+    state["positions"][f"WULF|{FAR}|15.0|C"] = {"option_id": "stub", "qty": 1,
+                                                "track": "other"}
+    _loop(cfg, state, b, srv, monkeypatch)
+    assert srv.asked[-1] == {"limit": MAX, "track": "all"}
+    assert hc.had_exit_access() is True and "feed_gap" not in state
+    assert not any("may have been missed" in t for t in told)
+
+
+def test_feed_gap_sells_only_what_was_held_at_the_gap(monkeypatch):
+    # review: a feed_gap sold every row at the no-signal sell time,
+    # positions bought after the gap (whose exits arrive normally) too
+    a, b_ = f"SPY|{FAR}|700.0|C", f"QQQ|{FAR}|600.0|C"
+    state = {"positions": {
+        a: {"option_id": "x", "qty": 1, "opened_event": "E1", "live": True},
+        b_: {"option_id": "y", "qty": 1, "opened_event": "E2", "live": True}},
+        "signal_loss": {"since": time.time() - 600, "cause": "feed_gap"},
+        "feed_gap": {"since": time.time() - 600, "keys": [a], "opened": {a: "E1"}}}
+    assert [k for k, _r in agent._signal_loss_rows(state)] == [a]
+    # another cause: every row, as before
+    state["signal_loss"]["cause"] = "pass_ended"
+    assert sorted(k for k, _r in agent._signal_loss_rows(state)) == sorted([a, b_])
+    # the gap row sold and bought again under the same contract: not the
+    # position that may have missed its exit -> the gap ends
+    state["signal_loss"]["cause"] = "feed_gap"
+    state["positions"][a] = {"option_id": "x", "qty": 1, "opened_event": "E3"}
+    hc._LAST_POLL.update(exits=True, why="")
+    hc._check_window({}, state, lambda s: None, {"events": []},
+                     {"limit": hc.FEED_LIMIT}, [])
+    assert "feed_gap" not in state and hc.had_exit_access() is True
+    assert agent._signal_loss_rows(state) == []
 
 
 def test_feed_gap_cause_has_its_own_words():
