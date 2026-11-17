@@ -63,6 +63,7 @@ export const REASON_CODES = [
   "expiry_guard",
   "exit_remainder",
   "closed_outside",
+  "expired_unsold",
   "signal_loss",
   "after_signal_loss_sell",
   "pass_wont_cover",

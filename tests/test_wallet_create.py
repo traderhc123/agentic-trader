@@ -127,7 +127,7 @@ def test_fund_quote_math(monkeypatch):
     assert q["ok"] and q["usd"] == 128.0 and q["day_passes"] == 2
     # one $50 day pass at $64k/BTC = 78,125 sats, ceil to 100 -> 78,200
     assert q["day_pass_sats"] == 78_200
-    assert q["suggested_sats"] == 78_200       # no cap known
+    assert q["suggested_sats"] == 78_200 + 782  # + LNbits fee reserve; no cap known
     assert webui._fund_quote(0)["usd"] == 0
 
 

@@ -125,6 +125,9 @@ _ROW_CODES = ("past_expiry_guard", "exit_already_arrived",
               "rule_not_in_list", "rule_skip_list", "rule_side",
               "rule_min_strike", "rule_0dte", "rule_loss_streak",
               "expiry_guard", "exit_remainder", "closed_outside",
+              # a contract that expired still held: booked as an exit with
+              # no order (agent._expired_exit_row)
+              "expired_unsold",
               # the no-signal sell (agent.signal_loss_tick) and the two
               # entries it and a short wallet day-pass skip
               "signal_loss", "after_signal_loss_sell", "pass_wont_cover",
@@ -1593,7 +1596,8 @@ def _pass(cfg, state, now):
         for token in tokens:
             rec = cache.get(hc._token_id(token))
             rec = rec if isinstance(rec, dict) else {}
-            statuses.add(rec.get("status"))
+            # None while hc.poll can't rely on it either (hc._known_status)
+            statuses.add(hc._known_status(cfg, rec, token, now.timestamp()))
             if rec.get("status") in hc._USABLE and (
                     best is None or (rec.get("status") == "active"
                                      and best.get("status") != "active")):
@@ -1666,7 +1670,7 @@ def _exit_loss(cfg, state, now, blocked=False, acct=None):
 # the account, a re-sold remainder, the ledger check, the no-signal sell):
 # not signals
 _OWN_EVENT_IDS = ("expiry-guard|", "outside|", "ledger|", "exit-rest|",
-                  "no-signal|")
+                  "no-signal|", "expired|")
 
 
 def _last_signal(rows, rt):
@@ -1836,8 +1840,19 @@ def _pass_notice(cfg, state, signals=None):
             and (not isinstance(p, dict) or p.get("kind") == "day_pass")):
         return {"level": "warn", "code": "pass", "text": text}
     if isinstance(p, dict):
-        if signals.get("entry_access") is True \
-                or p.get("kind") in ("subscription", "not_needed"):
+        if signals.get("entry_access") is True:
+            return None
+        if p.get("kind") == "subscription":
+            # the one pass notice that is about the key itself: its balance
+            # can't pay for today (hc.poll; cleared on the next entry read)
+            try:
+                from sources import agenthc_day_trade_ideas as hc
+                if text == _text(hc.KEY_BALANCE_EMPTY_TEXT):
+                    return {"level": "warn", "code": "pass", "text": text}
+            except Exception:
+                pass
+            return None
+        if p.get("kind") == "not_needed":
             return None
         if (p.get("auto_pay") and cfg.get("lnbits_url")
                 and p.get("status") != "exits_only"
