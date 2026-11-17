@@ -24,6 +24,7 @@ needed to run it). Without a build, the built-in pages below are served.
 
 import json
 import os
+import re
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1011,6 +1012,9 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div>
    <div class="field"><label for="sf-cap">Max new entries per day</label>
     <input type="number" id="sf-cap" value="5" min="1"></div>
+   <div class="field"><label for="sf-pos">Open positions at once (most held at the same time,
+    real and practice together)</label>
+    <input type="number" id="sf-pos" value="10" min="1" max="1000"></div>
    <div class="field"><label for="sf-maxloss">Max daily loss in $ (optional, blank/0 = off) — once today's estimated
     realized loss reaches this, no new entries until tomorrow; exits still run</label>
     <input type="number" id="sf-maxloss" placeholder="e.g. 300" min="0"></div>
@@ -1443,9 +1447,11 @@ async function boot(){
   // defaults: re-saving the step must not switch the mode or reset the cap.
   SF={dry:(typeof st.dry_run==='boolean')?st.dry_run:null,
       cap:st.max_entries_per_day==null?null:String(st.max_entries_per_day),
+      pos:st.max_open_positions==null?null:String(st.max_open_positions),
       loss:st.max_daily_loss_usd>0?String(st.max_daily_loss_usd):''};
   if(SF.dry!==null){document.getElementById('sf-dry').checked=SF.dry;sfDryChanged();}
   if(SF.cap!==null)document.getElementById('sf-cap').value=SF.cap;
+  if(SF.pos!==null)document.getElementById('sf-pos').value=SF.pos;
   if(SF.loss)document.getElementById('sf-maxloss').value=SF.loss;
   cur=Math.min(maxUnlocked,STEPS.length-1);render();booted=true;
   loadBrokers();
@@ -1721,15 +1727,17 @@ async function doSizing(){
     :'<span class="err">'+esc(r.error)+'</span>';
   if(r.ok)done('s-sizing');
 }
-let SF={dry:null,cap:null,loss:''};
+let SF={dry:null,cap:null,pos:null,loss:''};
 async function doSafety(){
   const dry=document.getElementById('sf-dry').checked,cap=document.getElementById('sf-cap').value;
+  const pos=document.getElementById('sf-pos').value;
   let loss=document.getElementById('sf-maxloss').value;
   if(!String(loss).trim()&&SF.loss)loss='0';  // you cleared a limit that was set: off
   const body={};
   // mode and cap are sent only when you changed them here (or never set them)
   if(SF.dry===null||dry!==SF.dry)body.dry=dry;
   if(SF.cap===null||String(cap)!==SF.cap)body.cap=cap;
+  if(SF.pos===null||String(pos)!==SF.pos)body.positions=pos;
   const r=await api('/api/safety',{...body,seeded:booted,
     max_loss:loss,
     discord:document.getElementById('nt-discord').value,
@@ -1739,7 +1747,7 @@ async function doSafety(){
     policy:document.getElementById('pol-text').value,
     anthropic_key:document.getElementById('pol-key').value});
   if(r.ok){done('s-safety');
-    SF={dry:dry,cap:String(cap),loss:(Number(loss)>0)?String(loss):''};
+    SF={dry:dry,cap:String(cap),pos:String(pos),loss:(Number(loss)>0)?String(loss):''};
     document.getElementById('done-body').innerHTML=
      '<p class="ok">Setup complete — pick where your agent should live.</p>'+
      '<details><summary class="muted">…or start it from a terminal instead</summary>'+
@@ -2362,7 +2370,7 @@ async function refresh(){
     }else{$('pnl-total').textContent='';$('pnl-big').textContent='';}
     $('trades').innerHTML=rows.length?rows.map(x=>{
       const a=x.action||'';let ic='skip',icon='skip',title,pnl='<span class="pnl faint">—</span>';
-      const note=(a==='policy_veto'||a==='entry'||a==='exit')&&x.reason?esc(String(x.reason).slice(0,120)):'';
+      const note=(a==='policy_veto'||a==='entry'||a==='exit'||a==='skip_position_cap')&&x.reason?esc(String(x.reason).slice(0,120)):'';
       let n=note;
       // real-money rows get an explicit LIVE tag — absence of DRY-RUN is not a signal
       const mt=x.dry?'<span class="tag dry">DRY-RUN</span>':(x.dry===false?'<span class="tag live">LIVE</span>':'');
@@ -3387,6 +3395,37 @@ def _apply_entry_cap(cfg, raw_cap, seeded):
         cfg["max_entries_per_day"] = 5
 
 
+def _position_cap_value(raw):
+    """(value, error) for the Safety form's "Open positions at once".
+    Blank or not sent: (None, "") = keep what is set."""
+    import agent as A
+    raw = str(raw if raw is not None else "").strip()
+    if not raw:
+        return None, ""
+    lo, hi = A.POSITION_CAP_RANGE
+    try:
+        val = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        val = None
+    if val is None or val != int(val) or not lo <= val <= hi:
+        return None, (f"Open positions at once must be a whole number from "
+                      f"{lo} to {hi}. Nothing was changed.")
+    return int(val), ""
+
+
+def _apply_position_cap(cfg, val, seeded):
+    """The most positions open at once from a checked form value
+    (_position_cap_value). None: keep what is set. As for the daily cap,
+    only a form filled in from the current settings (`seeded`) may RAISE
+    it: a page still open from before an update has no say over it."""
+    import agent as A
+    if val is None:
+        return
+    if seeded is not True and val > A.saved_position_cap(cfg):
+        return
+    A.set_position_cap(cfg, val)
+
+
 def _apply_daily_loss(cfg, raw_loss):
     """The daily loss limit from a form value; blank keeps any existing
     limit (re-running the wizard), 0 = off."""
@@ -3554,7 +3593,7 @@ def _v2_text(v, name, longest=500):
 # ignores what is outside; /v2 refuses it and says the range.
 _V2_LIMIT_RANGES = {"max_entries_per_day": (1, 1000),
                     "max_daily_loss_usd": (0, 1_000_000_000),  # 0 = no limit
-                    "max_open_positions": (1, 1000)}
+                    "max_open_positions": (1, 1000)}  # = agent.POSITION_CAP_RANGE
 # trade size: mode -> (low, high, whole number, name); budget and percent
 # must be more than `low`, contracts at least `low`
 _V2_SIZE_RANGES = {"budget": (0, 10_000_000, False, "dollars per trade"),
@@ -3956,6 +3995,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "dry_run": (bool(cfg["dry_run"]) if cfg.get("dry_run") is not None
                         else None),
             "max_entries_per_day": cfg.get("max_entries_per_day"),
+            "max_open_positions": cfg.get("max_open_positions"),
             "max_daily_loss_usd": cfg.get("max_daily_loss_usd"),
         }
 
@@ -4567,6 +4607,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                                   data.get("anthropic_key", ""))
         if perr:
             return {"ok": False, "error": perr}
+        positions, perr = _position_cap_value(data.get("positions"))
+        if perr:
+            return {"ok": False, "error": perr}
         # Mode and cap change only when the form sends them (it sends what
         # the owner changed). Left out, they stay as they are — saving a
         # ticker rule must never switch the mode or reset the cap. Never
@@ -4576,6 +4619,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         elif cfg.get("dry_run") is None:
             cfg["dry_run"] = True
         _apply_entry_cap(cfg, data.get("cap"), data.get("seeded"))
+        _apply_position_cap(cfg, positions, data.get("seeded"))
         _apply_daily_loss(cfg, data.get("max_loss"))
         cfg.setdefault("max_event_age_s", 300)
         import rules
@@ -4835,9 +4879,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         if handled:
             return {"reply": reply}
         s = d_status(None)
-        return {"reply": _ask_llm((cfg_getter() if cfg_getter else cfg), text,
-                                  s.get("fields", {}),
-                                  get_trades() if get_trades else [])}
+        answer = _ask_llm((cfg_getter() if cfg_getter else cfg), text,
+                          s.get("fields", {}),
+                          get_trades() if get_trades else [])
+        if _asks_for_positions_limit(text):
+            answer = _POSITIONS_LIMIT_NOTE + (answer or "")
+        return {"reply": answer}
 
     # ── /v2 settings API ─────────────────────────────────────────────────────
     # Typed payloads in; underneath, the code the classic pages and the chat
@@ -6819,12 +6866,30 @@ _V2_ASK_SYSTEM = (
     "provided. You cannot place, modify, or size trades, and you cannot "
     "change any setting: this box only answers. For control, tell the user "
     "where it is on their dashboard: Pause / Resume and Practice / LIVE in "
-    "the bar at the top; trade size, daily limits, the expiry-day sell time "
+    "the bar at the top; trade size, daily limits, the most positions open "
+    "at once, the expiry-day sell time "
     "and which signals to take in Rules & limits; the signal source, signal "
     "days and the payment wallet in Signals & pass; the broker, AI helper, "
     "alerts, start at login, stopping or starting the agent and code changes "
     "in Settings. Never give investment advice; you may explain what the "
     "agent did and why (per its logs). Be concise and plain-spoken.")
+
+
+# "I want 20 open trades at once", "max open positions 20": not a chat
+# command, so it is answered, never acted on. The answer starts by saying so.
+_POSITIONS_LIMIT_RE = re.compile(
+    r"(?=.*\d)(?=.*\b(?:positions?|trades?)\b)"
+    r"(?=.*\b(?:open|at once|at a time|at the same time|concurrent|"
+    r"simultaneous)\b)"
+    r"(?=.*\b(?:want|wanna|like|set|max|maximum|limit|cap|allow|up to|"
+    r"raise|increase|more|change|let|can|could)\b)", re.I | re.S)
+_POSITIONS_LIMIT_NOTE = ("Nothing was changed. To change how many positions "
+                         "can be open at once, say: set positions N "
+                         "(for example: set positions 20).\n\n")
+
+
+def _asks_for_positions_limit(text):
+    return bool(_POSITIONS_LIMIT_RE.match(str(text or "")))
 
 
 def _ask_llm(cfg, question, status_fields, trades, system=None):
@@ -6846,8 +6911,9 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "modify, or size trades — for control, tell the user the "
                 "exact command (pause, resume, dry on/off, set budget N, "
                 "set contracts N, set percent N, set other budget|contracts|"
-                "percent N, other sizing same, other trades on|off, set positions N, "
-                "set cap N, stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N, set autopay cap N|auto). Never give investment advice; you may "
+                "percent N, other sizing same, other trades on|off, "
+                "set positions N (most positions open at once), "
+                "set cap N (new trades per day), stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N, set autopay cap N|auto). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
             support.scrub(

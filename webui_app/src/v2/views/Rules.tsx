@@ -865,7 +865,8 @@ function PolicyRow({ page }: { page: Page }) {
               }}
             />
             <span className="help" id={`${id}-h`}>
-              They can only stop new trades; the agent always sells what it holds on the exit signal. This does not change Practice or LIVE.
+              They can only stop new trades; the agent always sells what it holds on the exit signal. This does not change Practice or LIVE. To allow
+              more (open positions at once, new trades per day), change the limits on this page.
             </span>
           </div>
           {policy && (

@@ -304,7 +304,7 @@ export function LlmStep() {
         }
       >
         {st?.policy_on && <p className="m-0 text-sm text-fg2">You already have plain-English rules saved. Typing here replaces them.</p>}
-        <Field htmlFor="pol-text" label="My trading policy" help="It can only say no to a trade, never start one.">
+        <Field htmlFor="pol-text" label="My trading policy" help="It can only say no to a trade, never start one. To allow more trades, change the limits in the Safety step.">
           <Textarea
             id="pol-text"
             rows={4}
@@ -619,6 +619,7 @@ function safetyShown(st: WizardState | null | undefined) {
   return {
     dry: typeof st?.dry_run === "boolean" ? st.dry_run : true,
     cap: st?.max_entries_per_day != null ? String(st.max_entries_per_day) : "5",
+    positions: st?.max_open_positions != null ? String(st.max_open_positions) : "10",
     max_loss: st?.max_daily_loss_usd && st.max_daily_loss_usd > 0 ? String(st.max_daily_loss_usd) : "",
     rule_tickers: (r.rule_tickers || []).join(", "),
     rule_skip_tickers: (r.rule_skip_tickers || []).join(", "),
@@ -638,6 +639,7 @@ export function SafetyStep() {
   const s0 = safetyShown(st);
   const [dry, setDry] = useState(s0.dry);
   const [cap, setCap] = useState(s0.cap);
+  const [positions, setPositions] = useState(s0.positions);
   const [maxLoss, setMaxLoss] = useState(s0.max_loss);
   const [discord, setDiscord] = useState("");
   const [ntfy, setNtfy] = useState("");
@@ -662,6 +664,7 @@ export function SafetyStep() {
     shown.current = s;
     setDry(s.dry);
     setCap(s.cap);
+    setPositions(s.positions);
     setMaxLoss(s.max_loss);
     setTickers(s.rule_tickers);
     setSkipTickers(s.rule_skip_tickers);
@@ -680,6 +683,7 @@ export function SafetyStep() {
     const now: ReturnType<typeof safetyShown> = {
       dry,
       cap,
+      positions,
       max_loss: maxLoss,
       rule_tickers: tickers,
       rule_skip_tickers: skipTickers,
@@ -744,6 +748,22 @@ export function SafetyStep() {
       <Block label="Limits">
         <Field htmlFor="sf-cap" label="Max new entries per day" className="max-w-xs">
           <Input id="sf-cap" type="number" min={1} value={cap} onChange={(e) => setCap(e.target.value)} className="font-mono" />
+        </Field>
+        <Field
+          htmlFor="sf-positions"
+          label="Open positions at once"
+          help="The most positions held at the same time, real and practice counted together."
+          className="max-w-xs"
+        >
+          <Input
+            id="sf-positions"
+            type="number"
+            min={1}
+            max={1000}
+            value={positions}
+            onChange={(e) => setPositions(e.target.value)}
+            className="font-mono"
+          />
         </Field>
         <Field
           htmlFor="sf-maxloss"
