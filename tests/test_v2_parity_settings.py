@@ -469,7 +469,7 @@ def test_making_the_agents_wallet_is_the_classic_create(home, app, lnbits):
                       lambda: c.post("/api/wallet/create", {}),
                       lambda: c.confirmed("/api/v2/wallet/create", {}),
                       scrub=lambda o: o.update(lnbits_admin_key="k", lnbits_wallet_page="p"))
-    assert out["source"] == "agenthc" and out["max_autopay_sats"] == 30_000
+    assert out["source"] == "agenthc" and out["max_autopay_sats"] == "auto"
     assert len(lnbits["made"]) == 2
     # the preview names the source change too, and no link to the wallet
     write_cfg(home, start)

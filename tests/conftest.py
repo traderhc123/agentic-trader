@@ -24,6 +24,18 @@ def _no_phone_remote(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_pass_price_ask(monkeypatch):
+    """Pass prices come from AgentHC (pass_prices asks it): tests start with
+    a cache that never expires and holds no server prices, so the built-in
+    fallback prices apply and nothing goes to the network. Tests of the
+    server-price path reset hc._price_cache themselves."""
+    from sources import agenthc_day_trade_ideas as hc
+    monkeypatch.setattr(hc, "_price_cache",
+                        {"at": float("inf"), "usd": None, "sats": None})
+    monkeypatch.setattr(hc, "_live_btc_usd", lambda: 0.0)   # the auto cap's BTC price
+
+
+@pytest.fixture(autouse=True)
 def _no_order_waits(monkeypatch):
     """moomoo's exit fill check polls with sleeps: none in tests."""
     from brokers import moomoo

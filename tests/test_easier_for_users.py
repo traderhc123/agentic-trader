@@ -106,17 +106,17 @@ def test_failed_diagnosis_names_the_proxy(monkeypatch):
 
 def test_unsold_pass_size_is_a_friendly_message(fresh_http, monkeypatch):
     monkeypatch.setattr(requests, "post", lambda url, **kw: _R(400, {
-        "detail": {"error": "invalid_days", "options": [5, 20, 60]}}))
+        "detail": {"error": "invalid_days", "options": [5]}}))
     with pytest.raises(hc.PassSizeUnavailable) as exc:
         hc.buy_pass(1)
-    assert "1-day passes aren't on sale right now — pick 5, 20, 60" in str(exc.value)
+    assert "1-day passes aren't on sale right now — pick 5 signal days." in str(exc.value)
 
 
 def test_refilling_pass_size_is_a_friendly_message(fresh_http, monkeypatch):
     monkeypatch.setattr(requests, "post", lambda url, **kw: _R(503, {
         "detail": {"error": "pass_size_temporarily_unavailable"}}))
     with pytest.raises(hc.PassSizeRefilling) as exc:
-        hc.buy_pass(60)
+        hc.buy_pass(5)
     assert "briefly unavailable while our node refills" in str(exc.value)
     assert isinstance(exc.value, hc.PassSizeUnavailable)
 
@@ -199,8 +199,35 @@ def test_pass_options_reads_the_servers_sizes(fresh_http, monkeypatch):
 
 def test_pass_options_empty_list_means_all_paused(fresh_http, monkeypatch):
     monkeypatch.setattr(requests, "post", lambda url, **kw: _R(400, {
-        "detail": {"error": "invalid_days", "options": [], "paused": [1, 5, 20, 60]}}))
+        "detail": {"error": "invalid_days", "options": [], "paused": [1, 5]}}))
     assert hc.pass_options() == []
+
+
+def test_pass_offer_reads_the_servers_prices(fresh_http, monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda url, **kw: _R(400, {
+        "detail": {"error": "invalid_days", "options": [1, 5], "paused": [],
+                   "prices_usd": {"1": 50.0, "5": 225.0},
+                   "prices_sats": {"1": 55_600, "5": 250_000}}}))
+    assert hc.pass_offer() == {"options": [1, 5],
+                               "prices_usd": {1: 50.0, 5: 225.0},
+                               "prices_sats": {1: 55_600, 5: 250_000}}
+
+
+def test_pass_offer_without_prices_from_an_older_server(fresh_http, monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda url, **kw: _R(400, {
+        "detail": {"error": "invalid_days", "options": [1, 5]}}))
+    assert hc.pass_offer() == {"options": [1, 5], "prices_usd": None,
+                               "prices_sats": None}
+    assert hc.PASS_PRICES_USD == {1: 50.0, 5: 225.0}
+
+
+def test_pass_offer_drops_unusable_prices(fresh_http, monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda url, **kw: _R(400, {
+        "detail": {"error": "invalid_days", "options": [1, 5],
+                   "prices_usd": {"1": "x", "5": 225, "0": 9, "7": -1},
+                   "prices_sats": "nope"}}))
+    out = hc.pass_offer()
+    assert out["prices_usd"] == {5: 225.0} and out["prices_sats"] is None
 
 
 def test_pass_options_unknown_when_server_unreachable(fresh_http, monkeypatch):
@@ -218,6 +245,109 @@ def test_wizard_hides_pass_sizes_not_on_sale():
     assert "Array.isArray(r.options)" in html          # [] hides every card
     assert "poll(passSizes" in html                    # sizes come back on their own
     assert 'id="pass-sizes-note"' in html
+
+
+def test_wizard_sells_one_day_and_five_day_passes_only():
+    html = webui._WIZARD_HTML
+    assert 'buyPass(1)' in html and 'buyPass(5)' in html
+    assert 'buyPass(20)' not in html and 'buyPass(60)' not in html
+    # built-in prices until the server's arrive; every price in the copy is
+    # a [data-pass-usd] the server's prices_usd rewrites
+    assert '≈ <span data-pass-usd="1">$50</span>' in html
+    assert '≈ <span data-pass-usd="5">$225</span>' in html and "Save $25" in html
+    assert "passPrices(r.prices_usd)" in html
+    assert "~$10" not in html and "~$50" not in html   # no hard-coded day price left
+
+
+# ── pass prices: the server's, else the built-in fallback ──
+
+SERVER_PRICES = {"detail": {"error": "invalid_days", "options": [1, 5],
+                            "prices_usd": {"1": 40.0, "5": 180.0},
+                            "prices_sats": {"1": 61_000, "5": 274_000}}}
+
+
+@pytest.fixture
+def price_cache(monkeypatch):
+    """An empty, expired price cache (conftest's never expires)."""
+    c = {"at": 0.0, "usd": None, "sats": None}
+    monkeypatch.setattr(hc, "_price_cache", c)
+    return c
+
+
+def _posts(monkeypatch, answer):
+    calls = []
+
+    def post(url, **kw):
+        calls.append(kw.get("json"))
+        if isinstance(answer, Exception):
+            raise answer
+        return _R(400, answer)
+    monkeypatch.setattr(requests, "post", post)
+    return calls
+
+
+def test_pass_prices_come_from_the_server_and_are_cached(fresh_http, monkeypatch,
+                                                         price_cache):
+    calls = _posts(monkeypatch, SERVER_PRICES)
+    p = hc.pass_prices()
+    assert p == {"usd": {1: 40.0, 5: 180.0}, "sats": {1: 61_000, 5: 274_000},
+                 "from_server": True}
+    assert hc.day_pass_price() == {"usd": 40.0, "sats": 61_000, "from_server": True}
+    assert calls == [{"days": 0}]                    # asked once, then cached
+
+
+def test_pass_prices_fall_back_when_the_server_cannot_be_reached(
+        fresh_http, monkeypatch, price_cache):
+    monkeypatch.setattr(nc, "proxy_for", lambda url: "")
+    calls = _posts(monkeypatch, requests.exceptions.ConnectionError("down"))
+    assert hc.pass_prices() == {"usd": {1: 50.0, 5: 225.0}, "sats": None,
+                                "from_server": False}
+    assert hc.day_pass_price() == {"usd": 50.0, "sats": None, "from_server": False}
+    assert len(calls) == 1                           # retried in a minute, not every call
+
+
+def test_pass_prices_fall_back_for_an_older_server(fresh_http, monkeypatch, price_cache):
+    _posts(monkeypatch, {"detail": {"error": "invalid_days", "options": [1, 5]}})
+    assert hc.pass_prices() == {"usd": {1: 50.0, 5: 225.0}, "sats": None,
+                                "from_server": False}
+
+
+def test_pass_prices_keep_the_last_server_prices_while_unreachable(
+        fresh_http, monkeypatch, price_cache):
+    _posts(monkeypatch, SERVER_PRICES)
+    hc.pass_prices()
+    price_cache["at"] = 0.0                          # expired
+    monkeypatch.setattr(nc, "proxy_for", lambda url: "")
+    _posts(monkeypatch, requests.exceptions.ConnectionError("down"))
+    assert hc.day_pass_price()["usd"] == 40.0
+
+
+def test_fund_quote_uses_the_servers_day_price(monkeypatch):
+    monkeypatch.setattr(hc, "_price_cache", {"at": float("inf"),
+                                             "usd": {1: 40.0, 5: 180.0},
+                                             "sats": {1: 61_000, 5: 274_000}})
+    monkeypatch.setattr(webui, "_btc_usd", lambda: 64000.0)
+    q = webui._fund_quote(200_000)                   # $128
+    assert q["day_pass_usd"] == 40.0 and q["day_passes"] == 3
+    assert q["day_pass_sats"] == q["suggested_sats"] == 61_000   # the server's sats
+
+
+def test_fund_quote_reports_the_day_price_without_a_btc_price(monkeypatch):
+    monkeypatch.setattr(webui, "_btc_usd", lambda: 0.0)
+    q = webui._fund_quote(0)
+    assert q["ok"] is False and q["day_pass_usd"] == 50.0      # fallback
+
+
+def test_doctor_day_price_server_then_fallback(monkeypatch):
+    import agent
+    monkeypatch.setattr(hc, "_price_cache", {"at": float("inf"),
+                                             "usd": {1: 40.0}, "sats": {1: 61_000}})
+    assert agent._day_pass_price() == (40.0, 61_000)
+    monkeypatch.setattr(hc, "_price_cache", {"at": float("inf"), "usd": None, "sats": None})
+    monkeypatch.setattr(webui, "_btc_usd", lambda: 0.0)
+    assert agent._day_pass_price() == (50.0, agent.DAY_PASS_SATS_EST)
+    monkeypatch.setattr(webui, "_btc_usd", lambda: 100_000.0)
+    assert agent._day_pass_price() == (50.0, 50_000)
 
 
 def test_polled_status_errors_are_diagnosed_once_per_minute(monkeypatch):

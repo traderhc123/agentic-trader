@@ -57,7 +57,8 @@ MARKET_TZ = ZoneInfo("America/New_York")
 import llm_policy
 from brokers import BROKERS, account_tag, order_guard
 from brokers.market_hours import REGULAR_CLOSE_MIN, close_minute, is_trading_day
-from lightning_wallet import WalletError, print_funding_invoice, wallet_from_cfg
+from lightning_wallet import (DAY_PASS_SATS_EST, WalletError, print_funding_invoice,
+                              wallet_from_cfg)
 from notifications import notify
 from notifications import setup as notifications_setup
 from sources import SOURCES
@@ -6162,7 +6163,36 @@ def _apply_command(text):
 
 # commands that change nothing (a trailing "?" is fine: "status?")
 _SHOW_COMMANDS = ("status", "rules", "my rules", "show rules", "autostart",
-                  "start at login", "expiry guard", "expiry alert")
+                  "start at login", "expiry guard", "expiry alert",
+                  "autopay cap")
+
+
+def _autopay_cap_command(t, cfg):
+    """'autopay cap' shows the wallet's per-invoice auto-pay cap; 'set
+    autopay cap N' fixes it at N sats (0 = never auto-pay); 'set autopay
+    cap auto' follows AgentHC's day price again. (handled, reply)"""
+    from sources import agenthc_day_trade_ideas as hc
+    usage = ("Usage: set autopay cap 80000   (sats, a fixed cap) · "
+             "set autopay cap auto   (follows AgentHC's day price)")
+    if t == "autopay cap":
+        return True, f"Auto-pay cap per day-pass: {hc.autopay_cap_words(cfg)}. {usage}"
+    if t in ("set autopay cap auto", "set autopay cap to auto"):
+        cfg["max_autopay_sats"] = hc.AUTOPAY_AUTO
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, f"Auto-pay cap per day-pass: {hc.autopay_cap_words(cfg)}."
+    val = _command_whole(t, "set autopay cap")
+    if val is None or not 0 <= val <= 10_000_000:
+        return True, _NOTHING_CHANGED + usage
+    if val == hc.AUTOPAY_FALLBACK_SATS:
+        return True, (_NOTHING_CHANGED + f"{val:,} was the old default and is "
+                      "read as auto. Pick another number (e.g. 31000), or say "
+                      "'set autopay cap auto'.")
+    cfg["max_autopay_sats"] = val
+    _save(CONFIG_PATH, cfg, private=True)
+    if val == 0:
+        return True, "Auto-pay cap set to 0: the wallet never pays a day-pass by itself."
+    return True, (f"Auto-pay cap per day-pass: {hc.autopay_cap_words(cfg)}. "
+                  "'set autopay cap auto' follows AgentHC's price again.")
 
 
 def _command(t, cfg, text):
@@ -6358,6 +6388,8 @@ def _command(t, cfg, text):
         set_position_cap(cfg, val)
         _save(CONFIG_PATH, cfg, private=True)
         return True, f"Max concurrent open positions set to {val}."
+    if t == "autopay cap" or t.startswith("set autopay cap"):
+        return _autopay_cap_command(t, cfg)
     if t.startswith("set max loss"):
         val = _command_number(t, "set max loss")
         if val is None:
@@ -7251,6 +7283,28 @@ def _read_holdings_once(fn, client, cfg, rows):
                   or "the answer wasn't clear, so the agent would change nothing")
 
 
+def _day_pass_price():
+    """(usd, sats) for one feed day-pass: AgentHC's own price (the shared
+    hc.day_pass_price; the built-in fallback when the server can't say).
+    sats: the server's figure, else that USD at the live BTC price (the
+    wizard's quote), else DAY_PASS_SATS_EST."""
+    from sources import agenthc_day_trade_ideas as hc
+    try:
+        day = hc.day_pass_price()
+    except Exception:
+        day = {"usd": hc.DAY_PASS_USD, "sats": None}
+    if day.get("sats"):
+        return day["usd"], int(day["sats"])
+    try:
+        import webui
+        q = webui._fund_quote(0)
+        if q.get("ok") and int(q.get("day_pass_sats") or 0) > 0:
+            return day["usd"], int(q["day_pass_sats"])
+    except Exception:
+        pass
+    return day["usd"], DAY_PASS_SATS_EST
+
+
 def doctor_checks():
     """Every readiness check as data: [{id, label, ok, detail, fix, who}].
     who = "owner" for steps only the human can do (agreement, Robinhood
@@ -7420,9 +7474,11 @@ def _feed_access_check(cfg, state, check):
     if wallet:
         try:
             bal = wallet.balance_sats()
-            check("feed_access", bal >= 10_000, "Wallet funded",
-                  f"{bal:,} sats ({'~' + str(bal // 12_000) + ' more market day(s)' if bal >= 10_000 else 'below one ~$10 day-pass'})",
-                  "python agent.py fund 50000   (the OWNER pays the invoice)",
+            from sources.agenthc_day_trade_ideas import usd_words
+            day_usd, day = _day_pass_price()
+            check("feed_access", bal >= day, "Wallet funded",
+                  f"{bal:,} sats ({'~' + str(bal // day) + ' more market day(s)' if bal >= day else f'below one ~{usd_words(day_usd)} day-pass (~{day:,} sats)'})",
+                  "python agent.py fund 100000   (the OWNER pays the invoice)",
                   who="owner")
         except WalletError as exc:
             check("feed_access", False, "Lightning wallet", str(exc)[:80],

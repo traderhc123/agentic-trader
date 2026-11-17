@@ -7,7 +7,7 @@ carry AgentHC's own paper P&L %% statistic. Educational commentary, NOT
 investment advice (full terms in the feed's `disclosure` field and this
 repo's DISCLAIMER.md).
 
-Access is sats-based: the agent auto-buys a ~$10/day Lightning day-pass
+Access is sats-based: the agent auto-buys a ~$50/day Lightning day-pass
 (price floats with Bitcoin's USD price) from its built-in wallet, or uses a
 Premium AgentHC API key. Free aggregate track record (hypothetical, labeled):
 GET https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record
@@ -34,13 +34,24 @@ def _now_et():
 
 NAME = "agenthc"
 DESCRIPTION = ("AgentHC Agentic Day Trade Ideas — journal events from a "
-               "published paper-trade system (~$10/day in sats, or Premium key)")
+               "published paper-trade system (~$50/day in sats, or Premium key)")
 
 AGENTHC_API = os.getenv("AGENTHC_API", "https://api.traderhc.com")
 FEED_PATH = "/api/v1/trading/day-trade-ideas"
 
 
 PASS_PATH = FEED_PATH + "/pass"
+# Prepaid pass prices in USD (paid in sats at the live BTC price): 1 signal
+# day or a 5-day bundle. FALLBACK only, for a server that can't be reached
+# or doesn't send prices: AgentHC sends prices_usd/prices_sats with its pass
+# options (pass_prices() reads them) and sets the real price on each
+# invoice. The 24h wallet day-pass costs the same as 1 signal day.
+DAY_PASS_USD = 50.0
+PASS_PRICES_USD = {1: 50.0, 5: 225.0}
+_PRICE_TTL_S = 300              # how long the server's prices are reused
+_PRICE_RETRY_S = 60             # after a failed ask: try again this soon
+# The server's last prices: {days: usd} / {days: sats}, or None.
+_price_cache = {"at": 0.0, "usd": None, "sats": None}
 PASS_LOW_DAYS = 2               # warn when this many signal days (or fewer) remain
 # Server statuses that still read the feed: "exits_only" = days used up, but
 # exit signals keep coming for a few market days so open positions can close.
@@ -48,7 +59,7 @@ _USABLE = ("active", "exits_only")
 _PENDING_RECHECK_S = 60         # status poll cadence while an invoice is unpaid
 _INVOICE_LIFETIME_S = 3600      # server invoices expire after 1h
 
-# Wallet day-pass (the agent pays ~$10 from its own wallet).
+# Wallet day-pass (the agent pays ~$50 from its own wallet).
 _DAYPASS_S = 23 * 3600          # how long the agent uses a paid day-pass token
 _OPEN_MIN = 9 * 60 + 30         # regular session opens 9:30 AM ET
 _BUY_LEAD_MIN = 60              # earliest purchase: this long before the open
@@ -145,18 +156,188 @@ def buy_pass(days, extend_token=None):
     return resp.json()
 
 
-def pass_options():
-    """Pass sizes (signal days) the server sells right now, e.g. [1, 5];
-    [] when every size is paused (the node is refilling); None if it can't
-    be asked. The server answers a days=0 request with its options and
-    creates no invoice."""
+def _price_map(raw, cast):
+    """{days: price} from the server's {"1": 50.0, "5": 225.0} (string
+    keys); entries that aren't a positive size and positive price are
+    dropped. None when the field is missing or nothing usable is left."""
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for k, v in raw.items():
+        try:
+            days, price = int(k), cast(v)
+        except (TypeError, ValueError):
+            continue
+        if days > 0 and price > 0 and not isinstance(v, bool):
+            out[days] = price
+    return out or None
+
+
+def pass_offer():
+    """What the server sells right now: {"options": [1, 5] | [] | None,
+    "prices_usd": {1: 50.0, 5: 225.0} | None, "prices_sats": {1: n, 5: n}
+    | None}. options: [] when every size is paused (the node is refilling),
+    None if the server can't be asked. The prices are None from servers
+    that don't send them (the pages then show PASS_PRICES_USD). The server
+    answers a days=0 request with its options and creates no invoice."""
+    out = {"options": None, "prices_usd": None, "prices_sats": None}
     try:
         resp = _http.post(f"{AGENTHC_API}{PASS_PATH}", json={"days": 0}, timeout=10)
         detail = resp.json().get("detail") or {}
-        opts = detail.get("options") if isinstance(detail, dict) else None
-        return sorted(int(n) for n in opts) if isinstance(opts, list) else None
     except Exception:
+        return out
+    if not isinstance(detail, dict):
+        return out
+    opts = detail.get("options")
+    try:
+        out["options"] = sorted(int(n) for n in opts) if isinstance(opts, list) else None
+    except (TypeError, ValueError):
+        out["options"] = None
+    out["prices_usd"] = _price_map(detail.get("prices_usd"), float)
+    out["prices_sats"] = _price_map(detail.get("prices_sats"), int)
+    # the server answered: its prices (None from an older server) are now
+    # the ones to show
+    _price_cache.update(at=time.time(), usd=out["prices_usd"],
+                        sats=out["prices_sats"])
+    return out
+
+
+def pass_prices(max_age=_PRICE_TTL_S):
+    """The pass prices to show: {"usd": {1: 50.0, 5: 225.0}, "sats":
+    {1: n, 5: n} | None, "from_server": bool}. The ONE place the client
+    gets AgentHC's prices (prepaid passes and the wallet day-pass alike).
+    Asks the server at most every max_age seconds (any pass_offer() call
+    refreshes it too); PASS_PRICES_USD (and no sats) when the server can't
+    be reached and never answered, or is an older one without prices."""
+    c = _price_cache
+    if time.time() - c["at"] >= max_age:
+        pass_offer()
+        if time.time() - c["at"] >= max_age:   # not reached: keep what we had
+            c["at"] = time.time() - max_age + _PRICE_RETRY_S
+    usd = c["usd"]
+    return {"usd": dict(usd) if usd else dict(PASS_PRICES_USD),
+            "sats": dict(c["sats"]) if c["sats"] else None,
+            "from_server": bool(usd)}
+
+
+def day_pass_price():
+    """One day's price, {"usd": 50.0, "sats": n | None, "from_server": bool}:
+    1 signal day, which is also what the 24h wallet day-pass costs. sats is
+    the server's own figure (None when it sent none)."""
+    p = pass_prices()
+    return {"usd": p["usd"].get(1) or DAY_PASS_USD,
+            "sats": (p["sats"] or {}).get(1), "from_server": p["from_server"]}
+
+
+def usd_words(v):
+    """"$50" / "$49.50" for copy."""
+    v = float(v)
+    return f"${v:,.0f}" if v == int(v) else f"${v:,.2f}"
+
+
+# ── auto-pay caps ────────────────────────────────────────────────────────────
+# max_autopay_sats (per invoice) and max_autopay_sats_per_day default to
+# "auto": AgentHC's own 1-day price in sats + 10% (BTC can move between the
+# quote and the invoice), rounded up to 1,000 sats, never above
+# AUTOPAY_AUTO_CEILING_SATS. A number the owner saved is used exactly as is
+# (no ceiling). 30000, the fixed default setup used to write, counts as
+# auto. With no price from AgentHC the cap is AUTOPAY_FALLBACK_SATS (fails
+# safe). autopay_caps() is the ONE place a cap is read.
+AUTOPAY_AUTO = "auto"
+AUTOPAY_FALLBACK_SATS = 30_000
+AUTOPAY_AUTO_CEILING_SATS = 150_000
+_AUTOPAY_MARGIN = 1.10
+
+
+def _plus_margin_k(sats):
+    """sats + 10%, rounded up to 1,000 (rounded to 6 places first, so float
+    noise like 55000.000000000004 doesn't add a thousand)."""
+    n = -(-round(float(sats) * _AUTOPAY_MARGIN, 6) // 1)
+    return int(-(-n // 1000) * 1000)
+
+
+def _live_btc_usd():
+    """USD per BTC (the dashboard's 5-minute cached quote), 0.0 if none."""
+    try:
+        import webui
+        return float(webui._btc_usd() or 0.0)
+    except Exception:
+        return 0.0
+
+
+def owner_autopay_cap(value):
+    """The owner's fixed cap from a saved max_autopay_sats(_per_day), or
+    None for auto: missing, "auto", the old default 30000, or anything that
+    isn't a whole number of sats (0 or more)."""
+    if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, str):
+        v = value.strip().replace(",", "").replace("_", "")
+        if not v.isdigit():
+            return None
+        value = int(v)
+    if not isinstance(value, (int, float)) or value < 0 or value != int(value):
+        return None
+    n = int(value)
+    return None if n == AUTOPAY_FALLBACK_SATS else n
+
+
+def auto_autopay_cap():
+    """{"sats": n, "basis": "server_sats" | "server_usd" | "fallback"}: the
+    auto cap now. server_sats = AgentHC's 1-day sats + 10%; server_usd = its
+    USD day price at the live BTC price + 10% (it sent no sats); fallback =
+    AUTOPAY_FALLBACK_SATS (no price from AgentHC, or no BTC price)."""
+    day = day_pass_price()
+    base, basis = None, "fallback"
+    if day.get("sats"):
+        base, basis = float(day["sats"]), "server_sats"
+    elif day.get("from_server"):
+        btc = _live_btc_usd()
+        if btc > 0:
+            base, basis = float(day["usd"]) / btc * 1e8, "server_usd"
+    if base is None or base <= 0:
+        return {"sats": AUTOPAY_FALLBACK_SATS, "basis": "fallback"}
+    sats = _plus_margin_k(base)
+    return {"sats": min(sats, AUTOPAY_AUTO_CEILING_SATS), "basis": basis}
+
+
+def autopay_caps(cfg):
+    """The auto-pay caps in force: {"per_invoice": n, "per_day": n,
+    "per_invoice_auto": bool, "per_day_auto": bool, "auto_basis": str |
+    None}. per_day defaults to the per-invoice cap (one pass a day)."""
+    inv = owner_autopay_cap(cfg.get("max_autopay_sats"))
+    day = owner_autopay_cap(cfg.get("max_autopay_sats_per_day"))
+    auto = auto_autopay_cap() if inv is None else None
+    per_invoice = inv if inv is not None else auto["sats"]
+    return {"per_invoice": per_invoice,
+            "per_day": day if day is not None else per_invoice,
+            "per_invoice_auto": inv is None, "per_day_auto": day is None,
+            "auto_basis": auto["basis"] if auto else None}
+
+
+def autopay_cap_words(cfg, caps=None):
+    """"Auto: follows AgentHC's day price (now ≈ 61,000 sats)" or "Fixed:
+    60,000 sats" — the per-invoice cap, for the owner."""
+    caps = caps or autopay_caps(cfg)
+    n = caps["per_invoice"]
+    if not caps["per_invoice_auto"]:
+        return f"Fixed: {n:,} sats"
+    if caps["auto_basis"] == "fallback":
+        return (f"Auto: follows AgentHC's day price (now {n:,} sats: "
+                "AgentHC's price isn't known yet)")
+    return f"Auto: follows AgentHC's day price (now ≈ {n:,} sats)"
+
+
+AUTOPAY_HOW_TO_SET = ("say 'set autopay cap 80000' on the dashboard for a "
+                      "fixed number, or 'set autopay cap auto' to follow "
+                      "AgentHC's price (max_autopay_sats in config.json)")
+
+
+def pass_options():
+    """Pass sizes (signal days) the server sells right now, e.g. [1, 5];
+    [] when every size is paused (the node is refilling); None if it can't
+    be asked."""
+    return pass_offer()["options"]
 
 
 def pass_status(token):
@@ -736,7 +917,7 @@ def accept_terms(cfg):
 
 
 def _pass_purchase_allowed(cfg, state, save_state, now=None):
-    """Recurring-day-pass gate: the agent only auto-pays the ~$10 pass when
+    """Recurring-day-pass gate: the agent only auto-pays the ~$50 pass when
     the operator turned 'Recurring day-pass' ON (wizard Source tab / config
     day_pass_recurring). OFF (the default) = the agent never spends without
     approval — it notifies once per day and returns no events instead.
@@ -790,7 +971,7 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
         if time.time() < float(state.get("daypass_retry_at") or 0):
             return False  # the last try failed (already reported): wait a bit
         spent = _autopay_spent_today(state, now)
-        cap = _daily_autopay_cap(cfg)
+        cap = autopay_caps(cfg)["per_day"]
         if spent["sats"] >= cap:
             day = now.strftime("%Y-%m-%d")
             if state.get("autopay_cap_notified") != day:
@@ -808,7 +989,8 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
     if state.get("pass_needed_notified") != day:
         state["pass_needed_notified"] = day
         save_state(state)
-        print("Day-pass required (~$10 in sats) but recurring payments are "
+        print(f"Day-pass required (~{usd_words(day_pass_price()['usd'])} in sats) "
+              "but recurring payments are "
               "OFF — turn ON 'Recurring day-pass' in the wizard Source tab "
               "to let the agent buy it each day.")
     return False
@@ -855,7 +1037,8 @@ def _no_receipt_stop(cfg, state, save_state):
 def _one_pass_a_day(cfg):
     """True unless the owner chose to allow more than one wallet day-pass a
     day by setting max_autopay_sats_per_day (never with a prepaid pass)."""
-    return bool(_pass_tokens(cfg)) or cfg.get("max_autopay_sats_per_day") is None
+    return (bool(_pass_tokens(cfg))
+            or owner_autopay_cap(cfg.get("max_autopay_sats_per_day")) is None)
 
 
 def _next_buy_time(cfg, now):
@@ -880,15 +1063,27 @@ def _next_buy_time(cfg, now):
 
 
 def _daily_autopay_cap(cfg):
-    """Total sats the agent may auto-pay per market day. Defaults to ONE
-    invoice's worth (max_autopay_sats): a healthy feed never needs a second
-    pass the same day, so a second purchase means something is wrong (e.g.
-    the server keeps rejecting a valid pass) — without this cap the agent
-    would re-buy on every poll and drain the wallet. Counted from the
-    amounts in the invoices themselves; only payments that went through, or
-    whose outcome is still unknown, count."""
-    per_invoice = int(cfg.get("max_autopay_sats", 30_000))
-    return int(cfg.get("max_autopay_sats_per_day", per_invoice))
+    """Total sats the agent may auto-pay per market day (autopay_caps).
+    Defaults to ONE invoice's worth (the per-invoice cap): a healthy feed
+    never needs a second pass the same day, so a second purchase means
+    something is wrong (e.g. the server keeps rejecting a valid pass) —
+    without this cap the agent would re-buy on every poll and drain the
+    wallet. Counted from the amounts in the invoices themselves; only
+    payments that went through, or whose outcome is still unknown, count."""
+    return autopay_caps(cfg)["per_day"]
+
+
+def autopay_refusal_text(amount, cfg, caps=None):
+    """Why a day-pass invoice above the per-invoice cap was not paid: the
+    cap in force now and how to raise it."""
+    caps = caps or autopay_caps(cfg)
+    need = _plus_margin_k(amount)
+    return (f"The day-pass costs {amount:,} sats, which is more than your "
+            f"auto-pay cap for one pass ({caps['per_invoice']:,} sats), so "
+            "the agent did not pay. Nothing was paid. Your cap now: "
+            f"{autopay_cap_words(cfg, caps)}. If that price is right, raise "
+            f"it: say 'set autopay cap {need}' on the dashboard (or set "
+            f"max_autopay_sats to {need} in config.json).")
 
 
 def _record_paid_day(state, day):
@@ -1165,15 +1360,12 @@ def _pay_day_pass(cfg, state, body, save_state, running_until=None):
         raise InvoiceRefused(
             "The feed sent a Lightning invoice that is not the one its "
             "day-pass belongs to, so the agent did not pay it. Nothing was paid.")
-    cap = int(cfg.get("max_autopay_sats", 30_000))
+    caps = autopay_caps(cfg)
+    cap = caps["per_invoice"]
     if amount > cap:
-        raise InvoiceRefused(
-            f"The day-pass costs {amount:,} sats, which is more than your "
-            f"auto-pay cap for one pass ({cap:,} sats), so the agent did not "
-            "pay. Nothing was paid. If that price is right, raise "
-            "max_autopay_sats in config.json.")
+        raise InvoiceRefused(autopay_refusal_text(amount, cfg, caps))
     spent = _autopay_spent_today(state)
-    daily_cap = _daily_autopay_cap(cfg)
+    daily_cap = caps["per_day"]
     if spent["sats"] + amount > daily_cap:
         raise InvoiceRefused(
             f"A day-pass ({amount:,} sats) would take today's spending over "
@@ -1734,7 +1926,8 @@ def setup(cfg):
     print("     several entries a day (your daily cap + budget still apply)")
     scope = input("Choose [1/2, default 1]: ").strip() or "1"
     cfg["include_other_trades"] = scope == "2"
-    print("  1) Lightning day-pass — the agent pays ~$10/day in sats from its")
+    print(f"  1) Lightning day-pass — the agent pays "
+          f"~{usd_words(day_pass_price()['usd'])}/day in sats from its")
     print("     own wallet, no account needed (recommended for agents)")
     print("  2) AgentHC Premium API key (sats-purchased subscription)")
     choice = input("Choose [1/2, default 1]: ").strip() or "1"

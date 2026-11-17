@@ -164,7 +164,9 @@ def _settings(tab):
                     "source_site": None,
                     "wallet": {"site": "demo.lnbits.com" if cfg.get("lnbits_url") else None,
                                "warning": None, "page_on_file": bool(cfg.get("lnbits_url")),
-                               "autopay_cap_sats": 30000, "invoice_cap_sats": None,
+                               "autopay_cap_sats": 61000, "autopay_cap_auto": True,
+                               "autopay_cap_words": "Auto: follows AgentHC's day price (now ≈ 61,000 sats)",
+                               "invoice_cap_sats": None,
                                "new_site": "demo.lnbits.com", "new_warning": None},
                     "api_key": {"set": False, "last4": None}, "pass_on_file": True,
                     # the fixture's invoice is never paid: it stays waiting
@@ -489,14 +491,17 @@ class Handler(BaseHTTPRequestHandler):
                  "/api/llm/providers": lambda: {"providers": {"anthropic": {
                      "name": "Anthropic", "base_url": "https://api.anthropic.com",
                      "keys_url": "console.anthropic.com"}}},
-                 "/api/pass/options": lambda: {"options": [1, 5, 20, 60]},
+                 "/api/pass/options": lambda: {"options": [1, 5],
+                                               "prices_usd": {"1": 50.0, "5": 225.0},
+                                               "prices_sats": {"1": 51600, "5": 232000}},
                  "/api/pass/status": lambda: {"status": "pending"},
                  "/api/wallet/balance": lambda: (
                      {"ok": True, "sats": 41200} if tab["cfg"].get("lnbits_url")
                      else {"ok": False, "error": "no wallet"}),
                  "/api/wallet/quote": lambda: {"ok": True, "btc_usd": 97000.0, "usd": 0.0,
-                                               "day_passes": 0, "day_pass_sats": 10400,
-                                               "suggested_sats": 10400, "invoice_cap": None},
+                                               "day_pass_usd": 50.0,
+                                               "day_passes": 0, "day_pass_sats": 51600,
+                                               "suggested_sats": 51600, "invoice_cap": None},
                  "/api/proposal": lambda: (
                      {"pending": True, "explanation": "(fixture) Adds a connector for another broker.",
                       "warnings": [], "diff": "--- a/brokers/example.py\n+++ b/brokers/example.py\n"

@@ -6,6 +6,7 @@
 // is shown here, read-only.
 import { useEffect, useRef, useState } from "react";
 import type { Invoice, PassCheck, PassOptions, Preview, WalletBalance, WalletPage } from "../../lib/settingsApi";
+import { passPriceUsd, passSavingUsd } from "../../lib/settingsApi";
 import type { Status } from "../../lib/viewModel";
 import { FieldError, ReviewDialog, SettingsDoubt, Switch, askPreview } from "../Forms";
 import { API, getJson, send } from "../lib/http";
@@ -39,7 +40,7 @@ const plain = (t: string, strong = true) => (
 );
 
 /** Every size the wizard offers; the server says which are on sale now. */
-const SIZES = [1, 5, 20, 60];
+const SIZES = [1, 5];
 
 type Step =
   | { kind: "pick" }
@@ -51,6 +52,7 @@ type Step =
 function BuyDays({ page, onClose }: { page: Page; onClose: () => void }) {
   const [step, setStep] = useState<Step>({ kind: "pick" });
   const [sizes, setSizes] = useState<number[] | null | undefined>(undefined); // undefined: asking
+  const [prices, setPrices] = useState<Record<string, number> | null>(null); // the server's USD prices, if it sent them
   const [days, setDays] = useState<number | null>(null);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -61,12 +63,17 @@ function BuyDays({ page, onClose }: { page: Page; onClose: () => void }) {
     const r = await getJson<PassOptions>(API.passOptions);
     const o = r.ok && Array.isArray(r.body.options) ? r.body.options.filter((x) => Number.isInteger(x) && x > 0) : null;
     setSizes(o);
+    setPrices(r.ok && r.body.prices_usd && typeof r.body.prices_usd === "object" ? r.body.prices_usd : null);
     return o;
   };
   useEffect(() => {
     loadSizes();
     return () => clearInterval(timer.current);
   }, []);
+  const aboutPrice = (n: number) => {
+    const p = passPriceUsd(n, prices);
+    return p != null ? `About ${usd(p, p % 1 ? 2 : 0)}. ` : "";
+  };
   const shown = sizes == null ? SIZES : SIZES.filter((x) => sizes.includes(x)).concat(sizes.filter((x) => !SIZES.includes(x)));
 
   const review = async () => {
@@ -139,7 +146,7 @@ function BuyDays({ page, onClose }: { page: Page; onClose: () => void }) {
             </dd>
             <dt>Price</dt>
             <dd>
-              Shown on the payment code <small>AgentHC sets it when the code is made.</small>
+              {aboutPrice(step.days)}Exact sats on the payment code <small>AgentHC sets it when the code is made.</small>
             </dd>
           </dl>
         )}
@@ -224,13 +231,23 @@ function BuyDays({ page, onClose }: { page: Page; onClose: () => void }) {
       ) : (
         <>
           <div className="pass-opts" role="radiogroup" aria-label="How many signal days">
-            {shown.map((n) => (
-              <label key={n} className="pass-opt">
-                <input type="radio" name="days" value={n} checked={days === n} onChange={() => (setDays(n), setErr(""))} />
-                <b>{n}</b>
-                <span>signal {n === 1 ? "day, to try it" : "days"}</span>
-              </label>
-            ))}
+            {shown.map((n) => {
+              const price = passPriceUsd(n, prices);
+              const save = passSavingUsd(n, prices);
+              return (
+                <label key={n} className="pass-opt">
+                  <input type="radio" name="days" value={n} checked={days === n} onChange={() => (setDays(n), setErr(""))} />
+                  <b>{n}</b>
+                  <span>signal {n === 1 ? "day, to try it" : "days"}</span>
+                  {price != null && (
+                    <em>
+                      about {usd(price, price % 1 ? 2 : 0)}
+                      {save > 0 && <small> · save {usd(save, save % 1 ? 2 : 0)}</small>}
+                    </em>
+                  )}
+                </label>
+              );
+            })}
           </div>
           {sizes == null && <p className="small muted">This page could not ask AgentHC which sizes are on sale, so all are shown.</p>}
         </>
@@ -474,6 +491,17 @@ function WalletPanel({ page, open }: { page: Page; open: (o: Open) => void }) {
           </button>
         }
       />
+      {w?.autopay_cap_words && (
+        <Row
+          label="Auto-pay cap"
+          exp={`The most the wallet pays for one day-pass. ${
+            w.autopay_cap_auto
+              ? "For a fixed number, say “set autopay cap 80000” in the chat."
+              : "Say “set autopay cap auto” in the chat to follow AgentHC's day price again."
+          }`}
+          val={<span className="tag tag-plain">{w.autopay_cap_words}</span>}
+        />
+      )}
       <Row
         label="Buys a day-pass by itself"
         exp={

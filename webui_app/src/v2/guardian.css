@@ -570,7 +570,7 @@ main:focus{outline:none}
 .always .ic{margin-top:1px;color:var(--ink2);width:18px;height:18px}
 
 /* ───────── Signals ───────── */
-.pass-opts{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.pass-opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
 .pass-opt{position:relative;border:1px solid var(--line2);border-radius:var(--r2);padding:12px 16px;background:var(--surface);cursor:pointer;display:grid;gap:2px}
 .pass-opt input{position:absolute;opacity:0;inset:0;cursor:pointer}
 .pass-opt b{font:700 24px/1 var(--display)}

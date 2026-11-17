@@ -292,9 +292,34 @@ export interface AiProviders {
 /** POST /api/llm/models (lists models; saves nothing) */
 export type AiModels = { ok: true; provider: string; models: string[]; suggested: string } | { ok: false; error: string; need_provider?: boolean };
 
-/** GET /api/pass/options: sizes on sale now; [] = none right now; null = could not ask */
+/** GET /api/pass/options: sizes on sale now; [] = none right now; null = could not ask.
+ *  prices_usd / prices_sats: the server's price per size (keys "1", "5"); null or
+ *  missing from an older server. */
 export interface PassOptions {
   options: number[] | null;
+  prices_usd?: Record<string, number> | null;
+  prices_sats?: Record<string, number> | null;
+}
+/** Prepaid pass prices in USD (paid in sats) shown when the server sends none.
+ *  AgentHC sets the real price on each invoice. */
+export const PASS_PRICES_USD: Record<number, number> = { 1: 50, 5: 225 };
+/** The USD price to show for a pass size: the server's when it sent one, else
+ *  the built-in price; null for a size with neither. */
+export function passPriceUsd(days: number, server?: Record<string, number> | null): number | null {
+  const v = server ? Number(server[String(days)]) : NaN;
+  if (Number.isFinite(v) && v > 0) return v;
+  return PASS_PRICES_USD[days] ?? null;
+}
+/** "$50", "$49.50": a pass price for copy. */
+export function passUsdWords(v: number): string {
+  return "$" + (v % 1 ? v.toFixed(2) : String(v));
+}
+/** What a bundle saves against buying its days one at a time (USD); 0 when nothing. */
+export function passSavingUsd(days: number, server?: Record<string, number> | null): number {
+  const one = passPriceUsd(1, server);
+  const all = passPriceUsd(days, server);
+  if (days <= 1 || one == null || all == null) return 0;
+  return Math.max(0, Math.round((days * one - all) * 100) / 100);
 }
 /** GET /api/pass/status (the classic route; it also files a paid invoice's pass) */
 export interface PassCheck {
@@ -370,8 +395,12 @@ export interface WalletView {
   warning: string | null;
   /** a wallet page link is on file (open it with POST /api/v2/wallet/page) */
   page_on_file: boolean;
-  /** the most one day-pass payment may cost; null: not set */
+  /** the most one day-pass payment may cost (the cap in force); null: not known */
   autopay_cap_sats: number | null;
+  /** the cap follows AgentHC's day price (+10%); false: a number the owner set */
+  autopay_cap_auto?: boolean;
+  /** "Auto: follows AgentHC's day price (now ≈ 61,000 sats)" / "Fixed: 60,000 sats" */
+  autopay_cap_words?: string;
   /** the wallet's largest invoice, when it has said; null: not known */
   invoice_cap_sats: number | null;
   /** where a new wallet would be made, and its test-server warning */
@@ -380,9 +409,17 @@ export interface WalletView {
 }
 
 /** GET /api/wallet/quote?sats=N (classic, reused): what N sats are worth now. */
+/** day_pass_usd: AgentHC's price for one day-pass (the built-in one when it can't say);
+ *  older agents leave it out. */
 export type WalletQuote =
-  | { ok: true; btc_usd: number; usd: number; day_passes: number; day_pass_sats: number; suggested_sats: number; invoice_cap: number | null }
-  | { ok: false; error: string };
+  | ({ ok: true; btc_usd: number; usd: number; day_pass_usd?: number; day_passes: number; day_pass_sats: number; suggested_sats: number; invoice_cap: number | null } & AutopayCap)
+  | ({ ok: false; error: string; day_pass_usd?: number } & AutopayCap);
+/** The wallet's auto-pay cap, as /api/wallet/quote reports it (older agents leave it out). */
+export interface AutopayCap {
+  autopay_cap_sats?: number;
+  autopay_cap_auto?: boolean;
+  autopay_cap_words?: string;
+}
 
 /** POST /api/v2/wallet/fund, confirmed: the invoice to pay into the agent's wallet. */
 export interface FundInvoice {

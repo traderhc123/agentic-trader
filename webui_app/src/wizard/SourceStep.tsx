@@ -7,13 +7,14 @@ import { Field, Input, Select } from "../components/ui/field";
 import { QR } from "../components/ui/qr";
 import { Msg, err, info, ok, type MsgT } from "../components/ui/tag";
 import { api } from "../lib/api";
+import { passPriceUsd, passSavingUsd, passUsdWords } from "../lib/settingsApi";
 import { cn } from "../lib/cn";
 import { copyToClipboard, usePolling } from "../lib/hooks";
 import { PASS_SIZES_MS, balanceEvery, passStatusEvery } from "./polls";
 import { BackBtn, Spacer } from "./steps";
 import { Block, Notice, StepCard, useWiz } from "./Wizard";
 
-const PASSES: { days: number; tag?: string }[] = [{ days: 1, tag: "Try it" }, { days: 5 }, { days: 20 }, { days: 60 }];
+const PASSES: { days: number; tag?: string }[] = [{ days: 1, tag: "Try it" }, { days: 5 }];
 
 interface Invoice {
   bolt11: string;
@@ -37,6 +38,7 @@ export function SourceStep() {
 
   // pass purchase
   const [sizes, setSizes] = useState<number[] | null>(null); // null = server not asked / unknown → show all
+  const [prices, setPrices] = useState<Record<string, number> | null>(null); // the server's USD prices, if it sent them
   const [selDays, setSelDays] = useState<number | null>(null);
   const [passMsg, setPassMsg] = useState<MsgT>(null);
   const [inv, setInv] = useState<Invoice | null>(null);
@@ -54,8 +56,11 @@ export function SourceStep() {
   // every 15 minutes while it is visible (each ask goes on to AgentHC).
   usePolling(
     () =>
-      api<{ options?: number[] }>("/api/pass/options")
-        .then((r) => Array.isArray(r.options) && setSizes(r.options))
+      api<{ options?: number[]; prices_usd?: Record<string, number> | null }>("/api/pass/options")
+        .then((r) => {
+          if (r.prices_usd && typeof r.prices_usd === "object") setPrices(r.prices_usd);
+          if (Array.isArray(r.options)) setSizes(r.options);
+        })
         .catch(() => {}),
     PASS_SIZES_MS,
   );
@@ -208,7 +213,8 @@ export function SourceStep() {
           <Block label="Access" desc="Prepay signal days in sats over Lightning.">
             <p className="m-0 max-w-[72ch] text-sm leading-relaxed text-fg2">
               One Lightning payment from the wallet you already use (Cash App, Strike, Phoenix, Alby…).{" "}
-              <b className="text-fg">About $10 per signal day</b>, priced in sats.
+              <b className="text-fg">About {passUsdWords(passPriceUsd(1, prices) ?? 50)} per signal day</b>, or 5 signal days for about{" "}
+              {passUsdWords(passPriceUsd(5, prices) ?? 225)}, priced in sats.
             </p>
             <dl className="m-0 grid grid-cols-3 gap-px overflow-hidden rounded border border-line bg-line text-xs max-sm:grid-cols-1">
               {[
@@ -243,10 +249,14 @@ export function SourceStep() {
                       : "border-line2 bg-panel2 hover:border-accent/50 hover:bg-raise",
                   )}
                 >
-                  <span className="h-4 text-2xs font-medium text-accent">{p.tag || ""}</span>
+                  <span className="h-4 text-2xs font-medium text-accent">
+                    {p.tag || (passSavingUsd(p.days, prices) > 0 ? `Save ${passUsdWords(passSavingUsd(p.days, prices))}` : "")}
+                  </span>
                   <span className="mt-1 font-mono text-2xl font-medium leading-none tracking-[-0.02em] text-fg">{p.days}</span>
                   <span className="mt-1 text-xs text-muted">signal day{p.days > 1 ? "s" : ""}</span>
-                  <span className="mt-3 w-full border-t border-line pt-2 font-mono text-xs text-fg2">≈ ${p.days * 10}</span>
+                  <span className="mt-3 w-full border-t border-line pt-2 font-mono text-xs text-fg2">
+                    ≈ {passUsdWords(passPriceUsd(p.days, prices) ?? 0)}
+                  </span>
                 </button>
               ))}
             </div>
@@ -325,7 +335,7 @@ export function SourceStep() {
               onToggle={setAdvOpen}
               summary="Advanced: auto-pay each day from a Lightning wallet the agent controls, or use an API key"
             >
-              <AgentWallet />
+              <AgentWallet dayUsd={passPriceUsd(1, prices) ?? 50} />
               <p className="m-0 text-xs text-muted">Your own LNbits wallet:</p>
               <Field htmlFor="ln-url" label="LNbits instance URL">
                 <Input id="ln-url" placeholder="https://…" value={lnUrl} onChange={(e) => setLnUrl(e.target.value)} />
@@ -364,7 +374,7 @@ export function SourceStep() {
 }
 
 // ── agent-held wallet (advanced) ────────────────────────────────────────────
-function AgentWallet() {
+function AgentWallet({ dayUsd }: { dayUsd: number }) {
   const { st } = useWiz();
   const [made, setMade] = useState<{ label: string; page?: string } | null>(
     st?.wallet?.connected ? { label: "Wallet connected", page: st.wallet.page } : null,
@@ -373,9 +383,10 @@ function AgentWallet() {
   const [warn, setWarn] = useState("");
   // after a replace: where the old wallet's details were saved, and that its sats were not moved
   const [madeNote, setMadeNote] = useState("");
-  const [sats, setSats] = useState("16000");
+  const [sats, setSats] = useState("75000");
   const satsEdited = useRef(false);
   const [quote, setQuote] = useState("");
+  const [capWords, setCapWords] = useState<{ words: string; auto: boolean } | null>(null);
   const [note, setNote] = useState("");
   const [inv, setInv] = useState<{ bolt11: string; qr?: number[][] | null } | null>(null);
   const [bal, setBal] = useState<number | null>(null);
@@ -422,7 +433,7 @@ function AgentWallet() {
     try {
       const r = await api("/api/wallet/quote?sats=" + n);
       if (!r.ok) return setQuote("");
-      let t = `${n.toLocaleString()} sats ≈ $${r.usd.toFixed(2)} (BTC $${Math.round(r.btc_usd).toLocaleString()}) · covers ~${r.day_passes} day-pass${r.day_passes === 1 ? "" : "es"} at ~$10/day`;
+      let t = `${n.toLocaleString()} sats ≈ $${r.usd.toFixed(2)} (BTC $${Math.round(r.btc_usd).toLocaleString()}) · covers ~${r.day_passes} day-pass${r.day_passes === 1 ? "" : "es"} at ~${passUsdWords(r.day_pass_usd || dayUsd)}/day`;
       if (r.day_pass_sats) t += `. One day pass ≈ ${r.day_pass_sats.toLocaleString()} sats`;
       if (r.invoice_cap) t += ` · instance max ${r.invoice_cap.toLocaleString()} sats per invoice`;
       setQuote(t);
@@ -431,12 +442,13 @@ function AgentWallet() {
     }
   };
 
-  // Price-aware default: ONE ~$10 day pass at the CURRENT BTC price (clamped
+  // Price-aware default: ONE day pass (AgentHC's price) at the CURRENT BTC price (clamped
   // to the instance's per-invoice cap) — unless the user already typed.
   useEffect(() => {
     if (!made) return;
     api("/api/wallet/quote?sats=0")
       .then((r) => {
+        if (r && typeof r.autopay_cap_words === "string") setCapWords({ words: r.autopay_cap_words, auto: !!r.autopay_cap_auto });
         let s = sats;
         if (r && r.ok && r.suggested_sats && !satsEdited.current) {
           s = String(r.suggested_sats);
@@ -534,7 +546,7 @@ function AgentWallet() {
   return (
     <div className="space-y-3">
       <p className="m-0 text-sm text-muted">
-        The agent pays about $10 each market day from a wallet it holds the keys to. Only for people who want hands-off daily payments.
+        The agent pays about {passUsdWords(dayUsd)} each market day from a wallet it holds the keys to. Only for people who want hands-off daily payments.
       </p>
       <div className="flex flex-wrap items-center gap-3">
         <Button onClick={() => create()}>{made ? "Create a new wallet (replaces this one)" : "Create my agent's wallet for me"}</Button>
@@ -569,7 +581,7 @@ function AgentWallet() {
           <p className="m-0 text-sm text-fg2">
             Wallet ready. Now give your agent some sats: pay this invoice from any Lightning app (Strike, Cash App, Phoenix, Alby…).
           </p>
-          <Field htmlFor="fund-sats" label="Amount in sats (a day pass is about $10 of bitcoin)">
+          <Field htmlFor="fund-sats" label={`Amount in sats (a day pass is about ${passUsdWords(dayUsd)} of bitcoin)`}>
             <div className="flex gap-2">
               <Input
                 id="fund-sats"
@@ -597,10 +609,18 @@ function AgentWallet() {
               Recurring day-pass: {recurring ? "On" : "Off"}
             </Button>
             <span className="min-w-[220px] flex-1 text-xs text-muted">
-              On = the agent buys each day's ~$10 pass from its wallet automatically (never above your auto-pay cap). Off = it never
+              On = the agent buys each day's ~{passUsdWords(dayUsd)} pass from its wallet automatically (never above your auto-pay cap). Off = it never
               spends without you.
             </span>
           </div>
+          {capWords && (
+            <p className="m-0 text-xs text-muted">
+              Auto-pay cap per day-pass: {capWords.words}.{" "}
+              {capWords.auto
+                ? "For a fixed number, say “set autopay cap 80000” on the dashboard."
+                : "Say “set autopay cap auto” on the dashboard to follow AgentHC's price again."}
+            </p>
+          )}
           {inv && (
             <div className="flex gap-4 max-sm:flex-col max-sm:items-center">
               <QR matrix={inv.qr} />

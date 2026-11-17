@@ -803,7 +803,8 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <div class="fs-lbl">Access — prepay signal days<p>Prepaid in sats over Lightning.</p></div>
    <div class="stack">
     <p class="copy">One Lightning payment from the wallet you already use (Cash
-    App, Strike, Phoenix, Alby…) — <b>~$10 per signal day</b>, priced in sats.</p>
+    App, Strike, Phoenix, Alby…) — <b>~<span data-pass-usd="1">$50</span> per signal
+    day</b>, or 5 signal days for ~<span data-pass-usd="5">$225</span>, priced in sats.</p>
     <div class="facts">
      <div><h4>Billing</h4>A day
      is only used when your agent actually receives a trade signal (an entry or
@@ -816,10 +817,8 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     for main-pick signals; adding "other trades" (above) uses days on those
     too.</p>
     <div class="passes">
-     <button class="pass" data-days="1" onclick="buyPass(1)"><span class="tagline">Try it</span><span class="q">1</span><span class="u">signal day</span><span class="p">≈ $10</span></button>
-     <button class="pass" data-days="5" onclick="buyPass(5)"><span class="tagline"></span><span class="q">5</span><span class="u">signal days</span><span class="p">≈ $50</span></button>
-     <button class="pass" data-days="20" onclick="buyPass(20)"><span class="tagline"></span><span class="q">20</span><span class="u">signal days</span><span class="p">≈ $200</span></button>
-     <button class="pass" data-days="60" onclick="buyPass(60)"><span class="tagline"></span><span class="q">60</span><span class="u">signal days</span><span class="p">≈ $600</span></button>
+     <button class="pass" data-days="1" onclick="buyPass(1)"><span class="tagline">Try it</span><span class="q">1</span><span class="u">signal day</span><span class="p">≈ <span data-pass-usd="1">$50</span></span></button>
+     <button class="pass" data-days="5" onclick="buyPass(5)"><span class="tagline">Save $25</span><span class="q">5</span><span class="u">signal days</span><span class="p">≈ <span data-pass-usd="5">$225</span></span></button>
     </div>
     <p id="pass-sizes-note" class="status-line" role="status"></p>
     <p id="pass-status" class="status-line" role="status"></p>
@@ -857,24 +856,25 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     <details id="adv-wallet" class="adv"><summary><svg class="i chev"><use href="#i-chev"/></svg><span>Advanced: auto-pay each day
     from a Lightning wallet the agent controls, or use an API key</span></summary>
     <div class="adv-b">
-     <p class="muted">The agent pays ~$10 each market day from a wallet it holds
+     <p class="muted">The agent pays ~<span data-pass-usd="1">$50</span> each market day from a wallet it holds
      the keys to. Only for people who want hands-off daily payments.</p>
      <div class="navrow inline"><button onclick="makeWallet()">Create my agent's wallet for me</button>
       <span id="mw-msg" role="status" aria-live="polite"></span></div>
      <div id="fund-box" style="display:none">
       <p>Wallet ready ✓ — now give your agent some sats. Pay this invoice from any
       Lightning app (Strike, Cash App, Phoenix, Alby…):</p>
-      <div class="field"><label for="fund-sats">Amount (sats) — a day pass is ~$10 of bitcoin</label>
-       <div class="inrow"><input type="number" id="fund-sats" value="16000" min="1000" oninput="satsChanged()">
+      <div class="field"><label for="fund-sats">Amount (sats) — a day pass is ~<span data-pass-usd="1">$50</span> of bitcoin</label>
+       <div class="inrow"><input type="number" id="fund-sats" value="75000" min="1000" oninput="satsChanged()">
         <button onclick="fundInvoice()">Show invoice</button></div></div>
       <p id="fund-quote" class="muted" style="display:none;font-size:var(--fs-sm)"></p>
       <p id="fund-note" class="ok" style="display:none"></p>
       <div class="navrow inline">
        <button id="recur-btn" onclick="toggleRecurring()">Recurring day-pass: OFF</button>
-       <span class="muted" style="flex:1 1 220px;font-size:var(--fs-sm)">ON = the agent buys each day's ~$10 pass from its
+       <span class="muted" style="flex:1 1 220px;font-size:var(--fs-sm)">ON = the agent buys each day's ~<span data-pass-usd="1">$50</span> pass from its
        wallet automatically (never above your auto-pay cap). OFF = it never
        spends without you.</span>
       </div>
+      <p id="autopay-cap" class="muted" style="display:none;font-size:var(--fs-sm)"></p>
       <div id="fund-qr" class="qr" style="display:none"></div>
       <pre id="bolt11" class="bolt" style="display:none" tabindex="0" aria-label="Lightning invoice"></pre>
       <p id="fund-open" style="display:none">
@@ -1281,7 +1281,8 @@ async function updateQuote(){
     if(!r.ok){el.style.display='none';return;}
     let t=sats.toLocaleString()+' sats ≈ $'+r.usd.toFixed(2)
       +' (BTC $'+Math.round(r.btc_usd).toLocaleString()+')'
-      +' · covers ~'+r.day_passes+' day-pass'+(r.day_passes===1?'':'es')+' at ~$10/day';
+      +' · covers ~'+r.day_passes+' day-pass'+(r.day_passes===1?'':'es')
+      +(r.day_pass_usd?' at ~$'+(r.day_pass_usd%1?r.day_pass_usd.toFixed(2):r.day_pass_usd)+'/day':'');
     if(r.day_pass_sats)
       t+=' — one day pass ≈ '+r.day_pass_sats.toLocaleString()+' sats';
     if(r.invoice_cap)
@@ -1379,6 +1380,24 @@ function srcChanged(){
   for(const k of ['agenthc','url','manual'])
     document.getElementById('src-'+k).style.display = (k===v)?'':'none';
 }
+// AgentHC's own pass prices (USD) when it sends them: every
+// [data-pass-usd="N"] (cards and copy; 1 = the day-pass) shows the server's
+// price for N days; the built-in prices stay otherwise. A bundle's tagline
+// shows what it saves against buying single days.
+function passPrices(p){
+  if(!p||typeof p!=='object')return;
+  const usd=v=>'$'+(v%1?v.toFixed(2):String(v));
+  const one=+p['1'];
+  document.querySelectorAll('[data-pass-usd]').forEach(el=>{
+    const v=+p[el.dataset.passUsd];
+    if(v>0)el.textContent=usd(v);
+  });
+  document.querySelectorAll('.pass[data-days]').forEach(b=>{
+    const n=+b.dataset.days,v=+p[String(n)];
+    if(n>1&&one>0&&v>0){const save=n*one-v;
+      b.querySelector('.tagline').textContent=save>0?'Save '+usd(Math.round(save*100)/100):'';}
+  });
+}
 // Show only the pass sizes the feed server sells right now (it can take
 // sizes off sale, e.g. while its node can't receive that large a payment).
 // If the server can't be asked, every card stays visible. An empty list
@@ -1390,6 +1409,7 @@ async function passSizes(){
     if(!Array.isArray(r.options))return;
     document.querySelectorAll('.pass[data-days]').forEach(b=>{
       b.style.display=r.options.indexOf(+b.dataset.days)>=0?'':'none';});
+    passPrices(r.prices_usd);
     const n=document.getElementById('pass-sizes-note');
     if(n)n.textContent=r.options.length?'':'Passes are paused for a little while — '+
       'our node is refilling so it can receive the payment. This page checks again every 15 minutes while it is open.';
@@ -1509,10 +1529,16 @@ function showWallet(page,label){
     mw.appendChild(a);
   }
   document.getElementById('fund-box').style.display='';
-  // Price-aware default: ONE ~$10 day pass at the CURRENT BTC price
+  // Price-aware default: ONE day pass (AgentHC's price) at the CURRENT BTC price
   // (clamped to the instance's per-invoice cap when known) — unless the
   // user already typed an amount.
   api('/api/wallet/quote?sats=0').then(function(r){
+    const ac=document.getElementById('autopay-cap');
+    if(ac&&r&&r.autopay_cap_words){
+      ac.textContent='Auto-pay cap per day-pass: '+r.autopay_cap_words+'. '
+        +(r.autopay_cap_auto?'For a fixed number say "set autopay cap 80000" on the dashboard.'
+          :'Say "set autopay cap auto" on the dashboard to follow AgentHC’s price.');
+      ac.style.display='';}
     if(r&&r.ok&&r.suggested_sats&&!satsEdited)
       document.getElementById('fund-sats').value=r.suggested_sats;
     updateQuote();
@@ -2735,7 +2761,6 @@ def _install_requirements():
 # sources, fail-soft). Sats are meaningless to most users — the wizard shows
 # "≈ $X · covers ~N day-passes" next to the amount instead.
 _btc_usd_cache = {"t": 0.0, "usd": 0.0}
-_DAY_PASS_USD = 10.0        # feed day-pass ballpark, floats with BTC
 
 
 def _invoice_cap_from_error(msg):
@@ -2772,20 +2797,26 @@ def _btc_usd():
 
 def _fund_quote(sats, invoice_cap=0):
     """USD context for a sats amount: value, ~day-passes covered, and the
-    sats price of ONE ~$10 day pass at the current BTC price (the funding
-    default — this is a day-pass product). suggested_sats is the day pass
-    clamped to the instance's per-invoice cap when one is known.
-    {ok: False} when no live price is available (the funding box just omits
-    the hint)."""
+    price of ONE day pass (the funding default — this is a day-pass
+    product). The day pass's USD price is AgentHC's own (hc.day_pass_price,
+    the built-in fallback when the server can't say); its sats are the
+    server's figure when it sent one, else that USD at the live BTC price.
+    suggested_sats is the day pass clamped to the instance's per-invoice cap
+    when one is known. {ok: False} when no live price is available (the
+    funding box just omits the hint)."""
+    from sources import agenthc_day_trade_ideas as hc
+    day = hc.day_pass_price()
     usd_per_btc = _btc_usd()
     if usd_per_btc <= 0:
-        return {"ok": False, "error": "no live BTC price"}
+        return {"ok": False, "error": "no live BTC price",
+                "day_pass_usd": day["usd"]}
     usd = sats * usd_per_btc / 1e8
-    day_sats = int(-(-_DAY_PASS_USD / usd_per_btc * 1e8 // 100) * 100)  # ceil→100
+    day_sats = day["sats"] or int(-(-day["usd"] / usd_per_btc * 1e8 // 100) * 100)  # ceil→100
     suggested = min(day_sats, invoice_cap) if invoice_cap else day_sats
     return {"ok": True, "btc_usd": round(usd_per_btc, 2),
             "usd": round(usd, 2),
-            "day_passes": int(usd // _DAY_PASS_USD),
+            "day_pass_usd": day["usd"],
+            "day_passes": int(usd // day["usd"]),
             "day_pass_sats": day_sats,
             "suggested_sats": suggested,
             "invoice_cap": invoice_cap or None}
@@ -3008,7 +3039,7 @@ def _pass_buy(cfg, save, data):
     try:
         days = int(data.get("days") or 0)
     except (TypeError, ValueError):
-        return {"ok": False, "error": "pick 1, 5, 20 or 60 days"}
+        return {"ok": False, "error": "pick 1 or 5 days"}
     current = (cfg.get("feed_pass") or {}).get("token")
     extends = hc._token_id(current) if current else ""
     last = cfg.get("feed_pass_pending")
@@ -3183,7 +3214,7 @@ def _wallet_create(cfg, save, data, switching=None):
         cfg.pop("lnbits_wallet_page", None)   # never show the old wallet's page
         if page:
             cfg["lnbits_wallet_page"] = page
-        cfg.setdefault("max_autopay_sats", 30_000)
+        cfg.setdefault("max_autopay_sats", "auto")
         save()
     out = {"ok": True, "page": page, "warning": lightning_wallet.demo_warning(url)}
     if had:
@@ -3214,7 +3245,7 @@ def _use_pasted_wallet(cfg, url, new_key):
         cfg.pop("lnbits_wallet_page", None)  # the old wallet's page
     cfg["lnbits_url"] = url
     cfg["lnbits_admin_key"] = new_key
-    cfg.setdefault("max_autopay_sats", 30_000)
+    cfg.setdefault("max_autopay_sats", "auto")
     return ""
 
 
@@ -4359,8 +4390,15 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         return _pass_buy(cfg, save_now, data)
 
     def pass_options_route(_h):
+        """Sizes on sale, plus the server's prices when it sends them
+        (string keys, as JSON needs; null from an older server)."""
         from sources import agenthc_day_trade_ideas as hc
-        return {"options": hc.pass_options()}
+        o = hc.pass_offer()
+
+        def keyed(m):
+            return {str(k): v for k, v in m.items()} if m else None
+        return {"options": o["options"], "prices_usd": keyed(o["prices_usd"]),
+                "prices_sats": keyed(o["prices_sats"])}
 
     def pass_status_route(_h):
         return _pass_status(cfg, save)
@@ -4420,12 +4458,17 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                         or ["0"])[0])
         except ValueError:
             sats = 0
-        return _fund_quote(max(0, sats),
-                           int(cfg.get("lnbits_max_invoice_sats") or 0))
+        from sources import agenthc_day_trade_ideas as hc
+        caps = hc.autopay_caps(cfg)
+        return {**_fund_quote(max(0, sats),
+                              int(cfg.get("lnbits_max_invoice_sats") or 0)),
+                "autopay_cap_sats": caps["per_invoice"],
+                "autopay_cap_auto": caps["per_invoice_auto"],
+                "autopay_cap_words": hc.autopay_cap_words(cfg, caps)}
 
     def wallet_recurring(_h, data):
         # Recurring day-pass consent: ON = the agent may auto-pay each day's
-        # ~$10 pass from its wallet (still capped by max_autopay_sats);
+        # ~$50 pass from its wallet (still capped by max_autopay_sats);
         # OFF = it never spends without the operator. The run loop re-reads
         # config every poll, so this applies live without a restart.
         return _set_recurring(cfg, save, data.get("on"))
@@ -5001,16 +5044,19 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         through POST /api/v2/wallet/page), the caps; and where a new wallet
         would be made."""
         import lightning_wallet
+        from sources import agenthc_day_trade_ideas as hc
         url = str(cfg.get("lnbits_url") or "")
         new = str(lightning_wallet.DEFAULT_LNBITS or "")
-        cap = cfg.get("max_autopay_sats")
+        caps = hc.autopay_caps(cfg)
         inv = cfg.get("lnbits_max_invoice_sats")
         whole = lambda v: (int(v) if isinstance(v, (int, float))  # noqa: E731
                            and not isinstance(v, bool) and v > 0 else None)
         return {"site": _host_only(url) if url else None,
                 "warning": lightning_wallet.demo_warning(url) or None,
                 "page_on_file": bool(cfg.get("lnbits_wallet_page")),
-                "autopay_cap_sats": whole(cap),
+                "autopay_cap_sats": caps["per_invoice"],
+                "autopay_cap_auto": caps["per_invoice_auto"],
+                "autopay_cap_words": hc.autopay_cap_words(cfg, caps),
                 "invoice_cap_sats": whole(inv),
                 "new_site": _host_only(new) if new else None,
                 "new_warning": lightning_wallet.demo_warning(new) or None}
@@ -5519,14 +5565,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             if was == p["on"]:
                 return {"ok": True, "saved": False,
                         "note": "Nothing to change: that is your setting already."}
-            cap = cfg.get("max_autopay_sats")
+            from sources import agenthc_day_trade_ideas as hc
+            caps = hc.autopay_caps(cfg)
             wait = _two_step("recurring", p, data, [_change(
                 "day_pass_recurring", "Buy a day-pass automatically", was,
                 p["on"], "raises_risk" if p["on"] else "lowers_risk")], [
-                ("Each payment is capped at "
-                 f"{int(cap):,} sats." if isinstance(cap, (int, float))
-                 and not isinstance(cap, bool) else
-                 "Each payment is capped by your wallet's auto-pay limit.")
+                (f"Each payment is capped at {caps['per_invoice']:,} sats "
+                 f"({hc.autopay_cap_words(cfg, caps)}).")
                 if p["on"] else "Signal days you already bought are kept.",
                 "It does not switch between Practice and LIVE.",
                 does_not_trade])
@@ -6075,16 +6120,15 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             sats = _v2_number(p.get("sats"), "sats", 1000, cap or 100_000_000,
                               whole=True)
             p = {"sats": sats}
-            auto = cfg.get("max_autopay_sats")
+            from sources import agenthc_day_trade_ideas as hc
+            auto = hc.autopay_caps(cfg)["per_invoice"]
             wait = _two_step("wallet_fund", p, data, [_change(
                 "wallet_fund", "Add to the agent's wallet", None, sats,
                 "neutral")], [
                 "Nothing is paid yet: the next step shows a Lightning invoice, "
                 "and nothing is paid until you pay it from your own wallet app.",
                 ("The agent spends from this wallet only on day-passes, each "
-                 f"capped at {int(auto):,} sats." if isinstance(auto, (int, float))
-                 and not isinstance(auto, bool) else
-                 "The agent spends from this wallet only on day-passes."),
+                 f"capped at {auto:,} sats."),
                 "It does not switch between Practice and LIVE.", does_not_trade])
         if wait:
             return wait
@@ -6803,7 +6847,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "exact command (pause, resume, dry on/off, set budget N, "
                 "set contracts N, set percent N, set other budget|contracts|"
                 "percent N, other sizing same, other trades on|off, set positions N, "
-                "set cap N, stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N). Never give investment advice; you may "
+                "set cap N, stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N, set autopay cap N|auto). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
             support.scrub(

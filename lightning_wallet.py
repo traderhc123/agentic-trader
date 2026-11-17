@@ -1,7 +1,7 @@
 """Built-in Lightning wallet for the agent (LNbits backend).
 
 The Agentic Day Trade Ideas feed is sats-priced: agents pay a Lightning
-invoice (~$10/day, floating with Bitcoin's price) and receive a 24h access
+invoice (~$50/day, floating with Bitcoin's price) and receive a 24h access
 token (L402). This module gives the agent a wallet it can pay from.
 
 Why LNbits: it's the simplest way to give an agent its own Lightning wallet —
@@ -21,6 +21,11 @@ import time
 import requests
 
 _TIMEOUT = 20
+# Sats for one ~$50 feed day-pass when neither AgentHC's price nor a live
+# BTC price is at hand (≈ $50 at ~$67k/BTC; the real price is on each
+# invoice). Only used for "is the wallet funded?" hints, never as a
+# spending limit.
+DAY_PASS_SATS_EST = 75_000
 
 # Instance used when the agent creates its own wallet. Hosted instances with
 # open registration are custodial — the agent keeps only spending money there
@@ -270,7 +275,7 @@ def wallet_setup(cfg):
         cfg.pop("lnbits_wallet_page", None)
         if page:
             cfg["lnbits_wallet_page"] = page
-        cfg.setdefault("max_autopay_sats", 30_000)
+        cfg.setdefault("max_autopay_sats", "auto")
         print(f"Wallet created on {url} ✓ (custodial hosted wallet — the agent "
               "keeps only spending money here)")
         warn = demo_warning(url)
@@ -307,15 +312,30 @@ def wallet_setup(cfg):
         cfg.pop("lnbits_wallet_page", None)  # that was the old wallet's page
     cfg["lnbits_admin_key"] = key
     print(f"Wallet connected ✓  balance: {bal:,} sats")
-    if bal < 15_000:
-        print("Balance looks low for a ~$10/day pass. Fund it now?")
+    try:  # AgentHC's own day price (imported here: that module imports this one)
+        from sources.agenthc_day_trade_ideas import day_pass_price, usd_words
+        day = day_pass_price()
+        day_usd, day_sats = usd_words(day["usd"]), day["sats"] or DAY_PASS_SATS_EST
+    except Exception:
+        day_usd, day_sats = "$50", DAY_PASS_SATS_EST
+    if bal < day_sats:
+        print(f"Balance looks low for a ~{day_usd}/day pass. Fund it now?")
         raw = input("Amount in sats to request (blank to skip): ").strip()
         if raw.isdigit() and int(raw) > 0:
             print_funding_invoice(wallet, int(raw))
     # Safety cap: the agent will never auto-pay an invoice above this.
-    cfg.setdefault("max_autopay_sats", 30_000)
-    print(f"Auto-pay safety cap: {cfg['max_autopay_sats']:,} sats per invoice "
-          "(edit max_autopay_sats in config.json to change).")
+    # "auto" follows AgentHC's day price (sources/agenthc_day_trade_ideas
+    # autopay_caps); a number the owner saves is used as is.
+    cfg.setdefault("max_autopay_sats", "auto")
+    try:
+        from sources.agenthc_day_trade_ideas import autopay_cap_words
+        words = autopay_cap_words(cfg)
+    except Exception:
+        words = str(cfg["max_autopay_sats"])
+    print(f"Auto-pay safety cap per invoice: {words}.")
+    print("  Set a fixed number with max_autopay_sats in config.json (or say "
+          "'set autopay cap 80000' on the dashboard); \"auto\" (or 'set "
+          "autopay cap auto') follows AgentHC's price again.")
     return cfg
 
 

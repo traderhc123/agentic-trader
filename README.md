@@ -14,7 +14,7 @@ heartbeat — entirely under your configuration and responsibility.
 |---|---|
 | `manual` | Your own commands, appended to a local `commands.jsonl` — fully self-directed |
 | `url` | Any JSON feed URL you supply — bring your own signals |
-| `agenthc` *(optional, featured)* | [Agentic Day Trade Ideas](https://api.traderhc.com/docs) — AgentHC's published **hypothetical paper-trade journal** as declarative ENTERED/EXITED events. Sats-priced (~$10/day Lightning day-pass, price floats with Bitcoin). Free aggregate [track record](https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record) (hypothetical, labeled) |
+| `agenthc` *(optional, featured)* | [Agentic Day Trade Ideas](https://api.traderhc.com/docs) — AgentHC's published **hypothetical paper-trade journal** as declarative ENTERED/EXITED events. Sats-priced (~$50/day Lightning day-pass or 5 signal days for ~$225, price floats with Bitcoin). Free aggregate [track record](https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record) (hypothetical, labeled) |
 
 > ## ⚠️ Read this first
 > **Nothing here is investment advice.** Signal sources report facts; every
@@ -152,17 +152,17 @@ additionally needs prepaid signal days (below) or a Premium API key.
 
 ## 💰 Paying for the AgentHC feed
 
-The AgentHC feed costs **~$10 per signal day, paid in bitcoin sats** (the sats
-amount floats with Bitcoin's price). Two ways to pay:
+The AgentHC feed costs **~$50 per signal day, or ~$225 for 5 signal days,
+paid in bitcoin sats** (the sats amount floats with Bitcoin's price). Two ways to pay:
 
 **Prepaid signal days (recommended).** In the setup wizard's *Signal source*
-step, pick **1 (try it), 5, 20 or 60 signal days**. You get one Lightning invoice (QR
+step, pick **1 signal day (~$50) or 5 signal days (~$225, save $25)**. You get one Lightning invoice (QR
 code) — pay it from the wallet you already use (Cash App, Strike, Phoenix,
 Alby, …) and the page confirms by itself. The agent never holds money.
 A size can be briefly off sale while the server's Lightning node refills
-capacity after a large purchase (try a smaller pass or again in about an
-hour), and the big passes (≈$200 / ≈$600) may exceed some wallets'
-Lightning send limits.
+capacity after a large purchase (try the 1-day pass or again in about an
+hour), and the 5-day pass (≈$225) may exceed some wallets' Lightning send
+limits.
 
 A day is only used when your agent actually **receives a trade signal — an
 entry or an exit — that day**; quiet days (no picks, or your agent was off)
@@ -177,11 +177,16 @@ length in market days.
 keeps an LNbits wallet and buys a 24-hour pass each market day (only when you
 turn *Recurring day-pass* ON). Set it up under *Advanced* in the wizard, or
 with `python agent.py setup` (instance URL + Admin key), then fund it with
-`python agent.py fund 50000`. ⚠️ The one-click wallet lives on
+`python agent.py fund 100000`. ⚠️ The one-click wallet lives on
 demo.lnbits.com, a public test server that can be reset — keep only a few
 days of passes there, or use your own LNbits instance. Safety rails: never
-pays an invoice above `max_autopay_sats` (30,000 — the amount is read from
-the invoice itself); buys at most one day-pass a day (more only if you set
+pays an invoice above `max_autopay_sats` (the amount is read from the
+invoice itself). Its default, `"auto"`, follows AgentHC's own day price: that
+price in sats + 10%, rounded up to 1,000 sats, never above 150,000 (30,000
+while AgentHC's price isn't known). Say `autopay cap` on the dashboard to see
+it, `set autopay cap 80000` to fix a number (used exactly as set), or
+`set autopay cap auto` to go back; a saved 30000 (the old default) counts as
+auto. It buys at most one day-pass a day (more only if you set
 `max_autopay_sats_per_day` yourself), and only on a market day, from 8:30 AM
 ET until the close; a pass that is lost or refused is never paid for twice —
 you get an alert instead; the Admin key is stored with `0600` perms.
