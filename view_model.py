@@ -1525,7 +1525,11 @@ def _position(key, row, opened, c):
                       else _iso(entry.get("ts"))),
         "real": real,
         "account": _text(row.get("acct"), _NAME) if real else None,
-        "book": ui.get("book") if ui.get("book") in ("main", "other") else None,
+        # the ledger row's own book (what its exits follow) first, then
+        # the book its newest entry row was logged under
+        "book": ({"main": "main", "shadow": "other"}.get(A._row_book(row))
+                 or (ui.get("book") if ui.get("book") in ("main", "other")
+                     else None)),
         "expires_today": (contract is not None and contract["expiry"]
                           == c["now_et"].date().isoformat()),
         "pending": side if side in ("buy", "sell") else None,

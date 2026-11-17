@@ -68,7 +68,9 @@ class Book:
         return True
 
 
-LIVE = {"dry_run": False, "max_entries_per_day": 20, "max_open_positions": 10}
+# "other trades" on: the AgentHC source asks for both books
+LIVE = {"dry_run": False, "max_entries_per_day": 20, "max_open_positions": 10,
+        "include_other_trades": True}
 DRY = {**LIVE, "dry_run": True}
 
 
@@ -471,13 +473,14 @@ def test_robinhood_sells_only_the_exiting_books_contracts(home, no_policy, notes
     if not legacy:
         row["book"] = "shadow"
     state = {"positions": {KEY: row}, "seen": []}
-    agent.handle_event(ev("EXITED", "main", "m-out"), RH_CFG, state, robinhood, rh,
+    cfg = {**RH_CFG, "include_other_trades": True}
+    agent.handle_event(ev("EXITED", "main", "m-out"), cfg, state, robinhood, rh,
                        lambda s: None)
     if legacy:
         assert [a["quantity"] for a in rh.placed] == ["2"]
         return
     assert rh.placed == [] and state["positions"][KEY]["qty"] == 2
-    agent.handle_event(ev("EXITED", "other", "o-out"), RH_CFG, state, robinhood, rh,
+    agent.handle_event(ev("EXITED", "other", "o-out"), cfg, state, robinhood, rh,
                        lambda s: None)
     (sell,) = rh.placed
     assert sell["legs"][0]["side"] == "sell" and sell["quantity"] == "2"
@@ -507,3 +510,212 @@ def test_moomoo_sells_only_the_exiting_books_contracts(home, no_policy, notes,
     (sell,) = sdk.placed
     assert sell["trd_side"] == "SELL" and sell["qty"] == 3
     assert state["positions"] == {}
+
+
+# ── a book whose own exit can't arrive is never held ───────────────────────
+
+def test_other_trades_switched_off_lets_the_main_exit_sell_their_row(
+        home, no_policy):
+    """The AgentHC source asks for the main pick only once "other trades" is
+    off: their exit can't arrive any more, so the main exit sells the row
+    as before (never stranded until the expiry guard)."""
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2, "book": "shadow",
+                                 "track": "other"}}}
+    off = {**LIVE, "include_other_trades": False}
+    assert run(b, state, ev("EXITED", "main", "m-out"), off) == f"EXIT: {CONTRACT}"
+    assert b.sells == [("m-out", 2, 2)] and state["positions"] == {}
+
+
+def test_main_pick_row_is_still_held_with_other_trades_off(home, no_policy):
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2, "book": "main"}}}
+    off = {**LIVE, "include_other_trades": False}
+    assert "no order placed" in run(b, state, ev("EXITED", "other", "o-out"), off)
+    assert b.sells == []
+
+
+def test_other_sources_send_any_track_so_their_rows_stay_per_book(
+        home, no_policy):
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2, "book": "shadow"}}}
+    cfg = {**LIVE, "include_other_trades": False, "source": "generic_json_url"}
+    assert "no order placed" in run(b, state, ev("EXITED", "main", "m-out"), cfg)
+    assert b.sells == []
+
+
+# ── two non-main tracks are both "other trades", but never one book ────────
+
+def test_entry_records_the_raw_track(home, no_policy):
+    b, state = Book(), {"positions": {}}
+    run(b, state, ev("ENTERED", "swing", "s-in"))
+    row = state["positions"][KEY]
+    assert row["book"] == "shadow" and row["track"] == "swing"
+
+
+def test_an_exit_of_another_non_main_track_does_not_sell(home, no_policy):
+    b, state = Book(), {"positions": {}}
+    run(b, state, ev("ENTERED", "other", "o-in"))
+    out = run(b, state, ev("EXITED", "swing", "s-out"))
+    assert "no order placed" in out and 'track "swing"' in out
+    assert b.sells == [] and state["positions"][KEY]["qty"] == 2
+    assert run(b, state, ev("EXITED", "other", "o-out")) == f"EXIT: {CONTRACT}"
+    assert b.sells == [("o-out", 2, 2)]
+
+
+def test_a_shadow_row_without_a_track_closes_on_any_non_main_exit(home, no_policy):
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2, "book": "shadow"}}}
+    assert run(b, state, ev("EXITED", "swing", "s-out")) == f"EXIT: {CONTRACT}"
+
+
+def test_a_track_that_contradicts_the_book_is_ignored(home, no_policy):
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2, "book": "main",
+                                 "track": "other"}}}
+    assert "no order placed" in run(b, state, ev("EXITED", "other", "o-out"))
+    assert run(b, state, ev("EXITED", "main", "m-out")) == f"EXIT: {CONTRACT}"
+
+
+# ── the ledger check's record: never a stale book ──────────────────────────
+
+def test_the_record_drops_an_old_positions_book(home):
+    """agent_bought outlives each position in its contract: a later position
+    with no book must not inherit the earlier one's."""
+    state = {"positions": {}}
+    old = {"option_id": "opt-1", "qty": 2, "book": "shadow", "track": "other",
+           "opened_event": "o-in"}
+    agent._remember_agent_row(state, KEY, old, "fake:", agent._now(), new_ids=["b-1"])
+    rec = state["agent_bought"]["opt-1"]
+    assert rec["book"] == "shadow" and rec["track"] == "other"
+    new = {"option_id": "opt-1", "qty": 1, "opened_event": "n-in"}
+    agent._remember_agent_row(state, KEY, new, "fake:", agent._now(), new_ids=["b-2"])
+    assert "book" not in rec and "track" not in rec
+
+
+@pytest.mark.parametrize("book,exit_track,sold", [
+    ("shadow", "main", False), ("shadow", "other", True),
+    ("main", "other", False), (None, "main", True), (None, "other", True)])
+def test_ledger_check_readds_the_row_with_its_book(home, monkeypatch, book,
+                                                   exit_track, sold):
+    """The ledger lost a row the agent's own fills prove it bought: the
+    ledger check re-adds it with the record's book, and only that book's
+    exit sells it. A record with no book sells on either book's exit."""
+    from test_exit_remainder import LATER, U1, FakeBroker, _bought_state, _loop, et
+    sent = []
+    monkeypatch.setattr(agent, "notify", lambda cfg, msg, **kw: sent.append(msg))
+    monkeypatch.setattr(agent, "_problems_logged", set())
+    monkeypatch.setattr(agent, "_WATCH_SINCE", {})  # the run loop sets it
+    st = _bought_state(held_key=LATER)
+    if book:
+        st["agent_bought"][U1].update(book=book, track="main" if book == "main"
+                                      else "other")
+    fills = [{"order_id": "buy-1", "side": "buy", "qty": 4,
+              "at": et(10, 0, day=(2026, 11, 4)).isoformat()}]
+    b = FakeBroker(held={U1: 4}, fills=fills)
+    out = {"event": "EXITED", "ticker": "RIVN", "expiry": "2026-11-13",
+           "strike": 13.5, "type": "C", "event_id": "x-out", "track": exit_track}
+    day = (2026, 11, 6)
+    saved = _loop(home, monkeypatch, st, b,
+                  [et(14, 0, day=day), et(14, 0, day=day, s=30), et(14, 1, day=day)],
+                  events={2: [out]})
+    if sold:
+        assert [(s["event_id"], s["qty"]) for s in b.sells] == [("x-out", 4)]
+        assert saved["positions"] == {}
+    else:
+        assert b.sells == []
+        row = saved["positions"][LATER]
+        assert row["qty"] == 4 and row["book"] == book
+
+
+# ── a buy that got no clear answer meets an exit ───────────────────────────
+
+class LostThenSettles(Book):
+    """Like the Alpaca and Robinhood adapters: the buy's answer is lost (a
+    note, no row); an EXITED with no row settles the note, finds the buy at
+    the broker, adopts it and sells it in the same call."""
+
+    def execute(self, client, cfg, event, state):
+        from brokers import order_guard
+        pos = state["positions"].get(KEY)
+        if event["event"] == "ENTERED" and not pos:
+            order_guard.note(state, KEY, "buy", "k", self.qty, "opt-1",
+                             event_id=event["event_id"])
+            return False
+        unc = order_guard.get(state, KEY)
+        if event["event"] == "EXITED" and not pos and unc:
+            order_guard.drop(state, KEY)
+            state["positions"][KEY] = {"option_id": "opt-1", "qty": self.qty,
+                                       "opened_event": unc["event_id"]}
+            order_guard.adopted_buy(state, KEY, unc, "b-1")
+        return super().execute(client, cfg, event, state)
+
+
+@pytest.mark.parametrize("entry_track,exit_track", [("main", "other"),
+                                                    ("other", "main")])
+def test_the_other_books_exit_never_settles_and_sells_a_lost_buy(
+        home, no_policy, notes, entry_track, exit_track):
+    from brokers import order_guard
+    b, state = LostThenSettles(), {"positions": {}}
+    run(b, state, ev("ENTERED", entry_track, "e-in"))
+    assert state["positions"] == {} and order_guard.get(state, KEY)
+    out = run(b, state, ev("EXITED", exit_track, "x-out"))
+    assert "no order placed" in out and "hasn't confirmed" in out
+    assert b.sells == [] and state["positions"] == {}
+    assert order_guard.get(state, KEY)             # left for the loop's reconcile
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["same-book", "legacy"])
+def test_a_lost_buy_is_still_sold_by_its_own_books_exit(home, no_policy, notes,
+                                                        legacy):
+    b, state = LostThenSettles(), {"positions": {}}
+    run(b, state, ev("ENTERED", "main", "m-in"))
+    exit_track = "main"
+    if legacy:  # no book remembered for it: any exit sells it, as before
+        state.pop("entry_books")
+        exit_track = "other"
+    assert run(b, state, ev("EXITED", exit_track, "x-out")) == f"EXIT: {CONTRACT}"
+    assert b.sells == [("x-out", 2, 2)] and state["positions"] == {}
+
+
+def test_a_found_buy_is_booked_before_the_next_exit_is_matched(
+        home, no_policy, notes):
+    """A buy an adapter found at the broker on the loop's reconcile, not yet
+    logged: the next exit signal first gives its row its book."""
+    from brokers import order_guard
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2,
+                                 "opened_event": "m-in"}},
+             "entry_books": {"m-in": "main"}}
+    order_guard.adopted_buy(state, KEY, {"event_id": "m-in", "at": agent._now()},
+                            "b-1")
+    out = run(b, state, ev("EXITED", "other", "o-out"))
+    assert "no order placed" in out and b.sells == []
+    assert state["positions"][KEY]["book"] == "main"
+
+
+def test_a_retried_entry_stamps_its_own_row(home, no_policy):
+    """The adapter wrote the row but its call raised: the retry of the same
+    signal finds the row (buys nothing) and records its book then."""
+    class Flaky(Book):
+        def execute(self, client, cfg, event, state):
+            changed = super().execute(client, cfg, event, state)
+            if event["event"] == "ENTERED" and changed:
+                raise RuntimeError("connection reset after the order")
+            return changed
+
+    b, state = Flaky(), {"positions": {}}
+    with pytest.raises(RuntimeError):
+        run(b, state, ev("ENTERED", "main", "m-in"))
+    assert "book" not in state["positions"][KEY]
+    run(b, state, ev("ENTERED", "main", "m-in"))
+    assert state["positions"][KEY]["book"] == "main" and b.buys == [("m-in", 2)]
+    assert "no order placed" in run(b, state, ev("EXITED", "other", "o-out"))
+
+
+def test_a_retry_never_stamps_another_signals_row(home, no_policy):
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2,
+                                 "opened_event": "old-in"}}}
+    run(b, state, ev("ENTERED", "main", "m-in"))
+    assert "book" not in state["positions"][KEY]
