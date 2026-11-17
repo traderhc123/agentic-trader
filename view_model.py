@@ -1214,10 +1214,12 @@ def _trade_size(cfg, prefix=""):
             "contracts": (max(1, n if n is not None else 1)
                           if mode == "contracts" else None),
             "percent": pct if mode == "percent" else None,
+            # never set: the cap the brokers apply (100), not "unknown"
             "max_contracts": _int(cfg.get(f"{prefix}max_contracts_per_trade")
                                   if cfg.get(f"{prefix}max_contracts_per_trade")
                                   is not None
-                                  else cfg.get("max_contracts_per_trade")),
+                                  else cfg.get("max_contracts_per_trade",
+                                               A.CONTRACT_CAP_DEFAULT)),
             "same_as_main": same}
 
 
@@ -1269,7 +1271,10 @@ def _limits(cfg, state, rows, mode, bp, now):
         "max_positions": max(0, pos_cap),
         "open_positions": {"real": n_real,
                            "practice": len(positions) - n_real},
-        "positions_reached": len(positions) >= pos_cap,
+        # counted as the entry gate counts them: this mode's positions only
+        # (agent._open_in_mode — real when live, practice in Practice)
+        "positions_reached": (A._open_in_mode(state, mode == "practice")
+                              >= pos_cap),
         "trade_size": {"main": _trade_size(cfg),
                        "other": _trade_size(cfg, "other_")},
         "cash": _cash(cfg, bp),
@@ -1587,7 +1592,8 @@ def _pass(cfg, state, now):
         for token in tokens:
             rec = cache.get(hc._token_id(token))
             rec = rec if isinstance(rec, dict) else {}
-            statuses.add(rec.get("status"))
+            # None while hc.poll can't rely on it either (hc._known_status)
+            statuses.add(hc._known_status(cfg, rec, token, now.timestamp()))
             if rec.get("status") in hc._USABLE and (
                     best is None or (rec.get("status") == "active"
                                      and best.get("status") != "active")):
@@ -1830,8 +1836,19 @@ def _pass_notice(cfg, state, signals=None):
             and (not isinstance(p, dict) or p.get("kind") == "day_pass")):
         return {"level": "warn", "code": "pass", "text": text}
     if isinstance(p, dict):
-        if signals.get("entry_access") is True \
-                or p.get("kind") in ("subscription", "not_needed"):
+        if signals.get("entry_access") is True:
+            return None
+        if p.get("kind") == "subscription":
+            # the one pass notice that is about the key itself: its balance
+            # can't pay for today (hc.poll; cleared on the next entry read)
+            try:
+                from sources import agenthc_day_trade_ideas as hc
+                if text == _text(hc.KEY_BALANCE_EMPTY_TEXT):
+                    return {"level": "warn", "code": "pass", "text": text}
+            except Exception:
+                pass
+            return None
+        if p.get("kind") == "not_needed":
             return None
         if (p.get("auto_pay") and cfg.get("lnbits_url")
                 and p.get("status") != "exits_only"

@@ -330,10 +330,13 @@ def test_blackout_limit_converts_to_market_after_window(monkeypatch):
     for the remainder (the mirror's verified conversion semantics)."""
     monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: False)
     rh = FakeRH({
-        "get_option_orders": _orders_result("o-1", "confirmed", "1"),
         "cancel_option_order": _mcp_result({"ok": True}),
         "place_option_order": _mcp_result({"data": {"id": "o-2"}}),
     })
+    # working before the cancel, dead (1 filled) after it: only a dead
+    # order's remainder is re-placed (test_order_state_races)
+    reads = iter([("confirmed", 1), ("cancelled", 1)])
+    monkeypatch.setattr(robinhood, "_order_status", lambda rh_, a, oid: next(reads))
     state = _entry_pending(qty=3, was_limit=True)
     robinhood.reconcile(rh, {"robinhood_account": "1"}, state, lambda s: None)
     pos = state["positions"]["SPY|2026-07-10|752.0|C"]
@@ -687,8 +690,8 @@ def test_alpaca_confirm_timeout_cancels_and_settles(monkeypatch):
     and settled with the actual fill — never assumed fully filled."""
     _no_waits(monkeypatch)
     cancels = []
-    monkeypatch.setattr(alpaca, "_order_state",
-                        lambda cfg, oid: ("accepted", 1))
+    reads = iter([("accepted", 1)] * alpaca._CONFIRM_TRIES + [("canceled", 1)])
+    monkeypatch.setattr(alpaca, "_order_state", lambda cfg, oid: next(reads))
     monkeypatch.setattr(alpaca.requests, "delete",
                         lambda url, **kw: cancels.append(url) or
                         type("R", (), {"status_code": 200})())

@@ -216,7 +216,7 @@ def test_position_cap_skip_names_the_command_to_raise_it(home, no_policy):
     out, calls = _eleventh_entry({**LIVE})
     assert calls == []
     assert "max open positions reached (10)" in out
-    assert "set positions" in out and "10 open now" in out
+    assert "set positions" in out and "10 real positions open now" in out
     rows = [json.loads(x) for x in
             (home / "trades.jsonl").read_text(encoding="utf-8").splitlines()]
     assert rows[-1]["action"] == "skip_position_cap"
@@ -261,7 +261,7 @@ def test_skip_counts_what_is_open_after_the_cap_was_lowered(home, no_policy):
     # 10 open, cap lowered to 4: still blocked, and the skip says 10 are open
     out, calls = _eleventh_entry({**LIVE, "max_open_positions": 4})
     assert calls == []
-    assert "max open positions reached (4)" in out and "10 open now" in out
+    assert "max open positions reached (4)" in out and "10 real positions open now" in out
 
 
 @pytest.mark.parametrize("cap", [20, 11])

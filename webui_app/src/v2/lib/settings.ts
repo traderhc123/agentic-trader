@@ -112,6 +112,7 @@ export function limitRange(s: SettingsView | null, key: LimitKey): Range {
     max_entries_per_day: [1, 1000],
     max_daily_loss_usd: [0, 1_000_000_000],
     max_open_positions: [1, 1000],
+    max_contracts_per_trade: [1, 1000],
   };
   const [low, high] = s?.limits.allowed?.[key] ?? fallback[key];
   return key === "max_daily_loss_usd" ? { low, high, money: true, zero: "0 turns the limit off" } : { low, high, whole: true };
@@ -156,7 +157,7 @@ export function savedTickers(v: string[] | string | null | undefined): string[] 
 
 // ── saying a value ──────────────────────────────────────────────────────────
 
-export type LimitKey = "max_entries_per_day" | "max_daily_loss_usd" | "max_open_positions";
+export type LimitKey = "max_entries_per_day" | "max_daily_loss_usd" | "max_open_positions" | "max_contracts_per_trade";
 export type Book = "main" | "other";
 
 export const SIZE_MODE_WORDS: Record<SizeMode, string> = {
@@ -188,6 +189,7 @@ export function valueWords(key: string, v: unknown): string {
   if (key === "max_daily_loss_usd") return lossWords(v);
   if (key === "max_entries_per_day") return isNum(v) ? `${count(v)} a day` : "not set";
   if (key === "max_open_positions") return isNum(v) ? `${count(v)} at once` : "not set";
+  if (key === "max_contracts_per_trade") return isNum(v) ? `${plural(v, "contract")} a trade at most` : "not set";
   if (key === "broker") {
     const b = (v ?? {}) as { id?: string | null; paper?: boolean | null };
     if (!b.id) return "No broker";
@@ -273,7 +275,9 @@ export function limitMeans(key: LimitKey, v: number, ctx: { mainUsd: number | nu
     return v > 0
       ? `Once today's closed trades have lost ${money(v)}, no new trades until tomorrow. It never sells anything, and a trade already open can lose more than this before it is sold.`
       : "No daily loss limit: losses never stop new trades.";
-  return `The agent holds at most ${plural(v, "position")} at a time, real and practice together. ${ctx.open} ${ctx.open === 1 ? "is" : "are"} open now${v < ctx.open ? ", so no new trades until some are sold. Nothing is sold because of this change" : ""}.`;
+  if (key === "max_contracts_per_trade")
+    return `No trade buys more than ${plural(v, "contract")}, whatever the trade size: a bigger budget or contract count is cut to ${count(v)}. Nothing already held changes.`;
+  return `The agent holds at most ${plural(v, "position")} at a time (real and practice are counted separately). ${ctx.open} ${ctx.open === 1 ? "is" : "are"} open now${v < ctx.open ? ", so no new trades until some are sold. Nothing is sold because of this change" : ""}.`;
 }
 
 export function sizeMeans(x: SizeSpec, book: Book): string {
@@ -288,7 +292,7 @@ export function sizeMeans(x: SizeSpec, book: Book): string {
  *  server changes only the keys sent). */
 export function limitsPayload(saved: SettingsView, draft: Partial<Record<LimitKey, number>> & { main?: SizeSpec; other?: SizeSpec | null }) {
   const out: Record<string, unknown> = {};
-  for (const k of ["max_entries_per_day", "max_daily_loss_usd", "max_open_positions"] as LimitKey[])
+  for (const k of ["max_entries_per_day", "max_daily_loss_usd", "max_open_positions", "max_contracts_per_trade"] as LimitKey[])
     if (draft[k] !== undefined && draft[k] !== saved.limits[k]) out[k] = draft[k];
   const size: Record<string, unknown> = {};
   if (draft.main) size.main = { mode: draft.main.mode, value: draft.main.value };
