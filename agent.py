@@ -152,6 +152,16 @@ def _fsync(fd):
             raise
 
 
+def _read_umask():
+    # os.umask can only be read by setting it: done once, at import
+    mask = os.umask(0o022)
+    os.umask(mask)
+    return mask
+
+
+_PUBLIC_FILE_MODE = 0o666 & ~_read_umask()
+
+
 def _write_json(path, payload, private):
     """Write `payload` to `path` so a power cut leaves the old file or the
     new one, never a half-written one: temp file, flush + fsync (the bytes
@@ -171,8 +181,12 @@ def _write_json(path, payload, private):
             json.dump(payload, f, indent=2)
             f.flush()
             _fsync(f.fileno())
-        if private and not platform_compat.IS_WINDOWS:
-            os.chmod(tmp, 0o600)  # Windows: inherits the locked directory's ACL
+        if not platform_compat.IS_WINDOWS:
+            # mkstemp makes every temp file 0600: a file that isn't private
+            # (trades, previews, …) keeps the permissions open() gave it
+            # before (0666 minus the umask), for whatever reads it as
+            # another user. Windows: inherits the locked directory's ACL.
+            os.chmod(tmp, 0o600 if private else _PUBLIC_FILE_MODE)
         _replace(tmp, path)
     except BaseException:
         try:
@@ -7840,6 +7854,16 @@ def cmd_export(path):
     import transfer
     if not path:
         path = transfer.export_filename()
+    # The passphrase first: a typo must not leave the agent stopped.
+    pw = getpass.getpass("Pick a passphrase for the move file (8+ characters): ")
+    if getpass.getpass("Type it again: ") != pw:
+        print("The passphrases didn't match — nothing exported.")
+        sys.exit(1)
+    if len(pw) < transfer.MIN_PASSPHRASE:
+        print(f"Pick a passphrase of at least {transfer.MIN_PASSPHRASE} "
+              "characters — nothing exported.")
+        sys.exit(1)
+    stopped_here = False
     if keep_running.is_running() or keep_running.supervisor_running():
         # The file must hold everything this computer has done: a trade the
         # running agent makes after the copy is taken would be missing on
@@ -7855,26 +7879,70 @@ def cmd_export(path):
             print("It could not be stopped, so nothing was exported. Run: "
                   "python agent.py stop — then export again.")
             sys.exit(1)
-    pw = getpass.getpass("Pick a passphrase for the move file (8+ characters): ")
-    if getpass.getpass("Type it again: ") != pw:
-        print("The passphrases didn't match — nothing exported.")
-        sys.exit(1)
+        stopped_here = True
+    retired = False
     try:
-        blob = transfer.export_bundle(pw)
-    except transfer.TransferError as exc:
-        print(f"Export failed: {exc}")
-        sys.exit(1)
-    with open(path, "wb") as f:
-        f.write(blob)
-    print(f"Saved {path} ({len(blob) // 1024} KB). It holds your broker login and "
-          "wallet keys — keep it like a password, and delete it after the move.")
-    if input("Stop the agent on THIS computer now so only the new one trades? "
-             "[Y/n] ").strip().lower() in ("", "y", "yes"):
-        if keep_running.is_running():
-            keep_running.stop()
-        print(transfer.mark_moved_away())
-    print("On the new computer: run the installer, then in the setup page choose "
-          "\"Moving from another computer?\" (or: python agent.py import FILE).")
+        try:
+            blob = transfer.export_bundle(pw)
+        except transfer.TransferError as exc:
+            print(f"Export failed: {exc}")
+            sys.exit(1)
+        try:
+            with open(path, "wb") as f:
+                f.write(blob)
+        except OSError as exc:
+            print(f"Could not save {path} ({exc}) — nothing exported.")
+            sys.exit(1)
+        print(f"Saved {path} ({len(blob) // 1024} KB). It holds your broker "
+              "login and wallet keys — keep it like a password, and delete it "
+              "after the move.")
+        if input("Retire THIS computer now (it won't run the agent again) so "
+                 "only the new one trades? [Y/n] ").strip().lower() in (
+                     "", "y", "yes"):
+            if keep_running.is_running() or keep_running.supervisor_running():
+                keep_running.stop()
+            print(transfer.mark_moved_away())
+            retired = True
+        elif stopped_here:
+            print("Not retired: the agent carries on here, so the file you "
+                  "saved is out of date as soon as it trades — make a new one "
+                  "when you move.")
+        print("On the new computer: run the installer, then in the setup page "
+              "choose \"Moving from another computer?\" (or: python agent.py "
+              "import FILE).")
+    finally:
+        if stopped_here and not retired:
+            _restart_after_export()
+
+
+def _restart_after_export():
+    """cmd_export stopped the agent for the copy and this computer was NOT
+    retired (export failed, or the owner keeps trading here): start it
+    again, so open positions keep their exits and expiry guard."""
+    import keep_running
+    import webui
+    print("The agent on this computer was stopped for the export — starting "
+          "it again…")
+    try:
+        if keep_running.is_running() or keep_running.supervisor_running():
+            ok = True  # something started it meanwhile
+        else:
+            before = keep_running.supervisor_status()
+            proc = keep_running.start_background(port=webui.APP_PORT)
+            ok = keep_running.wait_until_running(timeout=40, proc=proc,
+                                                 before=before)
+    except Exception as exc:
+        print(f"Starting it failed: {str(exc)[:200]}")
+        ok = False
+    if ok:
+        print("It is running again on this computer.")
+    elif keep_running.is_running() or keep_running.supervisor_running():
+        print("It is still starting — check in a minute: python agent.py "
+              "status")
+    else:
+        print("!! The agent on this computer is STOPPED: open positions get "
+              "no exit signals and no expiry-guard sells until it runs. "
+              "Start it again with: python agent.py start")
 
 
 def cmd_import(path):

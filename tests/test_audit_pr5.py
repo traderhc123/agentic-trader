@@ -436,3 +436,279 @@ def test_dashboard_import_that_changed_nothing_carries_on(mover, monkeypatch):
     r = route(None, {"data": "", "passphrase": "pw"})
     assert r["ok"] is False and not webui.orders_held()
     assert not webui.setup_replaced()
+
+
+# ── review fixups: a Move never leaves exits / the expiry guard off ─────────
+
+def _cli_agent(monkeypatch, answers, pws=(PW, PW)):
+    """A running agent for `agent.py export`; records stop / start."""
+    calls, up = [], {"on": True}
+    monkeypatch.setattr(keep_running, "is_running", lambda: up["on"])
+    monkeypatch.setattr(keep_running, "supervisor_running", lambda: False)
+    monkeypatch.setattr(keep_running, "disable_autostart", lambda: None)
+    monkeypatch.setattr(keep_running, "supervisor_status", lambda: {})
+
+    def stop(*a, **k):
+        calls.append("stop")
+        up["on"] = False
+        return True
+
+    def start_background(port=None):
+        calls.append("start")
+        up["on"] = True
+    monkeypatch.setattr(keep_running, "stop", stop)
+    monkeypatch.setattr(keep_running, "start_background", start_background)
+    monkeypatch.setattr(keep_running, "wait_until_running",
+                        lambda *a, **k: up["on"])
+    import getpass
+    pw_iter = iter(pws)
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": next(pw_iter))
+    ans = iter(answers)
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(ans))
+    return calls, up
+
+
+def test_cli_export_passphrase_typo_never_stops_the_agent(home, monkeypatch,
+                                                          tmp_path, capsys):
+    """REVIEW: the agent was stopped first, then a passphrase mismatch
+    exited and left it stopped (no exits, no expiry guard)."""
+    _write(home / "config.json", LIVE)
+    calls, up = _cli_agent(monkeypatch, ["y"], pws=(PW, PW + "x"))
+    with pytest.raises(SystemExit):
+        agent.cmd_export(str(tmp_path / "move.atmove"))
+    assert "stop" not in calls and up["on"] is True
+    assert not (tmp_path / "move.atmove").exists()
+
+
+def test_cli_export_that_fails_after_the_stop_starts_the_agent_again(
+        home, monkeypatch, tmp_path, capsys):
+    _write(home / "config.json", LIVE)
+    calls, up = _cli_agent(monkeypatch, ["y"])
+
+    def boom(pw):
+        raise transfer.TransferError("disk full")
+    monkeypatch.setattr(transfer, "export_bundle", boom)
+    with pytest.raises(SystemExit):
+        agent.cmd_export(str(tmp_path / "move.atmove"))
+    assert calls == ["stop", "start"] and up["on"] is True
+    assert transfer.moved_away() is None
+    assert "running again" in capsys.readouterr().out
+
+
+def test_cli_export_kept_here_starts_the_agent_again(home, monkeypatch,
+                                                     tmp_path, capsys):
+    """REVIEW: answering "n" (keep trading here) left the agent stopped."""
+    _write(home / "config.json", LIVE)
+    calls, up = _cli_agent(monkeypatch, ["y", "n"])
+    agent.cmd_export(str(tmp_path / "move.atmove"))
+    assert (tmp_path / "move.atmove").exists()
+    assert calls == ["stop", "start"] and up["on"] is True
+    assert transfer.moved_away() is None
+    assert "out of date" in capsys.readouterr().out
+
+
+def test_cli_export_that_cannot_restart_says_it_is_stopped(home, monkeypatch,
+                                                           tmp_path, capsys):
+    _write(home / "config.json", LIVE)
+    calls, up = _cli_agent(monkeypatch, ["y", "n"])
+    monkeypatch.setattr(keep_running, "start_background",
+                        lambda port=None: calls.append("start"))
+    monkeypatch.setattr(keep_running, "wait_until_running",
+                        lambda *a, **k: False)
+    agent.cmd_export(str(tmp_path / "move.atmove"))
+    out = capsys.readouterr().out
+    assert "STOPPED" in out and "python agent.py start" in out
+
+
+def test_cli_export_retired_does_not_start_it_again(home, monkeypatch,
+                                                    tmp_path):
+    _write(home / "config.json", LIVE)
+    calls, up = _cli_agent(monkeypatch, ["y", "y"])
+    agent.cmd_export(str(tmp_path / "move.atmove"))
+    assert calls == ["stop"] and up["on"] is False
+    assert transfer.moved_away()
+
+
+def _expiring_today(monkeypatch, hh, mm):
+    from datetime import datetime
+    now = datetime(2026, 11, 17, hh, mm, tzinfo=agent.MARKET_TZ)  # a Tuesday
+    monkeypatch.setattr(agent, "_et_now", lambda: now)
+    agent._save(agent.STATE_PATH, {"seen": [], "positions": {
+        "SPY|2026-11-17|600|call": {"qty": 1}}}, private=True, backup=True)
+
+
+def test_export_refused_when_the_hold_could_reach_the_expiry_sell(
+        mover, monkeypatch):
+    """REVIEW: an unfinished move holds the expiry guard too — pressed at
+    15:40 with a contract expiring today, nothing would sell it at 15:45."""
+    monkeypatch.setattr(transfer, "MOVE_HOLD_S", 600)
+    routes = mover()
+    _expiring_today(monkeypatch, 15, 40)
+    r = routes["/api/move/export"](None, {"passphrase": PW})
+    assert r["ok"] is False and "expires today" in r["error"]
+    assert "15:45" in r["error"]
+    assert transfer.HANDOFF["hold"] is False           # exits carry on
+    assert routes["/api/move/download"](None)["ok"] is False
+    _expiring_today(monkeypatch, 10, 0)                # hours to go: fine
+    assert routes["/api/move/export"](None, {"passphrase": PW})["ok"] is True
+
+
+def test_finish_while_the_time_limit_runs_out_stays_retired(mover,
+                                                            monkeypatch):
+    """REVIEW: the 10-minute timer firing between finish's checks and its
+    retiring lifted the hold of a computer that was being retired."""
+    told = []
+    monkeypatch.setattr(agent, "notify",
+                        lambda cfg, msg, *a, **k: told.append(msg))
+    timers = []
+
+    class Timer:
+        def __init__(self, s, fn, args=()):
+            timers.append((fn, args))
+            self.daemon = True
+
+        def start(self):
+            pass
+    monkeypatch.setattr(webui.threading, "Timer", Timer)
+    routes = mover()
+    assert routes["/api/move/export"](None, {"passphrase": PW})["ok"]
+    fn, args = timers[0]
+    real_mark = transfer.mark_moved_away
+    fired = []
+
+    def mark():
+        t = threading.Thread(target=fn, args=args)
+        t.start()
+        t.join(0.3)        # the timer, at exactly this moment
+        fired.append(t)
+        return real_mark()
+    monkeypatch.setattr(transfer, "mark_moved_away", mark)
+    assert routes["/api/move/finish"](None, {})["ok"] is True
+    fired[0].join(5)
+    assert transfer.HANDOFF["hold"] is True and transfer.moved_away()
+    assert not told                                   # no "carries on"
+
+
+def test_a_second_request_during_an_export_never_lifts_its_hold(mover):
+    """REVIEW: a finish arriving while the export waited for the cycle
+    lifted the hold; the export then made a file nothing held."""
+    routes = mover()
+    transfer.CYCLE_IDLE.clear()        # a cycle is running
+    out = {}
+    t1 = threading.Thread(target=lambda: out.setdefault(
+        "export", routes["/api/move/export"](None, {"passphrase": PW})))
+    t1.start()
+    deadline = time.time() + 10
+    while not transfer.HANDOFF["hold"] and time.time() < deadline:
+        time.sleep(0.01)
+    t2 = threading.Thread(target=lambda: out.setdefault(
+        "finish", routes["/api/move/finish"](None, {})))
+    t2.start()
+    time.sleep(0.2)
+    transfer.CYCLE_IDLE.set()          # the cycle ends
+    t1.join(10)
+    t2.join(10)
+    assert out["export"]["ok"] is True
+    # whatever the order, nothing trades here behind a file that was handed
+    # out: either retired (held for good), or the file is still held
+    assert transfer.HANDOFF["hold"] is True
+    d = routes["/api/move/download"](None)
+    assert getattr(d, "body", None) is None or transfer.HANDOFF["hold"]
+
+
+def test_wizard_export_refused_while_a_supervisor_may_start_the_agent(
+        mover, monkeypatch):
+    routes = mover(running=False)
+    monkeypatch.setattr(keep_running, "supervisor_running", lambda: True)
+    r = routes["/api/move/export"](None, {"passphrase": PW})
+    assert r["ok"] is False and "python agent.py stop" in r["error"]
+
+
+def test_wizard_finish_refused_when_the_agent_started_after_the_file(
+        mover, monkeypatch):
+    routes = mover(running=False)
+    up = {"on": False}
+    monkeypatch.setattr(keep_running, "is_running", lambda: up["on"])
+    monkeypatch.setattr(keep_running, "supervisor_running", lambda: False)
+    assert routes["/api/move/export"](None, {"passphrase": PW})["ok"]
+    up["on"] = True                    # start-at-login, `agent.py start`, ...
+    r = routes["/api/move/finish"](None, {})
+    assert r["ok"] is False and transfer.moved_away() is None
+
+
+def test_server_hand_off_after_an_export_keeps_the_hold(mover, monkeypatch):
+    """REVIEW (probe-confirmed): Create move file, then Move to a server:
+    when the export's 10 minutes ran out its timer lifted the hold the
+    server hand-off relied on — this computer traded alongside the
+    server."""
+    import llm_policy
+    told = []
+    monkeypatch.setattr(agent, "notify",
+                        lambda cfg, msg, *a, **k: told.append(msg))
+    monkeypatch.setattr(transfer, "MOVE_HOLD_S", 0.3)
+    monkeypatch.setattr(llm_policy, "entries_blocked", lambda cfg: False)
+    monkeypatch.setattr(provision, "create_droplet",
+                        lambda token, region: (7, "droplet 7 creating"))
+    monkeypatch.setattr(provision, "LOCAL_STOP_CAP_S", 0)
+    monkeypatch.setattr(provision, "LOCAL_STOP_AFTER_SHOWN_S", 0)
+    before = set(threading.enumerate())
+    routes = mover()
+    assert routes["/api/move/export"](None, {"passphrase": PW})["ok"]
+    r = routes["/api/deploy"](None, {"token": "t", "region": "nyc3"})
+    assert r["ok"], r
+    time.sleep(0.8)                    # the export's time limit runs out
+    assert transfer.HANDOFF["hold"] is True and transfer.moved_away()
+    assert not [m for m in told if "carries on trading" in m]
+    assert routes["/api/move/download"](None)["ok"] is False   # stale file
+    assert routes["/api/move/finish"](None, {})["ok"] is False
+    assert transfer.HANDOFF["hold"] is True
+    for t in set(threading.enumerate()) - before:
+        t.join(5)
+
+
+def test_import_never_leaves_live_settings_beside_imported_files(two_homes,
+                                                                 monkeypatch):
+    """REVIEW: a crash/kill part-way through the swaps (no rollback runs)
+    left this computer's own LIVE settings next to the old computer's
+    positions. They are practice mode on disk before anything is swapped."""
+    blob, new = two_homes
+    _write(new / "config.json", {"source": "agenthc", "broker": "alpaca",
+                                 "dry_run": False, "alpaca_key": "MINE"})
+    seen = []
+    real = os.replace
+
+    def replace(src, dst):
+        if not os.path.basename(dst).startswith("config.json"):
+            seen.append((os.path.basename(dst),
+                         _read(new / "config.json")["dry_run"]))
+        return real(src, dst)
+    monkeypatch.setattr(os, "replace", replace)
+    transfer.import_bundle(blob, PW, replace=True)
+    assert seen and all(dry is True for _n, dry in seen), seen
+    assert _read(new / "config.json")["alpaca_key"] == "BUNDLE"
+    assert not [n for n in os.listdir(new) if n.endswith(".tmp")]
+
+
+def test_clean_rollback_puts_live_settings_back_exactly(two_homes,
+                                                        monkeypatch):
+    blob, new = two_homes
+    _write(new / "config.json", {"source": "agenthc", "broker": "alpaca",
+                                 "dry_run": False, "alpaca_key": "MINE"})
+    before = _snapshot(new)
+    _failing_replace(monkeypatch, lambda s, d: d.endswith("trades.jsonl"))
+    with pytest.raises(transfer.TransferError) as e:
+        transfer.import_bundle(blob, PW, replace=True)
+    assert not isinstance(e.value, transfer.ImportIncomplete)
+    assert _snapshot(new) == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+def test_saved_files_keep_their_usual_permissions(home):
+    """REVIEW: mkstemp made every saved file 0600, private or not."""
+    mask = os.umask(0o022)
+    os.umask(mask)
+    p = str(home / "preview.json")
+    agent._save(p, {"a": 1})
+    assert os.stat(p).st_mode & 0o777 == 0o666 & ~mask
+    agent._save(str(home / "secret.json"), {"a": 1}, private=True)
+    assert os.stat(str(home / "secret.json")).st_mode & 0o777 == 0o600

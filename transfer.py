@@ -286,9 +286,30 @@ def import_bundle(blob, passphrase, replace=False):
     except BaseException:
         _discard(tmp for tmp, _dest in staged)
         raise
-    # 2) swap them in, keeping a copy of each file they replace; on any
+    # 2) this computer's own settings to practice mode first, on the disk: a
+    #    crash or kill part-way through 3) (no rollback runs then) leaves the
+    #    old computer's positions next to THESE settings — never LIVE.
+    cfg_path = os.path.join(root, "config.json")
+    try:
+        kept = _practice_first(cfg_path)
+    except BaseException:
+        _discard(tmp for tmp, _dest in staged)
+        raise
+    # 3) swap them in, keeping a copy of each file they replace; on any
     #    failure put every one back: all of the move file, or none of it.
-    _install_all(staged)
+    try:
+        _install_all(staged)
+    except ImportIncomplete:
+        _discard([kept] if kept else [])   # a mix: it stays in practice mode
+        raise
+    except BaseException:
+        if kept:  # a clean rollback: this computer's settings exactly as were
+            try:
+                _swap(kept, cfg_path)
+            except OSError:
+                pass  # stays in practice mode (safe); the copy is kept
+        raise
+    _discard([kept] if kept else [])
     resume_here()  # a fresh import is meant to run here
     return {"files": len(members), "created_at": manifest.get("created_at"),
             "from_os": manifest.get("from_os"), "was_live": was_live,
@@ -371,6 +392,43 @@ def _install_all(staged):
             "nothing was imported and this computer's setup is unchanged. "
             "Close anything that may have it open and try again.") from exc
     _discard(b for _d, b in done if b)
+
+
+_PRACTICE_KEEP_SUFFIX = ".import-own.tmp"
+
+
+def _practice_first(cfg_path):
+    """Before an import swaps anything: if this computer's own config.json
+    is not in practice mode, keep an exact copy of it and save it with
+    dry_run on (durably). Returns the copy's path (to put back on a clean
+    rollback), or None when nothing needed changing. Raises TransferError —
+    nothing imported — if it can't be done."""
+    import shutil
+    import agent
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None   # none, or unreadable: the agent can't trade on it
+    if not isinstance(cfg, dict) or cfg.get("dry_run") is True:
+        return None
+    kept = cfg_path + _PRACTICE_KEEP_SUFFIX
+    try:
+        shutil.copy2(cfg_path, kept)
+        cfg["dry_run"] = True
+        agent._write_json(cfg_path, cfg, private=True)
+    except OSError as exc:
+        try:
+            if os.path.exists(kept):
+                _swap(kept, cfg_path)
+        except OSError:
+            pass
+        raise TransferError(
+            "this computer's settings could not be switched to practice mode "
+            f"before the import ({str(exc)[:120]}), so nothing was imported. "
+            "Close anything that may have config.json open and try "
+            "again.") from exc
+    return kept
 
 
 def _force_dry_run(cfg_path):
