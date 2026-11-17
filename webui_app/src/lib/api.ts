@@ -214,6 +214,10 @@ export interface Proposal {
   explanation?: string;
   warnings?: string[];
   diff?: string;
+  /** the diff above is cut: it can never be applied */
+  truncated?: boolean;
+  /** sha256 of the whole diff; Apply posts it back so only this change applies */
+  diff_sha256?: string;
 }
 export interface WizardState {
   disclaimer: string;

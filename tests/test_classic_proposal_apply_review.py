@@ -10,6 +10,8 @@ Hermetic: no broker, wallet, AI, AgentHC or network; self_edit works on a
 throwaway source tree."""
 
 import hashlib
+import re
+from pathlib import Path
 
 import pytest
 
@@ -76,7 +78,7 @@ def test_classic_route_refuses_a_stale_change(home, app, repo):
     c = app()
     _stage([("helper_mod.py", "A = 1\n", "A = 2\n")])
     (repo / "helper_mod.py").write_text(UPDATED, encoding="utf-8")
-    r = c.post("/api/proposal/apply", {})  # what /dash (webui_dist) posts
+    r = c.post("/api/proposal/apply", {})  # a client that sends no sha
     assert r["ok"] is False and "changed since" in r["reply"]
     assert (repo / "helper_mod.py").read_text(encoding="utf-8") == UPDATED
     assert self_edit.current() is not None
@@ -129,3 +131,25 @@ def test_builtin_classic_page_sends_the_shown_sha_and_blocks_a_cut_diff():
     panel = panel[:panel.index("api('/api/trades')")]
     assert "truncated" in panel and "prop-apply" in panel and "disabled" in panel
     assert 'id="prop-apply"' in page
+
+
+# ── the React /dash page (webui_app -> webui_dist) ──
+
+def test_react_dash_sends_the_shown_sha_and_blocks_a_cut_diff():
+    src = (Path(webui.__file__).parent / "webui_app" / "src" / "dash"
+           / "Dashboard.tsx").read_text(encoding="utf-8")
+    panel = src[src.index("function ProposalPanel("):]
+    panel = panel[:panel.index("\n}\n")]
+    assert '"/api/proposal/apply", { diff_sha256: sha }' in panel
+    assert "p.diff_sha256" in panel and "p.truncated" in panel
+    assert "disabled={blocked}" in panel and "can't be applied" in panel
+
+
+def test_built_react_dash_sends_the_shown_sha():
+    """The bundle users get (webui_dist) was rebuilt from that source."""
+    dist = Path(webui.__file__).parent / "webui_dist" / "assets"
+    js = "".join(p.read_text(encoding="utf-8")
+                 for p in dist.glob("index-*.js"))
+    assert re.search(r'"/api/proposal/apply",\{diff_sha256:', js)
+    assert '"/api/proposal/apply",{})' not in js
+    assert "too large to show in full, so it can't be applied" in js
