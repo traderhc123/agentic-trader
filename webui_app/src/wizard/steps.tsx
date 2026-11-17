@@ -620,6 +620,8 @@ function safetyShown(st: WizardState | null | undefined) {
     dry: typeof st?.dry_run === "boolean" ? st.dry_run : true,
     cap: st?.max_entries_per_day != null ? String(st.max_entries_per_day) : "5",
     positions: st?.max_open_positions != null ? String(st.max_open_positions) : "10",
+    // never set: the agent's default, 100
+    max_contracts: st?.max_contracts_per_trade != null ? String(st.max_contracts_per_trade) : "100",
     max_loss: st?.max_daily_loss_usd && st.max_daily_loss_usd > 0 ? String(st.max_daily_loss_usd) : "",
     rule_tickers: (r.rule_tickers || []).join(", "),
     rule_skip_tickers: (r.rule_skip_tickers || []).join(", "),
@@ -640,6 +642,7 @@ export function SafetyStep() {
   const [dry, setDry] = useState(s0.dry);
   const [cap, setCap] = useState(s0.cap);
   const [positions, setPositions] = useState(s0.positions);
+  const [maxContracts, setMaxContracts] = useState(s0.max_contracts);
   const [maxLoss, setMaxLoss] = useState(s0.max_loss);
   const [discord, setDiscord] = useState("");
   const [ntfy, setNtfy] = useState("");
@@ -665,6 +668,7 @@ export function SafetyStep() {
     setDry(s.dry);
     setCap(s.cap);
     setPositions(s.positions);
+    setMaxContracts(s.max_contracts);
     setMaxLoss(s.max_loss);
     setTickers(s.rule_tickers);
     setSkipTickers(s.rule_skip_tickers);
@@ -684,6 +688,7 @@ export function SafetyStep() {
       dry,
       cap,
       positions,
+      max_contracts: maxContracts,
       max_loss: maxLoss,
       rule_tickers: tickers,
       rule_skip_tickers: skipTickers,
@@ -752,7 +757,7 @@ export function SafetyStep() {
         <Field
           htmlFor="sf-positions"
           label="Open positions at once"
-          help="The most positions held at the same time, real and practice counted together."
+          help="The most positions held at the same time. Real and practice positions are counted separately."
           className="max-w-xs"
         >
           <Input
@@ -762,6 +767,22 @@ export function SafetyStep() {
             max={1000}
             value={positions}
             onChange={(e) => setPositions(e.target.value)}
+            className="font-mono"
+          />
+        </Field>
+        <Field
+          htmlFor="sf-max-contracts"
+          label="Most contracts in one trade"
+          help="Every trade is cut to this many contracts, whatever the budget or contract count."
+          className="max-w-xs"
+        >
+          <Input
+            id="sf-max-contracts"
+            type="number"
+            min={1}
+            max={1000}
+            value={maxContracts}
+            onChange={(e) => setMaxContracts(e.target.value)}
             className="font-mono"
           />
         </Field>
