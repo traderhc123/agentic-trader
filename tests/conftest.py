@@ -52,6 +52,8 @@ def _no_state_hold_left_over(monkeypatch):
     import webui
     monkeypatch.setitem(agent._STATE_HELD, "on", False)
     monkeypatch.setitem(webui.CONTROLS, "replaced", False)
+    # the in-memory "trade log can't be read" skip rows (_problems_today)
+    monkeypatch.setattr(agent, "_UNREADABLE_SKIPS", [])
 
 
 @pytest.fixture(autouse=True)

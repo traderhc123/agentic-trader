@@ -55,10 +55,18 @@ def exit_results(trades):
     A position sold in pieces logs several exit rows: a partial fill and
     the remainder the agent re-sells, or a partial close in the broker app
     followed by the agent's exit. Rows marked "partial" leave the position
-    open, so the next exit row of the same contract (and book) is the same
-    position: its P&L is added to that one result, never counted as a
-    second trade. An entry row in that contract starts a new position. A
-    partly sold position counts at once with what it has lost so far."""
+    open, so the next exit row of the same contract (and mode: practice or
+    real) is the same position: its P&L is added to that one result, never
+    counted as a second trade. An entry row in that contract starts a new
+    position. A partly sold position counts at once with what it has lost
+    so far.
+
+    The key has no book: entry and exit rows don't carry one, and the agent
+    holds one position per contract (state["positions"] is keyed by
+    contract), so a contract's exits are one position's. If two books can
+    ever hold the same contract at once, write the book on entry and exit
+    rows and add it to this key — or one book's partial exit would merge
+    with the other book's exit and two losses would count as one."""
     results, open_ = [], {}
     for t in trades:
         key = (bool(t.get("dry")), t.get("contract"))

@@ -936,7 +936,9 @@ class TradeLogUnreadable(OSError):
 
 def _todays_log_rows(today, strict=False):
     """Every trade-log row that mentions `today` (a date, or a tuple of
-    dates; full-file scan), then the rows this run could not write yet — so
+    strings — a row mentioning any of them; full-file scan; this is only a
+    cheap pre-filter, callers check the row's fields), then the rows this
+    run could not write yet — so
     an unwritable log can't make today's entries or losses disappear from
     the limits.
 
@@ -1034,10 +1036,11 @@ def _et_day(ts):
 
 
 _POLICY_ROWS_SHOWN = 50
+_POLICY_EARLIER_SHOWN = 20
 
 
 def _policy_view(dry, strict=False):
-    """What the AI policy check is shown about today: (rows, context).
+    """What the AI policy check is shown: (rows, context).
 
     rows: today's entry and exit rows (ET market day; a close found in the
     account counts on the day it filled) of the mode the agent is in only,
@@ -1045,18 +1048,29 @@ def _policy_view(dry, strict=False):
     log would let skip/veto rows push today's entries out of view, and a
     per-day limit in policy.md would then let one more order through.
     context: the time now (ET), the mode, and the day's counts worked out
-    here, so the model need not count the rows itself. strict: as for
-    _entries_today."""
+    here, so the model need not count the rows itself; and "earlier": the
+    last _POLICY_EARLIER_SHOWN entry and exit rows of this mode from BEFORE
+    today (same scan, so skip rows can't crowd them out either) — written
+    rules that span days (a losing streak across days, "not a ticker I lost
+    on yesterday", a weekly cap) need them, as they had in the old last-20
+    window. strict: as for _entries_today."""
+    import collections
     import rules
-    from datetime import timedelta
     now = _et_now()
     today = now.date().isoformat()
-    # an ET day's rows carry that UTC date or the next one
-    next_utc = (now.date() + timedelta(days=1)).isoformat()
-    rows = [t for t in _todays_log_rows((today, next_utc), strict)
-            if t.get("action") in ("entry", "exit")
-            and bool(t.get("dry")) == bool(dry)
-            and _et_day(t.get("closed_at") or t.get("ts", "")) == today]
+    rows = []
+    earlier = collections.deque(maxlen=_POLICY_EARLIER_SHOWN)
+    # one pass over the whole log; the substrings are only a cheap pre-filter
+    for t in _todays_log_rows(('"entry"', '"exit"'), strict):
+        if (t.get("action") not in ("entry", "exit")
+                or bool(t.get("dry")) != bool(dry)):
+            continue
+        day = _et_day(t.get("closed_at") or t.get("ts", ""))
+        if day == today:
+            rows.append(t)
+        elif day and day < today:
+            earlier.append(t)
+    earlier = list(earlier)
     results = rules.exit_results(rows)
     measured = [v for v in results if v is not None]
     context = {
@@ -1066,9 +1080,12 @@ def _policy_view(dry, strict=False):
         "positions_closed_today": len(results),
         "losing_positions_today": sum(1 for v in measured if v < 0),
         "losses_in_a_row": rules.loss_streak(rows),
+        # the same streak carried back through the earlier rows shown
+        "losses_in_a_row_with_earlier": rules.loss_streak(earlier + rows),
         "est_realized_pnl_today_usd": round(sum(measured), 2),
         "rows_shown": min(len(rows), _POLICY_ROWS_SHOWN),
         "rows_today": len(rows),
+        "earlier": _rows_without_facts(earlier),
     }
     return _rows_without_facts(rows[-_POLICY_ROWS_SHOWN:]), context
 
@@ -1964,10 +1981,17 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
                 "dashboard activity log.)")
 
 
+# The latest skip_log_unreadable rows, also kept in memory: while the log
+# can't be read the dashboard can't read them back from it (_problems_today).
+_UNREADABLE_SKIPS = []
+_UNREADABLE_SKIPS_KEPT = 50
+
+
 def _log_unreadable_skip(cfg, state, save_state, ev, book, contract, why, exc):
     """An entry skipped because the trade log can't be read (handle_event):
-    a row the dashboard lists (kept in memory if the log can't be written
-    either) and a high-priority alert at most once a day. Never raises."""
+    a row in the log, also kept in memory so the dashboard's problems list
+    shows it DURING the outage (_problems_today), and a high-priority alert
+    at most once a day. Never raises."""
     try:
         rec = {"action": "skip_log_unreadable", "book": book,
                "event_id": ev.get("event_id"), "contract": contract,
@@ -1975,6 +1999,8 @@ def _log_unreadable_skip(cfg, state, save_state, ev, book, contract, why, exc):
         if cfg.get("dry_run"):
             rec["dry"] = True
         _log_trade(_row_facts(rec, cfg, "daily_cap"))
+        _UNREADABLE_SKIPS.append(rec)
+        del _UNREADABLE_SKIPS[:-_UNREADABLE_SKIPS_KEPT]
         today = datetime.now(timezone.utc).date().isoformat()
         sent = state.setdefault("problem_notified", {})
         if sent.get("skip_log_unreadable") == today:
@@ -2198,7 +2224,15 @@ def _problems_today():
                                          "skip_log_unreadable"}
              | _OWN_SKIPS)
     out = {}
-    for t in _recent_trades(300):
+    rows = _recent_trades(300)
+    # while the log can't be read, its skip_log_unreadable rows only exist
+    # in memory (_log_unreadable_skip); once it can, they're on file too
+    on_file = {(t.get("action"), t.get("event_id"), t.get("ts")) for t in rows}
+    extra = [t for t in _UNREADABLE_SKIPS
+             if (t.get("action"), t.get("event_id"), t.get("ts")) not in on_file]
+    if extra:
+        rows = sorted(rows + extra, key=lambda t: str(t.get("ts", "")))
+    for t in rows:
         if t.get("action") not in kinds or not str(t.get("ts", "")).startswith(today):
             continue
         p = out.setdefault(t["action"], {"kind": t["action"], "count": 0})

@@ -184,6 +184,57 @@ def test_evaluate_without_context_keeps_the_old_prompt(home, monkeypatch):
     assert len(_log_rows(seen[-1])) == 20
 
 
+def _earlier_rows(prompt):
+    body = prompt.split("EARLIER TRADE LOG", 1)[1]
+    body = body.split("for rules that span days):\n", 1)[1]
+    return json.loads(body.split("\n\nTODAY'S TRADE LOG", 1)[0])
+
+
+def test_policy_check_is_shown_earlier_days_for_rules_that_span_days(
+        home, monkeypatch):
+    """Review fix: written rules that span days ("stop after 3 losing trades
+    in a row" counted across days, "not a ticker I lost on yesterday", a
+    weekly cap) need the rows from before today, as the old last-20 window
+    usually had. They come in their own EARLIER section — this mode's
+    entries and exits only, so skip rows and practice rows can't crowd them
+    out — and the streak line says 'today', with the cross-day streak too."""
+    from datetime import timedelta
+    seen = _policy(home, monkeypatch,
+                   text="- Stop after 3 losing trades in a row.\n")
+    d2 = (agent._et_now().date() - timedelta(days=2)).isoformat()
+    y = (agent._et_now().date() - timedelta(days=1)).isoformat()
+    rows = [{"action": "entry", "dry": False, "event_id": f"old{i}",
+             "contract": f"AAPL {EXP} $30{i % 10}.0 C",
+             "ts": f"{d2}T15:{i:02d}:00+00:00"} for i in range(30)]
+    for i in range(3):                       # three losing live trades yesterday
+        c = f"TSLA {EXP} $40{i}.0 C"
+        rows += [{"action": "entry", "dry": False, "event_id": f"y{i}",
+                  "contract": c, "ts": f"{y}T{14 + 2 * i}:00:00+00:00"},
+                 {"action": "exit", "dry": False, "event_id": f"y{i}x",
+                  "contract": c, "est_pnl_usd": -100.0,
+                  "ts": f"{y}T{15 + 2 * i}:00:00+00:00"}]
+    rows += [{"action": "exit", "dry": True, "event_id": "py", "contract": "P",
+              "est_pnl_usd": 50.0, "ts": f"{y}T19:30:00+00:00"}]   # practice win
+    rows += [{"action": "skip_rule", "event_id": f"s{i}", "contract": "QQQ x P",
+              "ts": f"{y}T19:40:00+00:00"} for i in range(30)]
+    (home / "trades.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    _skips(25)                               # and today's skip rows
+    out = agent.handle_event(make_event(event_id="new", expiry=EXP),
+                             {"dry_run": False, "max_entries_per_day": 10},
+                             {"positions": {}}, PriceBroker(), object(), NOSAVE)
+    assert out.startswith("ENTRY")  # the stub AI approves; we check what it saw
+    prompt = seen[-1]
+    earlier = [r["event_id"] for r in _earlier_rows(prompt)]
+    assert len(earlier) == agent._POLICY_EARLIER_SHOWN == 20
+    assert earlier[-6:] == ["y0", "y0x", "y1", "y1x", "y2", "y2x"]
+    assert earlier[0] == "old16"
+    assert _log_rows(prompt) == []           # nothing today yet
+    assert "losing trades in a row today (most recent): 0" in prompt
+    assert "counting the EARLIER rows shown too: 3" in prompt
+    assert "EARLIER TRADE LOG" in llm_policy._SYSTEM
+
+
 # ── 2. a position sold in pieces is one loss ────────────────────────────────
 
 def _x(contract, pnl, partial=False, dry=False, **kw):
@@ -319,6 +370,24 @@ def test_unreadable_log_skips_the_entry_with_a_row_and_one_alert(
     assert len(alerts) == 1 and "can't be read" in alerts[0][0]
     assert alerts[0][1].get("priority") == "high"
     assert agent._problems_today()[0]["kind"] == "skip_log_unreadable"
+
+
+def test_unreadable_log_skip_shows_on_the_dashboard_during_the_outage(
+        home, unreadable, no_policy):
+    """Review fix: the skip rows are written to the log, which is exactly
+    what can't be read back — the problems list shows them from memory
+    while the outage lasts, and counts each once after it ends."""
+    for i, eid in enumerate(("n1", "n2")):
+        agent.handle_event(make_event(event_id=eid, strike=700.0 + i, expiry=EXP),
+                           {"dry_run": False}, {"positions": {}}, PriceBroker(),
+                           object(), NOSAVE)
+    probs = agent._problems_today()          # the log still can't be read
+    assert probs and probs[0]["kind"] == "skip_log_unreadable"
+    assert probs[0]["count"] == 2
+    unreadable[0] = False
+    probs = [p for p in agent._problems_today()
+             if p["kind"] == "skip_log_unreadable"]
+    assert len(probs) == 1 and probs[0]["count"] == 2
 
 
 def test_unreadable_log_skips_in_practice_mode_too(unreadable, no_policy):
