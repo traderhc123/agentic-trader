@@ -22,6 +22,17 @@ doesn't hold can open a short). So every sell first reads what the account
 holds, and is never sent for more than that, less what working sells are
 already selling — and is NOT sent at all while the holdings can't be read
 (_order, order_guard.check_order).
+
+A buy whose place_order gets no clear answer (OpenD timed out, the
+connection dropped, the answer couldn't be read) may have reached moomoo.
+It is never sent again: every buy carries an id derived from its signal
+(order_guard.order_key) as its order remark, the agent looks the order up
+by that remark, adopts it when it is there, and otherwise remembers it in
+state["unconfirmed_orders"] and keeps looking (reconcile). The same lookup
+runs before every buy, so a signal handled again after a crash (before
+state.json was saved) never sends a second buy. moomoo doesn't refuse a
+repeated remark itself: the lookup is what stops the repeat. An order
+OpenD explicitly turns down stays a plain failure.
 """
 
 import math
@@ -470,10 +481,36 @@ def _expires_today(expiry):
         return False
 
 
+# OpenD's words for "the request may have gone out, but no answer came back"
+# (moomoo-api common/err.py and open_context_base.py: a request timeout,
+# the connection lost or closed mid-request, an answer that couldn't be
+# read). Anything else OpenD returns is its own answer: a rejection.
+_NO_ANSWER_RX = re.compile(
+    r"time\s*out|timed\s*out|disconnect|connection\s+(lost|closed)|"
+    r"not\s+connected|send\s*fail|abnormal|packet|^\s*invalid\s*$", re.I)
+
+
+class _Unconfirmed(Exception):
+    """A buy request got no clear answer from OpenD: it may or may not have
+    reached moomoo. Never answered by sending it again (order_guard).
+    `.qty`: the contracts the request was for."""
+
+    def __init__(self, why, qty):
+        super().__init__(why)
+        self.qty = qty
+
+
+def _account(cfg):
+    """Paper and real are separate accounts: their order ids never mix."""
+    return "moomoo:paper" if cfg.get("moomoo_paper", True) else "moomoo:real"
+
+
 def _order(cfg, sdk, code, side, qty, price, effect=None, contract=None,
-           expiry=None):
+           expiry=None, remark=None):
     """Marketable limit at the given price. Returns the order id (an
     order_guard.OrderId: .qty is how many contracts it was for) or None.
+    A buy whose request got no clear answer raises _Unconfirmed (it may
+    be at moomoo: the caller looks it up by `remark`, the id sent with it).
 
     THE ONLY place a moomoo order is sent. It sends nothing but a
     buy-to-open or a sell-to-close (order_guard.check_order), and a sell
@@ -529,9 +566,18 @@ def _order(cfg, sdk, code, side, qty, price, effect=None, contract=None,
                                            expires_today=_expires_today(expiry))
                 return None
         trd_side = sdk.TrdSide.BUY if side == "buy" else sdk.TrdSide.SELL
-        ret, data = ctx.place_order(
-            price=round(float(price), 2), qty=int(qty), code=code,
-            trd_side=trd_side, order_type=sdk.OrderType.NORMAL, trd_env=env)
+        extra = {"remark": str(remark)} if remark else {}
+        try:
+            ret, data = ctx.place_order(
+                price=round(float(price), 2), qty=int(qty), code=code,
+                trd_side=trd_side, order_type=sdk.OrderType.NORMAL, trd_env=env,
+                **extra)
+        except Exception as exc:
+            if side == "buy":  # sent, maybe; never answered
+                raise _Unconfirmed(f"{type(exc).__name__}: {exc}", int(qty)) from exc
+            raise
+        if ret != sdk.RET_OK and side == "buy" and _NO_ANSWER_RX.search(str(data)):
+            raise _Unconfirmed(str(data)[:200], int(qty))
         if ret != sdk.RET_OK:
             print(f"  ORDER FAILED: {data}")
             broker_events.report(_fail_kind(side),
@@ -543,6 +589,8 @@ def _order(cfg, sdk, code, side, qty, price, effect=None, contract=None,
             oid = "submitted"
         print(f"  moomoo order {side} x{qty} {code} @ ${price:.2f} -> {oid}")
         return order_guard.OrderId(oid, qty)
+    except _Unconfirmed:
+        raise
     except Exception as exc:
         print(f"  ORDER FAILED: {exc}")
         broker_events.report(_fail_kind(side), f"moomoo order error: {exc}")
@@ -577,6 +625,18 @@ def execute(cl, cfg, event, state):
     if event["event"] == "ENTERED":
         if pos_key in state["positions"]:
             return False
+        if _settle_unconfirmed(cfg, sdk, state, pos_key) == "unknown":
+            # an earlier buy of this contract got no clear answer and moomoo
+            # still can't say whether it is there: never buy on top of it
+            print(f"SKIPPED {contract}: an earlier buy order for it is still "
+                  "unconfirmed — not buying again")
+            broker_events.report(
+                "order_failed", f"an earlier buy order for {contract} is still "
+                "unconfirmed (the agent can't tell whether it went through), so "
+                "it did not buy again — check your moomoo app", placed=True)
+            return False
+        if pos_key in state["positions"]:
+            return False  # that earlier buy is the position now
         ask = _ask_price(cfg, sdk, code)
         if ask <= 0:
             down = _gateway_down_text(cfg)
@@ -600,9 +660,45 @@ def execute(cl, cfg, event, state):
                 "skip_budget" if "exceeds your" in note else
                 "skip_no_quote" if "no quote" in note else "skip_sizing", note)
             return False
+        key = order_guard.order_key(_account(cfg), event, "buy")
+        if event.get("event_id"):
+            # this signal handled once already (the agent stopped before it
+            # saved): its buy is at moomoo under this remark — never buy twice
+            prior = _order_by_remark(cfg, sdk, code, "buy", key)
+            if prior is None:
+                print(f"SKIPPED {contract}: couldn't read the moomoo order list "
+                      "to make sure this signal wasn't bought already")
+                broker_events.report(
+                    "order_failed", f"couldn't read your moomoo orders to make "
+                    f"sure this signal's buy of {contract} isn't there already, "
+                    "so the agent did not buy (a second buy can't be undone)")
+                return False
+            if prior:
+                return _adopt_order(state, pos_key, event.get("event_id"), code,
+                                    contract, prior, qty)
         print(f"ENTERED event -> buying {qty}x {contract} ({note})")
-        oid = _order(cfg, sdk, code, "buy", qty, ask, effect="open",
-                     contract=contract)
+        try:
+            oid = _order(cfg, sdk, code, "buy", qty, ask, effect="open",
+                         contract=contract, remark=key)
+        except _Unconfirmed as exc:
+            qty = exc.qty if isinstance(exc.qty, int) else qty
+            found = _order_by_remark(cfg, sdk, code, "buy", key, qty=qty,
+                                     fresh=True)
+            if found:
+                print(f"  no clear answer from OpenD to the buy order ({exc}), "
+                      "but the order is there — using it")
+                return _adopt_order(state, pos_key, event.get("event_id"), code,
+                                    contract, found, qty)
+            order_guard.note(state, pos_key, "buy", key, qty, code,
+                             event_id=event.get("event_id"), contract=contract)
+            print(f"  no answer from OpenD to the buy order ({exc}) and it isn't "
+                  "listed — NOT sending it again without knowing")
+            broker_events.report(
+                "order_failed", order_guard.lost_text("moomoo", "buy", qty, contract)
+                + " It will NOT send this buy again. Check your moomoo app: if "
+                "the order is there, the agent finds it on its own and manages "
+                "the position; if it isn't, this trade was missed.", placed=True)
+            return False
         if oid:
             qty = getattr(oid, "qty", qty)
             _remember_order(state, oid)
@@ -614,6 +710,13 @@ def execute(cl, cfg, event, state):
             state["positions"][pos_key] = row
             return True
     elif event["event"] == "EXITED":
+        if order_guard.get(state, pos_key) and pos_key not in state["positions"]:
+            # the buy got no clear answer: find out first
+            if _settle_unconfirmed(cfg, sdk, state, pos_key) == "unknown":
+                # the BUY may be there: keep the exit until that is known
+                raise RuntimeError(
+                    f"can't tell yet whether the buy order for {contract} went "
+                    "through — its exit signal waits until the agent knows")
         pos = state["positions"].get(pos_key)
         if not pos:
             return False
@@ -771,6 +874,161 @@ def _confirm_sell(cfg, sdk, oid, qty):
                 print(f"  sell didn't fill in time — cancelled; filled {dealt}/{qty}")
                 return min(dealt, qty), True
     return qty, False
+
+
+# ── buys whose request got no clear answer (order_guard) ───────────────────
+
+
+def _order_by_remark(cfg, sdk, code, side, remark, qty=None, fresh=False):
+    """Today's order on `code` that the agent sent under `remark` (its
+    order_guard.order_key), as a dict; False when moomoo lists none; None
+    when the order list can't be read. Only an order matching the code, the
+    side, the remark (and `qty` when given) counts: an order the owner
+    placed in the app never carries the agent's remark. fresh: ask moomoo
+    itself (rate-limited), not OpenD's cache of the orders it sent."""
+    if not remark or not str(code or "").startswith("US."):
+        return None
+    ctx = None
+    try:
+        ctx = _trade_ctx(cfg, sdk)
+        env = _trd_env(cfg, sdk)
+        if fresh:
+            ret, data = _fresh_query(sdk, ctx.order_list_query, code=code,
+                                     trd_env=env, refresh_cache=True)
+        else:
+            ret, data = ctx.order_list_query(code=code, trd_env=env,
+                                             refresh_cache=False)
+        if ret != sdk.RET_OK or data is None:
+            return None
+        for i in range(len(data)):
+            row = data.iloc[i]
+            if str(row.get("remark") or "") != str(remark):
+                continue
+            if str(row.get("code")) != code:
+                continue
+            if not str(row.get("trd_side") or "").rsplit(".", 1)[-1].upper() \
+                    .startswith(side.upper()):
+                continue
+            if qty is not None and order_guard.contracts(
+                    float(row.get("qty") or 0)) != int(qty):
+                continue
+            if not row.get("order_id"):
+                return None
+            return {k: row.get(k) for k in ("order_id", "code", "trd_side", "qty",
+                                             "dealt_qty", "order_status")}
+        return False
+    except Exception:
+        return None
+    finally:
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
+def _booked_qty(order, asked):
+    """The contracts an order found at moomoo is booked for: what filled once
+    it is done, what it was for while it works (entries are booked on
+    acceptance: VERIFIES_FILLS)."""
+    status = str(order.get("order_status")).rsplit(".", 1)[-1].upper()
+    try:
+        dealt = int(float(order.get("dealt_qty") or 0))
+        want = int(float(order.get("qty") or 0)) or int(asked)
+    except (TypeError, ValueError, OverflowError):
+        return int(asked)
+    if status == "FILLED_ALL":
+        return dealt or want
+    if status in _MM_DONE:
+        return dealt
+    return want
+
+
+def _adopt_order(state, pos_key, event_id, code, contract, order, asked):
+    """A buy for this signal found at moomoo becomes the position (never a
+    second buy). True when the ledger now has it."""
+    oid = str(order["order_id"])
+    if oid in {str(i) for i in state.get("agent_order_ids") or ()}:
+        # the agent booked this order before (and has sold it since)
+        print(f"SKIPPED {contract}: this signal's buy order ({oid}) was handled "
+              "already — not buying again")
+        broker_events.report("order_failed", f"this signal's buy order for "
+                             f"{contract} was handled already ({oid}), so the "
+                             "agent did not buy again", placed=True)
+        return False
+    qty = _booked_qty(order, asked)
+    if qty < 1:
+        print(f"  moomoo already has this signal's buy order ({oid}); it ended "
+              "unfilled — not buying again")
+        broker_events.report("entry_unfilled", f"the buy order for {contract} "
+                             f"({oid}) is at moomoo but ended without a fill — "
+                             "the agent did not buy again")
+        return False
+    _remember_order(state, oid)
+    print(f"  moomoo already has this signal's buy order ({oid}, {qty}x) — "
+          "using it, not buying again")
+    state["positions"][pos_key] = {"option_id": code, "qty": qty,
+                                   "opened_event": event_id,
+                                   "last_order_at": time.time(),
+                                   "order_ids": [oid]}
+    return True
+
+
+def _settle_unconfirmed(cfg, sdk, state, pos_key):
+    """Look up a buy whose request got no clear answer (order_guard).
+    "clear": nothing is waiting (any more); "adopted": it is at moomoo and
+    the ledger has it (queued for the agent to log as the entry it is);
+    "unknown": moomoo can't say yet — never place another buy on it.
+    moomoo notes only buys: a sell is re-sent only after a fresh holdings
+    read (_order), so an unclear sell needs no note."""
+    unc = order_guard.get(state, pos_key)
+    if not unc:
+        return "clear"
+    if (unc.get("side") != "buy" or pos_key in state["positions"]
+            or order_guard.age(unc) > order_guard.GIVE_UP_S):
+        order_guard.drop(state, pos_key)  # nothing left it could change
+        return "clear"
+    try:
+        asked = int(unc.get("qty") or 0)
+    except (TypeError, ValueError):
+        asked = 0
+    found = _order_by_remark(cfg, sdk, unc.get("option_id"), "buy",
+                             unc.get("key"), qty=asked or None, fresh=True)
+    if found is None:
+        return "unknown"
+    if found is False:
+        if order_guard.age(unc) < order_guard.BUY_KEEP_S:
+            return "unknown"  # not there now; it may still show up late
+        order_guard.drop(state, pos_key)
+        return "clear"
+    order_guard.drop(state, pos_key)
+    contract = unc.get("contract") or pos_key.replace("|", " ")
+    if not _adopt_order(state, pos_key, unc.get("event_id"), unc.get("option_id"),
+                        contract, found, asked):
+        return "clear"
+    print(f"  the buy order for {contract} did reach moomoo — using it")
+    order_guard.adopted_buy(state, pos_key, unc, found["order_id"])
+    return "adopted"
+
+
+def reconcile(cl, cfg, state, save_state):
+    """Called by the agent once per loop, before new events: looks again for
+    buy orders whose request got no clear answer. One that is at moomoo
+    after all becomes the position it bought. No OpenD call unless such an
+    order is waiting."""
+    if not order_guard.unconfirmed(state):
+        return
+    cfg = cl.cfg if isinstance(cl, _Client) else cfg
+    try:
+        sdk = _sdk()
+    except RuntimeError:
+        return
+    changed = False
+    for pos_key in list(order_guard.unconfirmed(state)):
+        if _settle_unconfirmed(cfg, sdk, state, pos_key) != "unknown":
+            changed = True
+    if changed:
+        save_state(state)
 
 
 _AGENT_ORDERS_KEPT = 200
