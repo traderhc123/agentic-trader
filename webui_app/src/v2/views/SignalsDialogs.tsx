@@ -14,6 +14,7 @@
 // After each, the page reads the settings again and shows those.
 import { useEffect, useId, useState } from "react";
 import type { FundInvoice, Preview, SettingsView, WalletBalance, WalletQuote } from "../../lib/settingsApi";
+import { passPriceUsd, passUsdWords } from "../../lib/settingsApi";
 import { FieldError, ReviewDialog, askPreview } from "../Forms";
 import { API, getJson, send } from "../lib/http";
 import { readAddress, readSats, scopeWords, sourceWords } from "../lib/settings";
@@ -325,6 +326,21 @@ export function ConnectWalletDialog({ page, onClose }: { page: Page; onClose: ()
   );
 }
 
+/** One day-pass's USD price: AgentHC's, as the agent's quote reports it,
+ *  else the built-in one. */
+function dayUsd(q: WalletQuote | null | undefined): number {
+  const v = q?.day_pass_usd;
+  return typeof v === "number" && v > 0 ? v : (passPriceUsd(1) ?? 50);
+}
+/** dayUsd(), asked of the agent once (its quote caches AgentHC's prices). */
+function useDayPassUsd(): number {
+  const [q, setQ] = useState<WalletQuote | null>(null);
+  useEffect(() => {
+    getJson<WalletQuote>(`${API.walletQuote}?sats=0`).then((r) => r.ok && setQ(r.body));
+  }, []);
+  return dayUsd(q);
+}
+
 type FundStep = { kind: "amount" } | { kind: "review"; sats: number; preview: Preview } | { kind: "pay"; inv: FundInvoice };
 
 /** Add sats to the agent's wallet: amount (with its worth now) → the
@@ -388,7 +404,7 @@ export function FundDialog({ page, onClose }: { page: Page; onClose: () => void 
         {() =>
           quote && quote.ok ? (
             <p className="small">
-              About {usd(quote.usd)} at {usd(quote.btc_usd, 0)} a bitcoin: {plural(quote.day_passes, "day-pass", "day-passes")} at about $10 each.
+              About {usd(quote.usd)} at {usd(quote.btc_usd, 0)} a bitcoin: {plural(quote.day_passes, "day-pass", "day-passes")} at about {passUsdWords(dayUsd(quote))} each.
             </p>
           ) : null
         }
@@ -430,7 +446,7 @@ export function FundDialog({ page, onClose }: { page: Page; onClose: () => void 
   return (
     <Dialog
       title="Add sats to your agent's wallet"
-      lead="The agent pays for its day-passes from this wallet (about $10 a market day, in sats)."
+      lead={`The agent pays for its day-passes from this wallet (about ${passUsdWords(dayUsd(quote))} a market day, in sats).`}
       onClose={() => !busy && onClose()}
       foot={
         <>
@@ -476,6 +492,7 @@ export function RecurringDialog({ page, onClose }: { page: Page; onClose: () => 
   const next = !v.signals.recurring;
   const payload = { on: next };
   const ask = usePreview(API.recurring, payload);
+  const day = useDayPassUsd();
   const title = next ? "Let the agent buy its day-pass by itself?" : "Stop buying day-passes automatically?";
   if (ask.kind !== "review") return <Asking title={title} ask={ask} onClose={onClose} />;
   return (
@@ -486,7 +503,7 @@ export function RecurringDialog({ page, onClose }: { page: Page; onClose: () => 
       title={title}
       lead={
         next
-          ? "On each market day it reads signals, the agent pays for that day's pass from its wallet (about $10 in sats)."
+          ? `On each market day it reads signals, the agent pays for that day's pass from its wallet (about ${passUsdWords(day)} in sats).`
           : "The agent never spends from its wallet by itself. It reads signals only with days you buy, or a key."
       }
       cancel="Keep it as it is"

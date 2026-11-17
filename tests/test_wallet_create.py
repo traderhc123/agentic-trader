@@ -123,17 +123,17 @@ def test_qr_matrix_recovers_after_bootstrap(monkeypatch):
 def test_fund_quote_math(monkeypatch):
     import webui
     monkeypatch.setattr(webui, "_btc_usd", lambda: 64000.0)
-    q = webui._fund_quote(50_000)
-    assert q["ok"] and q["usd"] == 32.0 and q["day_passes"] == 3
-    # one $10 day pass at $64k/BTC = 15,625 sats, ceil to 100 -> 15,700
-    assert q["day_pass_sats"] == 15_700
-    assert q["suggested_sats"] == 15_700       # no cap known
+    q = webui._fund_quote(200_000)
+    assert q["ok"] and q["usd"] == 128.0 and q["day_passes"] == 2
+    # one $50 day pass at $64k/BTC = 78,125 sats, ceil to 100 -> 78,200
+    assert q["day_pass_sats"] == 78_200
+    assert q["suggested_sats"] == 78_200       # no cap known
     assert webui._fund_quote(0)["usd"] == 0
 
 
 def test_fund_quote_clamps_to_invoice_cap(monkeypatch):
     import webui
-    monkeypatch.setattr(webui, "_btc_usd", lambda: 5000.0)  # cheap BTC: pass=200k sats
+    monkeypatch.setattr(webui, "_btc_usd", lambda: 25000.0)  # cheap BTC: pass=200k sats
     q = webui._fund_quote(0, invoice_cap=100_000)
     assert q["day_pass_sats"] == 200_000
     assert q["suggested_sats"] == 100_000

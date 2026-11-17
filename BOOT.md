@@ -124,17 +124,17 @@ This walks through, in order:
    apply only when they pick `agenthc`.
 2. **AgentHC feed access (sats-based)** — in the wizard's Signal source
    step:
-   - **Prepaid signal days (recommended)**: the human picks 1 / 5 / 20 / 60
+   - **Prepaid signal days (recommended)**: the human picks 1 or 5
      signal days and pays ONE Lightning invoice (QR code) from the wallet
-     they already use (Cash App, Strike, Phoenix…). ~$10 per signal day,
-     priced in sats; a day is only used when the agent receives an entry or
-     exit that day (quiet days free; "other trades" signals count only if
+     they already use (Cash App, Strike, Phoenix…). ~$50 per signal day
+     (5 days for ~$225), priced in sats; a day is only used when the agent
+     receives an entry or exit that day (quiet days free; "other trades" signals count only if
      they chose main + other). The agent holds no money. You never pay it
      for them.
      Paying constitutes acceptance of the feed terms (stated with the
      invoice).
    - **Advanced — daily auto-pay from an agent wallet**: an LNbits wallet the
-     agent controls buys a ~$10 day-pass each market day (only with
+     agent controls buys a ~$50 day-pass each market day (only with
      "Recurring day-pass" ON). The one-click wallet is on demo.lnbits.com, a
      public test server — keep only a few days of passes there. Safety caps:
      `max_autopay_sats` per invoice, and one day-pass a day (more only if

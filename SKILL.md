@@ -42,8 +42,8 @@ cd ~/agentic-trader
 ```
 
 Signal sources: `manual` (human's own commands), `url` (any JSON feed), or
-`agenthc` — AgentHC's Agentic Day Trade Ideas journal feed (~$10/day paid in
-sats via the built-in Lightning wallet; free hypothetical track record at
+`agenthc` — AgentHC's Agentic Day Trade Ideas journal feed (~$50/day, or 5
+days for ~$225, paid in sats via the built-in Lightning wallet; free hypothetical track record at
 https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record).
 
 Full assistant instructions: [BOOT.md](https://github.com/traderhc123/agentic-trader/blob/main/BOOT.md)

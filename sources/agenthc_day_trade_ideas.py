@@ -7,7 +7,7 @@ carry AgentHC's own paper P&L %% statistic. Educational commentary, NOT
 investment advice (full terms in the feed's `disclosure` field and this
 repo's DISCLAIMER.md).
 
-Access is sats-based: the agent auto-buys a ~$10/day Lightning day-pass
+Access is sats-based: the agent auto-buys a ~$50/day Lightning day-pass
 (price floats with Bitcoin's USD price) from its built-in wallet, or uses a
 Premium AgentHC API key. Free aggregate track record (hypothetical, labeled):
 GET https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record
@@ -34,13 +34,24 @@ def _now_et():
 
 NAME = "agenthc"
 DESCRIPTION = ("AgentHC Agentic Day Trade Ideas — journal events from a "
-               "published paper-trade system (~$10/day in sats, or Premium key)")
+               "published paper-trade system (~$50/day in sats, or Premium key)")
 
 AGENTHC_API = os.getenv("AGENTHC_API", "https://api.traderhc.com")
 FEED_PATH = "/api/v1/trading/day-trade-ideas"
 
 
 PASS_PATH = FEED_PATH + "/pass"
+# Prepaid pass prices in USD (paid in sats at the live BTC price): 1 signal
+# day or a 5-day bundle. FALLBACK only, for a server that can't be reached
+# or doesn't send prices: AgentHC sends prices_usd/prices_sats with its pass
+# options (pass_prices() reads them) and sets the real price on each
+# invoice. The 24h wallet day-pass costs the same as 1 signal day.
+DAY_PASS_USD = 50.0
+PASS_PRICES_USD = {1: 50.0, 5: 225.0}
+_PRICE_TTL_S = 300              # how long the server's prices are reused
+_PRICE_RETRY_S = 60             # after a failed ask: try again this soon
+# The server's last prices: {days: usd} / {days: sats}, or None.
+_price_cache = {"at": 0.0, "usd": None, "sats": None}
 PASS_LOW_DAYS = 2               # warn when this many signal days (or fewer) remain
 # Server statuses that still read the feed: "exits_only" = days used up, but
 # exit signals keep coming for a few market days so open positions can close.
@@ -48,7 +59,7 @@ _USABLE = ("active", "exits_only")
 _PENDING_RECHECK_S = 60         # status poll cadence while an invoice is unpaid
 _INVOICE_LIFETIME_S = 3600      # server invoices expire after 1h
 
-# Wallet day-pass (the agent pays ~$10 from its own wallet).
+# Wallet day-pass (the agent pays ~$50 from its own wallet).
 _DAYPASS_S = 23 * 3600          # how long the agent uses a paid day-pass token
 _OPEN_MIN = 9 * 60 + 30         # regular session opens 9:30 AM ET
 _BUY_LEAD_MIN = 60              # earliest purchase: this long before the open
@@ -145,18 +156,90 @@ def buy_pass(days, extend_token=None):
     return resp.json()
 
 
-def pass_options():
-    """Pass sizes (signal days) the server sells right now, e.g. [1, 5];
-    [] when every size is paused (the node is refilling); None if it can't
-    be asked. The server answers a days=0 request with its options and
-    creates no invoice."""
+def _price_map(raw, cast):
+    """{days: price} from the server's {"1": 50.0, "5": 225.0} (string
+    keys); entries that aren't a positive size and positive price are
+    dropped. None when the field is missing or nothing usable is left."""
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for k, v in raw.items():
+        try:
+            days, price = int(k), cast(v)
+        except (TypeError, ValueError):
+            continue
+        if days > 0 and price > 0 and not isinstance(v, bool):
+            out[days] = price
+    return out or None
+
+
+def pass_offer():
+    """What the server sells right now: {"options": [1, 5] | [] | None,
+    "prices_usd": {1: 50.0, 5: 225.0} | None, "prices_sats": {1: n, 5: n}
+    | None}. options: [] when every size is paused (the node is refilling),
+    None if the server can't be asked. The prices are None from servers
+    that don't send them (the pages then show PASS_PRICES_USD). The server
+    answers a days=0 request with its options and creates no invoice."""
+    out = {"options": None, "prices_usd": None, "prices_sats": None}
     try:
         resp = _http.post(f"{AGENTHC_API}{PASS_PATH}", json={"days": 0}, timeout=10)
         detail = resp.json().get("detail") or {}
-        opts = detail.get("options") if isinstance(detail, dict) else None
-        return sorted(int(n) for n in opts) if isinstance(opts, list) else None
     except Exception:
-        return None
+        return out
+    if not isinstance(detail, dict):
+        return out
+    opts = detail.get("options")
+    try:
+        out["options"] = sorted(int(n) for n in opts) if isinstance(opts, list) else None
+    except (TypeError, ValueError):
+        out["options"] = None
+    out["prices_usd"] = _price_map(detail.get("prices_usd"), float)
+    out["prices_sats"] = _price_map(detail.get("prices_sats"), int)
+    # the server answered: its prices (None from an older server) are now
+    # the ones to show
+    _price_cache.update(at=time.time(), usd=out["prices_usd"],
+                        sats=out["prices_sats"])
+    return out
+
+
+def pass_prices(max_age=_PRICE_TTL_S):
+    """The pass prices to show: {"usd": {1: 50.0, 5: 225.0}, "sats":
+    {1: n, 5: n} | None, "from_server": bool}. The ONE place the client
+    gets AgentHC's prices (prepaid passes and the wallet day-pass alike).
+    Asks the server at most every max_age seconds (any pass_offer() call
+    refreshes it too); PASS_PRICES_USD (and no sats) when the server can't
+    be reached and never answered, or is an older one without prices."""
+    c = _price_cache
+    if time.time() - c["at"] >= max_age:
+        pass_offer()
+        if time.time() - c["at"] >= max_age:   # not reached: keep what we had
+            c["at"] = time.time() - max_age + _PRICE_RETRY_S
+    usd = c["usd"]
+    return {"usd": dict(usd) if usd else dict(PASS_PRICES_USD),
+            "sats": dict(c["sats"]) if c["sats"] else None,
+            "from_server": bool(usd)}
+
+
+def day_pass_price():
+    """One day's price, {"usd": 50.0, "sats": n | None, "from_server": bool}:
+    1 signal day, which is also what the 24h wallet day-pass costs. sats is
+    the server's own figure (None when it sent none)."""
+    p = pass_prices()
+    return {"usd": p["usd"].get(1) or DAY_PASS_USD,
+            "sats": (p["sats"] or {}).get(1), "from_server": p["from_server"]}
+
+
+def usd_words(v):
+    """"$50" / "$49.50" for copy."""
+    v = float(v)
+    return f"${v:,.0f}" if v == int(v) else f"${v:,.2f}"
+
+
+def pass_options():
+    """Pass sizes (signal days) the server sells right now, e.g. [1, 5];
+    [] when every size is paused (the node is refilling); None if it can't
+    be asked."""
+    return pass_offer()["options"]
 
 
 def pass_status(token):
@@ -736,7 +819,7 @@ def accept_terms(cfg):
 
 
 def _pass_purchase_allowed(cfg, state, save_state, now=None):
-    """Recurring-day-pass gate: the agent only auto-pays the ~$10 pass when
+    """Recurring-day-pass gate: the agent only auto-pays the ~$50 pass when
     the operator turned 'Recurring day-pass' ON (wizard Source tab / config
     day_pass_recurring). OFF (the default) = the agent never spends without
     approval — it notifies once per day and returns no events instead.
@@ -808,7 +891,8 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
     if state.get("pass_needed_notified") != day:
         state["pass_needed_notified"] = day
         save_state(state)
-        print("Day-pass required (~$10 in sats) but recurring payments are "
+        print(f"Day-pass required (~{usd_words(day_pass_price()['usd'])} in sats) "
+              "but recurring payments are "
               "OFF — turn ON 'Recurring day-pass' in the wizard Source tab "
               "to let the agent buy it each day.")
     return False
@@ -1734,7 +1818,8 @@ def setup(cfg):
     print("     several entries a day (your daily cap + budget still apply)")
     scope = input("Choose [1/2, default 1]: ").strip() or "1"
     cfg["include_other_trades"] = scope == "2"
-    print("  1) Lightning day-pass — the agent pays ~$10/day in sats from its")
+    print(f"  1) Lightning day-pass — the agent pays "
+          f"~{usd_words(day_pass_price()['usd'])}/day in sats from its")
     print("     own wallet, no account needed (recommended for agents)")
     print("  2) AgentHC Premium API key (sats-purchased subscription)")
     choice = input("Choose [1/2, default 1]: ").strip() or "1"

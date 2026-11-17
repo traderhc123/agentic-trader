@@ -237,14 +237,14 @@ docker run -d --name agentic-trader --restart on-failure -v agentic-trader-data:
 - **Max daily loss** (optional): set it in the wizard's Safety step or say
   `set max loss 300` in the dashboard — after an estimated $300 realized loss
   in a day, no new entries until tomorrow (exits still run).
-- **Prepaid feed access**: for the AgentHC feed, buy 1 (try it), 5, 20 or 60
-  signal days in the wizard with one Lightning payment from the wallet you
+- **Prepaid feed access**: for the AgentHC feed, buy 1 signal day (~$50) or 5
+  signal days (~$225) in the wizard with one Lightning payment from the wallet you
   already use —
   the agent holds no money. A day is only used when your agent receives a
   trade signal (entry or exit) that day; quiet days are free. You're notified
   when 2 days are left; buying more carries unused days over. A size can be
   briefly off sale while the server's Lightning node refills capacity after a
-  large purchase, and big passes (≈$200/$600) may exceed some wallets'
+  large purchase, and the 5-day pass (≈$225) may exceed some wallets'
   Lightning send limits.
 - **Day-pass spend cap** (only if you chose the Advanced wallet auto-pay): at
   most one day-pass per day, bought only on a market day (from 8:30 AM ET
