@@ -55,6 +55,39 @@ def exit_qty(pos, event):
     return qty
 
 
+# The most contracts one trade buys when max_contracts_per_trade was never
+# set (the same number as agent.CONTRACT_CAP_DEFAULT).
+CONTRACT_CAP_DEFAULT = 100
+
+
+def contract_cap(cfg):
+    """max_contracts_per_trade as the adapters read it: never set = the
+    default. (A value that is not a whole number raises, as it always did.)"""
+    v = cfg.get("max_contracts_per_trade")
+    return CONTRACT_CAP_DEFAULT if v is None else int(v)
+
+
+def capped(cfg, qty, note):
+    """(qty, note) after max_contracts_per_trade. When the cap cuts the
+    order the note says so, with the size the sizing asked for, so a capped
+    trade never looks like a full one."""
+    cap = contract_cap(cfg)
+    if qty <= cap:
+        return qty, note
+    if cap < 1:
+        return 0, f"{note} — max contracts per trade is {cap} — skipped"
+    return cap, (f"{note} — capped at {cap} by max contracts per trade "
+                 "(change it with: set max contracts N)")
+
+
+def fixed_count(cfg):
+    """(qty, note) for sizing_mode "contracts": contracts_per_trade (at
+    least 1), then the cap."""
+    n = max(1, int(cfg.get("contracts_per_trade", 1)))
+    return capped(cfg, n, "fixed contract count" if n <= contract_cap(cfg)
+                  else f"fixed contract count ({n})")
+
+
 def quote_number(obj, key):
     """The first `key` value found anywhere in a quote payload, as a float:
     0.0 for an explicit zero, None when the key is absent, null or not a

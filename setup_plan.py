@@ -38,8 +38,12 @@ EXAMPLE_PLAN = {
     "broker": {"type": "alpaca", "alpaca_key_id": "…", "alpaca_secret": "…",
                "alpaca_paper": True},
     "sizing": {"mode": "contracts", "contracts_per_trade": 1},
+    # No max_contracts_per_trade here: left out, the agent's default (100)
+    # applies. Set it only to the owner's own number — it cuts EVERY trade
+    # to it, whatever the budget (an example value of 10 here once capped
+    # assistant-built setups at 10 contracts a trade).
     "safety": {"max_entries_per_day": 3, "max_open_positions": 5,
-               "max_daily_loss_usd": 0, "max_contracts_per_trade": 10},
+               "max_daily_loss_usd": 0},
     "notifications": {"ntfy_topic": "my-agent-alerts"},
     # built-in rules: no AI needed (only what the owner actually asked for)
     "rules": {"tickers": ["SPY", "QQQ"], "sides": "calls", "skip_0dte": True,
@@ -106,6 +110,38 @@ def _size_words(cfg):
     if mode == "percent":
         return f"{_num(cfg.get('percent_per_trade')):g}% of the account per trade"
     return f"{int(_num(cfg.get('contracts_per_trade'), 1) or 1)} contract(s) per trade"
+
+
+def _contract_cap(cfg, prefix=""):
+    """max_contracts_per_trade as the agent applies it to one book (the
+    "other trades" book uses its own when one is saved)."""
+    v = cfg.get(f"{prefix}max_contracts_per_trade") if prefix else None
+    if v in (None, ""):
+        v = cfg.get("max_contracts_per_trade")
+    return int(_num(v, _CAP_DEFAULT["max_contracts_per_trade"]))
+
+
+def _cap_warnings(cfg):
+    """Where max_contracts_per_trade cuts the trade size the owner chose,
+    in words (the size line alone would say the uncut size)."""
+    out = []
+    for prefix, name in (("", "main pick"), ("other_", "other trades")):
+        mode = str(cfg.get(f"{prefix}sizing_mode") or "")
+        if prefix and mode not in _SIZE_KEY:
+            continue  # sized like the main pick
+        mode = mode or "contracts"
+        cap = _contract_cap(cfg, prefix)
+        n = int(_num(cfg.get(f"{prefix}contracts_per_trade"), 1) or 1)
+        if mode == "contracts" and n > cap:
+            out.append(f"{name}: {n} contracts per trade, but "
+                       f"max_contracts_per_trade is {cap} — each trade buys "
+                       f"{cap}. Leave max_contracts_per_trade out (default "
+                       f"{_CAP_DEFAULT['max_contracts_per_trade']}) or set "
+                       "the owner's own number")
+        elif mode in ("budget", "percent") and cap < _CAP_DEFAULT["max_contracts_per_trade"]:
+            out.append(f"{name}: max_contracts_per_trade is {cap} — no trade "
+                       f"buys more than {cap} contracts, whatever the budget")
+    return out
 
 
 def _broker_view(cfg):
@@ -428,6 +464,10 @@ def apply(plan, cfg, consent_ok, home):
         new["dry_run"] = True
     report["mode"] = "DRY-RUN" if new.get("dry_run") else "LIVE"
     report["sizing"] = _size_words(new)
+    report["warnings"] = _cap_warnings(new)
+    if report["warnings"]:
+        cap = _contract_cap(new)
+        report["sizing"] += f" (at most {cap} contract{'' if cap == 1 else 's'} per trade)"
     new.setdefault("max_event_age_s", 300)
     new.setdefault("max_entries_per_day", 5)
     new.setdefault("poll_seconds", 30)

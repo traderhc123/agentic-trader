@@ -34,7 +34,7 @@ import broker_events
 import platform_compat
 
 from . import order_guard
-from .pricing import exit_qty, marketable_limit
+from .pricing import capped, exit_qty, fixed_count, marketable_limit
 
 # Every status line in this module goes through safe_print: a console that
 # can't show a character ("→" on a Windows cp1252 stdout) must never stop an
@@ -350,15 +350,28 @@ def _size(cfg, price):
             if qty < 1:
                 return 0, (f"1 contract ≈ ${price * 100:,.0f} exceeds your "
                            f"${budget:,.0f} budget — skipped")
-            return (min(qty, int(cfg.get("max_contracts_per_trade", 100))),
-                    f"${budget:,.0f} budget @ ~${price:.2f} → {qty}x")
+            return capped(cfg, qty, f"${budget:,.0f} budget @ ~${price:.2f} → {qty}x")
         if budget > 0:
             # Never guess a size without a price — a fixed-count fallback can
             # spend far past the budget (same rule as robinhood/alpaca).
             return 0, "no quote available for budget sizing — skipped"
         return 0, "budget mode but budget_per_trade_usd unset — skipped"
-    return min(max(1, int(cfg.get("contracts_per_trade", 1))),
-               int(cfg.get("max_contracts_per_trade", 100))), "fixed contract count"
+    return fixed_count(cfg)
+
+
+def size_preview(cl, cfg, event):
+    """(qty, note) a live entry would buy now — read-only (one quote from
+    OpenD, as execute reads it), for the dry-run book. Like a live entry,
+    no quote means no trade."""
+    sizing = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    conn = cl.cfg if isinstance(cl, _Client) else sizing
+    ask = _ask_price(conn, _sdk(), _moomoo_code(event))
+    if ask <= 0:
+        down = _gateway_down_text(conn)
+        return 0, (f"no quote available — {down}" if down else
+                   "no quote from OpenD (options quote subscription active on "
+                   "the moomoo account?)")
+    return _size(sizing, ask)
 
 
 def _fail_kind(side):
