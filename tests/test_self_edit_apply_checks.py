@@ -30,10 +30,13 @@ def sandbox(tmp_path, monkeypatch):
 
 
 def _stage(home, changes):
+    # as self_edit.propose writes it: each change with its diff against the
+    # file as it is now (Apply refuses any other)
+    from test_self_edit import _as_proposed
     with open(os.path.join(str(home), "proposal.json"), "w",
               encoding="utf-8") as f:
         json.dump({"request": "test", "explanation": "", "warnings": [],
-                   "changes": changes}, f)
+                   "changes": [_as_proposed(ch) for ch in changes]}, f)
 
 
 # ── I4a: Windows paths ──

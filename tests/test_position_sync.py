@@ -20,7 +20,8 @@ U2 = "7f9e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b"
 KEY = "SPY|2099-12-18|752.0|C"
 KEY2 = "QQQ|2099-12-18|500.0|P"
 CONTRACT = "SPY 2099-12-18 $752.0 C"
-CFG = {"broker": "robinhood", "robinhood_account": "A1",
+# a live setup: never-chosen modes are practice now (audit PR1)
+CFG = {"dry_run": False, "broker": "robinhood", "robinhood_account": "A1",
        "max_entries_per_day": 50}
 TAG = account_tag(CFG)
 T0 = datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc).timestamp()
@@ -1654,7 +1655,8 @@ class FakeAlpaca:
         return _AResp(204, None)
 
 
-ALPACA = {"broker": "alpaca", "alpaca_paper": False, "alpaca_key_id": "k",
+# a live setup: never-chosen modes are practice now (audit PR1)
+ALPACA = {"dry_run": False, "broker": "alpaca", "alpaca_paper": False, "alpaca_key_id": "k",
           "alpaca_secret": "s"}
 
 

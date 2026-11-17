@@ -13,16 +13,18 @@ Premium AgentHC API key. Free aggregate track record (hypothetical, labeled):
 GET https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record
 """
 
+import math
 import os
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests  # noqa: F401  (tests stub requests.get/post; _http calls them)
 
 from lightning_wallet import (PaymentNotSent, PaymentRefused, WalletKeyRejected,
-                              wallet_fingerprint, wallet_from_cfg, wallet_setup)
+                              fee_reserve_sats, wallet_fingerprint,
+                              wallet_from_cfg, wallet_setup)
 from net_check import http as _http  # steps around a broken proxy setting
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -58,6 +60,7 @@ PASS_LOW_DAYS = 2               # warn when this many signal days (or fewer) rem
 _USABLE = ("active", "exits_only")
 _PENDING_RECHECK_S = 60         # status poll cadence while an invoice is unpaid
 _INVOICE_LIFETIME_S = 3600      # server invoices expire after 1h
+_UNPAID_RECHECK_S = 3600        # an invoice AgentHC called unpaid: asked again this often
 
 # Wallet day-pass (the agent pays ~$50 from its own wallet).
 _DAYPASS_S = 23 * 3600          # how long the agent uses a paid day-pass token
@@ -86,6 +89,12 @@ PASS_USED_UP_TEXT = ("Your signal pass is used up: no new trades until you buy "
                      "trades your agent already opened still arrive.")
 PASS_RUN_OUT_TEXT = ("Your signal pass has run out: no new trades until you "
                      f"buy more signal days ({_SETTINGS}).")
+KEY_BALANCE_EMPTY_TEXT = (
+    "AgentHC asked for payment on your Premium API key: the key's balance "
+    "can't pay for today's signals. Top up your key with AgentHC. While an "
+    "API key is set your agent never buys a day-pass with its wallet, so "
+    "nothing was paid. Until the key is topped up the agent gets no new "
+    "trades.")
 
 
 class PassUnavailable(RuntimeError):
@@ -666,24 +675,70 @@ def _token_id(token):
     return hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
+def _main_pass_token(cfg):
+    main = cfg.get("feed_pass")
+    return main.get("token") if isinstance(main, dict) else None
+
+
+def _invoice_overdue(rec, now):
+    """The pass invoice first seen in `rec` can't be paid any more (its
+    lifetime, plus slack for clocks that differ, is over)."""
+    try:
+        first = float(rec.get("first_seen", now))
+    except (TypeError, ValueError):
+        first = 0.0
+    return now - first > _INVOICE_LIFETIME_S + 300
+
+
+def _pass_status_unknown(cfg, rec, token, now):
+    """True while a saved pass status can't be relied on until AgentHC is
+    asked again: an invoice past its lifetime that AgentHC has not answered
+    for since (the owner may have paid it while the agent wasn't checking),
+    an "unpaid" saved by an older version from elapsed time alone, or an
+    "unpaid" pass that has since become the main pass (the dashboard saw it
+    paid). The agent reads nothing and the wallet buys nothing meanwhile."""
+    st = rec.get("status")
+    if st == "pending":
+        return _invoice_overdue(rec, now)
+    if st == "unpaid":
+        try:
+            said_after_expiry = (float(rec.get("checked") or 0)
+                                 > float(rec.get("first_seen") or 0)
+                                 + _INVOICE_LIFETIME_S + 300)
+        except (TypeError, ValueError):
+            said_after_expiry = False
+        return (not said_after_expiry
+                or (token == _main_pass_token(cfg) and not rec.get("main")))
+    return False
+
+
+def _known_status(cfg, rec, token, now=None):
+    """A pass's saved status, or None while it is not known (no check has
+    answered yet, or _pass_status_unknown). No request."""
+    rec = rec if isinstance(rec, dict) else {}
+    now = time.time() if now is None else now
+    return None if _pass_status_unknown(cfg, rec, token, now) else rec.get("status")
+
+
 def _refresh_pass(cfg, state, save_state, force=False):
     """Return the usable (active) pass token, checking the server only when
-    needed: pending invoices at most once a minute until they expire, active
-    passes only after their end time or when the feed refused them."""
+    needed: pending invoices at most once a minute, an invoice past its
+    lifetime until AgentHC answers for it (only AgentHC's answer makes it
+    "unpaid", never the time alone), "unpaid" ones once an hour and as soon
+    as one becomes the main pass, active passes only after their end time
+    or when the feed refused them."""
     cache = state.setdefault("pass_status", {})
     now = time.time()
+    main = _main_pass_token(cfg)
     best, best_until = None, 0.0
     for token in _pass_tokens(cfg):
         tid = _token_id(token)
         rec = cache.get(tid) or {}
         st = rec.get("status")
-        if st == "pending" and now - rec.get("first_seen", now) > _INVOICE_LIFETIME_S + 300:
-            rec["status"] = st = "unpaid"   # invoice expired without payment
-            cache[tid] = rec
-            save_state(state)
         stale = (force or st is None
-                 or (st == "pending" and now - rec.get("checked", 0) > _PENDING_RECHECK_S
-                     and now - rec.get("first_seen", now) < _INVOICE_LIFETIME_S + 300)
+                 or _pass_status_unknown(cfg, rec, token, now)
+                 or (st == "pending" and now - rec.get("checked", 0) > _PENDING_RECHECK_S)
+                 or (st == "unpaid" and now - rec.get("checked", 0) > _UNPAID_RECHECK_S)
                  or (st in _USABLE and now > rec.get("until_ts", 0)))
         if stale:
             try:
@@ -692,9 +747,15 @@ def _refresh_pass(cfg, state, save_state, force=False):
                 fresh = None
             if fresh is not None:
                 until_ts = _iso_ts(fresh.get("access_until"))
-                rec = {"status": fresh.get("status"), "until_ts": until_ts,
+                first_seen = rec.get("first_seen", now)
+                status = fresh.get("status")
+                if status == "pending" and _invoice_overdue({"first_seen": first_seen}, now):
+                    # AgentHC itself says not paid, and it can't be any more
+                    status = "unpaid"
+                rec = {"status": status, "until_ts": until_ts,
                        "days_left": fresh.get("days_left", fresh.get("trading_days_left")),
-                       "checked": now, "first_seen": rec.get("first_seen", now)}
+                       "checked": now, "first_seen": first_seen,
+                       "main": token == main}
                 if fresh.get("exits_until"):
                     rec["exits_until"] = _iso_ts(fresh["exits_until"]) or None
                 cache[tid] = rec
@@ -795,14 +856,199 @@ def _token_status(state, token):
     return ((state.get("pass_status") or {}).get(_token_id(token)) or {}).get("status")
 
 
+# ── which events a read asks for ────────────────────────────────────────────
+# The feed answers with its newest `limit` events of one track ("main") or
+# of every track ("all"), newest first. Two ways that lost exit signals:
+#   - "other trades" switched off while the agent still held one: reading
+#     track=main never listed its EXITED, so it rode to the expiry guard.
+#     The agent reads track=all while its ledger (or the exits it still
+#     owes) holds something known to come from other trades (a row that
+#     doesn't say counts as the main pick); the agent drops other-trades
+#     ENTERED events itself, and their EXITED events unless the ledger row
+#     for that contract is itself an other-trades one
+#     (agent._handle_feed_events) — a shadow-book exit never sells a main
+#     position.
+#   - 20 events of track=all are a few hours of the shadow book: an exit
+#     published before a sleep or restart fell out of the window. Reads of
+#     track=all, and the first read after a gap, ask for FEED_LIMIT_MAX.
+#     A full window whose oldest event is newer than the last good read
+#     may still have dropped one: _check_window keeps the no-signal sell
+#     armed for what was held then (state["feed_gap"]).
+FEED_LIMIT = 20          # main pick only, read every loop: plenty
+FEED_LIMIT_MAX = 100     # the most AgentHC lists in one answer
+FEED_GAP_S = 300         # longer than this since the last good read: a gap
+
+
+def _row_track(row):
+    """The track a ledger row was opened from: its own "track", else the
+    one in the id of the event that opened it (only a non-main AgentHC id
+    ends in "|<track>": ENTERED|T|expiry|strike|type|occurred_at[|track]),
+    else None (a row that doesn't say: a practice row of an older version).
+    Its "book" (agent per-book exits: "main" | "shadow") wins over a track
+    that contradicts it, as in the agent (agent._row_book / _row_track)."""
+    track, book = row.get("track"), row.get("book")
+    book = book if book in ("main", "shadow") else None
+    if (isinstance(track, str) and track
+            and (book is None or (track == "main") == (book == "main"))):
+        return track
+    if book is not None:
+        return "main" if book == "main" else "other"
+    opened = row.get("opened_event")
+    if isinstance(opened, str) and opened:
+        parts = opened.split("|")
+        return parts[6] if len(parts) >= 7 and parts[6] else "main"
+    return None
+
+
+def held_as_other(row):
+    """True for a ledger row known to come from "other trades". A row that
+    doesn't say (a practice row of an older version, a row the ledger check
+    rebuilt without its opening event) counts as the main pick: with other
+    trades off it never switches reads to every track, and no other-trades
+    exit is let through for it — as before tracks were remembered."""
+    track = _row_track(row) if isinstance(row, dict) else None
+    return track is not None and track != "main"
+
+
+def _holds_other_track(state):
+    """The ledger, or the exits still owed, hold something known to come
+    from other trades (held_as_other)."""
+    rows = (state or {}).get("positions")
+    for row in (rows.values() if isinstance(rows, dict) else ()):
+        if held_as_other(row):
+            return True
+    owed = (state or {}).get("exits_to_retry")
+    for ev in (owed if isinstance(owed, list) else ()):
+        if isinstance(ev, dict) and str(ev.get("track", "main")) != "main":
+            return True
+    return False
+
+
+def _last_read(state):
+    rec = (state or {}).get("feed_read")
+    return rec if isinstance(rec, dict) else {}
+
+
+def _feed_params(cfg, state):
+    """{"limit", "track"} for the next read of the feed."""
+    track = ("all" if cfg.get("include_other_trades") or _holds_other_track(state)
+             else "main")
+    last = _last_read(state).get("local")
+    gap = (not isinstance(last, (int, float)) or isinstance(last, bool)
+           or not 0 <= time.time() - last <= FEED_GAP_S)
+    return {"limit": FEED_LIMIT_MAX if track == "all" or gap else FEED_LIMIT,
+            "track": track}
+
+
+def _epoch(value):
+    """An ISO time (no offset = UTC) or epoch seconds as epoch seconds, or None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) and value > 0 else None
+    try:
+        t = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return t.timestamp()
+
+
+def _id_track(event_id):
+    """The track in an AgentHC event id (non-main ids end in "|<track>")."""
+    parts = str(event_id).split("|")
+    return parts[6] if len(parts) >= 7 and parts[6] else "main"
+
+
+def _opened_mark(row):
+    """What tells this position apart from a later one under the same
+    contract: the event that opened it, else when (None: a practice row,
+    which says neither)."""
+    return row.get("opened_event") or row.get("opened_at") or None
+
+
+def _check_window(cfg, state, save_state, body, params, events):
+    """After a good read: remember it, and keep the no-signal sell armed
+    while an exit may have fallen out of the feed's window.
+
+    A full window (as many events as asked for) whose oldest event is newer
+    than the last good read may have dropped events in between — an exit
+    for a position held now among them. (With no earlier read on record:
+    a full window that lists nothing the agent has handled, judged only
+    by the tracks it has handled events of: the first read of every track
+    after reading the main pick only is no gap by itself.) What the
+    ledger holds then is kept in state["feed_gap"] (each row with the
+    event or time it was opened: a position bought again later under the
+    same contract is not one of them); while any of it is still held, this
+    read counts as one without exit access (cause "feed_gap"): the owner
+    is warned and, if no exit comes, those rows — only those — are sold at
+    the no-signal sell time (agent.signal_loss_tick). Never raises."""
+    try:
+        raw = body.get("events") if isinstance(body, dict) else None
+        raw = raw if isinstance(raw, list) else []
+        rows = state.get("positions")
+        held = sorted(k for k, r in (rows.items() if isinstance(rows, dict) else ())
+                      if isinstance(r, dict))
+        server_now = _epoch(body.get("timestamp")) if isinstance(body, dict) else None
+        prev = _last_read(state)
+        if held and len(raw) >= int(params.get("limit") or FEED_LIMIT):
+            times = [t for t in (_epoch(e.get("occurred_at")) for e in raw
+                                 if isinstance(e, dict)) if t is not None]
+            since = prev.get("server") or prev.get("local")
+            if isinstance(since, (int, float)) and not isinstance(since, bool):
+                lost = bool(times) and min(times) > since
+            else:
+                seen = set(i for i in (state.get("seen") or ())
+                           if isinstance(i, str))
+                tracks = {_id_track(i) for i in seen}
+                alike = [e for e in events
+                         if not tracks or str(e.get("track", "main")) in tracks]
+                lost = bool(alike) and not any(e["event_id"] in seen
+                                               for e in alike)
+            if lost:
+                state["feed_gap"] = {"since": time.time(), "keys": held,
+                                     "opened": {k: _opened_mark(rows[k])
+                                                for k in held}}
+                save_state(state)
+                text = ("agentic-trader: your agent was away long enough that "
+                        "AgentHC published more signals than one read lists, so "
+                        "an exit signal for a position you hold may have been "
+                        "missed (" + ", ".join(held) + "). If no exit arrives, "
+                        "the agent sells it at the no-signal sell time.")
+                print(text)
+                try:
+                    from notifications import notify
+                    notify(cfg, text)
+                except Exception:
+                    pass
+        state["feed_read"] = {"local": time.time(), "server": server_now}
+        gap = state.get("feed_gap")
+        if isinstance(gap, dict):
+            marks = gap.get("opened") if isinstance(gap.get("opened"), dict) else {}
+            # still held, and the same position (not one bought again since)
+            still = [k for k in (gap.get("keys") or ())
+                     if isinstance((rows or {}).get(k), dict)
+                     and _opened_mark(rows[k]) == marks.get(k)]
+            if still:
+                _LAST_POLL.update(exits=False, why="feed_gap")
+                if still != gap.get("keys"):
+                    gap["keys"] = still
+                    save_state(state)
+            else:
+                state.pop("feed_gap", None)
+                save_state(state)
+    except Exception as exc:
+        print(f"feed window check failed (non-fatal): {str(exc)[:150]}")
+
+
 def _wallet_over_exits_only(cfg, state, save_state):
     """Buy today's wallet day-pass while the prepaid pass only gets exits,
     and read the feed with it. None when it was not bought (the caller
     then reads the exits with the used-up pass)."""
-    track = "all" if cfg.get("include_other_trades") else "main"
     try:
         resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
-                         params={"limit": 20, "track": track}, timeout=15)
+                         params=_feed_params(cfg, state), timeout=15)
         if resp.status_code != 402:
             return None
         if not _buy_day_pass(cfg, state, resp.json(), save_state):
@@ -814,13 +1060,21 @@ def _wallet_over_exits_only(cfg, state, save_state):
     return poll(cfg, state, save_state, _retried=True)
 
 
-def _prepaid_may_take_over(cfg, state):
+def _prepaid_may_take_over(cfg, state, entries=False):
     """A prepaid pass that may give entries once the wallet day-pass ends:
     one with signal days left as last checked, or one the agent has not
     been able to check (a pass the owner just bought in the dashboard has
-    no status here until the agent asks AgentHC about it). No request."""
+    no status here until the agent asks AgentHC about it). No request.
+    `entries` (entry_cover): only a pass never checked yet counts as not
+    known; one whose saved status went stale (an invoice past its lifetime
+    AgentHC hasn't answered for, an old "unpaid") counts by that saved
+    status, so new entries are refused rather than allowed on a guess. The
+    renewal keeps treating it as unknown: the wallet never pays on one."""
     cache = (state or {}).get("pass_status") or {}
-    return any((cache.get(_token_id(t)) or {}).get("status") in (None, "active")
+    if entries:
+        return any(((cache.get(_token_id(t)) or {}).get("status")
+                    in (None, "active")) for t in _pass_tokens(cfg))
+    return any(_known_status(cfg, cache.get(_token_id(t)), t) in (None, "active")
                for t in _pass_tokens(cfg))
 
 
@@ -842,7 +1096,7 @@ def entry_cover(cfg, state, close_ts):
     if cfg.get("agenthc_api_key") or not _live_daypass(state):
         return True, None
     until = float((state.get("l402") or {}).get("expires_at") or 0)
-    if until >= close_ts or _prepaid_may_take_over(cfg, state):
+    if until >= close_ts or _prepaid_may_take_over(cfg, state, entries=True):
         return True, until
     return False, until
 
@@ -872,10 +1126,9 @@ def _renew_daypass(cfg, state, save_state):
             return
     if not _pass_purchase_allowed(cfg, state, save_state):
         return
-    track = "all" if cfg.get("include_other_trades") else "main"
     try:
         resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
-                         params={"limit": 20, "track": track}, timeout=15)
+                         params=_feed_params(cfg, state), timeout=15)
         if resp.status_code == 402:
             _buy_day_pass(cfg, state, resp.json(), save_state,
                           running_until=running)
@@ -940,6 +1193,11 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
     owner paid for today once already) — a lost or refused token is not a
     reason to pay again. Only an owner who set max_autopay_sats_per_day
     themselves (and has no prepaid pass) allows more, up to that many sats."""
+    if cfg.get("agenthc_api_key"):
+        # A Premium key reads the feed with the key only: a wallet day-pass
+        # would never be sent, so buying one only loses sats (poll() tells
+        # the owner to top up the key instead).
+        return False
     now = now or _now_et()
     day = now.strftime("%Y-%m-%d")
     paid_today = (state.get("pass_charged_day") == day
@@ -1174,19 +1432,24 @@ def _daypass_paid(state, pending, preimage):
 
 def _check_balance(cfg, state, save_state, wallet, paid_sats):
     """Right after a day-pass was paid: one balance read. A wallet that holds
-    less than that pass cost can't buy the next one, so the owner hears it
-    the day before. A balance that can't be read is ignored."""
+    less than that pass cost plus the wallet's routing-fee reserve
+    (fee_reserve_sats: LNbits refuses the payment without it) can't buy the
+    next one, so the owner hears it the day before. A balance that can't be
+    read is ignored."""
     try:
         bal = wallet.balance_sats()
         ends = datetime.fromtimestamp(float(state["l402"]["expires_at"]), MARKET_TZ)
+        need = int(paid_sats or 0)
+        need += fee_reserve_sats(need)
     except Exception:
         return
-    if isinstance(bal, bool) or not isinstance(bal, int) or bal >= int(paid_sats or 0):
+    if isinstance(bal, bool) or not isinstance(bal, int) or bal >= need:
         return
     _daypass_alert(
         cfg, state, save_state, "daypass_low_balance_notified",
         f"Your agent's wallet has {bal:,} sats left, less than one day-pass "
-        f"(about {int(paid_sats):,} sats). Add sats in the dashboard (Settings "
+        f"plus the wallet's routing-fee reserve (about {need:,} sats). Add "
+        "sats in the dashboard (Settings "
         "→ Signal source). If it cannot buy the next pass, the agent takes no "
         f"new trades from {ends.hour}:{ends.minute:02d} ET on "
         f"{ends:%A %b} {ends.day}.")
@@ -1398,7 +1661,9 @@ def _pay_day_pass(cfg, state, body, save_state, running_until=None):
         if outcome == "failed":
             reason = str(exc)[:200]   # the wallet's own words: console only
             short = (isinstance(exc, PaymentRefused) and re.search(
-                r"insufficient|not enough|balance", reason, re.I))
+                # LNbits' fee reserve: "You must reserve at least (N sat) to
+                # cover potential routing fees" is a short balance too
+                r"insufficient|not enough|balance|reserve|routing fee", reason, re.I))
             if isinstance(exc, WalletKeyRejected):
                 why = ("the wallet's server did not accept the agent's "
                        "wallet key — the wallet may no longer exist (public "
@@ -1474,10 +1739,9 @@ def _ended_daypass_exits(cfg, state, save_state):
             or float(tok.get("expires_at") or 0) > time.time()
             or not _holds_real_position(state)):
         return None
-    track = "all" if cfg.get("include_other_trades") else "main"
+    params = _feed_params(cfg, state)
     try:
-        resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
-                         params={"limit": 20, "track": track},
+        resp = _http.get(f"{AGENTHC_API}{FEED_PATH}", params=params,
                          headers={"Authorization": tok["token"]}, timeout=15)
         if resp.status_code in (401, 402):
             tok["exits_done"] = True
@@ -1485,11 +1749,13 @@ def _ended_daypass_exits(cfg, state, save_state):
             return None
         if resp.status_code != 200:
             return None
-        events = [e for e in _parse_events(resp.json()) if e["event"] == "EXITED"]
+        body = resp.json()
+        parsed = _parse_events(body)
     except Exception:
         return None
     _LAST_POLL["exits"] = True   # exits only: entry access stays False
-    return events
+    _check_window(cfg, state, save_state, body, params, parsed)
+    return [e for e in parsed if e["event"] == "EXITED"]
 
 
 def _day_pass_loss_code(cfg, state, now=None):
@@ -1532,15 +1798,17 @@ def had_exit_access():
     read the feed answered (entries and exits, or a used-up pass's exits
     only), False when it returned without reading (no pass or day-pass,
     a pass not paid or not checked, a refused day-pass, a feed that isn't
-    publishing). The agent sells a held position before the close when
-    this stays False (agent.signal_loss_tick)."""
+    publishing), and also after a read while an exit for a held position
+    may have fallen out of the feed's window (_check_window: feed_gap).
+    The agent sells a held position before the close when this stays
+    False (agent.signal_loss_tick)."""
     return bool(_LAST_POLL["exits"])
 
 
 def exit_loss_reason():
     """Why the last poll() read no exit signals ("" when it did):
     pass_unchecked, pass_unpaid, pass_ended, day_pass_refused,
-    feed_not_live, or a _day_pass_loss_code (no_day_pass, day_pass_off,
+    feed_not_live, feed_gap, or a _day_pass_loss_code (no_day_pass, day_pass_off,
     day_pass_short, day_pass_failed, day_pass_undecided). Also set when
     poll() raised because the wallet could not pay for the day-pass."""
     return "" if _LAST_POLL["exits"] else str(_LAST_POLL.get("why") or "")
@@ -1632,8 +1900,7 @@ def payment_pending(cfg, state):
     cache = state.get("pass_status")
     cache = cache if isinstance(cache, dict) else {}
     for token in _pass_tokens(cfg):
-        rec = cache.get(_token_id(token))
-        if not isinstance(rec, dict) or rec.get("status") in (None, "pending"):
+        if _known_status(cfg, cache.get(_token_id(token)), token) in (None, "pending"):
             return True
     return False
 
@@ -1684,10 +1951,11 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
                     return got
             return _poll_with_pass(cfg, state, save_state, token, _retried)
         cache = state.get("pass_status") or {}
-        statuses = {(cache.get(_token_id(t)) or {}).get("status")
+        statuses = {_known_status(cfg, cache.get(_token_id(t)), t)
                     for t in _pass_tokens(cfg)}
         if None in statuses:
-            # Status check failed (network/server error): the pass may well
+            # Status check failed (network/server error), or an expired
+            # invoice AgentHC hasn't answered for yet: the pass may well
             # be fine. Wait for the next poll — never pay the wallet on an
             # unknown, or the owner pays twice for the same day.
             return _no_read("pass_unchecked")
@@ -1711,16 +1979,15 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
         return _no_day_pass(cfg, state, save_state)
     if not _headers(cfg, state) and not _pass_purchase_allowed(cfg, state, save_state):
         return _no_day_pass(cfg, state, save_state)
-    track = "all" if cfg.get("include_other_trades") else "main"
+    params = _feed_params(cfg, state)
     headers = _headers(cfg, state)
     daypass = None if cfg.get("agenthc_api_key") else (state.get("l402") or {})
     if (daypass and headers.get("Authorization") and not _retried
             and time.time() - float(daypass.get("refused_at") or 0) < _REFUSED_RETRY_S):
         # AgentHC refused this paid pass a moment ago: offer it again later
         return _no_read("day_pass_refused")
-    resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
-                        params={"limit": 20, "track": track},
-                        headers=headers, timeout=15)
+    resp = _http.get(f"{AGENTHC_API}{FEED_PATH}", params=params,
+                     headers=headers, timeout=15)
     _note_feed_answer(resp)
     if (resp.status_code in (401, 402) and not _retried
             and not cfg.get("agenthc_api_key") and _pass_tokens(cfg)
@@ -1749,6 +2016,13 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             "doesn't clear up, contact AgentHC with "
             "the time of the payment from your wallet's payment list.")
         return _no_read("day_pass_refused")
+    if resp.status_code == 402 and cfg.get("agenthc_api_key"):
+        # The Premium key's balance can't pay for today. The agent never
+        # buys a wallet day-pass while a key is set (it would not be sent
+        # with the key): nothing is paid, the owner is told to top up.
+        _pass_notice(cfg, state, save_state, "key_balance_notified",
+                     KEY_BALANCE_EMPTY_TEXT)
+        return _no_read("feed_refused")
     if resp.status_code == 402 and not _retried:
         if undecided or not _pass_purchase_allowed(cfg, state, save_state):
             return _no_day_pass(cfg, state, save_state)
@@ -1791,14 +2065,16 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             save_state(state)
     _LAST_POLL.update(access=True, exits=True)
     _entry_read(state, save_state)
-    return _parse_events(resp.json())
+    body = resp.json()
+    events = _parse_events(body)
+    _check_window(cfg, state, save_state, body, params, events)
+    return events
 
 
 def _poll_with_pass(cfg, state, save_state, token, _retried):
-    track = "all" if cfg.get("include_other_trades") else "main"
-    resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
-                        params={"limit": 20, "track": track},
-                        headers={"Authorization": token}, timeout=15)
+    params = _feed_params(cfg, state)
+    resp = _http.get(f"{AGENTHC_API}{FEED_PATH}", params=params,
+                     headers={"Authorization": token}, timeout=15)
     _note_feed_answer(resp)
     if resp.status_code in (401, 402) and not _retried:
         _refresh_pass(cfg, state, save_state, force=True)  # ended/refused: recheck
@@ -1848,6 +2124,7 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
             _pass_notice(cfg, state, save_state, "pass_low_notified",
                          PASS_LOW_TEXT.format(n=left))
     events = _parse_events(body)
+    _check_window(cfg, state, save_state, body, params, events)
     if exits_only:
         # a used-up pass gets no entries: should the reply carry one anyway
         # (a server bug, a malformed answer), it never reaches the agent
@@ -1880,9 +2157,37 @@ def pass_summary(cfg, state):
     return "no access configured"
 
 
+# The feed's own clock: an entry's age is measured against the time AgentHC
+# answered (body["timestamp"]), not this computer's clock alone — a PC clock
+# that runs fast (WSL2 after a sleep, no time sync) made every fresh entry
+# "too old", a slow one let old entries through. Each event carries the
+# offset as clock_skew_s (this clock minus AgentHC's, seconds; agent._stale
+# subtracts it). A fast clock is corrected by CLOCK_SKEW_MAX_S at most, so
+# a bad server time can't make an old entry look fresh; a slow one fully
+# (that only makes entries older). No server time: no correction.
+CLOCK_SKEW_MAX_S = 600
+CLOCK_SKEW_WARN_S = 60
+_SKEW_WARNED = {"done": False}
+
+
+def _clock_skew(body):
+    server_now = _epoch(body.get("timestamp")) if isinstance(body, dict) else None
+    if server_now is None:
+        return None
+    skew = time.time() - server_now
+    if abs(skew) > CLOCK_SKEW_WARN_S and not _SKEW_WARNED["done"]:
+        _SKEW_WARNED["done"] = True
+        print(f"This computer's clock is {abs(skew) / 60:.1f} min "
+              f"{'ahead of' if skew > 0 else 'behind'} AgentHC's: signal ages "
+              "are measured with AgentHC's clock. Turn on automatic time sync "
+              "on this computer.")
+    return round(min(skew, CLOCK_SKEW_MAX_S), 3)
+
+
 def _parse_events(body):
     from sources import log_ignored, never_short_reason
     events = []
+    skew = _clock_skew(body)
     for ev in body.get("events", []):
         if not isinstance(ev, dict):
             continue
@@ -1914,6 +2219,8 @@ def _parse_events(body):
         # byte-identical across upgrades or the seen-events dedupe resets.
         if norm["track"] != "main":
             norm["event_id"] += f"|{norm['track']}"
+        if skew is not None:
+            norm["clock_skew_s"] = skew
         events.append(norm)
     return events
 
@@ -1921,10 +2228,12 @@ def _parse_events(body):
 def setup(cfg):
     print("\n-- AgentHC Agentic Day Trade Ideas (sats-based access) --")
     print("Which trade signals?")
-    print("  1) Main pick only — one high-conviction day trade (default)")
+    print("  1) Main pick only — one high-conviction day trade")
     print("  2) Main pick + \"other trades\" — AgentHC's wider journal;")
     print("     several entries a day (your daily cap + budget still apply)")
-    scope = input("Choose [1/2, default 1]: ").strip() or "1"
+    # re-running setup keeps what is saved on Enter
+    saved = "2" if cfg.get("include_other_trades") else "1"
+    scope = input(f"Choose [1/2, default {saved}]: ").strip() or saved
     cfg["include_other_trades"] = scope == "2"
     print(f"  1) Lightning day-pass — the agent pays "
           f"~{usd_words(day_pass_price()['usd'])}/day in sats from its")

@@ -45,6 +45,7 @@ is a registered investment adviser). See Section 3 of DISCLAIMER.md.
 
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -53,6 +54,15 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 MARKET_TZ = ZoneInfo("America/New_York")
+
+# `python agent.py run` (and the restart bootstrap in platform_compat, which
+# uses runpy) runs this file as __main__. webui.py, view_model.py and
+# transfer.py do `import agent`: without this line that loads a SECOND copy
+# of this file with its own CONFIG_LOCK, settings and holds, so a dashboard
+# settings save and a chat "dry on" (or the loop's safety auto-pause) did
+# not exclude each other and the save could write LIVE back. One module.
+if __name__ == "__main__":
+    sys.modules.setdefault("agent", sys.modules[__name__])
 
 import llm_policy
 from brokers import BROKERS, account_tag, order_guard
@@ -143,6 +153,16 @@ def _fsync(fd):
             raise
 
 
+def _read_umask():
+    # os.umask can only be read by setting it: done once, at import
+    mask = os.umask(0o022)
+    os.umask(mask)
+    return mask
+
+
+_PUBLIC_FILE_MODE = 0o666 & ~_read_umask()
+
+
 def _write_json(path, payload, private):
     """Write `payload` to `path` so a power cut leaves the old file or the
     new one, never a half-written one: temp file, flush + fsync (the bytes
@@ -150,21 +170,31 @@ def _write_json(path, payload, private):
     the system reports it could not put them on the disk, the temp file is
     removed and `path` is left as it was (OSError)."""
     import platform_compat
-    tmp = path + ".tmp"
+    import tempfile
+    # A temp file of its own, in the same folder (so the swap is a rename):
+    # two threads saving the same file at once each write their own, never
+    # one shared `path`.tmp that the other truncates or swaps away.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                               prefix=os.path.basename(path) + ".",
+                               suffix=".tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
             f.flush()
             _fsync(f.fileno())
-    except OSError:
+        if not platform_compat.IS_WINDOWS:
+            # mkstemp makes every temp file 0600: a file that isn't private
+            # (trades, previews, …) keeps the permissions open() gave it
+            # before (0666 minus the umask), for whatever reads it as
+            # another user. Windows: inherits the locked directory's ACL.
+            os.chmod(tmp, 0o600 if private else _PUBLIC_FILE_MODE)
+        _replace(tmp, path)
+    except BaseException:
         try:
             os.remove(tmp)
         except OSError:
             pass
         raise
-    if private and not platform_compat.IS_WINDOWS:
-        os.chmod(tmp, 0o600)  # Windows: inherits the locked directory's ACL
-    _replace(tmp, path)
     if not platform_compat.IS_WINDOWS:
         try:  # make the swap itself durable (POSIX: fsync the folder)
             fd = os.open(os.path.dirname(path), os.O_RDONLY)
@@ -383,7 +413,8 @@ _STATE_HELD_NOTE = (
 
 # The same for a hand-off to a server (transfer.HANDOFF): Resume is refused.
 _HANDOFF_NOTE = (
-    "This setup is being moved, or was moved, to a server. The agent on this "
+    "This setup is being moved, or was moved, to a server or another "
+    "computer. The agent on this "
     "computer places NO orders at all, exits and the expiry guard included, "
     "and reads no signals, so the two can never both trade. Resume is "
     "switched off; if the move fails, the agent carries on here by itself.")
@@ -746,6 +777,12 @@ def _stale(ev, cfg):
     listed the first time it read the feed): that one is never bought.
     EXITED events are never stale-blocked (closing an open position is
     always right).
+
+    The age is measured with the source's clock when it sends one
+    (clock_skew_s: this computer's clock minus the source's, in seconds):
+    a PC clock that runs fast must not make every fresh entry "old", nor a
+    slow one let old entries through. A fast clock is corrected by
+    _CLOCK_SKEW_MAX_S at most.
     """
     if ev.get("event") != "ENTERED":
         return False
@@ -757,7 +794,19 @@ def _stale(ev, cfg):
         age = (datetime.now(timezone.utc) - occurred).total_seconds()
     except ValueError:
         return False
-    return age > float(cfg.get("max_event_age_s", 300))
+    return age - _clock_skew(ev) > float(cfg.get("max_event_age_s", 300))
+
+
+_CLOCK_SKEW_MAX_S = 600
+
+
+def _clock_skew(ev):
+    """The event's clock_skew_s (0 when it has none), at most _CLOCK_SKEW_MAX_S."""
+    skew = ev.get("clock_skew_s")
+    if (isinstance(skew, bool) or not isinstance(skew, (int, float))
+            or not math.isfinite(skew)):
+        return 0.0
+    return min(float(skew), _CLOCK_SKEW_MAX_S)
 
 
 # When this run started receiving each track ("main" / "other"). A stale
@@ -781,6 +830,33 @@ def note_watching(cfg, now=None, access=True):
         _WATCH_SINCE.setdefault("other", now)
     else:
         _WATCH_SINCE.pop("other", None)  # switched off: restart the clock if back on
+
+
+def _other_trades_off(cfg):
+    """AgentHC source, "other trades" off: only main-pick entries are taken."""
+    return (cfg.get("source", "agenthc") == "agenthc"
+            and not cfg.get("include_other_trades"))
+
+
+def _not_for_this_book(ev, state):
+    """With other trades off: an other-trades ENTERED, or an other-trades
+    EXITED for a contract the ledger doesn't hold as an other-trades
+    position (held from the main pick, by a row that doesn't say, or not
+    at all)."""
+    if str(ev.get("track", "main")) == "main":
+        return False
+    if ev.get("event") == "ENTERED":
+        return True
+    if ev.get("event") != "EXITED":
+        return False
+    key = (f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
+           if _valid_event(ev) else None)
+    row = (state.get("positions") or {}).get(key) if key else None
+    fn = getattr(SOURCES.get("agenthc"), "held_as_other", None)
+    try:
+        return not (fn is not None and fn(row))
+    except Exception:
+        return True
 
 
 def _backlog(ev):
@@ -918,22 +994,39 @@ def _recent_trades(limit=50):
     return (rows + _unwritten_rows())[-limit:]
 
 
-def _trades_today():
+def _trades_today(strict=False):
     """Today's trade-log rows, oldest first (UTC day, like the entry cap).
-    A close found in the account counts on the day its sale filled."""
+    A close found in the account counts on the day its sale filled.
+    Full-file scan, like the entry cap: skip rows can't push today's exits
+    out of a tail (the loss-streak rule is built from these). strict: see
+    _todays_log_rows."""
     today = datetime.now(timezone.utc).date().isoformat()
-    return [t for t in _recent_trades(500)
+    return [t for t in _todays_log_rows(today, strict)
             if str(t.get("closed_at") or t.get("ts", "")).startswith(today)]
 
 
-def _todays_log_rows(today):
-    """Every trade-log row that mentions `today` (full-file scan), then the
-    rows this run could not write yet — so an unwritable log can't make
-    today's entries or losses disappear from the limits."""
+class TradeLogUnreadable(OSError):
+    """trades.jsonl exists but can't be read, so today's entries and losses
+    can't be counted (_todays_log_rows strict=True)."""
+
+
+def _todays_log_rows(today, strict=False):
+    """Every trade-log row that mentions `today` (a date, or a tuple of
+    strings — a row mentioning any of them; full-file scan; this is only a
+    cheap pre-filter, callers check the row's fields), then the rows this
+    run could not write yet — so
+    an unwritable log can't make today's entries or losses disappear from
+    the limits.
+
+    No log yet is an empty day. A log that exists but can't be read
+    (permissions, a lock) yields nothing — or, strict=True, raises
+    TradeLogUnreadable: the entry limits must not read it as "no entries,
+    no losses today" and let an order past a cap that was already hit."""
+    days = (today,) if isinstance(today, str) else tuple(today)
     try:
         with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
             for line in f:
-                if today not in line:
+                if not any(d in line for d in days):
                     continue
                 try:
                     t = json.loads(line)
@@ -941,12 +1034,15 @@ def _todays_log_rows(today):
                     continue
                 if isinstance(t, dict):
                     yield t
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        if strict:
+            raise TradeLogUnreadable(str(exc)) from exc
     yield from _unwritten_rows()
 
 
-def _entries_today(dry=False):
+def _entries_today(dry=False, strict=False):
     """Count today's entries by scanning the FULL trade log.
 
     Deliberately not a tail read: every skip/veto also appends a log line, so
@@ -956,10 +1052,12 @@ def _entries_today(dry=False):
     Real-money rows only by default. dry=True counts the dry-run (practice)
     rows instead: the two books never mix, so practice entries can't use up
     the real cap (handle_event passes the mode the agent is in).
+    strict: raise TradeLogUnreadable rather than count an unreadable log
+    as zero (_todays_log_rows).
     """
     today = datetime.now(timezone.utc).date().isoformat()
     count = 0
-    for t in _todays_log_rows(today):
+    for t in _todays_log_rows(today, strict):
         if (t.get("action") == "entry" and bool(t.get("dry")) == bool(dry)
                 and str(t.get("ts", "")).startswith(today)):
             count += 1
@@ -976,7 +1074,7 @@ def _counted_before(t):
         return False
 
 
-def _est_pnl_today(dry=False):
+def _est_pnl_today(dry=False, strict=False):
     """Today's estimated realized P&L (USD) from the trade log's exit records.
 
     An ESTIMATE: brokers don't report fill prices back to the agent, so each
@@ -985,10 +1083,11 @@ def _est_pnl_today(dry=False):
     Exits with no estimate at all count as 0 (see `unmeasured`). Full-log
     scan for the same reason as _entries_today, and like it real-money rows
     only (dry=True: the dry-run rows instead) — a practice gain must never
-    offset a real loss against max_daily_loss_usd."""
+    offset a real loss against max_daily_loss_usd. strict: as for
+    _entries_today."""
     today = datetime.now(timezone.utc).date().isoformat()
     total, unmeasured = 0.0, 0
-    for t in _todays_log_rows(today):
+    for t in _todays_log_rows(today, strict):
         # a close found in the account counts on the day it filled
         day = str(t.get("closed_at") or t.get("ts", ""))
         if (t.get("action") != "exit" or bool(t.get("dry")) != bool(dry)
@@ -1010,6 +1109,61 @@ def _et_day(ts):
     if d.tzinfo is None:
         d = d.replace(tzinfo=timezone.utc)
     return d.astimezone(MARKET_TZ).date().isoformat()
+
+
+_POLICY_ROWS_SHOWN = 50
+_POLICY_EARLIER_SHOWN = 20
+
+
+def _policy_view(dry, strict=False):
+    """What the AI policy check is shown: (rows, context).
+
+    rows: today's entry and exit rows (ET market day; a close found in the
+    account counts on the day it filled) of the mode the agent is in only,
+    oldest first, from a FULL-file scan like the entry cap — a tail of the
+    log would let skip/veto rows push today's entries out of view, and a
+    per-day limit in policy.md would then let one more order through.
+    context: the time now (ET), the mode, and the day's counts worked out
+    here, so the model need not count the rows itself; and "earlier": the
+    last _POLICY_EARLIER_SHOWN entry and exit rows of this mode from BEFORE
+    today (same scan, so skip rows can't crowd them out either) — written
+    rules that span days (a losing streak across days, "not a ticker I lost
+    on yesterday", a weekly cap) need them, as they had in the old last-20
+    window. strict: as for _entries_today."""
+    import collections
+    import rules
+    now = _et_now()
+    today = now.date().isoformat()
+    rows = []
+    earlier = collections.deque(maxlen=_POLICY_EARLIER_SHOWN)
+    # one pass over the whole log; the substrings are only a cheap pre-filter
+    for t in _todays_log_rows(('"entry"', '"exit"'), strict):
+        if (t.get("action") not in ("entry", "exit")
+                or bool(t.get("dry")) != bool(dry)):
+            continue
+        day = _et_day(t.get("closed_at") or t.get("ts", ""))
+        if day == today:
+            rows.append(t)
+        elif day and day < today:
+            earlier.append(t)
+    earlier = list(earlier)
+    results = rules.exit_results(rows)
+    measured = [v for v in results if v is not None]
+    context = {
+        "now_et": now.strftime("%Y-%m-%d %H:%M ET (%A)"),
+        "mode": "practice" if dry else "live",
+        "entries_today": sum(1 for t in rows if t.get("action") == "entry"),
+        "positions_closed_today": len(results),
+        "losing_positions_today": sum(1 for v in measured if v < 0),
+        "losses_in_a_row": rules.loss_streak(rows),
+        # the same streak carried back through the earlier rows shown
+        "losses_in_a_row_with_earlier": rules.loss_streak(earlier + rows),
+        "est_realized_pnl_today_usd": round(sum(measured), 2),
+        "rows_shown": min(len(rows), _POLICY_ROWS_SHOWN),
+        "rows_today": len(rows),
+        "earlier": _rows_without_facts(earlier),
+    }
+    return _rows_without_facts(rows[-_POLICY_ROWS_SHOWN:]), context
 
 
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -1447,24 +1601,97 @@ def _prune_expired_positions(cfg, state, save_state):
     contract can't be exited anymore, so the row is pure staleness.
     Bookkeeping only — places no orders. The notify matters: expiry without
     an exit usually means the premium was lost, so check the account.
+
+    A row that still held contracts is booked as an exit (cause "expired",
+    _expired_exit_row): the expiry guard leaves a no-bid loser to expire,
+    and without that row the worst losses were missing from P&L, Results
+    and the history. Closed-outside records (_prune_tombstones) were booked
+    when they closed and get no row.
     """
     today = _et_now().date().isoformat()
-    dropped, told = [], set()
+    dropped, told, booked = [], set(), {}
     for key in list(state.get("positions", {})):
         if _expired(key, today):
             row = state["positions"].pop(key)
             dropped.append(key)
             if isinstance(row, dict) and row.get("expired_alerted"):
                 told.add(key)  # the expiry check already alerted (once each)
+            rec = _expired_exit_row(cfg, key, row)
+            if rec is not None:
+                booked[key] = rec
     if _prune_tombstones(state, today) or dropped:
-        save_state(state)
+        # Saved before the rows are logged (as _close_outside): a crash in
+        # between can't book them twice. A save that FAILS is raised after
+        # the rows: the drop is already applied in memory and reaches disk
+        # with the next save, so skipping the rows would lose the losses.
+        save_failed = _save_error(save_state, state)
         for key in dropped:
+            rec = booked.get(key)
+            if rec is not None and not _logged_event(rec["event_id"]):
+                _log_trade(rec)
             msg = (f"pruned expired position {key} — expired without an exit "
                    f"event; check your broker account")
+            if rec is not None and rec.get("est_pnl_usd") is not None:
+                msg += (f" (counted as a loss of ${-rec['est_pnl_usd']:,.2f}, "
+                        "an estimate)")
             print(msg)
             if key not in told:
                 notify(cfg, f"agentic-trader: {msg}")
+        if save_failed is not None:
+            raise save_failed
     return dropped
+
+
+def _expired_exit_row(cfg, key, row):
+    """The trade-log exit row for a ledger row that expired still holding
+    contracts, or None (nothing left to book: no contracts, or an exit row
+    already counted them — exit_logged).
+
+    No sale happened, so the estimate is a total loss of what was paid:
+    -(entry_mark x qty x 100). Without an entry quote it is logged with no
+    estimate and counts as unmeasured. Dated (closed_at) at the expiry
+    day's close: that is when it was lost, and the daily loss limit and
+    the losing-streak rule count it on that day, not on the day this prune
+    runs — it must not block the next day's entries. Its book is the row's
+    own (`dry`), never the mode the agent is in now."""
+    if not isinstance(row, dict):
+        return None
+    held = _int0(row.get("qty"))
+    qty = held - min(held, _int0(row.get("exit_logged")))
+    if qty < 1:
+        return None
+    dry = bool(row.get("dry"))
+    rec = {"action": "exit", "cause": "expired",
+           "event_id": f"expired|{key}|{row.get('opened_event') or ''}",
+           "contract": _contract_of(key), "dry": dry, "qty": qty}
+    try:
+        rec["closed_at"] = _iso_at(_close_epoch(cfg, key.split("|")[1]))
+    except (ValueError, OverflowError, OSError):
+        pass  # no day to put it on: unmeasured, never counted on today
+    entry = _float0(row.get("entry_mark"))
+    if "closed_at" in rec and 0 < entry < float("inf"):
+        rec["est_pnl_usd"] = round(-entry * qty * 100, 2)
+        rec["reason"] = (f"Expired without a sale — counted as a total loss "
+                         f"of the ${entry:.2f} entry quote (estimate)")
+    else:
+        rec["reason"] = ("Expired without a sale — no entry quote was "
+                         "recorded, so the loss isn't measured")
+    facts = {"code": "expired_unsold", "sent": False, "qty": qty}
+    acct = row.get("acct")
+    if not dry and isinstance(acct, str) and ":" in acct:
+        facts["paper"] = acct.endswith(":paper")  # as _trade_facts
+    # labelled with the book whose contracts expired (as _trade_facts does
+    # for a sale); a row that doesn't say has no label, as before
+    book = {"main": "main", "shadow": "other"}.get(_row_book(row))
+    if book:
+        facts["book"] = book
+    return _row_facts(rec, cfg, **facts)
+
+
+def _logged_event(event_id):
+    """True when the trade log already has a row with this event_id
+    (full-file scan, plus the rows not written yet)."""
+    return any(t.get("event_id") == event_id for t in _todays_log_rows(event_id))
 
 
 def _expired(key, today):
@@ -1498,8 +1725,7 @@ def _maybe_daily_digest(cfg, state, save_state):
         return
     if state.get("last_digest_day") == day:
         return
-    today_utc = datetime.now(timezone.utc).date().isoformat()
-    todays = [t for t in _recent_trades(300) if str(t.get("ts", "")).startswith(today_utc)]
+    todays = _et_day_log_rows(day)
     entries = sum(1 for t in todays if t.get("action") == "entry")
     exits = sum(1 for t in todays if t.get("action") == "exit")
     vetoes = sum(1 for t in todays if t.get("action") == "policy_veto")
@@ -1510,6 +1736,47 @@ def _maybe_daily_digest(cfg, state, save_state):
                  f"Open positions: {', '.join(open_pos)}"))
     state["last_digest_day"] = day
     save_state(state)
+
+
+def _et_day_log_rows(day):
+    """Every trade-log row whose event happened on the ET market day `day`
+    (closed_at for a close found in the account, else ts — as the
+    dashboard's _row_day), oldest first, then the rows not written yet.
+    An expired-unsold exit (cause "expired") goes by ts, the day the prune
+    booked it: its closed_at is the expiry close, whose digest went out
+    before the prune could run (it runs once the expiry date has passed),
+    so by closed_at no digest would ever count it.
+    Full-file scan, like _todays_log_rows: a busy day's skip rows must not
+    push its trades out of a tail read. A row of that ET day carries that
+    UTC date or the next one."""
+    from datetime import timedelta
+    nxt = (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)).date().isoformat()
+    rows = []
+    try:
+        with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if day not in line and nxt not in line:
+                    continue
+                try:
+                    t = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(t, dict):
+                    rows.append(t)
+    except OSError:
+        pass
+    rows += _unwritten_rows()
+    out = []
+    for t in rows:
+        keys = ("ts",) if t.get("cause") == "expired" else ("closed_at", "ts")
+        for k in keys:
+            v = t.get(k)
+            got = _et_day(v) if isinstance(v, str) else ""
+            if got:
+                if got == day:
+                    out.append(t)
+                break
+    return out
 
 
 def _disclaimer_text():
@@ -1638,7 +1905,116 @@ def _dry_run_keeps_selling_real_positions(cfg):
 def _dry_run_holds_real_sells(cfg):
     """True when the agent is in dry-run and dry-run stops it from selling
     real positions too (only when the decision above is flipped)."""
-    return bool(cfg.get("dry_run")) and not _dry_run_keeps_selling_real_positions(cfg)
+    return _is_dry(cfg) and not _dry_run_keeps_selling_real_positions(cfg)
+
+
+def _dry_run_unset(cfg):
+    """True when the settings never chose practice or live (no `dry_run`,
+    or null): the Safety step was never saved."""
+    return (cfg or {}).get("dry_run") is None
+
+
+def _has_live_history(state=None, trades_path=None):
+    """True when this setup has already traded with real orders: a real
+    entry/exit row in trades.jsonl, or a real position in the ledger. A log
+    that can't be read counts as no history — the reading that can only
+    ever keep an unchosen mode in practice. trades_path: another setup's
+    log (a moved setup, transfer.py) instead of this one's."""
+    if state is None:
+        state = _load(STATE_PATH, {}) or {}
+    if isinstance(state, dict) and _real_positions(state):
+        return True
+    real = ("entry", "exit", "ledger_adopt")
+    try:
+        with open(trades_path or TRADES_PATH, encoding="utf-8",
+                  errors="replace") as f:
+            for line in f:
+                if '"dry": false' not in line and '"dry":false' not in line:
+                    continue
+                try:
+                    t = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(t, dict) and t.get("action") in real
+                        and t.get("dry") is False):
+                    return True
+    except OSError:
+        pass
+    return trades_path is None and any(
+        t.get("action") in real and t.get("dry") is False
+        for t in _unwritten_rows())
+
+
+# The mode _settle_dry_run decided for this run when the settings never
+# chose one, and whether "could not save the mode" was already printed. A
+# config.json that can't be written keeps coming back without the key; the
+# run keeps its first decision instead of working it out again from a
+# history that may read differently later (a trade log unreadable at start,
+# readable now, must not turn practice into live).
+_SETTLED_DRY = {"dry": None, "warned": False}
+
+
+def _is_dry(cfg, state=None):
+    """The mode the agent trades in — handle_event, doctor, status and the
+    dashboard all read it from here. A saved `dry_run` decides. Never
+    chosen: practice, unless this setup has already placed real orders
+    (_has_live_history) — that setup keeps the live mode it has been
+    running in, and the agent saves `dry_run: false` for it on start
+    (_settle_dry_run). Once this run has settled it, that decision stands
+    (_SETTLED_DRY). Never chosen never becomes live by itself."""
+    if not _dry_run_unset(cfg):
+        return bool(cfg["dry_run"])
+    if _SETTLED_DRY["dry"] is not None:
+        return _SETTLED_DRY["dry"]
+    return not _has_live_history(state)
+
+
+DRY_RUN_UNSET_PRACTICE_NOTE = (
+    "agentic-trader: practice or live was never chosen in your settings, so "
+    "the agent runs in PRACTICE (dry-run: no real orders) and saved that. "
+    "To place real orders, choose Live in the Safety settings or say 'go live'.")
+DRY_RUN_UNSET_LIVE_NOTE = (
+    "agentic-trader: practice or live was never chosen in your settings. This "
+    "setup has already placed real orders, so it stays LIVE as before and "
+    "saved that (dry_run: false). To stop placing real orders, choose "
+    "Practice in the Safety settings or say 'dry on'.")
+
+
+def _settle_dry_run(cfg, state=None):
+    """Write the mode the agent runs in when the settings never chose one,
+    so config.json, doctor and handle_event can't disagree: practice for a
+    setup with no real trades, live (and the owner is told once) for one
+    that has traded live. Returns the config to run with; a config.json
+    that can't be written right now leaves it unsaved (the mode is the same
+    either way: _is_dry)."""
+    if not _dry_run_unset(cfg):
+        return cfg
+    dry = _is_dry(cfg, state)
+    _SETTLED_DRY["dry"] = dry  # kept for the run, saved or not
+    wrote = []
+
+    def change(c):
+        if _dry_run_unset(c):
+            c["dry_run"] = dry
+            wrote.append(True)
+    try:
+        saved = update_config(change)
+    except OSError as exc:  # ConfigUnreadable / ConfigDamaged / read-only
+        if not _SETTLED_DRY["warned"]:  # once per run, not every loop
+            _SETTLED_DRY["warned"] = True
+            print(f"could not save the mode to config.json ({str(exc)[:120]}) "
+                  f"— running in {'PRACTICE' if dry else 'LIVE'} anyway")
+        return {**cfg, "dry_run": dry}
+    if not wrote:  # chosen meanwhile (the dashboard): that choice stands
+        return {**cfg, "dry_run": bool(saved["dry_run"])}
+    cfg = {**cfg, "dry_run": dry}
+    note = DRY_RUN_UNSET_PRACTICE_NOTE if dry else DRY_RUN_UNSET_LIVE_NOTE
+    print(note)
+    try:
+        notify(cfg, note, priority="high")
+    except Exception:
+        pass
+    return cfg
 
 
 def _opened_live(row):
@@ -1660,6 +2036,41 @@ def _real_positions(state):
     rows = (state or {}).get("positions")
     return [k for k, r in (rows.items() if isinstance(rows, dict) else ())
             if _opened_live(r)]
+
+
+def _open_in_mode(state, dry_mode):
+    """Positions open that count toward max_open_positions in this mode:
+    the real ones when live, the practice ones in dry-run — the way the
+    daily cap counts trades. A row that says neither way counts as real
+    (_opened_live), so real exposure is never under-counted."""
+    rows = (state or {}).get("positions")
+    rows = rows.values() if isinstance(rows, dict) else ()
+    return sum(1 for r in rows if _opened_live(r) != bool(dry_mode))
+
+
+def _buys_settling(state, today=None):
+    """Real buy orders whose outcome is still open (brokers/order_guard: no
+    clear answer, or a cancel Alpaca hadn't finished) and that have no
+    ledger row yet. Each may still fill, so it holds its slot under the
+    open-position cap — and, when sent `today` (UTC date) as a new entry,
+    under the daily entry cap — until it settles. (A re-placed order's
+    entry is in the trade log already: it isn't counted twice.)"""
+    try:
+        rows = (state or {}).get("positions") or {}
+        out = []
+        for key, rec in order_guard.unconfirmed(state or {}).items():
+            if not isinstance(rec, dict) or rec.get("side") != "buy" or key in rows:
+                continue
+            if today is not None:
+                if rec.get("replaces"):
+                    continue
+                sent = datetime.fromtimestamp(_float0(rec.get("at")), timezone.utc)
+                if sent.date().isoformat() != today:
+                    continue
+            out.append(key)
+        return out
+    except Exception:
+        return []
 
 
 def _dry_run_note(cfg, state):
@@ -1692,20 +2103,20 @@ def _mode_label(cfg, state):
     """The mode as the startup line and notification show it. In dry-run
     with real positions open, "no orders" would be untrue: those are still
     sold (_dry_run_keeps_selling_real_positions)."""
-    if not cfg.get("dry_run"):
+    if not _is_dry(cfg, state):
         return "LIVE"
     if _real_positions(state) and _dry_run_keeps_selling_real_positions(cfg):
         return "DRY-RUN (no new trades; real positions still get sold)"
     return "DRY-RUN (no orders)"
 
 
-def _mode(cfg):
+def _mode(cfg, state=None):
     """"practice" (dry-run: new trades are only recorded) or "live" (new
     trades are real orders) — the one place the dashboard's view-model and
     the trade log's mode stamp read it from. It is what handle_event does
-    with the same settings: only a true `dry_run` is practice, so settings
-    that never said are live."""
-    return "practice" if (cfg or {}).get("dry_run") else "live"
+    with the same settings (_is_dry): settings that never said are practice
+    unless this setup has already traded live."""
+    return "practice" if _is_dry(cfg, state) else "live"
 
 
 def _paused(cfg):
@@ -1745,6 +2156,32 @@ def _pause_note(cfg, state):
             "feed: the pause uses no signal day.")
 
 
+def _dry_size(cfg, event, broker, client):
+    """(qty, note) for a practice entry: what a live entry would buy now,
+    from the broker's read-only size_preview (the same sizing and quote the
+    live buy uses), so practice books the size live would. Only a fixed
+    contract count can be booked without a price: a budget (or % of the
+    account, already turned into a budget) that can't be priced is a skip,
+    as it is live, never contracts_per_trade."""
+    from brokers.pricing import fixed_count
+    why = "no broker connection to price it"
+    if broker is not None and client is not None:
+        try:
+            preview = getattr(broker, "size_preview", None)
+            if preview is not None:
+                return preview(client, cfg, event)
+            # an adapter without size_preview: the older read-only pair
+            option_id = broker.resolve_instrument(client, event)
+            if option_id:
+                return broker.size_contracts(client, cfg, option_id)
+            why = "couldn't look up the contract"
+        except Exception as exc:
+            why = f"couldn't price it: {str(exc)[:100] or type(exc).__name__}"
+    if str(cfg.get("sizing_mode", "contracts")) in ("budget", "percent"):
+        return 0, f"no quote available for budget sizing ({why}) — skipped"
+    return fixed_count(cfg)
+
+
 def _execute_dry(cfg, event, state, broker=None, client=None, on_skip=None):
     """Dry-run bookkeeping: identical position tracking, zero orders.
 
@@ -1755,16 +2192,7 @@ def _execute_dry(cfg, event, state, broker=None, client=None, on_skip=None):
                f"{'CALL' if event['type'] == 'C' else 'PUT'}"
     pos_key = f"{event['ticker']}|{event['expiry']}|{event['strike']}|{event['type']}"
     if event["event"] == "ENTERED" and pos_key not in state["positions"]:
-        qty = min(max(1, int(cfg.get("contracts_per_trade", 1))),
-                  int(cfg.get("max_contracts_per_trade", 100)))
-        note = "fixed contract count"
-        if broker is not None and client is not None:
-            try:  # read-only: resolve + quote so budget sizing previews accurately
-                option_id = broker.resolve_instrument(client, event)
-                if option_id:
-                    qty, note = broker.size_contracts(client, cfg, option_id)
-            except Exception:
-                pass
+        qty, note = _dry_size(cfg, event, broker, client)
         if qty < 1:
             print(f"[DRY-RUN] would SKIP {contract}: {note}")
             if on_skip is not None:
@@ -1901,6 +2329,46 @@ def _report_problem(cfg, state, save_state, kind, contract, message,
     notify(cfg, head + (f"\nFix: {hint}" if hint else "")
                 + "\n(No more alerts about this today; every case is in the "
                 "dashboard activity log.)")
+
+
+# The latest skip_log_unreadable rows, also kept in memory: while the log
+# can't be read the dashboard can't read them back from it (_problems_today).
+_UNREADABLE_SKIPS = []
+_UNREADABLE_SKIPS_KEPT = 50
+
+
+def _log_unreadable_skip(cfg, state, save_state, ev, book, contract, why, exc):
+    """An entry skipped because the trade log can't be read (handle_event):
+    a row in the log, also kept in memory so the dashboard's problems list
+    shows it DURING the outage (_problems_today), and a high-priority alert
+    at most once a day. Never raises."""
+    try:
+        rec = {"action": "skip_log_unreadable", "book": book,
+               "event_id": ev.get("event_id"), "contract": contract,
+               "reason": f"{why} ({str(exc)[:150]})"}
+        if cfg.get("dry_run"):
+            rec["dry"] = True
+        _log_trade(_row_facts(rec, cfg, "daily_cap"))
+        _UNREADABLE_SKIPS.append(rec)
+        del _UNREADABLE_SKIPS[:-_UNREADABLE_SKIPS_KEPT]
+        today = datetime.now(timezone.utc).date().isoformat()
+        sent = state.setdefault("problem_notified", {})
+        if sent.get("skip_log_unreadable") == today:
+            return
+        sent["skip_log_unreadable"] = today
+        try:
+            save_state(state)
+        except Exception:
+            pass
+        notify(cfg, f"⚠️ agentic-trader: entry NOT placed ({contract}) — your "
+                    f"trade log ({TRADES_PATH}) can't be read, so the daily "
+                    "entry cap, max daily loss and loss-streak rule can't be "
+                    "checked. New entries are skipped until it can be read; "
+                    "exits still run. Check the file's permissions, or close "
+                    "whatever has it open.\n(No more alerts about this today.)",
+               priority="high")
+    except Exception:
+        pass
 
 
 def _log_adopted_buys(cfg, state, save_state, broker, client):
@@ -2105,10 +2573,19 @@ def _problems_today():
     """Today's 'trade didn't happen' rows, grouped for the dashboard."""
     import broker_events
     today = datetime.now(timezone.utc).date().isoformat()
-    kinds = (set(broker_events.KINDS) | {"skip_stale", "skip_sizing", "skip_ai_needed"}
+    kinds = (set(broker_events.KINDS) | {"skip_stale", "skip_sizing", "skip_ai_needed",
+                                         "skip_log_unreadable"}
              | _OWN_SKIPS)
     out = {}
-    for t in _recent_trades(300):
+    rows = _recent_trades(300)
+    # while the log can't be read, its skip_log_unreadable rows only exist
+    # in memory (_log_unreadable_skip); once it can, they're on file too
+    on_file = {(t.get("action"), t.get("event_id"), t.get("ts")) for t in rows}
+    extra = [t for t in _UNREADABLE_SKIPS
+             if (t.get("action"), t.get("event_id"), t.get("ts")) not in on_file]
+    if extra:
+        rows = sorted(rows + extra, key=lambda t: str(t.get("ts", "")))
+    for t in rows:
         if t.get("action") not in kinds or not str(t.get("ts", "")).startswith(today):
             continue
         p = out.setdefault(t["action"], {"kind": t["action"], "count": 0})
@@ -3122,8 +3599,12 @@ def _note_stale_exit(state, event_id):
 # The row also keeps the signal's raw track ("main", "other", ...): two
 # non-main tracks are both the "shadow" book, and an exit of one must not
 # sell the other's row either. "book" is what sizing and the dashboard use.
-# A row of the "other trades" book closes on any exit, as before, while the
-# AgentHC source is set to main pick only: its own exit can't arrive then.
+# One model with the AgentHC source's reads (audit PR2): row["track"] is the
+# same raw track the source looks at (held_as_other) to keep reading every
+# track while an "other trades" row is held, even after the owner turns
+# other trades off — so that row's own exit still arrives, and a main-pick
+# exit for the same contract never sells it. A row with a track but no
+# (valid) book takes the track's book; a row with neither is legacy.
 _BOOK_WORDS = {"main": "main pick", "shadow": '"other trades"'}
 _ENTRY_BOOKS_KEPT = 50
 
@@ -3148,9 +3629,16 @@ def _event_book(ev):
 
 
 def _row_book(row):
-    """The book whose entry opened this ledger row, or None (unknown)."""
-    b = row.get("book") if isinstance(row, dict) else None
-    return b if isinstance(b, str) and b in _BOOK_WORDS else None
+    """The book whose entry opened this ledger row, or None (unknown): its
+    "book", else the book of its raw "track" (a row stamped with the track
+    alone, by a version between audit PR2 and per-book exits)."""
+    if not isinstance(row, dict):
+        return None
+    b = row.get("book")
+    if isinstance(b, str) and b in _BOOK_WORDS:
+        return b
+    t = row.get("track")
+    return _book_of_track(t) if isinstance(t, str) and t else None
 
 
 def _row_track(row):
@@ -3162,23 +3650,16 @@ def _row_track(row):
     return t
 
 
-def _other_trades_unheard(cfg):
-    """True when "other trades" exits can't reach the agent: the AgentHC
-    source asks for the main pick only (sources/agenthc_day_trade_ideas)."""
-    return (isinstance(cfg, dict) and cfg.get("source", "agenthc") == "agenthc"
-            and not cfg.get("include_other_trades"))
-
-
 def _other_books_row(row, ev, cfg=None):
     """The row's book when `ev` is an exit signal of ANOTHER book (or
-    another track of it), which must not sell it; else None. A row whose own
-    exit can't arrive any more (other trades switched off) is never held."""
+    another track of it), which must not sell it; else None. With "other
+    trades" off an "other trades" row is still held for its own exit: the
+    AgentHC source keeps reading every track while one is held
+    (held_as_other), so that exit still arrives."""
     if not isinstance(ev, dict) or ev.get("event") != "EXITED":
         return None
     mine, theirs = _event_track(ev), _row_book(row)
     if mine is None or theirs is None:
-        return None
-    if theirs == "shadow" and _other_trades_unheard(cfg):
         return None
     held = _row_track(row)
     if held is not None:
@@ -3383,6 +3864,11 @@ def _rows_without_facts(rows):
 @_order_in_flight
 def handle_event(ev, cfg, state, broker, client, save_state):
     """Run one new event through the safety pipeline. Returns a log line or None."""
+    if _dry_run_unset(cfg):
+        # never chosen: the mode doctor and the dashboard report (_is_dry) —
+        # practice unless this setup has already traded live. Before, a
+        # missing key read as live here while doctor said DRY-RUN.
+        cfg = {**cfg, "dry_run": _is_dry(cfg, state)}
     contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
     book = "main" if str(ev.get("track", "main")) == "main" else "shadow"
 
@@ -3399,9 +3885,15 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         msg = f"SKIPPED stale ENTERED ({contract}) — older than " \
               f"{int(cfg.get('max_event_age_s', 300))}s"
         print(msg)
+        # a fast clock is corrected only up to _CLOCK_SKEW_MAX_S: past that
+        # the clock, not a sleep, may be why
+        hint = ("computer asleep or offline?"
+                if _clock_skew(ev) < _CLOCK_SKEW_MAX_S else
+                f"this computer's clock is {_CLOCK_SKEW_MAX_S // 60}+ min fast — "
+                "turn on automatic time sync")
         _report_problem(cfg, state, save_state, "skip_stale", contract,
                         f"signal was {int(cfg.get('max_event_age_s', 300))}s+ old "
-                        "when the agent saw it (computer asleep or offline?)",
+                        f"when the agent saw it ({hint})",
                         event_id=ev["event_id"], book=book, check="signal_fresh",
                         params={"max_age_s": int(cfg.get("max_event_age_s", 300))})
         return msg
@@ -3479,8 +3971,30 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # Counted from the rows of the mode the agent is in: real trades
         # when live, practice trades in dry-run — never one against the other.
         dry_mode = bool(cfg.get("dry_run"))
+        # Today's entries and losses come from the trade log. A log that
+        # exists but can't be read is not "nothing today": no new entries
+        # until it can be read (fail closed). Exits never get here.
+        try:
+            n_today = _entries_today(dry_mode, strict=True)
+            pnl_today, _unmeasured = _est_pnl_today(dry_mode, strict=True)
+            today_rows = [t for t in _trades_today(strict=True)
+                          if bool(t.get("dry")) == dry_mode]
+            policy_rows, policy_ctx = _policy_view(dry_mode, strict=True)
+        except TradeLogUnreadable as exc:
+            why = ("the trade log can't be read, so the daily entry cap, max "
+                   "daily loss and loss-streak rule can't be checked — no new "
+                   "entries until it can be read (exits still run)")
+            msg = f"SKIPPED {contract}: {why}"
+            print(msg + f" [{str(exc)[:150]}]")
+            _log_unreadable_skip(cfg, state, save_state, ev, book, contract,
+                                 why, exc)
+            return msg
         cap = int(cfg.get("max_entries_per_day", 5))
-        if _entries_today(dry_mode) >= cap:
+        # n_today was read strictly above (fail closed on an unreadable log).
+        if not dry_mode:  # a real buy still settling may become an entry
+            n_today += len(_buys_settling(
+                state, datetime.now(timezone.utc).date().isoformat()))
+        if n_today >= cap:
             msg = f"SKIPPED {contract}: daily entry cap reached ({cap})"
             print(msg)
             _log_trade(_row_facts(
@@ -3490,10 +4004,19 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             return msg
         # Concurrent-exposure cap: the daily cap resets every day, so without
         # this a feed could accumulate unbounded open positions across days.
+        # Counted like the daily cap: real positions when live, practice
+        # ones in dry-run (_open_in_mode), so practice left open from before
+        # going live never blocks real trades.
         pos_cap = int(cfg.get("max_open_positions", 10))
-        n_open = len(state.get("positions", {}))
-        if n_open >= pos_cap:
-            how = (f"{n_open} open now, real and practice together. "
+        n_open = _open_in_mode(state, dry_mode)
+        settling = 0 if dry_mode else len(_buys_settling(state))
+        if n_open + settling >= pos_cap:
+            how = (f"{n_open} {'practice' if dry_mode else 'real'} "
+                   f"position{'' if n_open == 1 else 's'} open now"
+                   + (f", plus {settling} buy order"
+                      f"{'' if settling == 1 else 's'} still settling at your "
+                      "broker (it may fill)" if settling else "")
+                   + " (real and practice are counted separately). "
                    "To allow more, say 'set positions N' in the dashboard "
                    "chat, or raise Open positions at once in the settings")
             msg = f"SKIPPED {contract}: max open positions reached ({pos_cap}) — {how}"
@@ -3508,7 +4031,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # the limit, stop opening positions. Exits are never blocked.
         loss_cap = float(cfg.get("max_daily_loss_usd") or 0)
         if loss_cap > 0:
-            pnl, _unmeasured = _est_pnl_today(dry_mode)
+            pnl = pnl_today
             if -pnl >= loss_cap:
                 msg = (f"SKIPPED {contract}: max daily loss reached "
                        f"(est. ${-pnl:,.0f} of ${loss_cap:,.0f}) — no new "
@@ -3523,8 +4046,6 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # Built-in rules (plain settings, no AI): tickers, calls/puts, min
         # strike, no 0DTE, stop after a losing streak.
         import rules
-        today_rows = [t for t in _trades_today()
-                      if bool(t.get("dry")) == dry_mode]
         ok, why = rules.check(cfg, ev, today_rows)
         if not ok:
             msg = f"SKIPPED {contract}: {why} (your rules)"
@@ -3535,8 +4056,9 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 **_rule_facts(cfg, ev, today_rows)))
             return msg
         # The user's own policy, applied by the LLM policy brain (veto-only).
-        verdict = llm_policy.evaluate(
-            cfg, ev, _rows_without_facts(_recent_trades(20)))
+        # Shown today's entries and exits of this mode from the whole log,
+        # the time now and the day's counts (_policy_view).
+        verdict = llm_policy.evaluate(cfg, ev, policy_rows, context=policy_ctx)
         if not verdict["act"] and verdict.get("ai_problem"):
             # NOT the owner's rules saying no: the AI that checks them is
             # missing or failing, so every entry is being skipped. Log it as
@@ -3631,6 +4153,21 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                             event_id=ev["event_id"], dry=dry, book=book,
                             check="trade_size")
             return msg
+    if (ev["event"] == "ENTERED" and existing is not None
+            and not cfg.get("dry_run") and not _opened_live(existing)):
+        # A practice position in this same contract, left open from
+        # dry-run: the ledger has one row per contract, so the real buy
+        # can't be placed next to it. Say so, never skip it silently.
+        why = ("a practice (dry-run) position in this contract is still "
+               "open, so the agent did not buy it for real. Close your "
+               "practice positions (or let their exit signals close them) "
+               "to take signals in this contract live")
+        msg = f"SKIPPED {contract}: {why}"
+        print(msg)
+        _report_problem(cfg, state, save_state, "broker_no_order", contract,
+                        why, event_id=ev["event_id"], book=book,
+                        check="broker_order", code="practice_row_held")
+        return msg
     if ev["event"] == "EXITED" and existing and not dry:
         if (existing.get("pending") or {}).get("side") == "sell":
             print(f"EXITED {contract}: the agent's sell is already working — "
@@ -4023,7 +4560,29 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
     # only the agent's own exits may cap or reprice a sell
     new = [_from_feed(ev) for ev in events
            if ev.get("event_id") not in seen and ev.get("event_id") not in owed_ids]
-    known = list(events) + owed
+    off = _other_trades_off(cfg)
+    if off:
+        # The AgentHC source reads every track while the agent still holds
+        # an "other trades" position (its exit must reach it), but the
+        # owner turned other trades off: their entries are not taken, and
+        # their exits reach only a position opened from other trades — the
+        # shadow book often trades the main pick's contract and exits at
+        # another time, and must never sell the main position (positions
+        # are keyed by contract alone). Remembered, so they aren't looked
+        # at again.
+        dropped = [ev for ev in new if ev.get("event_id")
+                   and _not_for_this_book(ev, state)]
+        for ev in dropped:
+            seen.add(ev["event_id"])
+            _mark_seen(state, ev["event_id"], listed)
+        if dropped:
+            print(f"ignored {len(dropped)} \"other trades\" signal(s): "
+                  "other trades are off")
+            new = [ev for ev in new if ev.get("event_id") not in seen]
+            save_state(state)
+    # with other trades off, a shadow-book exit doesn't end a main entry
+    known = [ev for ev in events
+             if not off or str(ev.get("track", "main")) == "main"] + owed
     batch = (owed + [ev for ev in new if ev.get("event") == "EXITED"]
              + [ev for ev in new if ev.get("event") != "EXITED"])
     for ev in batch:
@@ -4045,6 +4604,11 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
         except Exception as exc:
             error = exc
         if opens and key in state["positions"]:
+            # which signals its exit comes with: its book and raw track (the
+            # AgentHC source keeps reading that track while it's held; only
+            # that book's exit sells it). handle_event stamps it already;
+            # this covers an entry that raised after the row was written.
+            _stamp_book(state["positions"][key], ev)
             # A new position: an exit still owed for this contract is older
             # than it (or the entry wouldn't have been bought) — it was for
             # an earlier position and must never sell this one.
@@ -4423,6 +4987,8 @@ _SIGNAL_LOSS_WHY = {
     "feed_error": "the signal feed can't be read",
     "feed_not_live": "the signal feed can't be read",
     "feed_refused": "the signal feed is refusing the agent",
+    "feed_gap": ("the agent was away long enough that an exit signal may "
+                 "have scrolled out of the signal feed"),
 }
 # what the owner can do about it (none: the agent keeps trying)
 _BUY_DAYS = "buy signal days (dashboard → Settings → Signal source)"
@@ -4556,10 +5122,20 @@ def _signal_loss_acct(cfg, broker=None, client=None):
 
 def _signal_loss_rows(state):
     """[(key, row)] ledger rows that hold contracts or have an order
-    working, of every expiry."""
+    working, of every expiry. While the loss is a feed_gap (an exit may
+    have scrolled out of the feed while the agent was away), only the rows
+    held then that are still held (state["feed_gap"]["keys"], kept by the
+    AgentHC source): positions bought since get their exits normally."""
     rows = state.get("positions")
-    return [(k, r) for k, r in (list(rows.items()) if isinstance(rows, dict) else ())
-            if isinstance(r, dict) and (_int0(r.get("qty")) >= 1 or r.get("pending"))]
+    out = [(k, r) for k, r in (list(rows.items()) if isinstance(rows, dict) else ())
+           if isinstance(r, dict) and (_int0(r.get("qty")) >= 1 or r.get("pending"))]
+    rec = state.get("signal_loss")
+    if isinstance(rec, dict) and rec.get("cause") == "feed_gap":
+        gap = state.get("feed_gap")
+        keys = set(k for k in ((gap.get("keys") or ()) if isinstance(gap, dict)
+                               else ()) if isinstance(k, str))
+        out = [(k, r) for k, r in out if k in keys]
+    return out
 
 
 def _clock_et(ts, now_et):
@@ -5930,6 +6506,54 @@ def _expiry_setting(arg, default):
 
 # ── commands ─────────────────────────────────────────────────────────────────
 
+def _confirm_broker_switch(cfg, saved_bc):
+    """Terminal setup: True to go ahead with the broker just picked. The
+    agent never sells a real row whose account tag names another broker
+    account (_check_before_exit: "blocked"), so a switch away from the
+    broker a real row was opened at warns and asks first. Each row's broker
+    is the one its acct tag names; a row with no tag (from before rows were
+    tagged) counts as the saved broker's — the agent tags such a row with
+    the account it trades on its first read, so after a switch it may try
+    to sell it where it isn't held. Rows at the newly picked broker don't
+    warn. Enter (or anything but y) keeps the saved broker."""
+    old = {"2": "alpaca", "3": "moomoo"}.get(saved_bc, "robinhood")
+    new = cfg.get("broker")
+    if new == old:
+        return True
+    rows = (_load(STATE_PATH, {}) or {}).get("positions")
+    rows = rows if isinstance(rows, dict) else {}
+    stranded = {}  # broker -> ([tagged keys], [untagged keys])
+    for k in _real_positions({"positions": rows}):
+        acct = str((rows.get(k) or {}).get("acct") or "")
+        at = acct.split(":", 1)[0] if acct else old
+        if at != new:
+            stranded.setdefault(at, ([], []))[0 if acct else 1].append(k)
+    if not stranded:
+        return True
+    now = _BROKER_NAMES.get(new, new)
+    for at, (tagged, untagged) in stranded.items():
+        was = _BROKER_NAMES.get(at, at)
+        for keys in (tagged, untagged):
+            if not keys:
+                continue
+            one = len(keys) == 1
+            it = "it" if one else "them"
+            print(f"\nWARNING: you have {len(keys)} real position"
+                  f"{'' if one else 's'} open at {was}: "
+                  f"{', '.join(_contract_label(k) for k in keys)}.")
+            if keys is tagged:
+                what = f"the agent will NOT sell {it}"
+            else:
+                what = (f"the agent may try to sell {it} at {now}, where "
+                        f"{'it is' if one else 'they are'} not held")
+            print(f"After switching to {now} {what} — sell {it} yourself "
+                  f"in the {was} app.")
+    ok = input(f"Switch to {now} anyway? [y/N]: ").strip().lower() == "y"
+    if not ok:
+        print(f"Keeping {_BROKER_NAMES.get(old, old)}.")
+    return ok
+
+
 def cmd_setup():
     require_consent_or_exit()
     cfg = _load(CONFIG_PATH, {}) or {}
@@ -5950,81 +6574,22 @@ def cmd_setup():
     print("  1) Robinhood Agentic account (OAuth)")
     print("  2) Alpaca — paper or live (API keys; paper = zero real dollars)")
     print("  3) moomoo — paper or live (needs their OpenD gateway running)")
-    bc = input("Choose [1-3, default 1]: ").strip() or "1"
+    # Enter keeps the broker that is saved (re-running setup to change a key
+    # must not switch an Alpaca or moomoo owner to Robinhood)
+    saved_bc = {"alpaca": "2", "moomoo": "3"}.get(str(cfg.get("broker")), "1")
+    bc = input(f"Choose [1-3, default {saved_bc}]: ").strip() or saved_bc
     cfg["broker"] = {"2": "alpaca", "3": "moomoo"}.get(bc, "robinhood")
+    if not _confirm_broker_switch(cfg, saved_bc):
+        cfg["broker"] = {"2": "alpaca", "3": "moomoo"}.get(saved_bc, "robinhood")
     cfg = BROKERS[cfg["broker"]].setup(cfg)
 
-    print("\n== Step 3/4: Position sizing ==")
-    print(SIZING_NOTICE)
-    print("\n  1) Dollar budget per trade — buys as many contracts as fit;")
-    print("     skips the trade if even one contract exceeds the budget")
-    print("  2) Fixed number of contracts per trade")
-    print("  3) Percent of account value per trade (re-read at each entry)")
-    mode = input("Choose [1-3, default 1]: ").strip() or "1"
-    if mode == "3":
-        cfg["sizing_mode"] = "percent"
-        while True:
-            raw = input("Percent of account per trade (e.g. 2): ").strip().rstrip("%")
-            try:
-                p = float(raw)
-                if 0 < p <= 100:
-                    break
-            except ValueError:
-                pass
-            print("Enter a percent between 0 and 100.")
-        cfg["percent_per_trade"] = p
-        cfg.setdefault("contracts_per_trade", 1)
-    elif mode == "2":
-        cfg["sizing_mode"] = "contracts"
-        while True:
-            raw = input("Contracts per trade [1]: ").strip() or "1"
-            try:
-                n = int(raw)
-                if n >= 1:
-                    break
-            except ValueError:
-                pass
-            print("Enter a positive integer.")
-        cfg["contracts_per_trade"] = n
-    else:
-        cfg["sizing_mode"] = "budget"
-        while True:
-            raw = input("Budget per trade in USD (e.g. 500): ").strip()
-            try:
-                b = float(raw)
-                if b > 0:
-                    break
-            except ValueError:
-                pass
-            print("Enter a positive dollar amount.")
-        cfg["budget_per_trade_usd"] = b
-        cfg.setdefault("contracts_per_trade", 1)  # dry-run fallback estimate
-    # 100 (was 25 through v2026-07): still a guard against a penny option
-    # ballooning one budget-mode trade into a lot too large to exit into thin
-    # quotes, without capping cheap contracts to a fraction of the budget.
-    cfg.setdefault("max_contracts_per_trade", 100)
-
-    if cfg.get("include_other_trades"):
-        print("\nYour source includes the \"other trades\" (shadow) journal. Size")
-        print("those separately from the main pick?")
-        print("  0) Same as the main pick (default)  1) Dollar budget")
-        print("  2) Fixed contracts  3) Percent of account")
-        omode = {"1": "budget", "2": "contracts", "3": "percent"}.get(
-            input("Choose [0-3, default 0]: ").strip(), "")
-        if omode:
-            raw = input({"budget": "Other-trades budget in USD: ",
-                         "contracts": "Other-trades contracts per trade: ",
-                         "percent": "Other-trades percent of account: "}[omode])
-            ok, err = set_book_sizing(cfg, "other", omode, raw)
-            if not ok:
-                print(f"{err} — other trades will use the main sizing.")
+    _ask_sizing(cfg)
 
     print("\n== Step 4/4: Safety rails & extras ==")
     dry = input("Start in DRY-RUN mode (log actions, place NO orders — "
                 "recommended for the first days)? [Y/n]: ").strip().lower()
     cfg["dry_run"] = dry != "n"
-    raw = input("Max new entries per day (hard cap) [5]: ").strip()
-    cfg["max_entries_per_day"] = int(raw) if raw.isdigit() else 5
+    _ask_daily_cap(cfg)
     _ask_position_cap(cfg)
     cfg.setdefault("max_event_age_s", 300)
     cfg = notifications_setup(cfg)
@@ -6038,6 +6603,97 @@ def cmd_setup():
     print("Start the heartbeat with: python agent.py run")
 
 
+def _ask_sizing(cfg):
+    """The terminal setup's sizing step: the main pick, max contracts per
+    trade and the "other trades" book. Every Enter keeps what is saved."""
+    print("\n== Step 3/4: Position sizing ==")
+    print(SIZING_NOTICE)
+    print("\n  1) Dollar budget per trade — buys as many contracts as fit;")
+    print("     skips the trade if even one contract exceeds the budget")
+    print("  2) Fixed number of contracts per trade")
+    print("  3) Percent of account value per trade (re-read at each entry)")
+    # Re-running setup (to change a broker key, say) must not reset what is
+    # saved: every Enter below keeps the saved value.
+    mode_key = {"budget": "1", "contracts": "2", "percent": "3"}
+    # a config with a contract count and no mode trades a fixed count (the
+    # brokers' default), so that is what Enter keeps
+    saved = mode_key.get(str(cfg.get("sizing_mode") or (
+        "contracts" if cfg.get("contracts_per_trade") else "")), "1")
+    mode = input(f"Choose [1-3, default {saved}]: ").strip() or saved
+    if mode == "3":
+        cfg["sizing_mode"] = "percent"
+        cur = _saved_amount(cfg, "percent_per_trade", 100)
+        while True:
+            raw = (input("Percent of account per trade "
+                         + (f"[{_amount_text(cur)}]" if cur else "(e.g. 2)") + ": ")
+                   .strip().rstrip("%") or (f"{_amount_text(cur)}" if cur else ""))
+            try:
+                p = float(raw)
+                if 0 < p <= 100:
+                    break
+            except ValueError:
+                pass
+            print("Enter a percent between 0 and 100.")
+        cfg["percent_per_trade"] = p
+        cfg.setdefault("contracts_per_trade", 1)
+    elif mode == "2":
+        cfg["sizing_mode"] = "contracts"
+        cur = int(_saved_amount(cfg, "contracts_per_trade") or 1)
+        while True:
+            raw = input(f"Contracts per trade [{cur}]: ").strip() or str(cur)
+            try:
+                n = int(raw)
+                if n >= 1:
+                    break
+            except ValueError:
+                pass
+            print("Enter a positive integer.")
+        cfg["contracts_per_trade"] = n
+    else:
+        cfg["sizing_mode"] = "budget"
+        cur = _saved_amount(cfg, "budget_per_trade_usd")
+        while True:
+            raw = (input("Budget per trade in USD "
+                         + (f"[{_amount_text(cur)}]" if cur else "(e.g. 500)") + ": ").strip()
+                   or (f"{_amount_text(cur)}" if cur else ""))
+            try:
+                b = float(raw)
+                if b > 0:
+                    break
+            except ValueError:
+                pass
+            print("Enter a positive dollar amount.")
+        cfg["budget_per_trade_usd"] = b
+        cfg.setdefault("contracts_per_trade", 1)
+    # 100 (was 25 through v2026-07): still a guard against a penny option
+    # ballooning one budget-mode trade into a lot too large to exit into thin
+    # quotes, without capping cheap contracts to a fraction of the budget.
+    _ask_contract_cap(cfg)
+
+    if cfg.get("include_other_trades"):
+        print("\nYour source includes the \"other trades\" (shadow) journal. Size")
+        print("those separately from the main pick?")
+        print("  0) Same as the main pick  1) Dollar budget")
+        print("  2) Fixed contracts  3) Percent of account")
+        osaved = str(cfg.get("other_sizing_mode") or "")
+        odefault = mode_key.get(osaved, "0")
+        pick = input(f"Choose [0-3, default {odefault}]: ").strip() or odefault
+        omode = {"1": "budget", "2": "contracts", "3": "percent"}.get(pick, "")
+        if pick == "0":
+            set_book_sizing(cfg, "other", "same", None)
+        elif omode:
+            cur = (_saved_amount(cfg, f"other_{_BOOK_VALUE_KEY[omode]}")
+                   if omode == osaved else None)
+            raw = input({"budget": "Other-trades budget in USD",
+                         "contracts": "Other-trades contracts per trade",
+                         "percent": "Other-trades percent of account"}[omode]
+                        + (f" [{_amount_text(cur)}]" if cur else "") + ": ").strip()
+            ok, err = set_book_sizing(cfg, "other", omode,
+                                      raw or (f"{_amount_text(cur)}" if cur else ""))
+            if not ok:
+                print(f"{err} — other trades keep the sizing they had.")
+
+
 def _feed_access(cfg, state):
     try:
         from sources import agenthc_day_trade_ideas as hc
@@ -6049,15 +6705,24 @@ def _feed_access(cfg, state):
 
 
 def _book_desc(cfg, prefix=""):
-    """One book's sizing in words; prefix "" = main pick, "other_" = shadow."""
+    """One book's sizing in words; prefix "" = main pick, "other_" = shadow.
+    Says when max contracts per trade limits it: a size the cap cuts must
+    never read as the size that is bought."""
     mode = str(cfg.get(f"{prefix}sizing_mode") or "contracts")
+    cap = saved_contract_cap(cfg, prefix)
+    most = (f", at most {cap} contract{'' if cap == 1 else 's'}"
+            if cap < CONTRACT_CAP_DEFAULT else "")
     if mode == "budget":
         return (f"${float(cfg.get(f'{prefix}budget_per_trade_usd', 0) or 0):,.0f}"
-                "/trade budget")
+                "/trade budget" + most)
     if mode == "percent":
         return (f"{float(cfg.get(f'{prefix}percent_per_trade', 0) or 0):g}%"
-                " of account/trade")
-    return f"{int(cfg.get(f'{prefix}contracts_per_trade', 1) or 1)} contract(s)/trade"
+                " of account/trade" + most)
+    n = int(cfg.get(f'{prefix}contracts_per_trade', 1) or 1)
+    if n > cap:
+        return (f"{n} contract(s)/trade — capped at {cap} per trade by max "
+                "contracts per trade")
+    return f"{n} contract(s)/trade"
 
 
 def shadow_sizing_unused(cfg):
@@ -6117,7 +6782,7 @@ def set_book_sizing(cfg, book, mode, value):
     cfg[f"{prefix}{_BOOK_VALUE_KEY[mode]}"] = val
     if book == "main":
         cfg.setdefault("contracts_per_trade", 1)
-    cfg.setdefault("max_contracts_per_trade", 100)
+    cfg.setdefault("max_contracts_per_trade", CONTRACT_CAP_DEFAULT)
     return True, ""
 
 
@@ -6158,13 +6823,135 @@ def _ask_position_cap(cfg):
     set; never set before: the gate's default."""
     cur = saved_position_cap(cfg)
     lo, hi = POSITION_CAP_RANGE
-    raw = input(f"Max positions open at once, real and practice together "
-                f"(hard cap, {lo}-{hi}) [{cur}]: ").strip()
+    raw = input(f"Max positions open at once (hard cap; real and practice "
+                f"are counted separately, {lo}-{hi}) [{cur}]: ").strip()
     val = int(raw) if raw.isdigit() else None
     if val is not None and not lo <= val <= hi:
         print(f"Must be {lo} to {hi}: keeping {cur}.")
         val = None
     set_position_cap(cfg, val if val is not None else cur)
+
+
+# Most contracts one trade buys (low, high): budget, percent and fixed-count
+# sizing are all cut to it (brokers/pricing.capped). Never set: 100 (25
+# through v2026-07). Shared by the chat command 'set max contracts N', the
+# setup wizards and the /v2 settings page.
+CONTRACT_CAP_DEFAULT = 100
+CONTRACT_CAP_RANGE = (1, 1000)
+
+
+def set_contract_cap(cfg, val):
+    """Most contracts one trade buys. Sets the value in `cfg`; the caller
+    saves it. One whole number in CONTRACT_CAP_RANGE, checked by the
+    caller. Applies to both books (an "other trades" cap of their own,
+    other_max_contracts_per_trade, is kept and still applies to them)."""
+    cfg["max_contracts_per_trade"] = val
+
+
+def saved_contract_cap(cfg, prefix=""):
+    """Max contracts per trade as saved, as a whole number; never set (or
+    unreadable): the default. prefix "other_": the "other trades" book,
+    which uses its own cap when one is saved."""
+    cur = cfg.get(f"{prefix}max_contracts_per_trade") if prefix else None
+    if cur in (None, ""):
+        cur = cfg.get("max_contracts_per_trade")
+    if cur is None or isinstance(cur, bool):
+        return CONTRACT_CAP_DEFAULT
+    try:
+        val = float(cur)
+        if val == int(val) and val >= 0:
+            return int(val)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return CONTRACT_CAP_DEFAULT
+
+
+def _cap_note(cfg):
+    """What max contracts per trade does to the main pick's size now, for a
+    reply ("" when it doesn't limit it)."""
+    cap = saved_contract_cap(cfg)
+    mode = str(cfg.get("sizing_mode") or "contracts")
+    raise_it = " To change it, say: set max contracts N."
+    if mode == "contracts":
+        n = int(_saved_amount(cfg, "contracts_per_trade") or 1)
+        if n > cap:
+            return (f" Each trade is capped at {cap} contract"
+                    f"{'' if cap == 1 else 's'} by max contracts per trade, so "
+                    f"{cap} are bought, not {n}." + raise_it)
+        return ""
+    if cap < CONTRACT_CAP_DEFAULT:
+        return (f" No trade buys more than {cap} contract"
+                f"{'' if cap == 1 else 's'} (max contracts per trade), "
+                "whatever the budget." + raise_it)
+    return ""
+
+
+def _amount_text(v):
+    """A saved amount as the terminal setup shows it and saves it back on
+    Enter, every digit kept (f"{v:g}" keeps 6: a $12,345.67 budget came
+    back as $12,345.70, $1,234,567 as $1,234,570)."""
+    v = float(v)
+    return str(int(v)) if v == int(v) else repr(v)
+
+
+def _saved_amount(cfg, key, most=None):
+    """A saved positive number (a size), or None when it isn't one (or is
+    above `most`)."""
+    v = cfg.get(key)
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        val = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not 0 < val < float("inf") or (most is not None and val > most):
+        return None
+    return val
+
+
+def _ask_whole(prompt, cur, lo, hi):
+    """A whole number from lo to hi from the terminal; Enter, or an answer
+    out of range, keeps `cur`."""
+    raw = input(f"{prompt} ({lo}-{hi}) [{cur}]: ").strip()
+    val = int(raw) if raw.isdigit() else None
+    if val is not None and not lo <= val <= hi:
+        print(f"Must be {lo} to {hi}: keeping {cur}.")
+        val = None
+    return val if val is not None else cur
+
+
+def _ask_contract_cap(cfg):
+    """The terminal setup's question for the most contracts one trade buys.
+    Enter keeps what is set; never set before: the default."""
+    cur = saved_contract_cap(cfg)
+    val = _ask_whole("Most contracts one trade may buy (hard cap)", cur,
+                     *CONTRACT_CAP_RANGE)
+    set_contract_cap(cfg, val)
+    note = _cap_note(cfg).strip()
+    if note:
+        print(note)
+
+
+# New trades per day (low, high), as on the /v2 settings page.
+DAILY_CAP_DEFAULT = 5
+DAILY_CAP_RANGE = (1, 1000)
+
+
+def _ask_daily_cap(cfg):
+    """The terminal setup's question for new trades per day. Enter keeps
+    what is set; never set before (or saved as 0): 5. 0 is refused (it
+    would skip every entry)."""
+    cur = cfg.get("max_entries_per_day")
+    try:
+        cur = int(cur) if cur is not None and not isinstance(cur, bool) else None
+    except (TypeError, ValueError, OverflowError):
+        cur = None
+    if cur is None or cur < DAILY_CAP_RANGE[0]:
+        # never set, or a 0 the old terminal setup saved (it skips every
+        # entry, and typing it is refused): Enter gives the default
+        cur = DAILY_CAP_DEFAULT
+    cfg["max_entries_per_day"] = _ask_whole("Max new entries per day (hard cap)",
+                                            cur, *DAILY_CAP_RANGE)
 
 
 # A chat command must match its whole grammar. A question, extra words, or
@@ -6300,7 +7087,46 @@ def _position_cap_command(t, cfg):
     set_position_cap(cfg, val)
     _save(CONFIG_PATH, cfg, private=True)
     return True, (f"Open positions at once set to {val} (real and practice "
-                  "counted together).")
+                  "positions are counted separately).")
+
+
+# 'set max contracts N' and the other ways owners write it: the most
+# contracts one trade buys. Checked before 'set contracts' (the size), so
+# "set contracts cap 50" is never read as a size.
+_CONTRACT_CAP_COMMANDS = ("set max contracts per trade", "set max contracts",
+                          "set contract cap", "set contracts cap",
+                          "set contract limit", "set contracts limit",
+                          "set max_contracts_per_trade",
+                          "max contracts per trade", "max contracts")
+# 'set contracts N' (the size of a fixed-count trade), also written so
+_CONTRACTS_COMMANDS = ("set contracts per trade", "set contract per trade",
+                       "set contracts", "set contract")
+
+
+def _contract_cap_command(t, cfg):
+    """(handled, reply) for any of _CONTRACT_CAP_COMMANDS, and 'max
+    contracts' alone (shows it)."""
+    lo, hi = CONTRACT_CAP_RANGE
+    if t in ("max contracts", "contract cap", "max contracts per trade"):
+        cap = saved_contract_cap(cfg)
+        return True, (f"Max contracts per trade: {cap}. Trade size now: "
+                      f"{_sizing_desc(cfg)}. To change it: set max contracts N "
+                      f"({lo} to {hi}).")
+    val = next((v for v in (_command_whole(t, name)
+                            for name in _CONTRACT_CAP_COMMANDS)
+                if v is not None), None)
+    if val is None or not lo <= val <= hi:
+        return True, (f"{_NOTHING_CHANGED}Max contracts per trade must be a "
+                      f"whole number from {lo} to {hi}. Usage: set max "
+                      "contracts 50")
+    set_contract_cap(cfg, val)
+    _save(CONFIG_PATH, cfg, private=True)
+    own = cfg.get("other_max_contracts_per_trade")
+    return True, (f"Max contracts per trade set to {val}: no trade buys more "
+                  f"than {val} contract{'' if val == 1 else 's'}. Trade size "
+                  f"now: {_sizing_desc(cfg)}."
+                  + (f" 'Other trades' keep their own cap of {own}."
+                     if own not in (None, "") else ""))
 
 
 def _rule_command(t, cfg, text=None):
@@ -6409,7 +7235,8 @@ def _apply_command(text):
 # commands that change nothing (a trailing "?" is fine: "status?")
 _SHOW_COMMANDS = ("status", "rules", "my rules", "show rules", "autostart",
                   "start at login", "expiry guard", "expiry alert",
-                  "autopay cap")
+                  "autopay cap", "max contracts", "contract cap",
+                  "max contracts per trade")
 
 
 def _autopay_cap_command(t, cfg):
@@ -6560,7 +7387,8 @@ def _command(t, cfg, text):
         cfg["sizing_mode"] = "budget"
         cfg["budget_per_trade_usd"] = val
         _save(CONFIG_PATH, cfg, private=True)
-        return True, f"Per-trade budget set to ${val:,.0f} (your decision — see DISCLAIMER.md)."
+        return True, (f"Per-trade budget set to ${val:,.0f} (your decision — see "
+                      f"DISCLAIMER.md).{_cap_note(cfg)}")
     if t.startswith("set other budget"):
         val = _command_number(t, "set other budget")
         if val is None or val <= 0:
@@ -6579,7 +7407,7 @@ def _command(t, cfg, text):
         cfg["other_sizing_mode"] = "contracts"
         cfg["other_contracts_per_trade"] = val
         _save(CONFIG_PATH, cfg, private=True)
-        return True, (f"'Other trades' sizing set to {val} contract(s)/trade — "
+        return True, (f"'Other trades' sizing set to {_book_desc(cfg, 'other_')} — "
                       "main pick keeps its own sizing.")
     if t.startswith("set percent") or t.startswith("set other percent"):
         book = "other" if t.startswith("set other") else "main"
@@ -6596,16 +7424,22 @@ def _command(t, cfg, text):
         return True, (f"{who} sizing set to {_book_desc(cfg, 'other_' if book == 'other' else '')}"
                       " — sized from your account value at each entry "
                       "(your decision — see DISCLAIMER.md).")
-    if t.startswith("set contracts"):
-        val = _command_number(t, "set contracts", unit="")
+    if t.startswith(_CONTRACT_CAP_COMMANDS) or t == "contract cap":
+        return _contract_cap_command(t, cfg)
+    if t.startswith("set contract"):
+        val = next((v for v in (_command_number(t, name, unit="")
+                                for name in _CONTRACTS_COMMANDS)
+                    if v is not None), None)
         if val is None:
-            return True, _NOTHING_CHANGED + "Usage: set contracts 1"
+            return True, (_NOTHING_CHANGED + "Usage: set contracts 1   (the "
+                          "most contracts one trade may buy: set max contracts N)")
         ok, err = set_book_sizing(cfg, "main", "contracts", val)
         if not ok:
             return True, (f"{_NOTHING_CHANGED}{err[0].upper()}{err[1:]}. "
                           "Usage: set contracts 1")
         _save(CONFIG_PATH, cfg, private=True)
-        return True, f"Main pick sizing set to {_book_desc(cfg)}."
+        return True, (f"Main pick sizing set to {int(val)} contract(s)/trade."
+                      f"{_cap_note(cfg)}")
     if t in ("other trades on", "other trades off"):
         if cfg.get("source", "agenthc") != "agenthc":
             return True, "That setting is for the AgentHC signal source only."
@@ -6614,7 +7448,9 @@ def _command(t, cfg, text):
         return True, ("Now getting the main pick + \"other trades\" (shadow book) "
                       "signals, sized with: " + _sizing_desc(cfg) + "."
                       if cfg["include_other_trades"] else
-                      "Now getting the main pick only — no \"other trades\" signals.")
+                      "Now getting the main pick only — no new \"other trades\" "
+                      "entries. Other trades it already holds still get their "
+                      "exit signals.")
     if t in ("other sizing same", "clear other sizing"):
         set_book_sizing(cfg, "other", "same", None)
         _save(CONFIG_PATH, cfg, private=True)
@@ -6654,9 +7490,9 @@ def _command(t, cfg, text):
         return True, "Self-edit OFF."
     if t == "status":
         st = _load(STATE_PATH, {"positions": {}})
-        note = _dry_run_note(cfg, st) if cfg.get("dry_run") else ""
-        dry = bool(cfg.get("dry_run"))  # each mode counts its own trades
-        return True, (f"{'DRY-RUN' if cfg.get('dry_run') else 'LIVE'} · "
+        dry = _is_dry(cfg, st)  # each mode counts its own trades
+        note = _dry_run_note(cfg, st) if dry else ""
+        return True, (f"{'DRY-RUN' if dry else 'LIVE'} · "
                       + ("ON HOLD (being moved to a server: no orders at "
                          "all) · " if _handed_off() else
                          "ON HOLD (memory file was damaged: no orders at "
@@ -6871,6 +7707,9 @@ def cmd_run(app_window=False):
     # sets the damaged file aside, alerts, and pauses if memory may be missing
     _state_startup(cfg, state, state_info)
     _seen_ids(state)  # brings an older version's list up to date
+    # practice or live never chosen: saved now, so config.json, doctor and
+    # every order agree (_settle_dry_run)
+    cfg = _settle_dry_run(cfg, state)
     if llm_policy.entries_blocked(cfg):
         if state.get("positions"):
             print("WARNING: " + llm_policy.BLOCKED_MSG + " Starting anyway so "
@@ -6925,7 +7764,7 @@ def cmd_run(app_window=False):
         st = _load(STATE_PATH, {"positions": {}})
         feed_note = _feed_schedule_note(c, source)
         return {
-            "mode": "DRY-RUN" if c.get("dry_run") else "LIVE",
+            "mode": "DRY-RUN" if _is_dry(c, st) else "LIVE",
             # also on a full hold: a damaged state.json (the dashboard then
             # offers Resume, which is what ends it) or a hand-off to a
             # server (Resume answers why not). "hold": the dashboard then
@@ -6944,7 +7783,7 @@ def cmd_run(app_window=False):
                 **({"feed access": _feed_access(c, st)}
                    if c.get("source") == "agenthc" else {}),
                 "sizing": _sizing_desc(c),
-                "entries today": (f"{_entries_today(bool(c.get('dry_run')))} / cap "
+                "entries today": (f"{_entries_today(_is_dry(c, st))} / cap "
                                   f"{c.get('max_entries_per_day', 5)}"),
                 "policy brain": ("blocked" if llm_policy.entries_blocked(c)
                                  else "on" if llm_policy.enabled(c) else "off"),
@@ -7074,7 +7913,7 @@ def cmd_run(app_window=False):
         mode += ", ON HOLD — no orders at all until you press Resume"
     elif _paused(cfg):  # saved in config.json: still paused after a restart
         mode += ", PAUSED — no new entries until you press Resume"
-    if cfg.get("dry_run") and _dry_run_note(cfg, state):
+    if _is_dry(cfg, state) and _dry_run_note(cfg, state):
         print("Dry-run with real positions open. " + _dry_run_note(cfg, state))
     print(f"Heartbeat started [{mode}]: source={cfg['source']}, "
           f"{_sizing_desc(cfg)}, policy brain "
@@ -7133,6 +7972,7 @@ def cmd_run(app_window=False):
             beat["saved"] = now_beat
             _save_heartbeat(state, save_state, now_beat)
         cfg = _load(CONFIG_PATH, cfg) or cfg  # dashboard edits apply live
+        cfg = _settle_dry_run(cfg, state)  # a mode removed by hand: saved again
         _RUN_CFG["cfg"] = cfg
         awake.apply(cfg)  # same thread every time (Windows needs that)
         if time.time() - dash["at"] > DASH_CHECK_EVERY_S:
@@ -7451,13 +8291,13 @@ def cmd_status():
     print(f"broker           : {broker_name}{detail}"
           f"{'' if broker_ready(cfg) else ' — NOT CONFIGURED'}")
     print(f"contracts/trade  : {cfg.get('contracts_per_trade', 'unset')}")
-    print(f"mode             : {'DRY-RUN' if cfg.get('dry_run') else 'LIVE'}"
+    print(f"mode             : {'DRY-RUN' if _is_dry(cfg, state) else 'LIVE'}"
           + (" · ON HOLD (memory file was damaged: no orders at all until "
              "you press Resume)" if _state_hold() is not None else
              " · PAUSED (no new entries; exits still run)" if _paused(cfg) else ""))
     print(f"policy brain     : {'ON (' + llm_policy.policy_path() + ')' if llm_policy.enabled(cfg) else 'off'}")
     print(f"daily entry cap  : {cfg.get('max_entries_per_day', 5)}")
-    print(f"entries today    : {_entries_today(bool(cfg.get('dry_run')))}")
+    print(f"entries today    : {_entries_today(_is_dry(cfg, state))}")
     print(f"open positions   : {list(state.get('positions', {})) or 'none'}")
 
 
@@ -7658,7 +8498,7 @@ def doctor_checks():
             cl = None
         bp = _buying_power(mod, cl, cfg)
         warn = _cash_warning(cfg, bp)
-        dry = bool(cfg.get("dry_run"))
+        dry = _is_dry(cfg, state)
         check("buying_power", dry or not warn, "Broker buying power",
               ("couldn't read it" if bp is None else f"${bp:,.2f}")
               + (f" — {warn}" if warn else "")
@@ -7716,9 +8556,13 @@ def _feed_access_check(cfg, state, check):
         try:
             bal = wallet.balance_sats()
             from sources.agenthc_day_trade_ideas import usd_words
+            from lightning_wallet import fee_reserve_sats
             day_usd, day = _day_pass_price()
-            check("feed_access", bal >= day, "Wallet funded",
-                  f"{bal:,} sats ({'~' + str(bal // day) + ' more market day(s)' if bal >= day else f'below one ~{usd_words(day_usd)} day-pass (~{day:,} sats)'})",
+            # LNbits refuses a payment unless the wallet also holds its
+            # routing-fee reserve ("You must reserve at least ...")
+            need = day + fee_reserve_sats(day)
+            check("feed_access", bal >= need, "Wallet funded",
+                  f"{bal:,} sats ({'~' + str(bal // need) + ' more market day(s)' if bal >= need else f'below one ~{usd_words(day_usd)} day-pass (~{day:,} sats + ~{need - day:,} sats LNbits fee reserve)'})",
                   "python agent.py fund 100000   (the OWNER pays the invoice)",
                   who="owner")
         except WalletError as exc:
@@ -7737,11 +8581,15 @@ def cmd_doctor(as_json=False):
     --json: machine-readable, for an assistant deciding whether setup is done."""
     checks, cfg = doctor_checks()
     failed = [c for c in checks if not c["ok"]]
-    mode = ("DRY-RUN" if cfg.get("dry_run", True) else "LIVE")
+    # the mode handle_event trades in (_is_dry), never a default of its own
+    dry = _is_dry(cfg)
+    unset = _dry_run_unset(cfg)
+    mode = "DRY-RUN" if dry else "LIVE"
     if as_json:
         print(json.dumps({
             "ready": not failed,
             "mode": mode,
+            "mode_chosen": not unset,
             "checks": checks,
             "owner_steps": [c["fix"] for c in failed if c["who"] == "owner"],
             "agent_steps": [c["fix"] for c in failed if c["who"] == "agent"],
@@ -7760,9 +8608,14 @@ def cmd_doctor(as_json=False):
         warn = demo_warning(cfg.get("lnbits_url"))
         if warn:
             print(f"  ⚠️  Wallet host: {warn}")
-    if "dry_run" not in cfg:
-        desc = "not set — setup defaults to DRY-RUN"
-    elif cfg["dry_run"]:
+    if unset and dry:
+        desc = ("DRY-RUN (never chosen — the agent starts in practice and "
+                "saves it)")
+    elif unset:
+        desc = ("LIVE ORDERS (never chosen — this setup has already placed "
+                "real orders, so it stays live; saved as dry_run: false when "
+                "the agent starts)")
+    elif dry:
         desc = "DRY-RUN (safe — logs what it WOULD do)"
     else:
         desc = "LIVE ORDERS"
@@ -7808,6 +8661,8 @@ def cmd_setup_from(path, as_json=False):
                 print("\nMode: DRY-RUN — no real orders. Only the owner can "
                       "go live (`dry off` in the dashboard).")
             print(f"Trade size now: {report.get('sizing', '?')}")
+            for w in report.get("warnings") or ():
+                print(f"  ⚠ {w}")
             if report["owner_steps"]:
                 print("\nStill needs the OWNER:")
                 for s_ in report["owner_steps"]:
@@ -8003,26 +8858,95 @@ def cmd_export(path):
     import transfer
     if not path:
         path = transfer.export_filename()
+    # The passphrase first: a typo must not leave the agent stopped.
     pw = getpass.getpass("Pick a passphrase for the move file (8+ characters): ")
     if getpass.getpass("Type it again: ") != pw:
         print("The passphrases didn't match — nothing exported.")
         sys.exit(1)
-    try:
-        blob = transfer.export_bundle(pw)
-    except transfer.TransferError as exc:
-        print(f"Export failed: {exc}")
+    if len(pw) < transfer.MIN_PASSPHRASE:
+        print(f"Pick a passphrase of at least {transfer.MIN_PASSPHRASE} "
+              "characters — nothing exported.")
         sys.exit(1)
-    with open(path, "wb") as f:
-        f.write(blob)
-    print(f"Saved {path} ({len(blob) // 1024} KB). It holds your broker login and "
-          "wallet keys — keep it like a password, and delete it after the move.")
-    if input("Stop the agent on THIS computer now so only the new one trades? "
-             "[Y/n] ").strip().lower() in ("", "y", "yes"):
-        if keep_running.is_running():
-            keep_running.stop()
-        print(transfer.mark_moved_away())
-    print("On the new computer: run the installer, then in the setup page choose "
-          "\"Moving from another computer?\" (or: python agent.py import FILE).")
+    stopped_here = False
+    if keep_running.is_running() or keep_running.supervisor_running():
+        # The file must hold everything this computer has done: a trade the
+        # running agent makes after the copy is taken would be missing on
+        # the new computer (nobody would sell it). Stop it BEFORE the copy.
+        print("The agent is running on this computer. It must stop before the "
+              "move file is made, or a trade it makes meanwhile would be "
+              "missing on the new computer.")
+        if input("Stop it now? [Y/n] ").strip().lower() not in ("", "y", "yes"):
+            print("Nothing exported. Stop it with: python agent.py stop — then "
+                  "export again.")
+            sys.exit(1)
+        if not keep_running.stop():
+            print("It could not be stopped, so nothing was exported. Run: "
+                  "python agent.py stop — then export again.")
+            sys.exit(1)
+        stopped_here = True
+    retired = False
+    try:
+        try:
+            blob = transfer.export_bundle(pw)
+        except transfer.TransferError as exc:
+            print(f"Export failed: {exc}")
+            sys.exit(1)
+        try:
+            with open(path, "wb") as f:
+                f.write(blob)
+        except OSError as exc:
+            print(f"Could not save {path} ({exc}) — nothing exported.")
+            sys.exit(1)
+        print(f"Saved {path} ({len(blob) // 1024} KB). It holds your broker "
+              "login and wallet keys — keep it like a password, and delete it "
+              "after the move.")
+        if input("Retire THIS computer now (it won't run the agent again) so "
+                 "only the new one trades? [Y/n] ").strip().lower() in (
+                     "", "y", "yes"):
+            if keep_running.is_running() or keep_running.supervisor_running():
+                keep_running.stop()
+            print(transfer.mark_moved_away())
+            retired = True
+        elif stopped_here:
+            print("Not retired: the agent carries on here, so the file you "
+                  "saved is out of date as soon as it trades — make a new one "
+                  "when you move.")
+        print("On the new computer: run the installer, then in the setup page "
+              "choose \"Moving from another computer?\" (or: python agent.py "
+              "import FILE).")
+    finally:
+        if stopped_here and not retired:
+            _restart_after_export()
+
+
+def _restart_after_export():
+    """cmd_export stopped the agent for the copy and this computer was NOT
+    retired (export failed, or the owner keeps trading here): start it
+    again, so open positions keep their exits and expiry guard."""
+    import keep_running
+    import webui
+    print("The agent on this computer was stopped for the export — starting "
+          "it again…")
+    try:
+        if keep_running.is_running() or keep_running.supervisor_running():
+            ok = True  # something started it meanwhile
+        else:
+            before = keep_running.supervisor_status()
+            proc = keep_running.start_background(port=webui.APP_PORT)
+            ok = keep_running.wait_until_running(timeout=40, proc=proc,
+                                                 before=before)
+    except Exception as exc:
+        print(f"Starting it failed: {str(exc)[:200]}")
+        ok = False
+    if ok:
+        print("It is running again on this computer.")
+    elif keep_running.is_running() or keep_running.supervisor_running():
+        print("It is still starting — check in a minute: python agent.py "
+              "status")
+    else:
+        print("!! The agent on this computer is STOPPED: open positions get "
+              "no exit signals and no expiry-guard sells until it runs. "
+              "Start it again with: python agent.py start")
 
 
 def cmd_import(path):

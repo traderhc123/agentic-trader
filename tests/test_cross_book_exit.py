@@ -254,6 +254,18 @@ def test_exit_row_carries_the_book_of_the_position_it_sold(home, no_policy):
     assert row["action"] == "exit" and row["ui"]["book"] == "other"
 
 
+@pytest.mark.parametrize("held,label", [
+    ({"book": "shadow"}, "other"), ({"book": "main"}, "main"),
+    ({"track": "other"}, "other"), ({}, None)])
+def test_an_expired_unsold_row_carries_its_book(home, held, label):
+    """audit PR7's expiry booking: the exit row for contracts that expired
+    unsold is labelled with the row's book, like a sale (none: no label)."""
+    row = {"option_id": "opt-1", "qty": 2, "entry_mark": 1.5, **held}
+    rec = agent._expired_exit_row(LIVE, KEY, row)
+    assert rec["action"] == "exit" and rec["cause"] == "expired"
+    assert rec["ui"].get("book") == label
+
+
 # ── exits still owed (the feed can't be read, the pass lapsed) ─────────────
 
 def test_owed_exits_are_matched_by_book_and_settled(home, no_policy, notes):
@@ -512,19 +524,37 @@ def test_moomoo_sells_only_the_exiting_books_contracts(home, no_policy, notes,
     assert state["positions"] == {}
 
 
-# ── a book whose own exit can't arrive is never held ───────────────────────
+# ── "other trades" switched off: each row still waits for its own exit ─────
 
-def test_other_trades_switched_off_lets_the_main_exit_sell_their_row(
+def test_other_trades_switched_off_still_holds_their_row_for_its_own_exit(
         home, no_policy):
-    """The AgentHC source asks for the main pick only once "other trades" is
-    off: their exit can't arrive any more, so the main exit sells the row
-    as before (never stranded until the expiry guard)."""
+    """With "other trades" off the AgentHC source keeps reading every track
+    while an other-trades row is held (audit PR2, held_as_other), so its own
+    exit still arrives: the main pick's exit for the same contract must not
+    sell it, and its own exit does."""
+    from sources import agenthc_day_trade_ideas as hc
     b = Book()
     state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2, "book": "shadow",
                                  "track": "other"}}}
     off = {**LIVE, "include_other_trades": False}
-    assert run(b, state, ev("EXITED", "main", "m-out"), off) == f"EXIT: {CONTRACT}"
-    assert b.sells == [("m-out", 2, 2)] and state["positions"] == {}
+    assert hc._feed_params(off, state)["track"] == "all"
+    assert "no order placed" in run(b, state, ev("EXITED", "main", "m-out"), off)
+    assert b.sells == [] and state["positions"][KEY]["qty"] == 2
+    assert run(b, state, ev("EXITED", "other", "o-out"), off) == f"EXIT: {CONTRACT}"
+    assert b.sells == [("o-out", 2, 2)] and state["positions"] == {}
+
+
+@pytest.mark.parametrize("row,other", [
+    ({"book": "shadow"}, True), ({"book": "main"}, False),
+    ({"track": "other"}, True), ({"track": "swing"}, True),
+    ({"book": "main", "track": "other"}, False),
+    ({"book": "shadow", "track": "main"}, True), ({}, False)])
+def test_the_source_and_the_agent_agree_on_a_rows_book(row, other):
+    """One model: the feed reads every track for exactly the rows the agent
+    holds for an "other trades" exit."""
+    from sources import agenthc_day_trade_ideas as hc
+    assert hc.held_as_other(row) is other
+    assert (agent._row_book(row) == "shadow") is other
 
 
 def test_main_pick_row_is_still_held_with_other_trades_off(home, no_policy):

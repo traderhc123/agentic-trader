@@ -1012,9 +1012,12 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div>
    <div class="field"><label for="sf-cap">Max new entries per day</label>
     <input type="number" id="sf-cap" value="5" min="1"></div>
-   <div class="field"><label for="sf-pos">Open positions at once (most held at the same time,
-    real and practice together)</label>
+   <div class="field"><label for="sf-pos">Open positions at once (most held at the same time;
+    real and practice are counted separately)</label>
     <input type="number" id="sf-pos" value="10" min="1" max="1000"></div>
+   <div class="field"><label for="sf-maxc">Most contracts in one trade (every trade is cut to this,
+    whatever the budget)</label>
+    <input type="number" id="sf-maxc" value="100" min="1" max="1000"></div>
    <div class="field"><label for="sf-maxloss">Max daily loss in $ (optional, blank/0 = off) — once today's estimated
     realized loss reaches this, no new entries until tomorrow; exits still run</label>
     <input type="number" id="sf-maxloss" placeholder="e.g. 300" min="0"></div>
@@ -1448,10 +1451,12 @@ async function boot(){
   SF={dry:(typeof st.dry_run==='boolean')?st.dry_run:null,
       cap:st.max_entries_per_day==null?null:String(st.max_entries_per_day),
       pos:st.max_open_positions==null?null:String(st.max_open_positions),
+      maxc:st.max_contracts_per_trade==null?null:String(st.max_contracts_per_trade),
       loss:st.max_daily_loss_usd>0?String(st.max_daily_loss_usd):''};
   if(SF.dry!==null){document.getElementById('sf-dry').checked=SF.dry;sfDryChanged();}
   if(SF.cap!==null)document.getElementById('sf-cap').value=SF.cap;
   if(SF.pos!==null)document.getElementById('sf-pos').value=SF.pos;
+  if(SF.maxc!==null)document.getElementById('sf-maxc').value=SF.maxc;
   if(SF.loss)document.getElementById('sf-maxloss').value=SF.loss;
   cur=Math.min(maxUnlocked,STEPS.length-1);render();booted=true;
   loadBrokers();
@@ -1727,10 +1732,11 @@ async function doSizing(){
     :'<span class="err">'+esc(r.error)+'</span>';
   if(r.ok)done('s-sizing');
 }
-let SF={dry:null,cap:null,pos:null,loss:''};
+let SF={dry:null,cap:null,pos:null,maxc:null,loss:''};
 async function doSafety(){
   const dry=document.getElementById('sf-dry').checked,cap=document.getElementById('sf-cap').value;
   const pos=document.getElementById('sf-pos').value;
+  const maxc=document.getElementById('sf-maxc').value;
   let loss=document.getElementById('sf-maxloss').value;
   if(!String(loss).trim()&&SF.loss)loss='0';  // you cleared a limit that was set: off
   const body={};
@@ -1738,6 +1744,8 @@ async function doSafety(){
   if(SF.dry===null||dry!==SF.dry)body.dry=dry;
   if(SF.cap===null||String(cap)!==SF.cap)body.cap=cap;
   if(SF.pos===null||String(pos)!==SF.pos)body.positions=pos;
+  // never set: the default (100) is shown, and sent only when you change it
+  if(String(maxc)!==(SF.maxc===null?'100':SF.maxc))body.max_contracts=maxc;
   const r=await api('/api/safety',{...body,seeded:booted,
     max_loss:loss,
     discord:document.getElementById('nt-discord').value,
@@ -1747,7 +1755,9 @@ async function doSafety(){
     policy:document.getElementById('pol-text').value,
     anthropic_key:document.getElementById('pol-key').value});
   if(r.ok){done('s-safety');
-    SF={dry:dry,cap:String(cap),pos:String(pos),loss:(Number(loss)>0)?String(loss):''};
+    SF={dry:dry,cap:String(cap),pos:String(pos),
+        maxc:('max_contracts' in body)?String(maxc):SF.maxc,
+        loss:(Number(loss)>0)?String(loss):''};
     document.getElementById('done-body').innerHTML=
      '<p class="ok">Setup complete — pick where your agent should live.</p>'+
      '<details><summary class="muted">…or start it from a terminal instead</summary>'+
@@ -2087,7 +2097,7 @@ _DASH_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
      <p id="prop-expl"></p><p id="prop-warn" class="prop-warn"></p>
      <pre id="prop-diff" class="diff" tabindex="0" aria-label="Proposed code diff"></pre>
      <div class="btnrow">
-      <button class="btn-primary" onclick="propApply()">Apply &amp; restart</button>
+      <button class="btn-primary" id="prop-apply" onclick="propApply()">Apply &amp; restart</button>
       <button class="back" onclick="propReject()">Reject</button>
       <span class="muted">Nothing changes until you apply.</span>
       <span id="prop-msg" role="status" aria-live="polite"></span>
@@ -2346,9 +2356,10 @@ async function refresh(){
       $('t-feed-s').textContent='signal source';$('tile-feed').classList.remove('bad');}
     try{
       const p=await api('/api/proposal');const panel=$('p-proposal');
-      if(p.pending){panel.style.display='';
+      if(p.pending){panel.style.display='';propSha=p.diff_sha256||'';
         $('prop-expl').textContent=p.explanation;
-        $('prop-warn').textContent=(p.warnings||[]).join('  ');
+        $('prop-warn').textContent=(p.warnings||[]).concat(p.truncated?['This change is too large to show in full, so it can\\'t be applied: Reject it and ask for a smaller change.']:[]).join('  ');
+        $('prop-apply').disabled=!!p.truncated||!propSha;
         $('prop-diff').innerHTML=String(p.diff||'').split('\\n').map(l=>{
           const c=l.charAt(0);
           const k=(l.startsWith('+++')||l.startsWith('---')||c==='@')?'h':c==='+'?'a':c==='-'?'d':'';
@@ -2385,9 +2396,11 @@ async function refresh(){
     }).join(''):'<li class="empty">Nothing yet — signals and the agent\\'s decisions show up here</li>';
   }catch(e){badMode('Agent unreachable','unreachable');}
 }
+let propSha='';
 async function propApply(){
   $('prop-msg').textContent='applying…';
-  const r=await api('/api/proposal/apply',{});
+  // only the change this panel shows (the server refuses any other)
+  const r=await api('/api/proposal/apply',{diff_sha256:propSha});
   $('prop-msg').textContent=r.reply;
 }
 async function propReject(){await api('/api/proposal/reject',{});refresh();}
@@ -2809,7 +2822,8 @@ def _fund_quote(sats, invoice_cap=0):
     product). The day pass's USD price is AgentHC's own (hc.day_pass_price,
     the built-in fallback when the server can't say); its sats are the
     server's figure when it sent one, else that USD at the live BTC price.
-    suggested_sats is the day pass clamped to the instance's per-invoice cap
+    suggested_sats is the day pass plus LNbits' routing-fee reserve (it
+    refuses a payment without it), clamped to the instance's per-invoice cap
     when one is known. {ok: False} when no live price is available (the
     funding box just omits the hint)."""
     from sources import agenthc_day_trade_ideas as hc
@@ -2820,7 +2834,9 @@ def _fund_quote(sats, invoice_cap=0):
                 "day_pass_usd": day["usd"]}
     usd = sats * usd_per_btc / 1e8
     day_sats = day["sats"] or int(-(-day["usd"] / usd_per_btc * 1e8 // 100) * 100)  # ceil→100
-    suggested = min(day_sats, invoice_cap) if invoice_cap else day_sats
+    from lightning_wallet import fee_reserve_sats
+    need = day_sats + fee_reserve_sats(day_sats)
+    suggested = min(need, invoice_cap) if invoice_cap else need
     return {"ok": True, "btc_usd": round(usd_per_btc, 2),
             "usd": round(usd, 2),
             "day_pass_usd": day["usd"],
@@ -3308,8 +3324,9 @@ def _restore_notes(cfg, acceptance=None):
         if cfg.get("other_sizing_mode"):
             notes["sizing"] += " · shadow book " + _book_note("other_")
     if cfg.get("max_entries_per_day") is not None:
+        import agent as A  # the mode the agent trades in (A._is_dry)
         notes["safety"] = (
-            f"Safety saved: {'DRY-RUN' if cfg.get('dry_run', True) else 'LIVE'}"
+            f"Safety saved: {'DRY-RUN' if A._is_dry(cfg) else 'LIVE'}"
             f" · max {cfg.get('max_entries_per_day')} entries/day")
     return notes
 
@@ -3395,22 +3412,46 @@ def _apply_entry_cap(cfg, raw_cap, seeded):
         cfg["max_entries_per_day"] = 5
 
 
-def _position_cap_value(raw):
-    """(value, error) for the Safety form's "Open positions at once".
-    Blank or not sent: (None, "") = keep what is set."""
-    import agent as A
+def _whole_form_value(raw, lo, hi, label):
+    """(value, error) for a whole-number field of the Safety form. Blank or
+    not sent: (None, "") = keep what is set."""
     raw = str(raw if raw is not None else "").strip()
     if not raw:
         return None, ""
-    lo, hi = A.POSITION_CAP_RANGE
     try:
         val = float(raw)
+        val = int(val) if val == int(val) else None
     except (TypeError, ValueError, OverflowError):
         val = None
-    if val is None or val != int(val) or not lo <= val <= hi:
-        return None, (f"Open positions at once must be a whole number from "
-                      f"{lo} to {hi}. Nothing was changed.")
-    return int(val), ""
+    if val is None or not lo <= val <= hi:
+        return None, (f"{label} must be a whole number from {lo} to {hi}. "
+                      "Nothing was changed.")
+    return val, ""
+
+
+def _position_cap_value(raw):
+    """(value, error) for the Safety form's "Open positions at once"."""
+    import agent as A
+    return _whole_form_value(raw, *A.POSITION_CAP_RANGE, "Open positions at once")
+
+
+def _contract_cap_value(raw):
+    """(value, error) for the Safety form's "Most contracts in one trade"."""
+    import agent as A
+    return _whole_form_value(raw, *A.CONTRACT_CAP_RANGE,
+                             "Most contracts in one trade")
+
+
+def _apply_contract_cap(cfg, val, seeded):
+    """Max contracts per trade from a checked form value. None: keep what
+    is set. Only a form filled in from the current settings (`seeded`) may
+    RAISE it, as for the other caps."""
+    import agent as A
+    if val is None:
+        return
+    if seeded is not True and val > A.saved_contract_cap(cfg):
+        return
+    A.set_contract_cap(cfg, val)
 
 
 def _apply_position_cap(cfg, val, seeded):
@@ -3593,7 +3634,8 @@ def _v2_text(v, name, longest=500):
 # ignores what is outside; /v2 refuses it and says the range.
 _V2_LIMIT_RANGES = {"max_entries_per_day": (1, 1000),
                     "max_daily_loss_usd": (0, 1_000_000_000),  # 0 = no limit
-                    "max_open_positions": (1, 1000)}  # = agent.POSITION_CAP_RANGE
+                    "max_open_positions": (1, 1000),  # = agent.POSITION_CAP_RANGE
+                    "max_contracts_per_trade": (1, 1000)}  # = agent.CONTRACT_CAP_RANGE
 # trade size: mode -> (low, high, whole number, name); budget and percent
 # must be more than `low`, contracts at least `low`
 _V2_SIZE_RANGES = {"budget": (0, 10_000_000, False, "dollars per trade"),
@@ -3996,6 +4038,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                         else None),
             "max_entries_per_day": cfg.get("max_entries_per_day"),
             "max_open_positions": cfg.get("max_open_positions"),
+            "max_contracts_per_trade": cfg.get("max_contracts_per_trade"),
             "max_daily_loss_usd": cfg.get("max_daily_loss_usd"),
         }
 
@@ -4144,6 +4187,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         return {"ok": True, "describe": llm_client.describe(cfg)}
 
     deploy_lock = threading.Lock()
+    # The "move to another computer" routes, their 10-minute timer and the
+    # moment a server hand-off takes the heartbeat's hold: one at a time
+    # (ThreadingHTTPServer runs requests in parallel).
+    move_lock = threading.RLock()
 
     def deploy(_h, data):
         # One at a time. A second click while the first is still talking to
@@ -4196,7 +4243,16 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         # A full stop: no entries, no exits, no expiry-guard sells (the
         # owner's own Pause, in config.json, would still sell on exits).
         # The dashboard shows it from the agent's status (agent._handed_off).
-        transfer.HANDOFF["hold"] = True  # this is what stops the heartbeat
+        with move_lock:
+            transfer.HANDOFF["hold"] = True  # this is what stops the heartbeat
+            # The hand-off owns the hold now: an unfinished "Create move
+            # file" must never lift it when its 10-minute limit runs out (the
+            # server would trade alongside this computer), and the file it
+            # made is out of date (dropped: it can't be downloaded or
+            # finished any more).
+            transfer.HANDOFF["by"] = None
+            pending.pop("move_hold", None)
+            pending.pop("move_blob", None)
 
         def carry_on_here():
             transfer.HANDOFF["hold"] = False
@@ -4311,7 +4367,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         bp = A._buying_power(mod, cl, cfg)
         return {"known": bp is not None, "buying_power": bp,
                 "warning": A._cash_warning(cfg, bp),
-                "dry_run": bool(cfg.get("dry_run"))}
+                "dry_run": A._is_dry(cfg)}
 
     def broker_connect(_h, data):
         return _broker_connect(data, save)
@@ -4406,12 +4462,26 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         return {"pending": True, "explanation": p.get("explanation", ""),
                 "warnings": p.get("warnings", []),
                 "diff": self_edit.shown_diff(p),
-                # the diff above is cut: /v2 says so and never applies it
-                "truncated": self_edit.diff_truncated(p)}
+                # the diff above is cut: no Apply ever applies it
+                "truncated": self_edit.diff_truncated(p),
+                # what the classic page posts back: Apply only this change
+                "diff_sha256": self_edit.diff_sha256(p)}
 
-    def proposal_apply(_h, _data):
+    def proposal_apply(_h, data):
+        """POST /api/proposal/apply [{diff_sha256}]. apply_and_restart
+        always refuses a cut diff or one made against older code; with the
+        sha the page was shown (GET /api/proposal), no other change either.
+        A sha that is sent must be one: never read as "no sha"."""
+        import re as _re
         import self_edit
-        ok, msg = self_edit.apply_and_restart(restart=get_status is not None)
+        sha = None
+        if isinstance(data, dict) and "diff_sha256" in data:
+            sha = data["diff_sha256"]
+            if not (isinstance(sha, str) and _re.fullmatch(r"[0-9a-f]{64}", sha)):
+                return {"ok": False, "reply": "diff_sha256 must be the sha256 "
+                        "of the change you reviewed — nothing was applied"}
+        ok, msg = self_edit.apply_and_restart(restart=get_status is not None,
+                                              expect_sha256=sha)
         return {"ok": ok, "reply": msg}
 
     def proposal_reject(_h, _data):
@@ -4610,6 +4680,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         positions, perr = _position_cap_value(data.get("positions"))
         if perr:
             return {"ok": False, "error": perr}
+        max_contracts, perr = _contract_cap_value(data.get("max_contracts"))
+        if perr:
+            return {"ok": False, "error": perr}
         # Mode and cap change only when the form sends them (it sends what
         # the owner changed). Left out, they stay as they are — saving a
         # ticker rule must never switch the mode or reset the cap. Never
@@ -4620,6 +4693,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             cfg["dry_run"] = True
         _apply_entry_cap(cfg, data.get("cap"), data.get("seeded"))
         _apply_position_cap(cfg, positions, data.get("seeded"))
+        _apply_contract_cap(cfg, max_contracts, data.get("seeded"))
         _apply_daily_loss(cfg, data.get("max_loss"))
         cfg.setdefault("max_event_age_s", 300)
         import rules
@@ -4668,21 +4742,181 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         cfg.setdefault("llm_fallback", "skip")
 
     # ── move to another computer ──
-    def move_export(_h, data):
+    def _end_move_hold():
+        """Lift the hold an unfinished "Create move file" put on the
+        heartbeat (only that one: never a server hand-off's), and forget
+        that file — what it holds is out of date as soon as trading here
+        resumes, so "I saved the file" needs a new one."""
         import transfer
+        with move_lock:
+            token = pending.pop("move_hold", None)
+            pending.pop("move_blob", None)
+            if (token is not None and transfer.HANDOFF.get("by") is token
+                    and not _retired_or_handing_off()):
+                transfer.HANDOFF["by"] = None
+                transfer.HANDOFF["hold"] = False
+
+    def _retired_or_handing_off():
+        """This computer was retired (moved to a server or another computer)
+        or a server hand-off has taken over: the hold must stay on."""
+        import transfer
+        return bool(transfer.moved_away() or pending.get("deploy")
+                    or pending.get("deploy_unmarked"))
+
+    def _move_hold_expired(token):
+        import transfer
+        with move_lock:
+            if pending.get("move_hold") is not token:
+                return  # finished (this computer is retired) or exported again
+            if _retired_or_handing_off():
+                pending.pop("move_hold", None)
+                pending.pop("move_blob", None)
+                return  # the hold is a server hand-off's (or for good) now
+            _end_move_hold()
+        msg = ("The move to another computer was not finished within "
+               f"{max(1, round(transfer.MOVE_HOLD_S / 60))} minutes, so the "
+               "agent here carries on trading. The move file you made is out "
+               "of date now: to move, create a new one.")
+        print(msg)
         try:
-            blob = transfer.export_bundle(str(data.get("passphrase") or ""))
-        except transfer.TransferError as exc:
-            return {"ok": False, "error": str(exc)}
+            A.notify(cfg, msg)
+        except Exception:
+            pass
+
+    def _move_hold_reaches_expiry_sell():
+        """The expiry-day sell time ("H:MM", or the close when the guard is
+        off) when a position expiring today is open and a move hold started
+        now (transfer.MOVE_HOLD_S, no orders at all) could still be on then;
+        else None. Read from state.json once the cycle in progress has
+        saved."""
+        import math
+        import transfer
+        now = A._et_now()
+        disk = A._load(A.CONFIG_PATH, {}) or {}
+        if not isinstance(disk, dict):
+            disk = dict(cfg)
+        if not A.is_trading_day(disk, now.date()):
+            return None
+        day = now.date().isoformat()
+        state, _how = A._read_state_file(A.STATE_PATH)
+        if not isinstance(state, dict) or not A._expiring_rows(state, day):
+            return None
+        guard, _alert, close = A._expiry_times(disk, day)
+        start = close if guard is None else min(guard, close)
+        now_m = now.hour * 60 + now.minute
+        if now_m >= close:
+            return None  # nothing trades any more today
+        if now_m + math.ceil(transfer.MOVE_HOLD_S / 60) < start:
+            return None
+        return A._hm(start)
+
+    def move_export(_h, data):
+        with move_lock:
+            return _move_export(data)
+
+    def _move_export(data):
+        import keep_running
+        import provision
+        import transfer
+        pw = str(data.get("passphrase") or "")
+        if len(pw) < transfer.MIN_PASSPHRASE:
+            return {"ok": False, "error": (
+                f"pick a passphrase of at least {transfer.MIN_PASSPHRASE} "
+                "characters")}
+        if _retired_or_handing_off() or deploy_lock.locked():
+            return {"ok": False, "error": (
+                "this setup is being moved, or was moved, to a server or "
+                "another computer, so no move file was made (it would be a "
+                "second copy trading the same account).")}
+        running_here = get_status is not None
+        if not running_here and (keep_running.is_running()
+                                 or keep_running.supervisor_running()):
+            # This page can't hold an agent that runs in another process (or
+            # one its supervisor is about to start again): a trade it made
+            # after the copy would be missing on the new computer, and
+            # nobody would ever sell it.
+            return {"ok": False, "error": (
+                "the agent is running on this computer right now, in the "
+                "background or another window. Stop it first with: "
+                "python agent.py stop — then create the move file again. "
+                "Nothing was changed.")}
+        _end_move_hold()  # an earlier, unfinished export: replaced by this one
+        token = None
+        if running_here:
+            # The new computer gets a copy of this one's memory (positions,
+            # signals handled, passes bought). Hold the heartbeat — no feed
+            # read, no orders, exits included, "resume" can't lift it — and
+            # wait until the cycle it is in has finished and saved, exactly as
+            # a move to a server does. It stays on hold until "I saved the
+            # file" retires this computer, or lifts by itself after
+            # transfer.MOVE_HOLD_S (the file is dropped then: out of date).
+            if not transfer.HANDOFF["hold"]:
+                token = object()
+                transfer.HANDOFF["by"] = token
+                transfer.HANDOFF["hold"] = True
+                pending["move_hold"] = token
+            if not transfer.CYCLE_IDLE.wait(provision.CYCLE_WAIT_S):
+                _end_move_hold()
+                return {"ok": False, "error": (
+                    "the agent is in the middle of handling a trade signal, "
+                    "so its positions can't be copied safely right now. No "
+                    "move file was made and nothing changed. Wait a minute, "
+                    "then press the button again.")}
+            try:
+                sell_at = _move_hold_reaches_expiry_sell()
+            except Exception:
+                sell_at = None
+            if sell_at:
+                # The hold stops the expiry guard too: a contract expiring
+                # today could be left unsold (exercised) past the close.
+                _end_move_hold()
+                return {"ok": False, "error": (
+                    "a position that expires today is open, and an unfinished "
+                    f"move holds every order for up to "
+                    f"{max(1, round(transfer.MOVE_HOLD_S / 60))} minutes — "
+                    f"the expiry-day sell at {sell_at} ET included. Create "
+                    "the move file after today's close (or once that "
+                    "position is closed). No move file was made and nothing "
+                    "changed.")}
+        try:
+            blob = transfer.export_bundle(pw)
+        except BaseException as exc:
+            _end_move_hold()
+            if isinstance(exc, transfer.TransferError):
+                return {"ok": False, "error": str(exc)}
+            raise
         pending["move_blob"] = blob
+        if token is not None:
+            timer = threading.Timer(transfer.MOVE_HOLD_S, _move_hold_expired,
+                                    args=(token,))
+            timer.daemon = True
+            timer.start()
         return {"ok": True, "filename": transfer.export_filename(),
                 "kb": max(1, len(blob) // 1024)}
 
+    def _move_file_current():
+        """The move file made here still holds everything this computer did:
+        the agent running in this process has been on hold since it was
+        made — the export's own hold, not lifted by its time limit, a failed
+        server hand-off or a second request — or no agent runs here."""
+        import transfer
+        if not pending.get("move_blob"):
+            return False
+        if get_status is None:
+            return True
+        token = pending.get("move_hold")
+        return bool(transfer.HANDOFF["hold"]) and (
+            token is None or transfer.HANDOFF.get("by") is token)
+
     def move_download(_h):
         import transfer
-        blob = pending.get("move_blob")
-        if not blob:
-            return {"ok": False, "error": "create the move file first"}
+        with move_lock:
+            if not _move_file_current():
+                _end_move_hold()
+                return {"ok": False, "error": (
+                    "create the move file first (a file made earlier is out "
+                    "of date: the agent here kept trading after it)")}
+            blob = pending["move_blob"]
         return RawResponse(blob, "application/octet-stream", {
             "Content-Disposition":
                 f'attachment; filename="{transfer.export_filename()}"'})
@@ -4690,10 +4924,44 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     def move_finish(_h, _data):
         """After the owner saved the file: retire this computer so the two
         can never both trade."""
+        with move_lock:
+            return _move_finish()
+
+    def _move_finish():
+        import keep_running
         import transfer
-        note = transfer.mark_moved_away()
+        running_here = get_status is not None
+        if not running_here and (keep_running.is_running()
+                                 or keep_running.supervisor_running()):
+            # An agent started in another process since the file was made
+            # (start-at-login, `agent.py start`) may have traded: the file
+            # is out of date, and that agent would keep trading anyway.
+            _end_move_hold()
+            return {"ok": False, "error": (
+                "the agent was started on this computer after the move file "
+                "was made, so the file may be out of date. Stop it with: "
+                "python agent.py stop — then create the move file again. "
+                "This computer was not retired; nothing was changed.")}
+        if not _move_file_current():
+            # No file, or the agent here has been trading again since it was
+            # made (its hold ran out): retiring now would leave whatever it
+            # did since missing on the new computer.
+            _end_move_hold()
+            return {"ok": False, "error": (
+                "Create and download your move file first (a file made "
+                "earlier is out of date: the agent here kept trading after "
+                "it). This computer was not retired; nothing was changed.")}
+        # retired: the hold stays on (no orders here ever again); only its
+        # time limit goes (under move_lock: the timer can't run meanwhile)
+        token = pending.pop("move_hold", None)
+        try:
+            note = transfer.mark_moved_away()
+        except BaseException:
+            if token is not None:  # not retired: the time limit still applies
+                pending["move_hold"] = token
+            raise
         pending.pop("move_blob", None)
-        if get_status is not None:  # the agent is running: stop it
+        if running_here:  # the agent is running: stop it
             CONTROLS["stop"] = True
             note += "; the agent here is stopping"
         return {"ok": True, "note": note}
@@ -4724,6 +4992,14 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             try:
                 info = transfer.import_bundle(blob, pw,
                                               replace=bool(data.get("replace")))
+            except transfer.ImportIncomplete:
+                if running_here:
+                    # some files ARE the imported ones now and could not be
+                    # put back: this process's memory must never be saved
+                    # over them and it must not trade on a mixed setup —
+                    # it stays on hold until it is restarted
+                    CONTROLS["replaced"] = True
+                raise
             except Exception:
                 if running_here:
                     # nothing changed: carry on as before — the owner's
@@ -4805,6 +5081,11 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         refused = _start_refused()
         if refused:
             return {"ok": False, "error": refused}
+        if A._dry_run_unset(cfg):
+            # practice or live never chosen (Safety step not saved): the
+            # mode the agent will trade in is saved before it starts —
+            # practice, unless this setup already traded live
+            cfg["dry_run"] = A._settle_dry_run(cfg)["dry_run"]
         save()
         import keep_running
         auto_note = ""
@@ -5038,7 +5319,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "max_entries_per_day": cfg.get("max_entries_per_day"),
                 "max_daily_loss_usd": cfg.get("max_daily_loss_usd"),
                 "max_open_positions": cfg.get("max_open_positions"),
-                "defaults": {"max_entries_per_day": 5, "max_open_positions": 10},
+                "max_contracts_per_trade": cfg.get("max_contracts_per_trade"),
+                "defaults": {"max_entries_per_day": 5, "max_open_positions": 10,
+                             "max_contracts_per_trade": A.CONTRACT_CAP_DEFAULT},
                 "allowed": _V2_LIMIT_RANGES,
             },
             "rules": {**{k: cfg.get(k) for k in rule_keys},
@@ -5229,6 +5512,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             A.set_position_cap(new, _v2_number(
                 p["max_open_positions"], "max_open_positions",
                 *_V2_LIMIT_RANGES["max_open_positions"], whole=True))
+        if "max_contracts_per_trade" in p:
+            A.set_contract_cap(new, _v2_number(
+                p["max_contracts_per_trade"], "max_contracts_per_trade",
+                *_V2_LIMIT_RANGES["max_contracts_per_trade"], whole=True))
         if "expiry_sell_et" in p:
             # the chat's "expiry guard off|HH:MM", by the same check and
             # into the same key (agent._expiry_setting)
@@ -5271,7 +5558,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         for key, label, default, unlimited in (
                 ("max_entries_per_day", "New trades per day", 5, False),
                 ("max_daily_loss_usd", "Daily loss limit", None, True),
-                ("max_open_positions", "Positions open at once", 10, False)):
+                ("max_open_positions", "Positions open at once", 10, False),
+                ("max_contracts_per_trade", "Most contracts in one trade",
+                 A.CONTRACT_CAP_DEFAULT, False)):
             if key in p and cfg.get(key, default) != new.get(key, default):
                 changes.append(_change(
                     key, label, cfg.get(key, default), new.get(key, default),
@@ -5282,12 +5571,14 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     @_v2
     def v2_limits(data):
         """POST /api/v2/settings/limits: trade size per book, new trades per
-        day, daily loss limit, positions open at once, the expiry-day sell
+        day, daily loss limit, positions open at once, the most contracts in
+        one trade (max_contracts_per_trade), the expiry-day sell
         time (the chat's "expiry guard") and the no-signal sell time (the
         chat's "no-signal sell"). Partial: only the keys sent change. Never
         touches Practice/LIVE or the pause."""
         p = _v2_payload(data, ("trade_size", "max_entries_per_day",
                                "max_daily_loss_usd", "max_open_positions",
+                               "max_contracts_per_trade",
                                "expiry_sell_et", "no_signal_sell_et"))
         if not p:
             raise _Invalid("Send at least one limit. Nothing was changed.")
@@ -5646,7 +5937,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                            "other": _book_size(cfg, "other_")},
             "limits": {"max_entries_per_day": cfg.get("max_entries_per_day", 5),
                        "max_daily_loss_usd": cfg.get("max_daily_loss_usd"),
-                       "max_open_positions": cfg.get("max_open_positions", 10)},
+                       "max_open_positions": cfg.get("max_open_positions", 10),
+                       "max_contracts_per_trade": cfg.get(
+                           "max_contracts_per_trade", A.CONTRACT_CAP_DEFAULT)},
             "real_positions": s.get("real_positions"),
             "cash_low": (lim.get("cash") or {}).get("low"),
         }
@@ -6867,7 +7160,7 @@ _V2_ASK_SYSTEM = (
     "change any setting: this box only answers. For control, tell the user "
     "where it is on their dashboard: Pause / Resume and Practice / LIVE in "
     "the bar at the top; trade size, daily limits, the most positions open "
-    "at once, the expiry-day sell time "
+    "at once, the most contracts in one trade, the expiry-day sell time "
     "and which signals to take in Rules & limits; the signal source, signal "
     "days and the payment wallet in Signals & pass; the broker, AI helper, "
     "alerts, start at login, stopping or starting the agent and code changes "
@@ -6913,6 +7206,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "set contracts N, set percent N, set other budget|contracts|"
                 "percent N, other sizing same, other trades on|off, "
                 "set positions N (most positions open at once), "
+                "set max contracts N (most contracts one trade buys), "
                 "set cap N (new trades per day), stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N, set autopay cap N|auto). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),

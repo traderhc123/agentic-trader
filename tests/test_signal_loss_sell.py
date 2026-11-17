@@ -333,14 +333,15 @@ def test_no_new_entry_after_a_no_signal_sale(monkeypatch, no_policy):
     ev = {"event": "ENTERED", "ticker": "SPY", "expiry": "2026-11-13",
           "strike": 600.0, "type": "C", "event_id": "e1"}
     b = StubBroker()
-    out = agent.handle_event(ev, {}, state, b, object(), lambda s: None)
+    live = {"dry_run": False}
+    out = agent.handle_event(ev, live, state, b, object(), lambda s: None)
     assert out and "SKIPPED" in out and b.calls == []
     (row,) = _log()
     assert row["action"] == "skip_rule"
     assert row["ui"]["code"] == "after_signal_loss_sell"
     # the next day trades again
     state["signal_loss_sold_day"] = "2026-11-05"
-    agent.handle_event({**ev, "event_id": "e2"}, {}, state, b, object(),
+    agent.handle_event({**ev, "event_id": "e2"}, live, state, b, object(),
                        lambda s: None)
     assert len(b.calls) == 1
 

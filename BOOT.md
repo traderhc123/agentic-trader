@@ -63,7 +63,10 @@ and apply them in one step. Order:
    skip_tickers, sides, min_strike, skip_0dte, loss_streak; no AI needed)
    for anything it covers; plain-English `policy` only for the rest (needs an
    AI). Write them to a plan file;
-   `python agent.py setup --example-plan` prints the format.
+   `python agent.py setup --example-plan` prints the format. Leave
+   `safety.max_contracts_per_trade` out unless the human gives their own
+   number: it cuts EVERY trade to that many contracts, whatever the budget
+   (default 100). The report's `warnings` say when it cuts their size.
 4. **Apply**: `python agent.py setup --from plan.json --json`.
    All-or-nothing — nothing is saved unless every part passes, including a
    real test call to the AI model and the broker's own key check. Then

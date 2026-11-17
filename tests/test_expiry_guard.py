@@ -574,9 +574,9 @@ def test_robinhood_reconcile_reprices_a_stale_guard_sell(monkeypatch):
     monkeypatch.setattr(robinhood.time, "sleep", lambda s: None)
     monkeypatch.setattr(robinhood, "_in_opening_blackout", lambda now=None: False)
     monkeypatch.setattr(robinhood, "_before_close", lambda now=None, cfg=None: True)
+    reads = iter([("confirmed", 0), ("cancelled", 0)])   # dead once cancelled
+    monkeypatch.setattr(robinhood, "_order_status", lambda rh_, a, oid: next(reads))
     rh = FakeRH({
-        "get_option_orders": _mcp({"data": {"results": [
-            {"id": "o-1", "state": "confirmed", "processed_quantity": "0"}]}}),
         "cancel_option_order": _mcp({"ok": True}),
         "get_option_quotes": _mcp({"data": {"results": [{"bid_price": "0.80"}]}}),
         "place_option_order": _mcp({"data": {"id": "o-2"}}),
@@ -682,9 +682,10 @@ def test_0dte_entry_before_the_guard_time_and_later_expiries_still_buy(
     monkeypatch.setattr(agent, "_et_now", lambda: et(15, 44))
     state = {"positions": {}, "seen": []}
     b = StubBroker()
-    assert agent.handle_event(_entry(), {}, state, b, object(), lambda s: None)
+    live = {"dry_run": False}
+    assert agent.handle_event(_entry(), live, state, b, object(), lambda s: None)
     monkeypatch.setattr(agent, "_et_now", lambda: et(15, 50))
-    agent.handle_event(_entry(expiry="2026-11-13", event_id="e-2"), {}, state, b,
+    agent.handle_event(_entry(expiry="2026-11-13", event_id="e-2"), live, state, b,
                        object(), lambda s: None)
     assert [e["event_id"] for e in b.calls] == ["e-1", "e-2"]
 
@@ -692,7 +693,7 @@ def test_0dte_entry_before_the_guard_time_and_later_expiries_still_buy(
 def test_0dte_entry_late_is_allowed_when_the_guard_is_off(monkeypatch, no_policy):
     monkeypatch.setattr(agent, "_et_now", lambda: et(15, 50))
     b = StubBroker()
-    agent.handle_event(_entry(), {"expiry_guard_et": "off"},
+    agent.handle_event(_entry(), {"expiry_guard_et": "off", "dry_run": False},
                        {"positions": {}, "seen": []}, b, object(), lambda s: None)
     assert len(b.calls) == 1
 

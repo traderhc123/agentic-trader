@@ -210,7 +210,7 @@ def test_save_reaches_the_disk_before_it_replaces_the_file(home, monkeypatch):
     assert order.index("fsync") < order.index("replace:state.json")
     assert order.index("replace:state.json") < order.index("replace:state.json.bak")
     assert _read(agent.STATE_PATH) == _GOOD == _read(agent.STATE_PATH + ".bak")
-    assert not os.path.exists(agent.STATE_PATH + ".tmp")
+    assert not [n for n in os.listdir(home) if n.endswith(".tmp")]
 
 
 def test_a_failed_backup_write_does_not_fail_the_save(home, monkeypatch):
@@ -292,7 +292,7 @@ def test_recent_trades_skips_unreadable_lines(home, broker, no_policy):
     assert [t["action"] for t in agent._recent_trades(50)] == [
         "exit", "skip_budget", "exit"]
     assert [p["kind"] for p in agent._problems_today()] == ["skip_budget"]
-    out = agent.handle_event(make_event(), {"rule_loss_streak": 2},
+    out = agent.handle_event(make_event(), {"rule_loss_streak": 2, "dry_run": False},
                              {"positions": {}}, broker, object(), lambda s: None)
     assert out and "losing exit" in out
     assert broker.calls == []
@@ -383,7 +383,14 @@ def test_unwritable_trade_log_cannot_bypass_the_daily_cap(home, monkeypatch, no_
     unwritable every entry looked like the day's first."""
     sent = []
     monkeypatch.setattr(agent, "notify", lambda cfg, msg, **k: sent.append(msg))
-    (home / "trades.jsonl").mkdir()  # appending to a folder fails on every OS
+    # A full disk / read-only file: writing fails, reading still works. (A
+    # log that can't be READ either skips entries outright —
+    # tests/test_entry_limits_fail_closed.py.)
+    real_append = agent._append_trade_rows
+
+    def disk_full(path, rows):
+        raise OSError(28, "No space left on device", path)
+    monkeypatch.setattr(agent, "_append_trade_rows", disk_full)
     cfg = {"dry_run": False, "max_entries_per_day": 1}
     state = {"positions": {}}
     b = _QuotedBroker([2.00, 1.00])
@@ -409,7 +416,7 @@ def test_unwritable_trade_log_cannot_bypass_the_daily_cap(home, monkeypatch, no_
 
     # once the log can be written again, the rows held in memory are written
     # first, in order, and nothing is counted twice
-    (home / "trades.jsonl").rmdir()
+    monkeypatch.setattr(agent, "_append_trade_rows", real_append)
     agent._log_trade({"action": "skip_rule", "contract": "z"})
     with open(agent.TRADES_PATH, encoding="utf-8") as f:
         written = [json.loads(x)["action"] for x in f]
@@ -663,8 +670,7 @@ def test_a_save_the_disk_refused_keeps_the_old_file_and_its_backup(home, monkeyp
         agent._save(agent.STATE_PATH, {"seen": [], "positions": {}},
                     private=True, backup=True)
     assert _read(agent.STATE_PATH) == _GOOD == _read(agent.STATE_PATH + ".bak")
-    assert not os.path.exists(agent.STATE_PATH + ".tmp")
-    assert not os.path.exists(agent.STATE_PATH + ".bak.tmp")
+    assert not [n for n in os.listdir(home) if n.endswith(".tmp")]
 
 
 def test_a_filesystem_without_fsync_can_still_save(home, monkeypatch):

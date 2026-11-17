@@ -1045,7 +1045,10 @@ def test_self_edit_that_cannot_restart_tells_the_owner(home, tmp_path,
               encoding="utf-8") as f:
         json.dump({"request": "test", "explanation": "", "warnings": [],
                    "changes": [{"path": "module.py",
-                                "content": "VALUE = 2\n"}]}, f)
+                                "content": "VALUE = 2\n",
+                                # as propose() writes it (Apply checks it)
+                                "diff": self_edit._diff_text(
+                                    "module.py", "VALUE = 1\n", "VALUE = 2\n")}]}, f)
     ok, msg = self_edit.apply_and_restart(restart=True)
     assert ok and "Restarting" in msg
     assert _wait_for(lambda: bool(told), 10)

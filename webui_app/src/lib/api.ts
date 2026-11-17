@@ -214,6 +214,10 @@ export interface Proposal {
   explanation?: string;
   warnings?: string[];
   diff?: string;
+  /** the diff above is cut: it can never be applied */
+  truncated?: boolean;
+  /** sha256 of the whole diff; Apply posts it back so only this change applies */
+  diff_sha256?: string;
 }
 export interface WizardState {
   disclaimer: string;
@@ -248,5 +252,6 @@ export interface WizardState {
   dry_run?: boolean | null;
   max_entries_per_day?: number | null;
   max_open_positions?: number | null;
+  max_contracts_per_trade?: number | null;
   max_daily_loss_usd?: number | null;
 }

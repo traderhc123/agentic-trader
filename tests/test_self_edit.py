@@ -24,10 +24,24 @@ def sandbox(tmp_path, monkeypatch):
     return repo, home
 
 
+def _as_proposed(ch):
+    """A change as self_edit.propose writes it: with the diff its content
+    makes against the file as it is now (Apply refuses any other)."""
+    if "diff" in ch:
+        return ch
+    repo = os.path.realpath(self_edit._repo())
+    dst = os.path.realpath(os.path.join(repo, ch["path"]))
+    old = ""
+    if dst.startswith(repo + os.sep) and os.path.isfile(dst):
+        with open(dst, encoding="utf-8") as f:
+            old = f.read()
+    return {**ch, "diff": self_edit._diff_text(ch["path"], old, ch["content"])}
+
+
 def _stage_proposal(home, changes):
     with open(os.path.join(str(home), "proposal.json"), "w") as f:
         json.dump({"request": "test", "explanation": "", "warnings": [],
-                   "changes": changes}, f)
+                   "changes": [_as_proposed(ch) for ch in changes]}, f)
 
 
 # ── FOUNDATION lock ──────────────────────────────────────────────────────────

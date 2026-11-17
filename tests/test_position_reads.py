@@ -19,7 +19,8 @@ U3 = "0b6c7d8e-9f01-4a2b-8c3d-4e5f6a7b8c9d"
 U4 = "5d4c3b2a-1f0e-4d9c-8b7a-6f5e4d3c2b1a"
 U5 = "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d"
 POSID = "e3a1d2c4-0000-4b1b-9c9c-123456789abc"
-CFG = {"robinhood_account": "A1"}
+# a live setup: never-chosen modes are practice now (audit PR1)
+CFG = {"dry_run": False, "robinhood_account": "A1"}
 
 
 class FakeRH:
@@ -394,7 +395,8 @@ def test_rh_finalize_pending_stamps_and_clears_miss():
 OCC1 = "SPY991218C00752000"
 OCC2 = "QQQ991218P00500000"
 OCC3 = "NVDA991218C01000000"
-ALPACA = {"alpaca_key_id": "k", "alpaca_secret": "s"}
+# a live setup: never-chosen modes are practice now (audit PR1)
+ALPACA = {"dry_run": False, "alpaca_key_id": "k", "alpaca_secret": "s"}
 
 
 class _Resp:
@@ -656,7 +658,8 @@ class _MMSDK:
         return _Q()
 
 
-MOOMOO = {"broker": "moomoo", "moomoo_paper": True, "contracts_per_trade": 1}
+# a live setup: never-chosen modes are practice now (audit PR1)
+MOOMOO = {"dry_run": False, "broker": "moomoo", "moomoo_paper": True, "contracts_per_trade": 1}
 
 
 def test_moomoo_positions_parse(monkeypatch):
@@ -714,7 +717,8 @@ def test_moomoo_positions_cross_checked_with_todays_fills(monkeypatch, positions
 # paper/real switch in the dashboard applies after a restart: until then the
 # client's startup copy decides where orders go, so holdings reads and the
 # account tag on every position follow that copy too.
-MM_REAL = {"broker": "moomoo", "moomoo_paper": False, "moomoo_trade_pwd": "x",
+# a live setup: never-chosen modes are practice now (audit PR1)
+MM_REAL = {"dry_run": False, "broker": "moomoo", "moomoo_paper": False, "moomoo_trade_pwd": "x",
            "contracts_per_trade": 1}
 MM_FLIPPED = {**MM_REAL, "moomoo_paper": True}    # live config after the switch
 MM_SPY = "US.SPY991218C752000"

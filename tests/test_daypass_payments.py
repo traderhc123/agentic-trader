@@ -1193,13 +1193,14 @@ def test_entry_is_skipped_when_the_day_pass_ends_before_the_close(
           "strike": 600.0, "type": "C", "event_id": "e1"}
     b = StubBroker()
     st = {"positions": {}, **_running(_et(12, 0))}
-    out = agent.handle_event(ev, {"source": "agenthc"}, st, b, object(),
-                             lambda s: None)
+    out = agent.handle_event(ev, {"source": "agenthc", "dry_run": False}, st, b,
+                             object(), lambda s: None)
     assert out and "SKIPPED" in out and "12:00 ET" in out and b.calls == []
     row = agent._read_trade_log()[-1]
     assert row["action"] == "skip_rule" and row["ui"]["code"] == "pass_wont_cover"
     st = {"positions": {}, **_running(_et(16, 30))}
-    agent.handle_event({**ev, "event_id": "e2"}, {"source": "agenthc"}, st, b,
+    agent.handle_event({**ev, "event_id": "e2"},
+                       {"source": "agenthc", "dry_run": False}, st, b,
                        object(), lambda s: None)
     assert len(b.calls) == 1
 
@@ -1213,7 +1214,8 @@ def test_low_balance_after_a_purchase_alerts_once(monkeypatch, clock, alerts):
     (text,) = alerts
     ends = datetime.fromtimestamp(state["l402"]["expires_at"], agenthc.MARKET_TZ)
     assert text == ("Your agent's wallet has 4,000 sats left, less than one "
-                    "day-pass (about 10,000 sats). Add sats in the dashboard "
+                    "day-pass plus the wallet's routing-fee reserve (about "
+                    "10,100 sats). Add sats in the dashboard "
                     "(Settings → Signal source). If it cannot buy the next "
                     "pass, the agent takes no new trades from "
                     f"{ends.hour}:{ends.minute:02d} ET on Thursday Jul 16.")

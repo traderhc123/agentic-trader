@@ -85,8 +85,9 @@ def report(repo_dir, doctor_checks, cfg, agenthc_host):
            f"({platform.machine()})",
            ""]
     out.append("setup:")
+    from agent import _is_dry  # the mode the agent trades in, not a default
     out.append(f"  source={cfg.get('source') or 'unset'} broker={cfg.get('broker') or 'unset'} "
-               f"mode={'DRY-RUN' if cfg.get('dry_run', True) else 'LIVE'} "
+               f"mode={'DRY-RUN' if _is_dry(cfg) else 'LIVE'} "
                f"other_trades={'on' if cfg.get('include_other_trades') else 'off'}")
     access = ", ".join(k for k, on in (
         ("prepaid pass", cfg.get("feed_pass")),

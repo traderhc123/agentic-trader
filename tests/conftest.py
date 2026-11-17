@@ -49,9 +49,18 @@ def _no_state_hold_left_over(monkeypatch):
     one test's hold must not stop the next test's loop. The same for "a
     move file was imported" (webui.CONTROLS["replaced"]), after which the
     loop saves nothing."""
+    import transfer
     import webui
     monkeypatch.setitem(agent._STATE_HELD, "on", False)
     monkeypatch.setitem(webui.CONTROLS, "replaced", False)
+    # a "Create move file" holds the heartbeat until "I saved the file"
+    # (or transfer.MOVE_HOLD_S): never into the next test
+    monkeypatch.setitem(transfer.HANDOFF, "hold", False)
+    monkeypatch.setitem(transfer.HANDOFF, "by", None)
+    monkeypatch.setattr(transfer, "MOVE_HOLD_S", 24 * 3600)
+    transfer.CYCLE_IDLE.set()
+    # the in-memory "trade log can't be read" skip rows (_problems_today)
+    monkeypatch.setattr(agent, "_UNREADABLE_SKIPS", [])
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +77,24 @@ def _no_read_schedule_left_over(monkeypatch):
     monkeypatch.setitem(agent._RUN_CFG, "cfg", None)
     import webui
     monkeypatch.setattr(webui, "_UPDATE_MEMO", {})  # the update check's answer
+
+
+@pytest.fixture(autouse=True)
+def _no_real_agent_home(tmp_path_factory, monkeypatch):
+    """A test without `home` still gets a throwaway agent home: a test that
+    logs a row must not write it into the real ~/.agentic-trader, and what
+    the agent reads from there (the live trade history behind a mode that
+    was never chosen, agent._is_dry) must not depend on the machine or on
+    the tests that ran before. `home` repoints the same paths again. Also
+    forgets the mode a previous test's run settled (agent._SETTLED_DRY)."""
+    h = tmp_path_factory.mktemp("default-agent-home")
+    monkeypatch.setenv("AGENT_HOME", str(h))
+    monkeypatch.setattr(agent, "HOME", str(h))
+    monkeypatch.setattr(agent, "ACCEPTANCE_PATH", str(h / "acceptance.json"))
+    monkeypatch.setattr(agent, "CONFIG_PATH", str(h / "config.json"))
+    monkeypatch.setattr(agent, "STATE_PATH", str(h / "state.json"))
+    monkeypatch.setattr(agent, "TRADES_PATH", str(h / "trades.jsonl"))
+    monkeypatch.setattr(agent, "_SETTLED_DRY", {"dry": None, "warned": False})
 
 
 @pytest.fixture
@@ -90,7 +117,7 @@ def no_policy(monkeypatch):
     import llm_policy
     monkeypatch.setattr(
         llm_policy, "evaluate",
-        lambda cfg, ev, log: {"act": True, "reason": "test: mechanical"})
+        lambda cfg, ev, log, **kw: {"act": True, "reason": "test: mechanical"})
 
 
 @pytest.fixture(autouse=True)

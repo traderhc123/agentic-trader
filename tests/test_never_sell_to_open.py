@@ -205,7 +205,8 @@ class AlpacaAPI:
         return _Resp(404, {})
 
 
-ALP = {"broker": "alpaca", "alpaca_key_id": "k", "alpaca_secret": "s",
+# a live setup: never-chosen modes are practice now (audit PR1)
+ALP = {"dry_run": False, "broker": "alpaca", "alpaca_key_id": "k", "alpaca_secret": "s",
        "contracts_per_trade": 3}
 
 
@@ -466,7 +467,8 @@ class RH:
         return {"content": []}
 
 
-RH_CFG = {"robinhood_account": "A1"}
+# a live setup: never-chosen modes are practice now (audit PR1)
+RH_CFG = {"dry_run": False, "robinhood_account": "A1"}
 
 
 def _rh_sell(rh, qty=3):
@@ -554,7 +556,8 @@ def test_robinhood_place_refuses_bad_quantities(qty):
 def test_robinhood_replaced_sell_is_capped_at_what_is_held(monkeypatch):
     """reconcile() re-places an expiry-guard sell: the same check applies."""
     rh = RH(held=1)
-    monkeypatch.setattr(robinhood, "_order_status", lambda rh, a, o: ("confirmed", 0))
+    reads = iter([("confirmed", 0), ("cancelled", 0)])   # dead once cancelled
+    monkeypatch.setattr(robinhood, "_order_status", lambda rh, a, o: next(reads))
     monkeypatch.setattr(robinhood, "_cancel_order", lambda rh, a, o: True)
     st = {"positions": {KEY: {"option_id": RH_ID, "qty": 3, "pending": {
         "order_id": "o-old", "side": "sell", "requested": 3, "filled": 0,
@@ -745,7 +748,8 @@ class MM:
         return Q()
 
 
-MM_CFG = {"broker": "moomoo", "moomoo_paper": True, "contracts_per_trade": 3}
+# a live setup: never-chosen modes are practice now (audit PR1)
+MM_CFG = {"dry_run": False, "broker": "moomoo", "moomoo_paper": True, "contracts_per_trade": 3}
 
 
 def _mm_sell(monkeypatch, sdk, qty=3, ev=None):
@@ -1269,14 +1273,24 @@ class MoomooFront(MM):
                                                   "order_status": "FILLED_ALL",
                                                   "dealt_qty": o["qty"]}]
                     return sdk.RET_OK, _DF(rows)
-                return sdk.RET_OK, _DF([
+                rows = [
                     {"code": s, "order_id": f"owner-{s}", "order_status": "SUBMITTED",
                      "trd_side": "TrdSide.SELL", "qty": float(n), "dealt_qty": 0.0}
-                    for s, n in sdk.acct.resting.items() if n])
+                    for s, n in sdk.acct.resting.items() if n]
+                if kw.get("code"):  # one contract's orders: the filled ones too
+                    rows = [r for r in rows if r["code"] == kw["code"]] + [
+                        {"code": o["sym"], "order_id": o["id"],
+                         "order_status": "FILLED_ALL",
+                         "trd_side": "TrdSide." + o["side"].upper(),
+                         "qty": float(o["qty"]), "dealt_qty": float(o["qty"]),
+                         "remark": o.get("remark", "")}
+                        for o in sdk.acct.orders if o["sym"] == kw["code"]]
+                return sdk.RET_OK, _DF(rows)
 
             def place_order(self, **kw):
                 oid = sdk.acct.order(kw["code"], "buy" if kw["trd_side"] == "BUY"
                                      else "sell", kw["qty"])
+                sdk.acct.orders[-1]["remark"] = kw.get("remark") or ""
                 if sdk.lose_next:  # the order went in; the answer is lost
                     sdk.lose_next = False
                     raise ConnectionError("OpenD connection dropped")
@@ -1344,7 +1358,8 @@ class RobinhoodFront:
 _FRONTS = {"alpaca": (AlpacaFront, alpaca, dict(ALP)),
            "moomoo": (MoomooFront, moomoo, dict(MM_CFG)),
            "robinhood": (RobinhoodFront, robinhood,
-                         {"broker": "robinhood", "robinhood_account": "A1",
+                         {"dry_run": False, "broker": "robinhood",
+                          "robinhood_account": "A1",
                           "contracts_per_trade": 3})}
 
 
