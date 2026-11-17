@@ -208,6 +208,19 @@ export const REASONS: Record<ReasonCode, Entry> = {
     why: () => "The agent found the sale in your account and stopped tracking the position.",
     can: nothing,
   },
+  expired_unsold: {
+    cat: "trade",
+    icon: "out",
+    title: (c) => (c.real === false ? `Practice position expired: ${c.name}` : `Expired without a sale: ${c.name}`),
+    sub: () => "Expired before it was sold",
+    what: (c) => `${c.name} expired while the agent still held ${qtyOf(c)}. No order was sent.${result(c)}`,
+    why: () =>
+      "The contract expired while the agent still held it. An expired contract cannot be sold, so the agent stopped tracking it and counts what was paid for it as lost.",
+    can: (c) =>
+      c.real === false
+        ? "Nothing needed. This is practice."
+        : `Check your ${c.broker} account. A contract that expired in the money may have been exercised, and then the real result differs from this estimate.`,
+  },
   records_corrected: {
     cat: "trade",
     icon: "note",
@@ -575,17 +588,18 @@ export interface Described {
   exitPath: boolean;
 }
 
-const TRADE_CODES = ["entered", "exit_signal", "expiry_guard", "signal_loss", "exit_remainder", "closed_outside"];
+const TRADE_CODES = ["entered", "exit_signal", "expiry_guard", "signal_loss", "exit_remainder", "closed_outside", "expired_unsold"];
 const EXIT_CODES = [
-  "exit_signal", "expiry_guard", "signal_loss", "exit_remainder", "closed_outside", "exit_failed", "exit_partial", "sell_unconfirmed",
+  "exit_signal", "expiry_guard", "signal_loss", "exit_remainder", "closed_outside", "expired_unsold", "exit_failed", "exit_partial", "sell_unconfirmed",
 ];
 /** an order that went in and may have filled: "filled" is not known */
 const UNCONFIRMED = ["buy_unconfirmed", "sell_unconfirmed"];
 
 /** Which money tag a row gets, from what the row recorded and nothing else. */
 export function tagOf(e: Activity): TagKind {
-  // a broker's paper-trading account is never real money
-  if (e.paper_account === true && e.real !== false && e.order_sent !== false) return "paper";
+  // a broker's paper-trading account is never real money (a contract that
+  // expired there was bought with an order, though none was sent at expiry)
+  if (e.paper_account === true && e.real !== false && (e.order_sent !== false || e.reason_code === "expired_unsold")) return "paper";
   if (e.action === "entry" || e.action === "exit")
     return e.real === true ? "real" : e.real === false ? "prac" : "unk";
   if (e.reason_code === "exit_failed" || e.reason_code === "exit_partial" || e.reason_code === "sell_unconfirmed")
@@ -609,10 +623,12 @@ function moneyLine(e: Activity, tag: TagKind, broker: string): string {
   switch (tag) {
     case "real":
       if (e.reason_code === "closed_outside") return `Real money. Sold at ${broker} by an order the agent did not send.`;
+      if (e.reason_code === "expired_unsold") return `Real money. No order was sent: the contract expired in your ${broker} account.`;
       if (e.reason_code === "exit_failed") return "Real money. A sell order was sent and did not go through.";
       return `Real money. ${orderFate(e, `at ${broker}`, `to ${broker}`)}`;
     case "paper":
       if (e.reason_code === "closed_outside") return `Not real money: sold in ${broker}'s paper-trading account by an order the agent did not send.`;
+      if (e.reason_code === "expired_unsold") return `Not real money: ${broker}'s paper-trading account. No order was sent: the contract expired.`;
       if (e.order_sent !== true) return `Not real money: ${broker}'s paper-trading account. Whether an order was sent was not recorded for this line.`;
       if (e.reason_code === "exit_failed") return `Not real money: ${broker}'s paper-trading account. A sell order was sent and did not go through.`;
       return `Not real money: ${broker}'s paper-trading account. ${orderFate(e, "in that account", "to that account")}`;
