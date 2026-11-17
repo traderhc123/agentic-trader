@@ -4697,7 +4697,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
 
     def _retired_or_handing_off():
         """This computer was retired (moved to a server or another computer)
-        by a server hand-off: the hold must stay on."""
+        or a server hand-off has taken over: the hold must stay on."""
         import transfer
         return bool(transfer.moved_away() or pending.get("deploy")
                     or pending.get("deploy_unmarked"))

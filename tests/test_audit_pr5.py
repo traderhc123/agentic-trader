@@ -228,7 +228,8 @@ def test_an_unfinished_move_lifts_the_hold_and_needs_a_new_file(mover,
     routes = mover()
     assert routes["/api/move/export"](None, {"passphrase": PW})["ok"]
     deadline = time.time() + 10
-    while transfer.HANDOFF["hold"] and time.time() < deadline:
+    # the timer lifts the hold first, then tells the owner (another thread)
+    while (transfer.HANDOFF["hold"] or not told) and time.time() < deadline:
         time.sleep(0.01)
     assert transfer.HANDOFF["hold"] is False     # trading (and exits) resume
     assert told and "out of date" in told[0]
