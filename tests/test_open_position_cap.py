@@ -202,9 +202,12 @@ def test_a_positions_request_the_chat_cannot_do_says_nothing_changed(
     assert "set positions" in reply and reply.endswith("Some answer.")
     assert "max_open_positions" not in _cfg(home)
     # an ordinary question gets just the answer
-    reply = h.routes_post["/api/command"](
-        None, {"text": "how did SPY do today?"})["reply"]
-    assert reply == "Some answer."
+    for q in ("how did SPY do today?", "why are my 3 open trades down?"):
+        reply = h.routes_post["/api/command"](None, {"text": q})["reply"]
+        assert reply == "Some answer."
+    for q in ("max open positions 20", "can I have 20 positions at once?"):
+        reply = h.routes_post["/api/command"](None, {"text": q})["reply"]
+        assert reply.startswith("Nothing was changed.")
 
 
 # ── the skip says how to raise the limit ────────────────────────────────────
@@ -213,7 +216,7 @@ def test_position_cap_skip_names_the_command_to_raise_it(home, no_policy):
     out, calls = _eleventh_entry({**LIVE})
     assert calls == []
     assert "max open positions reached (10)" in out
-    assert "set positions" in out
+    assert "set positions" in out and "10 open now" in out
     rows = [json.loads(x) for x in
             (home / "trades.jsonl").read_text(encoding="utf-8").splitlines()]
     assert rows[-1]["action"] == "skip_position_cap"
@@ -229,6 +232,8 @@ def test_position_cap_skip_names_the_command_to_raise_it(home, no_policy):
     ({"max_open_positions": 25}, "0", 25),
     ({"max_open_positions": 25}, "5000", 25),
     ({"max_open_positions": 25}, "abc", 25),
+    ({"max_open_positions": 25.0}, "", 25),
+    ({"max_open_positions": "25"}, "", 25),
 ])
 def test_terminal_setup_asks_for_positions_open_at_once(
         monkeypatch, start, answer, want):
@@ -250,3 +255,29 @@ def test_terminal_setup_runs_the_question():
 
 def test_every_place_uses_the_same_range():
     assert webui._V2_LIMIT_RANGES["max_open_positions"] == agent.POSITION_CAP_RANGE
+
+
+def test_skip_counts_what_is_open_after_the_cap_was_lowered(home, no_policy):
+    # 10 open, cap lowered to 4: still blocked, and the skip says 10 are open
+    out, calls = _eleventh_entry({**LIVE, "max_open_positions": 4})
+    assert calls == []
+    assert "max open positions reached (4)" in out and "10 open now" in out
+
+
+@pytest.mark.parametrize("cap", [20, 11])
+def test_the_gate_still_blocks_at_a_raised_cap(home, no_policy, cap):
+    cfg = {**LIVE, "max_open_positions": cap}
+    state = {"positions": {f"T{i}|2026-07-10|{i}.0|C": {"qty": 1}
+                           for i in range(cap)}}
+    broker = StubBroker()
+    cfg = {k: v for k, v in cfg.items() if k not in ("source", "broker")}
+    out = agent.handle_event(make_event(), cfg, state, broker, object(),
+                             lambda s: None)
+    assert broker.calls == [] and f"max open positions reached ({cap})" in out
+
+
+def test_a_seeded_form_compares_with_a_cap_saved_as_text(home, app):
+    # "20" saved by hand: an old page (not seeded) may still lower it to 15
+    h = app({**LIVE, "max_open_positions": "20"})
+    r = h.routes_post["/api/safety"](None, {"positions": "15", "seeded": False})
+    assert r["ok"] and _cfg(home)["max_open_positions"] == 15

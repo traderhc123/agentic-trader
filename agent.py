@@ -3367,8 +3367,9 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # Concurrent-exposure cap: the daily cap resets every day, so without
         # this a feed could accumulate unbounded open positions across days.
         pos_cap = int(cfg.get("max_open_positions", 10))
-        if len(state.get("positions", {})) >= pos_cap:
-            how = (f"{pos_cap} open now, real and practice together. "
+        n_open = len(state.get("positions", {}))
+        if n_open >= pos_cap:
+            how = (f"{n_open} open now, real and practice together. "
                    "To allow more, say 'set positions N' in the dashboard "
                    "chat, or raise Open positions at once in the settings")
             msg = f"SKIPPED {contract}: max open positions reached ({pos_cap}) — {how}"
@@ -5956,13 +5957,27 @@ def set_position_cap(cfg, val):
     cfg["max_open_positions"] = val
 
 
+def saved_position_cap(cfg):
+    """The most positions open at once as saved, as a whole number (a config
+    written by hand may say 20.0 or "20"); never set, or unreadable: the
+    gate's default."""
+    cur = cfg.get("max_open_positions")
+    if cur is None or isinstance(cur, bool):
+        return POSITION_CAP_DEFAULT
+    try:
+        val = float(cur)
+        if val == int(val) and val >= 1:
+            return int(val)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return POSITION_CAP_DEFAULT
+
+
 def _ask_position_cap(cfg):
     """The terminal setup's question for the most positions open at once.
     Enter (or an answer that is not a whole number in range) keeps what is
     set; never set before: the gate's default."""
-    cur = cfg.get("max_open_positions")
-    if not isinstance(cur, int) or isinstance(cur, bool):
-        cur = POSITION_CAP_DEFAULT
+    cur = saved_position_cap(cfg)
     lo, hi = POSITION_CAP_RANGE
     raw = input(f"Max positions open at once, real and practice together "
                 f"(hard cap, {lo}-{hi}) [{cur}]: ").strip()

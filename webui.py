@@ -3421,10 +3421,7 @@ def _apply_position_cap(cfg, val, seeded):
     import agent as A
     if val is None:
         return
-    old = cfg.get("max_open_positions")
-    if not isinstance(old, int) or isinstance(old, bool):
-        old = A.POSITION_CAP_DEFAULT
-    if seeded is not True and val > old:
+    if seeded is not True and val > A.saved_position_cap(cfg):
         return
     A.set_position_cap(cfg, val)
 
@@ -6869,7 +6866,8 @@ _V2_ASK_SYSTEM = (
     "provided. You cannot place, modify, or size trades, and you cannot "
     "change any setting: this box only answers. For control, tell the user "
     "where it is on their dashboard: Pause / Resume and Practice / LIVE in "
-    "the bar at the top; trade size, daily limits, the expiry-day sell time "
+    "the bar at the top; trade size, daily limits, the most positions open "
+    "at once, the expiry-day sell time "
     "and which signals to take in Rules & limits; the signal source, signal "
     "days and the payment wallet in Signals & pass; the broker, AI helper, "
     "alerts, start at login, stopping or starting the agent and code changes "
@@ -6882,7 +6880,9 @@ _V2_ASK_SYSTEM = (
 _POSITIONS_LIMIT_RE = re.compile(
     r"(?=.*\d)(?=.*\b(?:positions?|trades?)\b)"
     r"(?=.*\b(?:open|at once|at a time|at the same time|concurrent|"
-    r"simultaneous)\b)", re.I | re.S)
+    r"simultaneous)\b)"
+    r"(?=.*\b(?:want|wanna|like|set|max|maximum|limit|cap|allow|up to|"
+    r"raise|increase|more|change|let|can|could)\b)", re.I | re.S)
 _POSITIONS_LIMIT_NOTE = ("Nothing was changed. To change how many positions "
                          "can be open at once, say: set positions N "
                          "(for example: set positions 20).\n\n")
