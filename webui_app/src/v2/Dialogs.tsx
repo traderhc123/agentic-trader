@@ -84,6 +84,10 @@ function LiveFacts({ p, s }: { p: Preview; s: Status }) {
       </dd>
       <dt>Open positions at once</dt>
       <dd>{lim?.max_open_positions != null ? count(lim.max_open_positions) : UNKNOWN}</dd>
+      <dt>Most contracts in one trade</dt>
+      <dd>
+        {lim?.max_contracts_per_trade != null ? count(lim.max_contracts_per_trade) : UNKNOWN} <small>Every trade is cut to this, whatever its size.</small>
+      </dd>
       <dt>Real positions open now</dt>
       <dd>{p.real_positions != null ? count(p.real_positions) : UNKNOWN}</dd>
       {p.trade_size?.main?.mode === "budget" && p.trade_size.main.value != null && lim?.max_entries_per_day != null && (

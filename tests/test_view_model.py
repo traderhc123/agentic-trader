@@ -276,10 +276,16 @@ def test_daily_loss_limit_reached():
                  rows=rows)["limits"]["max_daily_loss"] is None
 
 
-def test_position_cap_reached_counts_real_and_practice_together():
-    s = build(cfg={**CFG, "dry_run": False, "max_open_positions": 2},
-              st=state(**{SPY: real_pos(), QQQ: PRACTICE_QQQ}))
+def test_position_cap_reached_counts_this_modes_positions():
+    # Counted as the entry gate counts them (agent._open_in_mode): LIVE
+    # counts real positions only, so a practice one left open from before
+    # going live never blocks real trades. (It used to count both together:
+    # 1 real + 1 practice reached a limit of 2 while the account held one.)
+    st = state(**{SPY: real_pos(), QQQ: PRACTICE_QQQ})
+    s = build(cfg={**CFG, "dry_run": False, "max_open_positions": 2}, st=st)
     assert s["limits"]["max_positions"] == 2
+    assert s["limits"]["positions_reached"] is False
+    s = build(cfg={**CFG, "dry_run": False, "max_open_positions": 1}, st=st)
     assert s["limits"]["positions_reached"] is True
     assert s["capabilities"]["opening"] == {
         "state": "cant", "reason_code": "position_cap_reached"}
@@ -568,7 +574,7 @@ def test_limits_match_the_agents_own_counters(home, frozen_now):
 def test_trade_sizes():
     s = build()["limits"]["trade_size"]
     assert s["main"] == {"mode": "budget", "usd": 500.0, "contracts": None,
-                         "percent": None, "max_contracts": None,
+                         "percent": None, "max_contracts": 100,  # never set: the default
                          "same_as_main": False}
     assert s["other"]["usd"] == 150.0 and s["other"]["same_as_main"] is False
     s = build(cfg={"sizing_mode": "percent", "percent_per_trade": 2.5,

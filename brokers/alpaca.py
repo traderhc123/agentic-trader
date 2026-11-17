@@ -27,7 +27,7 @@ import broker_events
 from platform_compat import safe_print
 
 from . import order_guard
-from .pricing import exit_qty, marketable_limit
+from .pricing import budget_qty, capped, exit_qty, fixed_count, marketable_limit
 
 # Every status line in this module goes through safe_print: a console that
 # can't show a character ("→" on a Windows cp1252 stdout) must never stop an
@@ -209,20 +209,29 @@ def _size(cfg, occ):
         return 0, "%-of-account sizing not resolved to a budget — skipped"
     if str(cfg.get("sizing_mode", "contracts")) == "budget":
         budget = float(cfg.get("budget_per_trade_usd", 0) or 0)
+        if budget <= 0:
+            # Budget mode with no budget (e.g. an "other trades" override
+            # without its amount): skip, like robinhood and moomoo — never
+            # fall back to a fixed count the owner didn't choose.
+            return 0, "budget mode but budget_per_trade_usd unset — skipped"
         price = _quote_price(cfg, occ)
-        if budget > 0 and price > 0:
-            qty = int(budget // (price * 100))
+        if price > 0:
+            qty = budget_qty(budget, price)
             if qty < 1:
                 return 0, (f"1 contract ≈ ${price * 100:,.0f} exceeds your "
                            f"${budget:,.0f} budget — skipped")
-            return (min(qty, int(cfg.get("max_contracts_per_trade", 100))),
-                    f"${budget:,.0f} budget @ ~${price:.2f} → {qty}x")
-        if budget > 0:
-            # No quote = no way to honor the budget; skipping beats silently
-            # buying an unknown-priced contract (matches the robinhood adapter).
-            return 0, "no quote available for budget sizing — skipped"
-    return min(max(1, int(cfg.get("contracts_per_trade", 1))),
-               int(cfg.get("max_contracts_per_trade", 100))), "fixed contract count"
+            return capped(cfg, qty, f"${budget:,.0f} budget @ ~${price:.2f} → {qty}x")
+        # No quote = no way to honor the budget; skipping beats silently
+        # buying an unknown-priced contract (matches the robinhood adapter).
+        return 0, "no quote available for budget sizing — skipped"
+    return fixed_count(cfg)
+
+
+def size_preview(cl, cfg, event):
+    """(qty, note) a live entry would buy now — read-only (one quote), for
+    the dry-run book: the same _size the live buy uses."""
+    cfg = cfg or (cl.cfg if isinstance(cl, _Client) else {})
+    return _size(cfg, _occ_symbol(event))
 
 
 _CONFIRM_TRIES = 3

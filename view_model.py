@@ -1215,10 +1215,12 @@ def _trade_size(cfg, prefix=""):
             "contracts": (max(1, n if n is not None else 1)
                           if mode == "contracts" else None),
             "percent": pct if mode == "percent" else None,
+            # never set: the cap the brokers apply (100), not "unknown"
             "max_contracts": _int(cfg.get(f"{prefix}max_contracts_per_trade")
                                   if cfg.get(f"{prefix}max_contracts_per_trade")
                                   is not None
-                                  else cfg.get("max_contracts_per_trade")),
+                                  else cfg.get("max_contracts_per_trade",
+                                               A.CONTRACT_CAP_DEFAULT)),
             "same_as_main": same}
 
 
@@ -1270,7 +1272,10 @@ def _limits(cfg, state, rows, mode, bp, now):
         "max_positions": max(0, pos_cap),
         "open_positions": {"real": n_real,
                            "practice": len(positions) - n_real},
-        "positions_reached": len(positions) >= pos_cap,
+        # counted as the entry gate counts them: this mode's positions only
+        # (agent._open_in_mode — real when live, practice in Practice)
+        "positions_reached": (A._open_in_mode(state, mode == "practice")
+                              >= pos_cap),
         "trade_size": {"main": _trade_size(cfg),
                        "other": _trade_size(cfg, "other_")},
         "cash": _cash(cfg, bp),
