@@ -1378,3 +1378,18 @@ def test_a_day_pass_alert_is_not_shown_while_a_prepaid_pass_reads(alert):
     s = build(cfg=cfg, st=st, rt=runtime(feed_access=True))
     assert s["signals"]["pass"]["kind"] == "prepaid"
     assert not [n for n in s["notices"] if n["code"] == "pass"]
+
+
+def test_position_book_comes_from_the_ledger_row_first():
+    """The row's own book (what its exits follow) wins over the newest
+    entry row's; a row without one falls back to the entry row."""
+    contract = "SPY 2026-11-13 $700.0 C"
+    rows = [entry(contract, at(9, 41), mode="live", book="main", qty=1)]
+    s = build(st=state(**{SPY: real_pos(book="shadow")}), rows=rows)
+    assert s["positions"][0]["book"] == "other"
+    s = build(st=state(**{SPY: real_pos(book="main")}))
+    assert s["positions"][0]["book"] == "main"
+    s = build(st=state(**{SPY: real_pos()}), rows=rows)
+    assert s["positions"][0]["book"] == "main"
+    s = build(st=state(**{SPY: real_pos(book="bogus")}))
+    assert s["positions"][0]["book"] is None

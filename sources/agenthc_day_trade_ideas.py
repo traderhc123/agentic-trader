@@ -883,10 +883,16 @@ def _row_track(row):
     """The track a ledger row was opened from: its own "track", else the
     one in the id of the event that opened it (only a non-main AgentHC id
     ends in "|<track>": ENTERED|T|expiry|strike|type|occurred_at[|track]),
-    else None (a row that doesn't say: a practice row of an older version)."""
-    track = row.get("track")
-    if isinstance(track, str) and track:
+    else None (a row that doesn't say: a practice row of an older version).
+    Its "book" (agent per-book exits: "main" | "shadow") wins over a track
+    that contradicts it, as in the agent (agent._row_book / _row_track)."""
+    track, book = row.get("track"), row.get("book")
+    book = book if book in ("main", "shadow") else None
+    if (isinstance(track, str) and track
+            and (book is None or (track == "main") == (book == "main"))):
         return track
+    if book is not None:
+        return "main" if book == "main" else "other"
     opened = row.get("opened_event")
     if isinstance(opened, str) and opened:
         parts = opened.split("|")

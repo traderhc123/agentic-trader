@@ -1680,6 +1680,11 @@ def _expired_exit_row(cfg, key, row):
     acct = row.get("acct")
     if not dry and isinstance(acct, str) and ":" in acct:
         facts["paper"] = acct.endswith(":paper")  # as _trade_facts
+    # labelled with the book whose contracts expired (as _trade_facts does
+    # for a sale); a row that doesn't say has no label, as before
+    book = {"main": "main", "shadow": "other"}.get(_row_book(row))
+    if book:
+        facts["book"] = book
     return _row_facts(rec, cfg, **facts)
 
 
@@ -2388,6 +2393,9 @@ def _log_adopted_buys(cfg, state, save_state, broker, client):
                   "type": kind}
             row = state["positions"].get(key)
             if isinstance(row, dict) and not row.get("dry"):
+                track = _entry_track(state, rec.get("event_id"))
+                if track is not None:
+                    _stamp_book(row, {"event_id": rec["event_id"]}, track=track)
                 now, tag = _now(), _account_tag(cfg, broker, client)
                 mark = _mark(broker, client, cfg, ev, "buy")
                 if mark > 0 and not row.get("entry_mark"):
@@ -3577,6 +3585,131 @@ def _note_stale_exit(state, event_id):
     state["stale_exits"] = (ids + [str(event_id)])[-_STALE_EXITS_KEPT:]
 
 
+# ── per-book exits ──────────────────────────────────────────────────────────
+# With "other trades" on, the AgentHC feed signals two books: the main pick
+# (track "main") and the wider journal (any other track; the "shadow" book
+# here). Both can name the same contract, and the ledger holds one row per
+# contract. An entry for a contract the ledger already holds buys nothing,
+# so a row's contracts are the ones ONE book's entry bought: its "book".
+# A feed exit sells a row only when it is that book's exit. A row without a
+# book (saved before it was recorded, or opened from a source that sends no
+# track: manual_file, generic_json_url) closes on any exit, as before. The
+# agent's own exits (expiry guard, no-signal sell, exit remainder) carry
+# exit_cause and no track: they sell a row whatever its book.
+# The row also keeps the signal's raw track ("main", "other", ...): two
+# non-main tracks are both the "shadow" book, and an exit of one must not
+# sell the other's row either. "book" is what sizing and the dashboard use.
+# One model with the AgentHC source's reads (audit PR2): row["track"] is the
+# same raw track the source looks at (held_as_other) to keep reading every
+# track while an "other trades" row is held, even after the owner turns
+# other trades off — so that row's own exit still arrives, and a main-pick
+# exit for the same contract never sells it. A row with a track but no
+# (valid) book takes the track's book; a row with neither is legacy.
+_BOOK_WORDS = {"main": "main pick", "shadow": '"other trades"'}
+_ENTRY_BOOKS_KEPT = 50
+
+
+def _event_track(ev):
+    """The raw track a feed signal names, or None when its source sends no
+    track or it is one of the agent's own exits."""
+    if not isinstance(ev, dict) or "track" not in ev or ev.get("exit_cause"):
+        return None
+    t = ev.get("track")
+    return str(t) if t is not None and str(t) else None
+
+
+def _book_of_track(track):
+    return None if track is None else ("main" if track == "main" else "shadow")
+
+
+def _event_book(ev):
+    """The book a feed signal names ("main" | "shadow"), or None when its
+    source sends no track or it is one of the agent's own exits."""
+    return _book_of_track(_event_track(ev))
+
+
+def _row_book(row):
+    """The book whose entry opened this ledger row, or None (unknown): its
+    "book", else the book of its raw "track" (a row stamped with the track
+    alone, by a version between audit PR2 and per-book exits)."""
+    if not isinstance(row, dict):
+        return None
+    b = row.get("book")
+    if isinstance(b, str) and b in _BOOK_WORDS:
+        return b
+    t = row.get("track")
+    return _book_of_track(t) if isinstance(t, str) and t else None
+
+
+def _row_track(row):
+    """The raw track of the entry that opened this row, when recorded and
+    consistent with its book; else None."""
+    t = row.get("track") if isinstance(row, dict) else None
+    if not isinstance(t, str) or not t or _book_of_track(t) != _row_book(row):
+        return None
+    return t
+
+
+def _other_books_row(row, ev, cfg=None):
+    """The row's book when `ev` is an exit signal of ANOTHER book (or
+    another track of it), which must not sell it; else None. With "other
+    trades" off an "other trades" row is still held for its own exit: the
+    AgentHC source keeps reading every track while one is held
+    (held_as_other), so that exit still arrives."""
+    if not isinstance(ev, dict) or ev.get("event") != "EXITED":
+        return None
+    mine, theirs = _event_track(ev), _row_book(row)
+    if mine is None or theirs is None:
+        return None
+    held = _row_track(row)
+    if held is not None:
+        return theirs if held != mine else None
+    return theirs if _book_of_track(mine) != theirs else None
+
+
+def _book_words(book, track=None):
+    """'main pick', '"other trades"', or '"other trades" (track "swing")'."""
+    words = _BOOK_WORDS.get(book, "other book")
+    if book == "shadow" and track and track != "other":
+        words += f' (track "{track}")'
+    return words
+
+
+def _stamp_book(row, ev, book=None, track=None):
+    """Record the book (and raw track) of the entry signal that just opened
+    `row`. `track`: the signal's raw track when `ev` doesn't carry it."""
+    track = track if track is not None else _event_track(ev)
+    book = book or _book_of_track(track)
+    if (isinstance(row, dict) and book in _BOOK_WORDS and _row_book(row) is None
+            and row.get("opened_event") in (None, (ev or {}).get("event_id"))):
+        row["book"] = book
+        if track is not None and _book_of_track(track) == book:
+            row["track"] = track
+
+
+def _note_entry_book(state, event_id, track):
+    """Remember the raw track of an entry signal sent to the broker. A buy
+    whose answer got lost and that the adapter finds at the broker on a
+    later loop (_log_adopted_buys) then belongs to that signal's book. The
+    newest _ENTRY_BOOKS_KEPT are kept."""
+    if not event_id or not isinstance(track, str) or not track:
+        return
+    books = state.get("entry_books")
+    books = dict(books) if isinstance(books, dict) else {}
+    books.pop(str(event_id), None)
+    books[str(event_id)] = track
+    for old in list(books)[:max(0, len(books) - _ENTRY_BOOKS_KEPT)]:
+        books.pop(old, None)
+    state["entry_books"] = books
+
+
+def _entry_track(state, event_id):
+    """The raw track _note_entry_book remembered for this entry, or None."""
+    books = state.get("entry_books")
+    t = books.get(str(event_id)) if isinstance(books, dict) and event_id else None
+    return t if isinstance(t, str) and t else None
+
+
 def _order_in_flight(fn):
     """Hold platform_compat.ORDER_LOCK while `fn` runs, so a restart (update,
     self-edit, import) waits until an order that was sent to the broker is
@@ -3959,11 +4092,40 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         policy_reason = (ev.get("exit_reason") or ev.get("guard_reason")
                          or "exits always close what was opened")
 
+    if ev["event"] == "EXITED" and state.get(order_guard.ADOPTED_KEY):
+        # a buy an adapter found at the broker since the last signal: its
+        # row gets its book before this exit is matched against it
+        _log_adopted_buys(cfg, state, save_state, broker, client)
+    existing = state["positions"].get(pos_key)
+    held_row, unconfirmed = existing, False
+    if existing is None and ev["event"] == "EXITED":
+        # A buy that got no clear answer from the broker: the Alpaca and
+        # Robinhood exit paths settle it and, when it is there, sell it in
+        # the same call — so it is matched by its signal's book first.
+        unc = order_guard.get(state, pos_key)
+        track = (_entry_track(state, unc.get("event_id"))
+                 if isinstance(unc, dict) and unc.get("side") == "buy" else None)
+        if track is not None:
+            held_row = {"book": _book_of_track(track), "track": track}
+            unconfirmed = True
+    owner = _other_books_row(held_row, ev, cfg)
+    if owner:
+        # The main pick and "other trades" can both signal this contract;
+        # the row holds what ONE of them bought (an entry for a contract
+        # the ledger holds buys nothing). This exit is the other book's:
+        # selling would close a position whose own exit hasn't come.
+        theirs = _book_words(owner, _row_track(held_row))
+        how = ("bought this contract (the broker hasn't confirmed that buy "
+               "yet)" if unconfirmed else "holds this contract")
+        msg = (f"EXITED {contract} ({_book_words(book, _event_track(ev))}): no "
+               f"order placed — the agent {how} for the {theirs}, and it "
+               f"stays open until the {theirs}'s own exit signal")
+        print(msg)
+        return msg
     # Never place a real order against a dry-run position — and never book
     # the exit of a REAL position as a dry-run exit: that drops it from the
     # ledger while the contracts stay at the broker
     # (_dry_run_keeps_selling_real_positions).
-    existing = state["positions"].get(pos_key)
     real_exit = ev["event"] == "EXITED" and _opened_live(existing)
     if real_exit and _dry_run_holds_real_sells(cfg):
         _report_problem(cfg, state, save_state, "exit_failed", contract,
@@ -4064,12 +4226,23 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 cfg, state, save_state, kind, contract, note,
                 event_id=ev["event_id"], dry=True, book=book,
                 check="trade_size"))
+        if action == "entry":
+            _stamp_book(state["positions"].get(pos_key), ev)
         prefix = "[DRY-RUN] "
     else:
         import broker_events
         broker_events.begin()
         ids_before = set(_ids(state.get("agent_order_ids")))
+        if ev["event"] == "ENTERED" and not existing:
+            # for a buy whose answer is lost and that turns up later
+            _note_entry_book(state, ev["event_id"], _event_track(ev))
         changed = broker.execute(client, ecfg, ev, state)
+        if ev["event"] == "ENTERED" and (
+                (changed and not existing)
+                or (existing and existing.get("opened_event") == ev["event_id"])):
+            # (the second: this signal's own row, written by an earlier try
+            # that raised or is still pending, and not stamped then)
+            _stamp_book(state["positions"].get(pos_key), ev)
         reported = broker_events.drain()
         # an earlier buy the adapter only now found at the broker: its entry
         adopted = _log_adopted_buys(cfg, state, save_state, broker, client)
@@ -4182,7 +4355,10 @@ def handle_event(ev, cfg, state, broker, client, save_state):
             for old in _ids((buried if isinstance(buried, dict) else {})
                             .get("held_exits")):
                 _note_stale_exit(state, old)
-        _log_trade(_trade_facts(record, cfg, book, dry,
+        # an exit row is labelled with the book whose contracts it sold
+        # (the expiry guard's exit, say, names no book itself)
+        fact_book = (_row_book(prior_pos) or book) if action == "exit" else book
+        _log_trade(_trade_facts(record, cfg, fact_book, dry,
                                 state["positions"].get(pos_key), prior_pos,
                                 mark, sold))
         save_state(state)
@@ -4428,11 +4604,11 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
         except Exception as exc:
             error = exc
         if opens and key in state["positions"]:
-            row = state["positions"][key]
-            if isinstance(row, dict):
-                # which signals its exit comes with (the AgentHC source keeps
-                # reading that track while it's held)
-                row.setdefault("track", str(ev.get("track", "main")))
+            # which signals its exit comes with: its book and raw track (the
+            # AgentHC source keeps reading that track while it's held; only
+            # that book's exit sells it). handle_event stamps it already;
+            # this covers an entry that raised after the row was written.
+            _stamp_book(state["positions"][key], ev)
             # A new position: an exit still owed for this contract is older
             # than it (or the entry wouldn't have been bought) — it was for
             # an earlier position and must never sell this one.
@@ -5621,6 +5797,14 @@ def _remember_agent_row(state, key, row, tag, now, new_ids=(), exited=None,
     for k in ("opened_event", "opened_at", "entry_mark"):
         if row.get(k) is not None:
             rec[k] = row[k]
+    # The book (and track) always come from the current row: the record
+    # outlives each position in this contract, and a later position without
+    # a book must not inherit the old one's (_adopt re-adds rows from it)
+    for k, v in (("book", _row_book(row)), ("track", _row_track(row))):
+        if v is not None:
+            rec[k] = v
+        else:
+            rec.pop(k, None)
     ids = _ids(rec.get("order_ids"))
     for i in _ids(row.get("order_ids")) + [str(i) for i in new_ids or ()]:
         if i not in ids:
@@ -6223,6 +6407,10 @@ def _adopt(cfg, state, broker, client, oid, key, h, have, tag, c, now_et, now):
             "opened_at": _float0(rec.get("opened_at")) or now}
         if rec.get("entry_mark"):
             row["entry_mark"] = rec["entry_mark"]
+        if _row_book(rec):  # the book whose entry bought them
+            row["book"] = rec["book"]
+            if _row_track(rec):
+                row["track"] = rec["track"]
     row["qty"] = target
     row["acct"] = row.get("acct") or tag
     row.update(held_seen=True, full_seen=True)

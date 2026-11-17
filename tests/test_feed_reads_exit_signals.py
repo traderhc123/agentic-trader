@@ -212,6 +212,52 @@ def test_other_trades_off_untracked_row_reads_main_and_ignores_shadow_exit(home,
     assert key in state["positions"]
 
 
+class OneRowBroker(StubBroker):
+    """Like the real adapters: an ENTERED for a contract the ledger already
+    holds buys nothing."""
+
+    def execute(self, client, cfg, event, state):
+        key = f"{event['ticker']}|{event['expiry']}|{event['strike']}|{event['type']}"
+        if event["event"] == "ENTERED" and key in state["positions"]:
+            self.calls.append(event)
+            return False
+        return super().execute(client, cfg, event, state)
+
+
+def test_other_trades_off_held_other_row_waits_for_its_own_exit_not_main(
+        home, monkeypatch, no_policy, told):
+    # per-book exits (#91) + this PR: the main pick and other trades signal
+    # the SAME contract; the row is the other-trades buy. With other trades
+    # then switched off, the main pick's exit must not sell it (per-book),
+    # and its own other-trades exit must still reach it (track=all).
+    cfg, state = _setup(monkeypatch)
+    b, srv = OneRowBroker(), Server()
+    t0 = datetime.now(timezone.utc) - timedelta(minutes=1)
+    key = f"SPY|{FAR}|700.0|C"
+    srv.lines.append(ev("ENTERED", "SPY", 700.0, "other", t0))
+    _loop(cfg, state, b, srv, monkeypatch)
+    # the main pick enters the same contract later: it buys nothing
+    srv.lines.append(ev("ENTERED", "SPY", 700.0, "main", t0 + timedelta(seconds=5)))
+    _loop(cfg, state, b, srv, monkeypatch)
+    row = state["positions"][key]
+    assert row["book"] == "shadow" and row["track"] == "other"
+    cfg["include_other_trades"] = False          # owner: other trades off
+    srv.lines.append(ev("EXITED", "SPY", 700.0, "main", t0 + timedelta(seconds=30)))
+    _loop(cfg, state, b, srv, monkeypatch)
+    assert srv.asked[-1]["track"] == "all"
+    assert key in state["positions"]             # the main exit isn't its exit
+    assert not [c for c in b.calls if c["event"] == "EXITED"]
+    assert any("no order placed" in t for t in told)
+    srv.lines.append(ev("EXITED", "SPY", 700.0, "other", t0 + timedelta(seconds=40)))
+    _loop(cfg, state, b, srv, monkeypatch)
+    assert srv.asked[-1]["track"] == "all"
+    assert key not in state["positions"]         # sold on its own exit
+    (sold,) = [c for c in b.calls if c["event"] == "EXITED"]
+    assert sold["track"] == "other"
+    _loop(cfg, state, b, srv, monkeypatch)
+    assert srv.asked[-1]["track"] == "main"      # nothing other held any more
+
+
 def test_other_trades_off_shadow_exit_does_not_skip_a_main_entry(home, monkeypatch, no_policy, told):
     # review: other-track exits were "known" exits, so a main ENTERED was
     # skipped as already over because the shadow book exited the contract
