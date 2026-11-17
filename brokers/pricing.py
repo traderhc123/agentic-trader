@@ -12,6 +12,8 @@ $0.05 or $0.01 — a price a nickel-tick class rejects, which would leave an
 expiring position unsold.
 """
 
+import math
+
 
 def _tick_down(cents):
     step = 10 if cents >= 300 else 5
@@ -78,6 +80,15 @@ def capped(cfg, qty, note):
         return 0, f"{note} — max contracts per trade is {cap} — skipped"
     return cap, (f"{note} — capped at {cap} by max contracts per trade "
                  "(change it with: set max contracts N)")
+
+
+def budget_qty(budget, price):
+    """Whole contracts a dollar budget buys at a per-share price. Floored
+    with a tiny tolerance: in floating point a $0.07 option costs
+    7.000000000000001 per contract, so budget // (price * 100) bought 99
+    with a $700 budget (and skipped a $7 one). The tolerance is far below a
+    cent, so it never buys a contract the budget can't pay for."""
+    return int(math.floor(budget / (price * 100) + 1e-9))
 
 
 def fixed_count(cfg):

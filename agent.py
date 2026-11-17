@@ -5867,8 +5867,8 @@ def _ask_sizing(cfg):
         cur = _saved_amount(cfg, "percent_per_trade", 100)
         while True:
             raw = (input("Percent of account per trade "
-                         + (f"[{cur:g}]" if cur else "(e.g. 2)") + ": ")
-                   .strip().rstrip("%") or (f"{cur:g}" if cur else ""))
+                         + (f"[{_amount_text(cur)}]" if cur else "(e.g. 2)") + ": ")
+                   .strip().rstrip("%") or (f"{_amount_text(cur)}" if cur else ""))
             try:
                 p = float(raw)
                 if 0 < p <= 100:
@@ -5896,8 +5896,8 @@ def _ask_sizing(cfg):
         cur = _saved_amount(cfg, "budget_per_trade_usd")
         while True:
             raw = (input("Budget per trade in USD "
-                         + (f"[{cur:g}]" if cur else "(e.g. 500)") + ": ").strip()
-                   or (f"{cur:g}" if cur else ""))
+                         + (f"[{_amount_text(cur)}]" if cur else "(e.g. 500)") + ": ").strip()
+                   or (f"{_amount_text(cur)}" if cur else ""))
             try:
                 b = float(raw)
                 if b > 0:
@@ -5929,9 +5929,9 @@ def _ask_sizing(cfg):
             raw = input({"budget": "Other-trades budget in USD",
                          "contracts": "Other-trades contracts per trade",
                          "percent": "Other-trades percent of account"}[omode]
-                        + (f" [{cur:g}]" if cur else "") + ": ").strip()
+                        + (f" [{_amount_text(cur)}]" if cur else "") + ": ").strip()
             ok, err = set_book_sizing(cfg, "other", omode,
-                                      raw or (f"{cur:g}" if cur else ""))
+                                      raw or (f"{_amount_text(cur)}" if cur else ""))
             if not ok:
                 print(f"{err} — other trades keep the sizing they had.")
 
@@ -6128,6 +6128,14 @@ def _cap_note(cfg):
     return ""
 
 
+def _amount_text(v):
+    """A saved amount as the terminal setup shows it and saves it back on
+    Enter, every digit kept (f"{v:g}" keeps 6: a $12,345.67 budget came
+    back as $12,345.70, $1,234,567 as $1,234,570)."""
+    v = float(v)
+    return str(int(v)) if v == int(v) else repr(v)
+
+
 def _saved_amount(cfg, key, most=None):
     """A saved positive number (a size), or None when it isn't one (or is
     above `most`)."""
@@ -6173,14 +6181,16 @@ DAILY_CAP_RANGE = (1, 1000)
 
 def _ask_daily_cap(cfg):
     """The terminal setup's question for new trades per day. Enter keeps
-    what is set; never set before: 5. 0 is refused (it would skip every
-    entry)."""
+    what is set; never set before (or saved as 0): 5. 0 is refused (it
+    would skip every entry)."""
     cur = cfg.get("max_entries_per_day")
     try:
         cur = int(cur) if cur is not None and not isinstance(cur, bool) else None
     except (TypeError, ValueError, OverflowError):
         cur = None
-    if cur is None or cur < 0:
+    if cur is None or cur < DAILY_CAP_RANGE[0]:
+        # never set, or a 0 the old terminal setup saved (it skips every
+        # entry, and typing it is refused): Enter gives the default
         cur = DAILY_CAP_DEFAULT
     cfg["max_entries_per_day"] = _ask_whole("Max new entries per day (hard cap)",
                                             cur, *DAILY_CAP_RANGE)

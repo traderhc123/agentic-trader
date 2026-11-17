@@ -20,7 +20,8 @@ from platform_compat import safe_print
 
 from . import order_guard
 from .market_hours import close_minute
-from .pricing import capped, exit_qty, fixed_count, marketable_limit, quote_number
+from .pricing import (budget_qty, capped, exit_qty, fixed_count, marketable_limit,
+                      quote_number)
 from .robinhood_mcp import RobinhoodMCP, content_json, tool_ok
 
 # Every status line in this module goes through safe_print: a console that
@@ -372,7 +373,7 @@ def size_contracts(rh, cfg, option_id):
         price = quote_price(rh, option_id)
         if price <= 0:
             return 0, "no quote available for budget sizing — skipped"
-        qty = int(budget // (price * 100))
+        qty = budget_qty(budget, price)
         if qty < 1:
             return 0, (f"1 contract ≈ ${price * 100:,.0f} exceeds your "
                        f"${budget:,.0f} per-trade budget — skipped")

@@ -532,3 +532,49 @@ def test_dashboard_limit_counts_this_modes_positions():
     lim = view_model._limits({**LIVE, "dry_run": True}, state, [], "practice",
                              None, view_model.datetime.now(view_model.timezone.utc))
     assert lim["positions_reached"] is True
+
+
+# ── review of #90: quantity math and what Enter keeps ───────────────────────
+
+@pytest.mark.parametrize("name", sorted(ADAPTERS))
+@pytest.mark.parametrize("budget,price,want", [
+    (700, 0.07, 100), (1400, 0.14, 100), (5600, 0.56, 100),  # float: 99 before
+    (7, 0.07, 1), (6.99, 0.07, 0), (5000, 2.0, 25), (5000, 2.01, 24)])
+def test_budget_buys_every_whole_contract_it_pays_for(monkeypatch, name, budget,
+                                                      price, want):
+    monkeypatch.setattr(alpaca, "_quote_price", lambda cfg, occ: price)
+    monkeypatch.setattr(robinhood, "resolve_instrument", lambda rh, ev: "opt-1")
+    monkeypatch.setattr(robinhood, "quote_price", lambda rh, oid, side="buy": price)
+    cfg = {"sizing_mode": "budget", "budget_per_trade_usd": budget,
+           "max_contracts_per_trade": 1000}
+    if name == "moomoo":
+        qty = moomoo._size(cfg, price)[0]
+    else:
+        qty = _live_size(name, cfg)[0]
+    assert qty == want
+
+
+def test_terminal_daily_cap_saved_zero_is_not_kept_on_enter(monkeypatch):
+    _answers(monkeypatch)                    # Enter
+    cfg = {"max_entries_per_day": 0}         # what the old setup took
+    agent._ask_daily_cap(cfg)
+    assert cfg["max_entries_per_day"] == 5
+
+
+@pytest.mark.parametrize("saved", [
+    {"sizing_mode": "budget", "budget_per_trade_usd": 12345.67,
+     "contracts_per_trade": 1, "max_contracts_per_trade": 100},
+    {"sizing_mode": "budget", "budget_per_trade_usd": 1234567.0,
+     "contracts_per_trade": 1, "max_contracts_per_trade": 100},
+    {"sizing_mode": "percent", "percent_per_trade": 0.125,
+     "contracts_per_trade": 1, "max_contracts_per_trade": 100},
+    {"sizing_mode": "budget", "budget_per_trade_usd": 800.0,
+     "contracts_per_trade": 1, "max_contracts_per_trade": 100,
+     "include_other_trades": True, "other_sizing_mode": "budget",
+     "other_budget_per_trade_usd": 12345.67},
+])
+def test_terminal_sizing_enter_keeps_every_digit(monkeypatch, saved):
+    _answers(monkeypatch)
+    cfg = dict(saved)
+    agent._ask_sizing(cfg)
+    assert cfg == saved

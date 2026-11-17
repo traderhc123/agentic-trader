@@ -34,7 +34,7 @@ import broker_events
 import platform_compat
 
 from . import order_guard
-from .pricing import capped, exit_qty, fixed_count, marketable_limit
+from .pricing import budget_qty, capped, exit_qty, fixed_count, marketable_limit
 
 # Every status line in this module goes through safe_print: a console that
 # can't show a character ("→" on a Windows cp1252 stdout) must never stop an
@@ -346,7 +346,7 @@ def _size(cfg, price):
     if str(cfg.get("sizing_mode", "contracts")) == "budget":
         budget = float(cfg.get("budget_per_trade_usd", 0) or 0)
         if budget > 0 and price > 0:
-            qty = int(budget // (price * 100))
+            qty = budget_qty(budget, price)
             if qty < 1:
                 return 0, (f"1 contract ≈ ${price * 100:,.0f} exceeds your "
                            f"${budget:,.0f} budget — skipped")
