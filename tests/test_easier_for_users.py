@@ -329,7 +329,8 @@ def test_fund_quote_uses_the_servers_day_price(monkeypatch):
     monkeypatch.setattr(webui, "_btc_usd", lambda: 64000.0)
     q = webui._fund_quote(200_000)                   # $128
     assert q["day_pass_usd"] == 40.0 and q["day_passes"] == 3
-    assert q["day_pass_sats"] == q["suggested_sats"] == 61_000   # the server's sats
+    assert q["day_pass_sats"] == 61_000                  # the server's sats
+    assert q["suggested_sats"] == 61_000 + 610           # + LNbits fee reserve
 
 
 def test_fund_quote_reports_the_day_price_without_a_btc_price(monkeypatch):

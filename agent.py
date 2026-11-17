@@ -45,6 +45,7 @@ is a registered investment adviser). See Section 3 of DISCLAIMER.md.
 
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -746,6 +747,12 @@ def _stale(ev, cfg):
     listed the first time it read the feed): that one is never bought.
     EXITED events are never stale-blocked (closing an open position is
     always right).
+
+    The age is measured with the source's clock when it sends one
+    (clock_skew_s: this computer's clock minus the source's, in seconds):
+    a PC clock that runs fast must not make every fresh entry "old", nor a
+    slow one let old entries through. A fast clock is corrected by
+    _CLOCK_SKEW_MAX_S at most.
     """
     if ev.get("event") != "ENTERED":
         return False
@@ -757,7 +764,19 @@ def _stale(ev, cfg):
         age = (datetime.now(timezone.utc) - occurred).total_seconds()
     except ValueError:
         return False
-    return age > float(cfg.get("max_event_age_s", 300))
+    return age - _clock_skew(ev) > float(cfg.get("max_event_age_s", 300))
+
+
+_CLOCK_SKEW_MAX_S = 600
+
+
+def _clock_skew(ev):
+    """The event's clock_skew_s (0 when it has none), at most _CLOCK_SKEW_MAX_S."""
+    skew = ev.get("clock_skew_s")
+    if (isinstance(skew, bool) or not isinstance(skew, (int, float))
+            or not math.isfinite(skew)):
+        return 0.0
+    return min(float(skew), _CLOCK_SKEW_MAX_S)
 
 
 # When this run started receiving each track ("main" / "other"). A stale
@@ -781,6 +800,33 @@ def note_watching(cfg, now=None, access=True):
         _WATCH_SINCE.setdefault("other", now)
     else:
         _WATCH_SINCE.pop("other", None)  # switched off: restart the clock if back on
+
+
+def _other_trades_off(cfg):
+    """AgentHC source, "other trades" off: only main-pick entries are taken."""
+    return (cfg.get("source", "agenthc") == "agenthc"
+            and not cfg.get("include_other_trades"))
+
+
+def _not_for_this_book(ev, state):
+    """With other trades off: an other-trades ENTERED, or an other-trades
+    EXITED for a contract the ledger doesn't hold as an other-trades
+    position (held from the main pick, by a row that doesn't say, or not
+    at all)."""
+    if str(ev.get("track", "main")) == "main":
+        return False
+    if ev.get("event") == "ENTERED":
+        return True
+    if ev.get("event") != "EXITED":
+        return False
+    key = (f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
+           if _valid_event(ev) else None)
+    row = (state.get("positions") or {}).get(key) if key else None
+    fn = getattr(SOURCES.get("agenthc"), "held_as_other", None)
+    try:
+        return not (fn is not None and fn(row))
+    except Exception:
+        return True
 
 
 def _backlog(ev):
@@ -3327,9 +3373,15 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         msg = f"SKIPPED stale ENTERED ({contract}) — older than " \
               f"{int(cfg.get('max_event_age_s', 300))}s"
         print(msg)
+        # a fast clock is corrected only up to _CLOCK_SKEW_MAX_S: past that
+        # the clock, not a sleep, may be why
+        hint = ("computer asleep or offline?"
+                if _clock_skew(ev) < _CLOCK_SKEW_MAX_S else
+                f"this computer's clock is {_CLOCK_SKEW_MAX_S // 60}+ min fast — "
+                "turn on automatic time sync")
         _report_problem(cfg, state, save_state, "skip_stale", contract,
                         f"signal was {int(cfg.get('max_event_age_s', 300))}s+ old "
-                        "when the agent saw it (computer asleep or offline?)",
+                        f"when the agent saw it ({hint})",
                         event_id=ev["event_id"], book=book, check="signal_fresh",
                         params={"max_age_s": int(cfg.get("max_event_age_s", 300))})
         return msg
@@ -3936,7 +3988,29 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
     # only the agent's own exits may cap or reprice a sell
     new = [_from_feed(ev) for ev in events
            if ev.get("event_id") not in seen and ev.get("event_id") not in owed_ids]
-    known = list(events) + owed
+    off = _other_trades_off(cfg)
+    if off:
+        # The AgentHC source reads every track while the agent still holds
+        # an "other trades" position (its exit must reach it), but the
+        # owner turned other trades off: their entries are not taken, and
+        # their exits reach only a position opened from other trades — the
+        # shadow book often trades the main pick's contract and exits at
+        # another time, and must never sell the main position (positions
+        # are keyed by contract alone). Remembered, so they aren't looked
+        # at again.
+        dropped = [ev for ev in new if ev.get("event_id")
+                   and _not_for_this_book(ev, state)]
+        for ev in dropped:
+            seen.add(ev["event_id"])
+            _mark_seen(state, ev["event_id"], listed)
+        if dropped:
+            print(f"ignored {len(dropped)} \"other trades\" signal(s): "
+                  "other trades are off")
+            new = [ev for ev in new if ev.get("event_id") not in seen]
+            save_state(state)
+    # with other trades off, a shadow-book exit doesn't end a main entry
+    known = [ev for ev in events
+             if not off or str(ev.get("track", "main")) == "main"] + owed
     batch = (owed + [ev for ev in new if ev.get("event") == "EXITED"]
              + [ev for ev in new if ev.get("event") != "EXITED"])
     for ev in batch:
@@ -3958,6 +4032,11 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
         except Exception as exc:
             error = exc
         if opens and key in state["positions"]:
+            row = state["positions"][key]
+            if isinstance(row, dict):
+                # which signals its exit comes with (the AgentHC source keeps
+                # reading that track while it's held)
+                row.setdefault("track", str(ev.get("track", "main")))
             # A new position: an exit still owed for this contract is older
             # than it (or the entry wouldn't have been bought) — it was for
             # an earlier position and must never sell this one.
@@ -4336,6 +4415,8 @@ _SIGNAL_LOSS_WHY = {
     "feed_error": "the signal feed can't be read",
     "feed_not_live": "the signal feed can't be read",
     "feed_refused": "the signal feed is refusing the agent",
+    "feed_gap": ("the agent was away long enough that an exit signal may "
+                 "have scrolled out of the signal feed"),
 }
 # what the owner can do about it (none: the agent keeps trying)
 _BUY_DAYS = "buy signal days (dashboard → Settings → Signal source)"
@@ -4469,10 +4550,20 @@ def _signal_loss_acct(cfg, broker=None, client=None):
 
 def _signal_loss_rows(state):
     """[(key, row)] ledger rows that hold contracts or have an order
-    working, of every expiry."""
+    working, of every expiry. While the loss is a feed_gap (an exit may
+    have scrolled out of the feed while the agent was away), only the rows
+    held then that are still held (state["feed_gap"]["keys"], kept by the
+    AgentHC source): positions bought since get their exits normally."""
     rows = state.get("positions")
-    return [(k, r) for k, r in (list(rows.items()) if isinstance(rows, dict) else ())
-            if isinstance(r, dict) and (_int0(r.get("qty")) >= 1 or r.get("pending"))]
+    out = [(k, r) for k, r in (list(rows.items()) if isinstance(rows, dict) else ())
+           if isinstance(r, dict) and (_int0(r.get("qty")) >= 1 or r.get("pending"))]
+    rec = state.get("signal_loss")
+    if isinstance(rec, dict) and rec.get("cause") == "feed_gap":
+        gap = state.get("feed_gap")
+        keys = set(k for k in ((gap.get("keys") or ()) if isinstance(gap, dict)
+                               else ()) if isinstance(k, str))
+        out = [(k, r) for k, r in out if k in keys]
+    return out
 
 
 def _clock_et(ts, now_et):
@@ -6723,7 +6814,9 @@ def _command(t, cfg, text):
         return True, ("Now getting the main pick + \"other trades\" (shadow book) "
                       "signals, sized with: " + _sizing_desc(cfg) + "."
                       if cfg["include_other_trades"] else
-                      "Now getting the main pick only — no \"other trades\" signals.")
+                      "Now getting the main pick only — no new \"other trades\" "
+                      "entries. Other trades it already holds still get their "
+                      "exit signals.")
     if t in ("other sizing same", "clear other sizing"):
         set_book_sizing(cfg, "other", "same", None)
         _save(CONFIG_PATH, cfg, private=True)
@@ -7825,9 +7918,13 @@ def _feed_access_check(cfg, state, check):
         try:
             bal = wallet.balance_sats()
             from sources.agenthc_day_trade_ideas import usd_words
+            from lightning_wallet import fee_reserve_sats
             day_usd, day = _day_pass_price()
-            check("feed_access", bal >= day, "Wallet funded",
-                  f"{bal:,} sats ({'~' + str(bal // day) + ' more market day(s)' if bal >= day else f'below one ~{usd_words(day_usd)} day-pass (~{day:,} sats)'})",
+            # LNbits refuses a payment unless the wallet also holds its
+            # routing-fee reserve ("You must reserve at least ...")
+            need = day + fee_reserve_sats(day)
+            check("feed_access", bal >= need, "Wallet funded",
+                  f"{bal:,} sats ({'~' + str(bal // need) + ' more market day(s)' if bal >= need else f'below one ~{usd_words(day_usd)} day-pass (~{day:,} sats + ~{need - day:,} sats LNbits fee reserve)'})",
                   "python agent.py fund 100000   (the OWNER pays the invoice)",
                   who="owner")
         except WalletError as exc:
