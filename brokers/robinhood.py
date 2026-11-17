@@ -20,7 +20,8 @@ from platform_compat import safe_print
 
 from . import order_guard
 from .market_hours import close_minute
-from .pricing import exit_qty, marketable_limit, quote_number
+from .pricing import (budget_qty, capped, exit_qty, fixed_count, marketable_limit,
+                      quote_number)
 from .robinhood_mcp import RobinhoodMCP, content_json, tool_ok
 
 # Every status line in this module goes through safe_print: a console that
@@ -372,14 +373,25 @@ def size_contracts(rh, cfg, option_id):
         price = quote_price(rh, option_id)
         if price <= 0:
             return 0, "no quote available for budget sizing — skipped"
-        qty = int(budget // (price * 100))
+        qty = budget_qty(budget, price)
         if qty < 1:
             return 0, (f"1 contract ≈ ${price * 100:,.0f} exceeds your "
                        f"${budget:,.0f} per-trade budget — skipped")
-        qty = min(qty, int(cfg.get("max_contracts_per_trade", 100)))
-        return qty, f"${budget:,.0f} budget @ ~${price:.2f} → {qty} contract(s)"
-    return min(max(1, int(cfg.get("contracts_per_trade", 1))),
-               int(cfg.get("max_contracts_per_trade", 100))), "fixed contract count"
+        return capped(cfg, qty,
+                      f"${budget:,.0f} budget @ ~${price:.2f} → {qty} contract(s)")
+    return fixed_count(cfg)
+
+
+def size_preview(rh, cfg, event):
+    """(qty, note) a live entry would buy now — read-only (the contract
+    lookup and one quote), for the dry-run book. Like a live entry, a
+    contract that can't be looked up means no trade."""
+    option_id = resolve_instrument(rh, event)
+    if not option_id:
+        down = getattr(rh, "last_error", None)
+        return 0, ("no quote available — couldn't look up the contract at "
+                   "Robinhood" + (f" (connection down: {down})" if down else ""))
+    return size_contracts(rh, cfg, option_id)
 
 
 def _extract_order_id(result):

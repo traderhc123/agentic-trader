@@ -272,7 +272,9 @@ docker run -d --name agentic-trader --restart on-failure -v agentic-trader-data:
   Percent mode re-reads your account value from the broker at each entry and
   turns it into a dollar budget for that trade; if the value can't be read,
   the entry is skipped rather than guessed. `max_contracts_per_trade` caps
-  every mode.
+  every mode (default 100; "Most contracts in one trade" in the Safety step
+  and on Rules & limits, or say `set max contracts N`). A trade it cuts says
+  so in the log.
 - **No weekend spend**: the recurring day-pass never auto-buys on Saturday or
   Sunday — the feed only publishes on market days, so a weekend pass would be
   wasted sats.
