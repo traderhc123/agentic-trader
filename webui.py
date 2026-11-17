@@ -4187,6 +4187,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         return {"ok": True, "describe": llm_client.describe(cfg)}
 
     deploy_lock = threading.Lock()
+    # The "move to another computer" routes, their 10-minute timer and the
+    # moment a server hand-off takes the heartbeat's hold: one at a time
+    # (ThreadingHTTPServer runs requests in parallel).
+    move_lock = threading.RLock()
 
     def deploy(_h, data):
         # One at a time. A second click while the first is still talking to
@@ -4239,7 +4243,16 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         # A full stop: no entries, no exits, no expiry-guard sells (the
         # owner's own Pause, in config.json, would still sell on exits).
         # The dashboard shows it from the agent's status (agent._handed_off).
-        transfer.HANDOFF["hold"] = True  # this is what stops the heartbeat
+        with move_lock:
+            transfer.HANDOFF["hold"] = True  # this is what stops the heartbeat
+            # The hand-off owns the hold now: an unfinished "Create move
+            # file" must never lift it when its 10-minute limit runs out (the
+            # server would trade alongside this computer), and the file it
+            # made is out of date (dropped: it can't be downloaded or
+            # finished any more).
+            transfer.HANDOFF["by"] = None
+            pending.pop("move_hold", None)
+            pending.pop("move_blob", None)
 
         def carry_on_here():
             transfer.HANDOFF["hold"] = False
@@ -4729,21 +4742,181 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         cfg.setdefault("llm_fallback", "skip")
 
     # ── move to another computer ──
-    def move_export(_h, data):
+    def _end_move_hold():
+        """Lift the hold an unfinished "Create move file" put on the
+        heartbeat (only that one: never a server hand-off's), and forget
+        that file — what it holds is out of date as soon as trading here
+        resumes, so "I saved the file" needs a new one."""
         import transfer
+        with move_lock:
+            token = pending.pop("move_hold", None)
+            pending.pop("move_blob", None)
+            if (token is not None and transfer.HANDOFF.get("by") is token
+                    and not _retired_or_handing_off()):
+                transfer.HANDOFF["by"] = None
+                transfer.HANDOFF["hold"] = False
+
+    def _retired_or_handing_off():
+        """This computer was retired (moved to a server or another computer)
+        or a server hand-off has taken over: the hold must stay on."""
+        import transfer
+        return bool(transfer.moved_away() or pending.get("deploy")
+                    or pending.get("deploy_unmarked"))
+
+    def _move_hold_expired(token):
+        import transfer
+        with move_lock:
+            if pending.get("move_hold") is not token:
+                return  # finished (this computer is retired) or exported again
+            if _retired_or_handing_off():
+                pending.pop("move_hold", None)
+                pending.pop("move_blob", None)
+                return  # the hold is a server hand-off's (or for good) now
+            _end_move_hold()
+        msg = ("The move to another computer was not finished within "
+               f"{max(1, round(transfer.MOVE_HOLD_S / 60))} minutes, so the "
+               "agent here carries on trading. The move file you made is out "
+               "of date now: to move, create a new one.")
+        print(msg)
         try:
-            blob = transfer.export_bundle(str(data.get("passphrase") or ""))
-        except transfer.TransferError as exc:
-            return {"ok": False, "error": str(exc)}
+            A.notify(cfg, msg)
+        except Exception:
+            pass
+
+    def _move_hold_reaches_expiry_sell():
+        """The expiry-day sell time ("H:MM", or the close when the guard is
+        off) when a position expiring today is open and a move hold started
+        now (transfer.MOVE_HOLD_S, no orders at all) could still be on then;
+        else None. Read from state.json once the cycle in progress has
+        saved."""
+        import math
+        import transfer
+        now = A._et_now()
+        disk = A._load(A.CONFIG_PATH, {}) or {}
+        if not isinstance(disk, dict):
+            disk = dict(cfg)
+        if not A.is_trading_day(disk, now.date()):
+            return None
+        day = now.date().isoformat()
+        state, _how = A._read_state_file(A.STATE_PATH)
+        if not isinstance(state, dict) or not A._expiring_rows(state, day):
+            return None
+        guard, _alert, close = A._expiry_times(disk, day)
+        start = close if guard is None else min(guard, close)
+        now_m = now.hour * 60 + now.minute
+        if now_m >= close:
+            return None  # nothing trades any more today
+        if now_m + math.ceil(transfer.MOVE_HOLD_S / 60) < start:
+            return None
+        return A._hm(start)
+
+    def move_export(_h, data):
+        with move_lock:
+            return _move_export(data)
+
+    def _move_export(data):
+        import keep_running
+        import provision
+        import transfer
+        pw = str(data.get("passphrase") or "")
+        if len(pw) < transfer.MIN_PASSPHRASE:
+            return {"ok": False, "error": (
+                f"pick a passphrase of at least {transfer.MIN_PASSPHRASE} "
+                "characters")}
+        if _retired_or_handing_off() or deploy_lock.locked():
+            return {"ok": False, "error": (
+                "this setup is being moved, or was moved, to a server or "
+                "another computer, so no move file was made (it would be a "
+                "second copy trading the same account).")}
+        running_here = get_status is not None
+        if not running_here and (keep_running.is_running()
+                                 or keep_running.supervisor_running()):
+            # This page can't hold an agent that runs in another process (or
+            # one its supervisor is about to start again): a trade it made
+            # after the copy would be missing on the new computer, and
+            # nobody would ever sell it.
+            return {"ok": False, "error": (
+                "the agent is running on this computer right now, in the "
+                "background or another window. Stop it first with: "
+                "python agent.py stop — then create the move file again. "
+                "Nothing was changed.")}
+        _end_move_hold()  # an earlier, unfinished export: replaced by this one
+        token = None
+        if running_here:
+            # The new computer gets a copy of this one's memory (positions,
+            # signals handled, passes bought). Hold the heartbeat — no feed
+            # read, no orders, exits included, "resume" can't lift it — and
+            # wait until the cycle it is in has finished and saved, exactly as
+            # a move to a server does. It stays on hold until "I saved the
+            # file" retires this computer, or lifts by itself after
+            # transfer.MOVE_HOLD_S (the file is dropped then: out of date).
+            if not transfer.HANDOFF["hold"]:
+                token = object()
+                transfer.HANDOFF["by"] = token
+                transfer.HANDOFF["hold"] = True
+                pending["move_hold"] = token
+            if not transfer.CYCLE_IDLE.wait(provision.CYCLE_WAIT_S):
+                _end_move_hold()
+                return {"ok": False, "error": (
+                    "the agent is in the middle of handling a trade signal, "
+                    "so its positions can't be copied safely right now. No "
+                    "move file was made and nothing changed. Wait a minute, "
+                    "then press the button again.")}
+            try:
+                sell_at = _move_hold_reaches_expiry_sell()
+            except Exception:
+                sell_at = None
+            if sell_at:
+                # The hold stops the expiry guard too: a contract expiring
+                # today could be left unsold (exercised) past the close.
+                _end_move_hold()
+                return {"ok": False, "error": (
+                    "a position that expires today is open, and an unfinished "
+                    f"move holds every order for up to "
+                    f"{max(1, round(transfer.MOVE_HOLD_S / 60))} minutes — "
+                    f"the expiry-day sell at {sell_at} ET included. Create "
+                    "the move file after today's close (or once that "
+                    "position is closed). No move file was made and nothing "
+                    "changed.")}
+        try:
+            blob = transfer.export_bundle(pw)
+        except BaseException as exc:
+            _end_move_hold()
+            if isinstance(exc, transfer.TransferError):
+                return {"ok": False, "error": str(exc)}
+            raise
         pending["move_blob"] = blob
+        if token is not None:
+            timer = threading.Timer(transfer.MOVE_HOLD_S, _move_hold_expired,
+                                    args=(token,))
+            timer.daemon = True
+            timer.start()
         return {"ok": True, "filename": transfer.export_filename(),
                 "kb": max(1, len(blob) // 1024)}
 
+    def _move_file_current():
+        """The move file made here still holds everything this computer did:
+        the agent running in this process has been on hold since it was
+        made — the export's own hold, not lifted by its time limit, a failed
+        server hand-off or a second request — or no agent runs here."""
+        import transfer
+        if not pending.get("move_blob"):
+            return False
+        if get_status is None:
+            return True
+        token = pending.get("move_hold")
+        return bool(transfer.HANDOFF["hold"]) and (
+            token is None or transfer.HANDOFF.get("by") is token)
+
     def move_download(_h):
         import transfer
-        blob = pending.get("move_blob")
-        if not blob:
-            return {"ok": False, "error": "create the move file first"}
+        with move_lock:
+            if not _move_file_current():
+                _end_move_hold()
+                return {"ok": False, "error": (
+                    "create the move file first (a file made earlier is out "
+                    "of date: the agent here kept trading after it)")}
+            blob = pending["move_blob"]
         return RawResponse(blob, "application/octet-stream", {
             "Content-Disposition":
                 f'attachment; filename="{transfer.export_filename()}"'})
@@ -4751,10 +4924,44 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     def move_finish(_h, _data):
         """After the owner saved the file: retire this computer so the two
         can never both trade."""
+        with move_lock:
+            return _move_finish()
+
+    def _move_finish():
+        import keep_running
         import transfer
-        note = transfer.mark_moved_away()
+        running_here = get_status is not None
+        if not running_here and (keep_running.is_running()
+                                 or keep_running.supervisor_running()):
+            # An agent started in another process since the file was made
+            # (start-at-login, `agent.py start`) may have traded: the file
+            # is out of date, and that agent would keep trading anyway.
+            _end_move_hold()
+            return {"ok": False, "error": (
+                "the agent was started on this computer after the move file "
+                "was made, so the file may be out of date. Stop it with: "
+                "python agent.py stop — then create the move file again. "
+                "This computer was not retired; nothing was changed.")}
+        if not _move_file_current():
+            # No file, or the agent here has been trading again since it was
+            # made (its hold ran out): retiring now would leave whatever it
+            # did since missing on the new computer.
+            _end_move_hold()
+            return {"ok": False, "error": (
+                "Create and download your move file first (a file made "
+                "earlier is out of date: the agent here kept trading after "
+                "it). This computer was not retired; nothing was changed.")}
+        # retired: the hold stays on (no orders here ever again); only its
+        # time limit goes (under move_lock: the timer can't run meanwhile)
+        token = pending.pop("move_hold", None)
+        try:
+            note = transfer.mark_moved_away()
+        except BaseException:
+            if token is not None:  # not retired: the time limit still applies
+                pending["move_hold"] = token
+            raise
         pending.pop("move_blob", None)
-        if get_status is not None:  # the agent is running: stop it
+        if running_here:  # the agent is running: stop it
             CONTROLS["stop"] = True
             note += "; the agent here is stopping"
         return {"ok": True, "note": note}
@@ -4785,6 +4992,14 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             try:
                 info = transfer.import_bundle(blob, pw,
                                               replace=bool(data.get("replace")))
+            except transfer.ImportIncomplete:
+                if running_here:
+                    # some files ARE the imported ones now and could not be
+                    # put back: this process's memory must never be saved
+                    # over them and it must not trade on a mixed setup —
+                    # it stays on hold until it is restarted
+                    CONTROLS["replaced"] = True
+                raise
             except Exception:
                 if running_here:
                     # nothing changed: carry on as before — the owner's
