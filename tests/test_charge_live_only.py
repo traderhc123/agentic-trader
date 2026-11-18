@@ -524,3 +524,89 @@ def test_go_live_reply_no_history_claim_and_alpaca_paper(home):
     reply = agent._apply_command("go live")[1]
     assert agent.ALPACA_PAPER_LIVE_TEXT in reply
     assert "receives the signals in real time and uses signal days" in reply
+
+
+# ── practice: a real position's exits, and a key practice isn't served to ──
+
+class ModeFeed:
+    """The feed answering by the mode each read says: {mode: (status, body)}."""
+
+    def __init__(self, by_mode):
+        self.by_mode, self.modes = by_mode, []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        mode = (params or {}).get("mode")
+        assert (headers or {}).get(hc.MODE_HEADER) == mode
+        self.modes.append(mode)
+        status, body = self.by_mode[mode]
+        return Resp(body, status=status)
+
+
+HELD = "SPY|2026-07-17|600.0|C"
+
+
+def _exit(ticker="SPY", release=False):
+    ev = {"event": "EXITED", "ticker": ticker, "expiry": "2026-07-17",
+          "strike": 600, "type": "C", "occurred_at": "2026-07-15T15:00:00+00:00",
+          "paper_pnl_pct": 5.0}
+    if release:
+        ev["practice_release"] = "on_close"
+    return ev
+
+
+def _real_state():
+    return {"positions": {HELD: {"option_id": "stub", "qty": 1, "live": True}}}
+
+
+def test_practice_with_a_real_position_also_reads_its_exits_with_mode_off(
+        monkeypatch, clock):
+    """AgentHC leaves an exit it can't pair out of a practice read: the
+    exits of a real position are also read with mode=off (never charged),
+    and only the held contracts' exits are taken from it."""
+    feed = ModeFeed({"dry_run": (200, {"events": []}),
+                     "off": (200, {"events": [_exit(), _exit("QQQ")]})})
+    monkeypatch.setattr(hc.requests, "get", feed.get)
+    cfg = {"agenthc_api_key": "k", "feed_mode": "dry_run"}
+    got = hc.poll(cfg, _real_state(), lambda s: None)
+    assert feed.modes == ["dry_run", "off"]
+    assert [(e["event"], e["ticker"]) for e in got] == [("EXITED", "SPY")]
+    assert "practice_release" not in got[0]
+    # the practice read already has it (released with its entry): once only
+    feed.by_mode["dry_run"] = (200, {"events": [_exit(release=True)]})
+    got = hc.poll(cfg, _real_state(), lambda s: None)
+    assert [e.get("practice_release") for e in got] == ["on_close"]
+    # nothing real held: no second read
+    feed.modes.clear()
+    hc.poll(cfg, {"positions": {}}, lambda s: None)
+    assert feed.modes == ["dry_run"]
+    # LIVE: one read, as before
+    feed.modes.clear()
+    feed.by_mode["live"] = (200, {"events": [_exit()]})
+    hc.poll({**cfg, "feed_mode": "live"}, _real_state(), lambda s: None)
+    assert feed.modes == ["live"]
+
+
+def test_a_key_practice_isnt_served_to_is_not_told_its_balance_is_empty(
+        monkeypatch, clock):
+    refused = (402, {"agent_mode": "dry_run",
+                     "mode_note": "Practice/off reads never buy a signal pass"})
+    feed = ModeFeed({"dry_run": refused,
+                     "off": (200, {"events": [_exit(), _exit("QQQ")]})})
+    monkeypatch.setattr(hc.requests, "get", feed.get)
+    cfg = {"agenthc_api_key": "k", "feed_mode": "dry_run"}
+    state = {"positions": {}}
+    assert hc.poll(cfg, state, lambda s: None) == []
+    assert state["pass_notice"] == hc.PRACTICE_KEY_NOT_SERVED_TEXT
+    assert "balance is not the problem" in hc.PRACTICE_KEY_NOT_SERVED_TEXT
+    assert feed.modes == ["dry_run"]
+    # a real position: its exits are still read (mode=off)
+    feed.modes.clear()
+    got = hc.poll(cfg, _real_state(), lambda s: None)
+    assert feed.modes == ["dry_run", "off"]
+    assert [e["ticker"] for e in got] == ["SPY"]
+    assert hc.had_exit_access() and not hc.had_access()
+    # a LIVE 402 is still the key's balance
+    state = {"positions": {}}
+    feed.by_mode["live"] = (402, {})
+    hc.poll({**cfg, "feed_mode": "live"}, state, lambda s: None)
+    assert state["pass_notice"] == hc.KEY_BALANCE_EMPTY_TEXT

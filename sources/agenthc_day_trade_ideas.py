@@ -79,10 +79,11 @@ def mode_params(mode):
     return {"mode": mode}, {MODE_HEADER: mode}
 
 
-def _feed_get(cfg, params, headers=None):
-    """GET the feed, saying the agent's mode (feed_mode). `params` itself is
-    left as it is (_check_window reads its limit)."""
-    extra_params, extra_headers = mode_params(feed_mode(cfg))
+def _feed_get(cfg, params, headers=None, mode=None):
+    """GET the feed, saying the agent's mode (feed_mode), or `mode` for a
+    read that is only for exits ("off": _real_exits_read). `params` itself
+    is left as it is (_check_window reads its limit)."""
+    extra_params, extra_headers = mode_params(mode or feed_mode(cfg))
     return _http.get(f"{AGENTHC_API}{FEED_PATH}",
                      params={**params, **extra_params},
                      headers={**(headers or {}), **extra_headers}, timeout=15)
@@ -1032,11 +1033,16 @@ def _check_window(cfg, state, save_state, body, params, events):
     the no-signal sell time (agent.signal_loss_tick). Never raises."""
     try:
         raw = body.get("events") if isinstance(body, dict) else None
-        # a completed trade released to practice keeps its original times
-        # (hours or days old by design): no gap is judged from it
         raw = [e for e in (raw if isinstance(raw, list) else [])
-               if not (isinstance(e, dict) and e.get("practice_release"))]
-        events = [e for e in events if not e.get("practice_release")]
+               if isinstance(e, dict)]
+        if any(e.get("practice_release") for e in raw):
+            # practice: completed trades, each exit with its entry. AgentHC's
+            # `limit` counts the exits, and an entry keeps its original
+            # (older) time: the window is judged on the exits alone
+            raw = [e for e in raw
+                   if e.get("practice_release") and e.get("event") == "EXITED"]
+            events = [e for e in events
+                      if e.get("practice_release") and e.get("event") == "EXITED"]
         rows = state.get("positions")
         held = sorted(k for k, r in (rows.items() if isinstance(rows, dict) else ())
                       if isinstance(r, dict))
@@ -1090,6 +1096,102 @@ def _check_window(cfg, state, save_state, body, params, events):
                 save_state(state)
     except Exception as exc:
         print(f"feed window check failed (non-fatal): {str(exc)[:150]}")
+
+
+def _held_keys(state):
+    rows = (state or {}).get("positions")
+    return ({k for k, r in rows.items() if isinstance(r, dict)}
+            if isinstance(rows, dict) else set())
+
+
+def _event_key(ev):
+    """The ledger's key for this event's contract (agent: state["positions"])."""
+    return f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
+
+
+def _real_exits_read(cfg, state, params, headers):
+    """In practice, while the agent holds a REAL position: (body, exits) of
+    a second read that says mode=off — EXITED events only, never charged,
+    and served to every key or pass that may read practice (and to a
+    Premium key AgentHC won't serve practice to). A practice read gets
+    completed trades only, and AgentHC leaves out an exit whose entry it
+    can no longer pair: the exit of a position bought with real money must
+    not depend on that. None when not in practice, nothing real is held,
+    or the read failed (the practice read still brings the exits it can
+    pair)."""
+    if feed_mode(cfg) != "dry_run" or not _holds_real_position(state):
+        return None
+    try:
+        resp = _feed_get(cfg, params, headers, mode="off")
+        if getattr(resp, "status_code", 0) != 200:
+            return None
+        body = resp.json()
+        exits = [e for e in _parse_events(body)
+                 if e["event"] == "EXITED" and not e.get("practice_release")]
+    except Exception:
+        return None
+    return body, exits
+
+
+def _finish_read(cfg, state, save_state, body, params, events, headers):
+    """After a good read: the window check (_check_window), and in practice
+    with a real position held the exits-only read (_real_exits_read). Its
+    exits for contracts the ledger holds that the practice read left out
+    are added (untagged: they go the usual exit way), and the window is
+    judged on it: it lists every exit, the practice read only those it
+    could pair. Every other exit stays with the practice read (a practice
+    trade is booked from its pair, never from a lone exit)."""
+    got = _real_exits_read(cfg, state, params, headers)
+    if got is None:
+        _check_window(cfg, state, save_state, body, params, events)
+        return events
+    off_body, exits = got
+    _check_window(cfg, state, save_state, off_body, params, exits)
+    have = {e["event_id"] for e in events}
+    held = _held_keys(state)
+    return events + [e for e in exits
+                     if e["event_id"] not in have and _event_key(e) in held]
+
+
+def _refused_mode(resp):
+    """The agent mode AgentHC says it refused ("agent_mode" in a 402 body,
+    or in a 403's detail), or None."""
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    mode = body.get("agent_mode")
+    if mode is None and isinstance(body.get("detail"), dict):
+        mode = body["detail"].get("agent_mode")
+    return mode if mode in FEED_MODES else None
+
+
+PRACTICE_KEY_NOT_SERVED_TEXT = (
+    "AgentHC does not serve practice to your API key: practice reads are "
+    "free only for a key whose own paid tier is Premium or higher (a key "
+    "lifted to Premium by $INTELL holdings is not). Nothing was charged, "
+    "and your key's balance is not the problem. Practice logs no trades "
+    "with this key. While your agent holds a real position it still reads "
+    "that position's exit signals. Go LIVE to trade the signals with the key.")
+
+
+def _practice_not_served(cfg, state, save_state, params, headers):
+    """A Premium key in practice that AgentHC won't serve practice to (it
+    says agent_mode dry_run in the refusal): say so — not that the key's
+    balance is empty — and, while a real position is held, read its exits
+    with mode=off (served to the key, never charged)."""
+    _pass_notice(cfg, state, save_state, "practice_key_notified",
+                 PRACTICE_KEY_NOT_SERVED_TEXT)
+    got = _real_exits_read(cfg, state, params, headers)
+    if got is None:
+        return _no_read("feed_refused")
+    body, exits = got
+    _LAST_POLL.update(access=False, exits=True)   # exits only
+    _check_window(cfg, state, save_state, body, params, exits)
+    held = _held_keys(state)
+    return [e for e in exits if _event_key(e) in held]
 
 
 def _wallet_over_exits_only(cfg, state, save_state):
@@ -1850,8 +1952,12 @@ def _ended_daypass_exits(cfg, state, save_state):
             or not _holds_real_position(state)):
         return None
     params = _feed_params(cfg, state)
+    # practice: an exits-only read says off (a practice read would bring
+    # only the exits AgentHC can pair, and as practice trades)
+    practice = feed_mode(cfg) == "dry_run"
     try:
-        resp = _feed_get(cfg, params, {"Authorization": tok["token"]})
+        resp = _feed_get(cfg, params, {"Authorization": tok["token"]},
+                         mode="off" if practice else None)
         if resp.status_code in (401, 402):
             tok["exits_done"] = True
             save_state(state)
@@ -1864,7 +1970,11 @@ def _ended_daypass_exits(cfg, state, save_state):
         return None
     _LAST_POLL["exits"] = True   # exits only: entry access stays False
     _check_window(cfg, state, save_state, body, params, parsed)
-    return [e for e in parsed if e["event"] == "EXITED"]
+    exits = [e for e in parsed if e["event"] == "EXITED"]
+    if practice:
+        held = _held_keys(state)
+        exits = [e for e in exits if _event_key(e) in held]
+    return exits
 
 
 def _day_pass_loss_code(cfg, state, now=None):
@@ -2129,6 +2239,11 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             "doesn't clear up, contact AgentHC with "
             "the time of the payment from your wallet's payment list.")
         return _no_read("day_pass_refused")
+    if (resp.status_code in (402, 403) and cfg.get("agenthc_api_key")
+            and feed_mode(cfg) == "dry_run" and _refused_mode(resp) == "dry_run"):
+        # AgentHC serves practice only to a key whose own paid tier is
+        # Premium+: nothing is owed, the balance is fine.
+        return _practice_not_served(cfg, state, save_state, params, headers)
     if resp.status_code == 402 and cfg.get("agenthc_api_key"):
         # The Premium key's balance can't pay for today. The agent never
         # buys a wallet day-pass while a key is set (it would not be sent
@@ -2180,8 +2295,7 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     _entry_read(state, save_state)
     body = resp.json()
     events = _parse_events(body)
-    _check_window(cfg, state, save_state, body, params, events)
-    return events
+    return _finish_read(cfg, state, save_state, body, params, events, headers)
 
 
 def _poll_with_pass(cfg, state, save_state, token, _retried):
@@ -2236,7 +2350,8 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
             _pass_notice(cfg, state, save_state, "pass_low_notified",
                          PASS_LOW_TEXT.format(n=left))
     events = _parse_events(body)
-    _check_window(cfg, state, save_state, body, params, events)
+    events = _finish_read(cfg, state, save_state, body, params, events,
+                          {"Authorization": token})
     if exits_only:
         # a used-up pass gets no entries: should the reply carry one anyway
         # (a server bug, a malformed answer), it never reaches the agent

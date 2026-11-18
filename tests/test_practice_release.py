@@ -73,10 +73,17 @@ def pair(t_in, t_out, pnl=12.5, **kw):
 
 CFG = {"source": "agenthc", "dry_run": True, "sizing_mode": "budget",
        "budget_per_trade_usd": 500, "include_other_trades": True}
+# practice started before every trade here (_note_practice_since)
+EARLY = datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp()
+
+
+def ts(iso):
+    return datetime.fromisoformat(iso).timestamp()
 
 
 def handle(events, cfg=None, state=None, broker=None):
     state = state if state is not None else {"positions": {}}
+    state.setdefault("practice_since", {"main": EARLY, "other": EARLY})
     agent._handle_feed_events(events, {**CFG, **(cfg or {})}, state, broker,
                               broker.client({}) if broker else None,
                               lambda s: None)
@@ -104,13 +111,25 @@ def test_the_source_keeps_the_release_tag_and_the_original_times():
     assert "practice_release" not in live
 
 
-def test_released_trades_never_count_toward_a_feed_gap(monkeypatch):
-    """Their times are hours old by design: a full window of them is no gap."""
+@pytest.mark.parametrize("last_read, gap", [(1.0, True), (4102444800.0, False)])
+def test_a_practice_window_is_judged_on_its_released_exits(last_read, gap):
+    """AgentHC's `limit` counts the exits of a practice read (each comes with
+    its entry): a window full of exits all newer than the last good read may
+    have dropped one. The entries keep their own, older times and don't hide
+    that; exits older than the last read are no gap."""
     state = {"positions": {"X|2099-12-18|1.0|C": {"option_id": "x", "qty": 1}},
-             "feed_read": {"local": 1.0, "server": 1.0}}
-    raw = [wire("EXITED", "2099-01-01T15:00:00+00:00", ticker=f"T{i}", pnl=1.0)
-           for i in range(3)]
+             "feed_read": {"local": last_read, "server": last_read}}
+    raw = []
+    for i in range(3):
+        raw += [wire("EXITED", "2099-01-01T15:00:00+00:00", ticker=f"T{i}", pnl=1.0),
+                wire("ENTERED", "2000-01-01T15:00:00+00:00", ticker=f"T{i}")]
     hc._check_window({}, state, lambda s: None, {"events": raw}, {"limit": 3},
+                     hc._parse_events({"events": raw}))
+    assert ("feed_gap" in state) is gap
+    # fewer exits than the limit (6 events, but 3 exits of 4): never a gap
+    state = {"positions": state["positions"],
+             "feed_read": {"local": 1.0, "server": 1.0}}
+    hc._check_window({}, state, lambda s: None, {"events": raw}, {"limit": 4},
                      hc._parse_events({"events": raw}))
     assert "feed_gap" not in state
 
@@ -349,3 +368,107 @@ def test_activity_shows_when_a_practice_trade_really_happened(home, sent, clock)
     assert got[0]["at"].startswith("2026-11-18T15:02")
     assert got[1]["est_pnl_usd"] == 62.5 and got[1]["real"] is False
     assert view_model.activity_row({"n": 1, "action": "entry"})["practice_note"] is None
+
+
+# ── review follow-ups ───────────────────────────────────────────────────────
+
+def test_trades_that_closed_before_practice_started_are_not_booked(
+        home, sent, clock, capsys):
+    """The first practice read lists earlier completed trades: a live agent
+    never buys that backlog, and practice doesn't book it either."""
+    state = {"positions": {}, "practice_since": {"main": ts(at(12, 0))}}
+    handle(pair(at(10, 0), at(11, 0)) + pair(at(11, 30), at(12, 30), ticker="QQQ"),
+           state=state)
+    assert [r["contract"].split()[0] for r in trades(home)] == ["QQQ", "QQQ"]
+    assert "1 earlier completed trade not booked" in capsys.readouterr().out
+    assert not any("SPY" in m for m in sent)
+    assert "practice_held" not in state
+    # an other-track trade with no start of its own starts it now
+    handle(pair(at(10, 0), at(11, 0), track="other"), state=state)
+    assert len(trades(home)) == 2
+    assert state["practice_since"]["other"] == NOW.timestamp()
+
+
+def test_practice_starts_at_the_first_practice_read_and_ends_with_live(clock):
+    saved = []
+    state = {"positions": {}}
+    agent._note_practice_since(CFG, state, saved.append)
+    assert state["practice_since"] == {"main": NOW.timestamp(),
+                                       "other": NOW.timestamp()}
+    clock["t"] = NOW + timedelta(hours=1)
+    agent._note_practice_since(CFG, state, saved.append)
+    assert state["practice_since"]["main"] == NOW.timestamp() and len(saved) == 1
+    # other trades off: "other" starts again when they are turned on
+    agent._note_practice_since({**CFG, "include_other_trades": False}, state,
+                               saved.append)
+    assert state["practice_since"] == {"main": NOW.timestamp()}
+    # a paused (off) read changes nothing; a LIVE read ends practice
+    agent._note_practice_since({**CFG, "paused": True}, state, saved.append)
+    assert state["practice_since"] == {"main": NOW.timestamp()}
+    agent._note_practice_since({**CFG, "dry_run": False}, state, saved.append)
+    assert "practice_since" not in state
+
+
+def test_the_ai_policy_never_sees_a_later_exit(home, sent, clock, monkeypatch):
+    """BBB's signal at 11:00 is judged while AAA (10:00 -> 14:00) is still
+    open: nothing about AAA's exit may reach the policy."""
+    import llm_policy
+    calls = []
+
+    def evaluate(cfg, ev, log, context=None):
+        calls.append((ev, log, context))
+        return {"act": True, "reason": "ok"}
+    monkeypatch.setattr(llm_policy, "evaluate", evaluate)
+    handle(pair(at(10, 0), at(14, 0), ticker="AAA")
+           + pair(at(11, 0), at(12, 0), ticker="BBB"))
+    (_ev1, log1, _c1), (ev2, log2, _c2) = calls
+    assert ev2["ticker"] == "BBB" and [r["action"] for r in log2] == ["entry"]
+    shown = json.dumps(log2)
+    assert "→ exit" not in shown and "exit_at" not in shown
+    assert "logged_at" not in shown and "practice_exit" not in shown
+    assert at(14, 0)[:16] not in shown
+    assert log2[0]["reason"] == "practice entry · $500.00 budget"
+
+
+def test_held_halves_are_retried_on_a_read_without_new_releases(home, sent, clock):
+    state = {"positions": {}, "practice_held": pair(at(10, 2), at(14, 31))}
+    handle([], state=state)
+    assert [r["action"] for r in trades(home)] == ["entry", "exit"]
+    assert "practice_held" not in state
+
+
+@pytest.mark.parametrize("opened_by", [0, 2])
+def test_only_its_own_round_trip_closes_a_held_position(home, sent, clock, opened_by):
+    """Two round trips in the held contract in one read (the agent was
+    offline): the first exit no older than the row's opening signal sells
+    it; the other round trip is a practice trade."""
+    events = parse(wire("ENTERED", at(10, 0)), wire("EXITED", at(11, 0), pnl=10.0),
+                   wire("ENTERED", at(12, 0)), wire("EXITED", at(13, 0), pnl=-10.0))
+    key = f"SPY|{EXPIRY}|600.0|C"
+    broker = Broker()
+    state = {"positions": {key: {"option_id": "stub", "qty": 1, "live": True,
+                                 "book": "main", "track": "main",
+                                 "opened_event": events[opened_by]["event_id"]}}}
+    handle(events, state=state, broker=broker)
+    assert [c[0] for c in broker.calls] == ["sell"]
+    assert state["positions"] == {}
+    real = [r for r in rows(home) if not r.get("practice_release")]
+    practice = [r for r in rows(home) if r.get("practice_release")]
+    assert [r["action"] for r in real] == ["exit"]
+    booked = ("10:00", "11:00") if opened_by == 2 else ("12:00", "13:00")
+    assert [r["action"] for r in practice] == ["entry", "exit"]
+    assert f"signal {booked[0]} → exit {booked[1]}" in practice[0]["reason"]
+    assert "practice_held" not in state
+
+
+def test_the_losing_streak_counts_practice_results_without_dollars(
+        home, sent, clock):
+    """A fixed contract count books no dollars: the losing-streak rule
+    counts the recorded result's sign."""
+    handle(pair(at(10, 0), at(11, 0), pnl=-20.0, ticker="AAA")
+           + pair(at(12, 0), at(13, 0), ticker="BBB"),
+           cfg={"sizing_mode": "contracts", "contracts_per_trade": 1,
+                "rule_loss_streak": 1})
+    got = rows(home)
+    assert [r["action"] for r in got] == ["entry", "exit", "skip_rule"]
+    assert got[2]["ui"]["code"] == "rule_loss_streak"

@@ -4779,10 +4779,13 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
             new = [ev for ev in new if ev.get("event_id") not in seen]
             save_state(state)
     released = [ev for ev in new if _practice_release(ev)]
-    if released:
+    if released or _practice_held(state):
         # practice: completed trades, released at their exit (never bought
         # or sold; no stale / backlog / already-exited check applies). The
         # exit of a contract the ledger holds comes back to go the usual way.
+        # Halves kept from an earlier read (a booking that failed, a log
+        # that couldn't be read) are retried on every read, not only when
+        # a new release arrives.
         new = [ev for ev in new if not _practice_release(ev)]
         new += _practice_release_events(released, cfg, state, broker, client,
                                         save_state, listed, seen)
@@ -4870,8 +4873,15 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
 # A release whose exit is for a contract the ledger holds (a real position
 # the agent still sells in practice, or a practice row from before this
 # version) goes the usual way instead: that exit closes that row.
+# Only the earliest such exit per held contract, and none older than the
+# signal that opened the row, closes it; any other round trip in that
+# contract is a practice trade like the rest.
 # Halves of a pair that arrive in different reads wait in
 # state["practice_held"] (the newest PRACTICE_HELD_KEPT, PRACTICE_HELD_DAYS).
+# A trade that closed before practice started (state["practice_since"], per
+# track: the first read with entry access in practice, and for "other" the
+# first with other trades on) is not booked: the first practice read lists
+# up to 100 earlier trades, and a live agent never buys that backlog either.
 
 PRACTICE_HELD_KEPT = 200
 PRACTICE_HELD_DAYS = 10
@@ -4954,6 +4964,79 @@ def _practice_exit_is_held(ev, state, cfg):
     return row is not None and not _other_books_row(row, ev, cfg)
 
 
+def _row_opened_signal(row):
+    """When AgentHC published the entry that opened this ledger row (the
+    occurred_at in its opened_event: the server's clock, as the exits'), or
+    None when the row doesn't say."""
+    parts = str((row or {}).get("opened_event") or "").split("|")
+    if len(parts) >= 6 and parts[0] == "ENTERED":
+        return _occurred_at({"occurred_at": parts[5]})
+    return None
+
+
+def _practice_routed(fresh, state, cfg):
+    """The released exits that go the usual way: per contract the ledger
+    holds (for that book), the earliest exit no older than the signal that
+    opened the row. One read can carry two round trips in that contract (the
+    agent was offline): only the first closes the row; a later one, or one
+    from before the row was opened, is booked as a practice trade."""
+    by_key = {}
+    for ev in fresh:
+        if _practice_exit_is_held(ev, state, cfg):
+            key = f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
+            by_key.setdefault(key, []).append(ev)
+    out = []
+    for key, exits in by_key.items():
+        opened = _row_opened_signal(state["positions"][key])
+        timed = sorted((e for e in exits if _occurred_at(e) is not None),
+                       key=_occurred_at)
+        later = [e for e in timed if opened is None or _occurred_at(e) >= opened]
+        if later:
+            out.append(later[0])
+        elif not timed:
+            out.append(exits[0])
+    return out
+
+
+def _practice_track(ev):
+    return "main" if str(ev.get("track", "main")) == "main" else "other"
+
+
+def _practice_since(state):
+    since = state.get("practice_since")
+    return ({k: float(v) for k, v in since.items()
+             if k in ("main", "other") and isinstance(v, (int, float))
+             and not isinstance(v, bool) and math.isfinite(v)}
+            if isinstance(since, dict) else {})
+
+
+def _note_practice_since(cfg, state, save_state):
+    """After a read of the AgentHC feed with entry access: when practice
+    began getting released trades, per track (state["practice_since"]). A
+    LIVE read ends it (practice starts afresh the next time), and a practice
+    read with other trades off ends "other" (turned on again later, it
+    starts then). A paused (off) read changes nothing."""
+    mode = _feed_mode(cfg, state)
+    old = _practice_since(state)
+    since = dict(old)
+    if mode == "live":
+        since = {}
+    elif mode == "dry_run":
+        now = datetime.now(timezone.utc).timestamp()
+        since.setdefault("main", now)
+        if cfg.get("include_other_trades"):
+            since.setdefault("other", now)
+        else:
+            since.pop("other", None)
+    if since == old and bool(since) == ("practice_since" in state):
+        return
+    if since:
+        state["practice_since"] = since
+    else:
+        state.pop("practice_since", None)
+    save_state(state)
+
+
 def _practice_release_events(released, cfg, state, broker, client, save_state,
                              listed, seen):
     """Book the completed trades of one read (see above). Returns the exits
@@ -4964,17 +5047,25 @@ def _practice_release_events(released, cfg, state, broker, client, save_state,
     fresh = [ev for ev in released
              if ev.get("event_id") and ev["event_id"] not in seen
              and ev["event_id"] not in ids]
-    routed = [ev for ev in fresh if _practice_exit_is_held(ev, state, cfg)]
+    routed = _practice_routed(fresh, state, cfg)
+    routed_ids = {ev["event_id"] for ev in routed}
+    # the entry of each routed exit (the latest of its contract and track at
+    # or before it): its position is in the ledger, nothing to book
+    taken = set()
+    for x in routed:
+        t_x = _occurred_at(x)
+        cands = [e for e in held + fresh
+                 if e.get("event") == "ENTERED" and _same_trade_side(e, x)
+                 and _occurred_at(e) is not None
+                 and (t_x is None or _occurred_at(e) <= t_x)]
+        if cands:
+            taken.add(max(cands, key=_occurred_at)["event_id"])
 
     def opened_held(ev):
-        # the entry of a position the ledger holds, whose exit goes the
-        # usual way: nothing to book
-        return ev.get("event") == "ENTERED" and any(
-            _same_trade_side(ev, x) and _occurred_at(x) is not None
-            and _occurred_at(ev) <= _occurred_at(x) for x in routed)
+        return ev.get("event_id") in taken
     held = [e for e in held if _occurred_at(e) is not None and not opened_held(e)]
     for ev in fresh:
-        if ev in routed:
+        if ev["event_id"] in routed_ids:
             continue
         seen.add(ev["event_id"])
         _mark_seen(state, ev["event_id"], listed)
@@ -4984,6 +5075,25 @@ def _practice_release_events(released, cfg, state, broker, client, save_state,
         held.append(dict(ev))
         ids.add(ev["event_id"])
     pairs = sorted(_practice_pairs(held), key=lambda p: _occurred_at(p[0]))
+    # closed before practice started (per track): not booked
+    since, earlier, kept = _practice_since(state), 0, []
+    now = datetime.now(timezone.utc).timestamp()
+    for entry, x in pairs:
+        k = _practice_track(x)
+        if k not in since:
+            since[k] = now
+            state["practice_since"] = since
+        if _occurred_at(x).timestamp() < since[k]:
+            earlier += 1
+            done = (entry["event_id"], x["event_id"])
+            held = [e for e in held if e["event_id"] not in done]
+        else:
+            kept.append((entry, x))
+    if earlier:
+        print(f"practice: {earlier} earlier completed trade"
+              f"{'' if earlier == 1 else 's'} not booked (closed before "
+              "practice started)")
+    pairs = kept
     rows = None
     if pairs:
         try:
@@ -5092,10 +5202,13 @@ def _practice_entry_check(entry, cfg, state, rows, t_in):
             return ("skip_daily_loss", f"max daily loss reached (est. "
                     f"${-pnl:,.0f} of ${loss_cap:,.0f})", "daily_loss",
                     {"max_loss_usd": loss_cap, "loss_usd": round(-pnl, 2)}, None)
-    ok, why, code, params = rules.check_detail(cfg, entry, today_rows, now=et)
+    ok, why, code, params = rules.check_detail(
+        cfg, entry, _practice_streak_rows(today_rows), now=et)
     if not ok:
         return ("skip_rule", f"{why} (your rules)", "your_rules", params, code)
-    rows_shown, ctx = _policy_view(True, now=et, rows_in=before)
+    # as the log stood at the signal: nothing about a later exit
+    rows_shown, ctx = _policy_view(
+        True, now=et, rows_in=[_practice_row_as_of(t) for t in before])
     ev = {k: v for k, v in entry.items() if k != "practice_release"}
     verdict = llm_policy.evaluate(cfg, ev, rows_shown, context=ctx)
     if not verdict["act"] and verdict.get("ai_problem"):
@@ -5103,6 +5216,44 @@ def _practice_entry_check(entry, cfg, state, rows, t_in):
     if not verdict["act"]:
         return ("policy_veto", verdict["reason"], "written_rules", None, None)
     return None
+
+
+def _practice_streak_rows(rows):
+    """The rows the losing-streak rule reads (rules.loss_streak, which only
+    looks at the sign of est_pnl_usd): a practice exit with no dollar result
+    (a fixed contract count: no price is published to practice) counts by
+    the sign of its recorded result."""
+    out = []
+    for t in rows:
+        pct = t.get("pnl_pct")
+        if (t.get("action") == "exit" and t.get("practice_release")
+                and t.get("est_pnl_usd") is None
+                and isinstance(pct, (int, float)) and not isinstance(pct, bool)):
+            t = {**t, "est_pnl_usd": float(pct)}   # its sign only
+        out.append(t)
+    return out
+
+
+# What a practice row says that wasn't known at its signal (the row is
+# written at the exit): never shown to the AI policy judging a later signal.
+_PRACTICE_LATER_KEYS = ("exit_at", "practice_exit", "logged_at", "signal_at")
+
+
+def _practice_row_as_of(t):
+    """A practice row as the AI policy may see it when judging a later
+    signal: no exit time, booking time or exit id, and an entry's reason
+    without its "→ exit" (its exit row, once that is before the signal,
+    carries the result)."""
+    if not (isinstance(t, dict) and t.get("practice_release")):
+        return t
+    out = {k: v for k, v in t.items() if k not in _PRACTICE_LATER_KEYS}
+    if t.get("action") == "entry":
+        amount = t.get("amount_usd")
+        out["reason"] = "practice entry" + (
+            f" · ${float(amount):,.2f} budget"
+            if isinstance(amount, (int, float)) and not isinstance(amount, bool)
+            else "")
+    return out
 
 
 def _book_practice_trade(entry, x, cfg, state, save_state, broker, client, rows):
@@ -8474,9 +8625,11 @@ def cmd_run(app_window=False):
             "real_positions": len(_real_positions(st)),
             "dry_run_note": _dry_run_note(c, st),
             "fields": {
-                "source": c.get("source"),
+                # the agent's own default (_agenthc_source): a config that
+                # never saved one reads AgentHC
+                "source": c.get("source", "agenthc"),
                 **({"feed access": _feed_access(c, st)}
-                   if c.get("source") == "agenthc" else {}),
+                   if _agenthc_source(c) else {}),
                 "sizing": _sizing_desc(c),
                 "entries today": (f"{_entries_today(_is_dry(c, st))} / cap "
                                   f"{c.get('max_entries_per_day', 5)}"),
@@ -8817,6 +8970,9 @@ def cmd_run(app_window=False):
                             _note_exit_source(cfg, state, save_state, "lost",
                                               _poll_exit_loss_reason(source))
                         note_watching(cfg, access=_poll_had_access(source))
+                        if (getattr(source, "NAME", "") == "agenthc"
+                                and _poll_had_access(source)):
+                            _note_practice_since(cfg, state, save_state)
                         _loop_note_poll(source, events, None)  # (dashboard)
                     else:
                         feed_read = False
