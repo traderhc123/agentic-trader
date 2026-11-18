@@ -159,3 +159,32 @@ def test_activity_marks_see_a_missing_log(home):
     assert set(marks) == {"state.json", "trades.jsonl"}
     (home / "trades.jsonl").write_text("x\n", encoding="utf-8")
     assert transfer.activity_marks() != marks
+
+
+def test_an_import_clears_the_staged_files_a_killed_import_left(tmp_path,
+                                                               monkeypatch):
+    """A killed import left `*.import.tmp` copies of the move file's files
+    next to their places; the next import removes them. The copies of this
+    computer's own files (`*.import-bak.tmp`) stay: after such a crash they
+    can be the only copy."""
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    (old / "config.json").write_text(
+        '{"source": "agenthc", "broker": "alpaca", "dry_run": false}',
+        encoding="utf-8")
+    (old / "state.json").write_text('{"positions": {}}', encoding="utf-8")
+    monkeypatch.setenv("AGENT_HOME", str(old))
+    blob = transfer.export_bundle(PW)
+    monkeypatch.setenv("AGENT_HOME", str(new))
+    (new / "sub").mkdir()
+    for n in ("state.json.import.tmp", "sub/x.json.import.tmp",
+              "notes.json.import.tmp"):
+        (new / n).write_text("half", encoding="utf-8")
+    (new / "state.json.import-bak.tmp").write_text("mine", encoding="utf-8")
+    transfer.import_bundle(blob, PW)
+    left = sorted(str(p.relative_to(new)).replace(os.sep, "/")
+                  for p in new.rglob("*.tmp"))
+    assert left == ["state.json.import-bak.tmp"]
+    assert (new / "state.json").read_text(encoding="utf-8") == \
+        '{"positions": {}}'

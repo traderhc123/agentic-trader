@@ -302,6 +302,7 @@ def import_bundle(blob, passphrase, replace=False):
     os.makedirs(root, exist_ok=True)
     import platform_compat
     platform_compat.make_private(root, is_dir=True)
+    _clear_stale_staging(root)
     # 1) every file written next to its place first (nothing replaced yet);
     #    config.json goes in LAST, so a setup without its forced dry-run is
     #    never there, not even half-way.
@@ -369,6 +370,18 @@ def _stage(root, rel, data):
     if not platform_compat.IS_WINDOWS:
         os.chmod(tmp, 0o600)
     return tmp, dest
+
+
+def _clear_stale_staging(root):
+    """Remove the staged copies (_STAGE_SUFFIX) an import that was killed
+    part-way left behind: they are only the move file's own bytes, which
+    this import writes again. The copies of this computer's own files
+    (_BACKUP_SUFFIX, _PRACTICE_KEEP_SUFFIX) are kept: after such a crash
+    they can be the only copy of the file they replaced."""
+    for dirpath, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ("__pycache__",)]
+        _discard(os.path.join(dirpath, n) for n in names
+                 if n.endswith(_STAGE_SUFFIX))
 
 
 def _discard(paths):
