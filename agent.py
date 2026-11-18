@@ -4570,11 +4570,23 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
         # another time, and must never sell the main position (positions
         # are keyed by contract alone). Remembered, so they aren't looked
         # at again.
+        # An exit still owed from before other trades were turned off (kept
+        # after a failed sell) obeys the same rule as a fresh one: it never
+        # sells a position it wouldn't sell if it arrived now. Settled.
+        dropped_owed = [ev for ev in owed if ev.get("event_id")
+                        and _not_for_this_book(ev, state)]
+        for ev in dropped_owed:
+            seen.add(ev["event_id"])
+            _mark_seen(state, ev["event_id"], listed)
+            _exit_settled(state, ev["event_id"])
+        if dropped_owed:
+            owed = [ev for ev in owed if ev.get("event_id") not in seen]
         dropped = [ev for ev in new if ev.get("event_id")
                    and _not_for_this_book(ev, state)]
         for ev in dropped:
             seen.add(ev["event_id"])
             _mark_seen(state, ev["event_id"], listed)
+        dropped += dropped_owed
         if dropped:
             print(f"ignored {len(dropped)} \"other trades\" signal(s): "
                   "other trades are off")

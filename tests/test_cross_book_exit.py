@@ -789,3 +789,43 @@ def test_a_main_row_stamped_with_its_track_alone_is_held_for_its_own_exit(
     poll(b, state, [ev("EXITED", "main", "m-out")], cfg)
     assert b.sells == [("m-out", 2, 2)] and state["positions"] == {}
 
+
+# ── an exit owed from before other trades were turned off ─────────────────
+
+@pytest.mark.parametrize("row", [{}, {"track": "main"}, {"book": "main"}])
+def test_an_owed_other_trades_exit_never_sells_after_other_trades_go_off(
+        home, no_policy, notes, row):
+    """An "other trades" exit for a contract held for the main pick (or by a
+    row that doesn't say) failed at the broker while other trades were on
+    and was kept to retry. The owner turns other trades off: the retry obeys
+    the same rule as a fresh exit — no order — and is settled."""
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2, **row}},
+             "seen": [], "exits_to_retry": [ev("EXITED", "other", "o-out")]}
+    for _ in range(2):
+        poll(b, state, [], OFF, feed_read=False)
+    assert b.sells == [] and state["positions"][KEY]["qty"] == 2
+    assert agent._exits_to_retry(state) == []
+    assert "o-out" in state["seen"]
+    poll(b, state, [ev("EXITED", "main", "m-out")], OFF)
+    assert b.sells == [("m-out", 2, 2)] and state["positions"] == {}
+
+
+def test_an_owed_other_trades_exit_still_sells_its_own_row_after_off(
+        home, no_policy, notes):
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2,
+                                 "book": "shadow", "track": "other"}},
+             "seen": [], "exits_to_retry": [ev("EXITED", "other", "o-out")]}
+    poll(b, state, [], OFF, feed_read=False)
+    assert b.sells == [("o-out", 2, 2)] and state["positions"] == {}
+    assert agent._exits_to_retry(state) == []
+
+
+def test_an_owed_main_exit_is_never_dropped_with_other_trades_off(
+        home, no_policy, notes):
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2}},
+             "seen": [], "exits_to_retry": [ev("EXITED", "main", "m-out")]}
+    poll(b, state, [], OFF, feed_read=False)
+    assert b.sells == [("m-out", 2, 2)] and state["positions"] == {}
