@@ -219,6 +219,23 @@ export interface Proposal {
   /** sha256 of the whole diff; Apply posts it back so only this change applies */
   diff_sha256?: string;
 }
+/** POST /api/proposal/apply. Two steps, as on /v2: the first answer (no
+ *  `confirm` sent) is a preview with a single-use token; the change is
+ *  applied only by the POST that sends {diff_sha256, confirm: token}. */
+export interface ProposalApplyReply {
+  ok: boolean;
+  reply: string;
+  needs_confirm?: boolean;
+  preview?: {
+    token: string;
+    diff_sha256: string;
+    files?: string[];
+    warnings?: string[];
+    does_not?: string[];
+    restarts?: boolean;
+    expires_in_s?: number;
+  };
+}
 export interface WizardState {
   disclaimer: string;
   consent: boolean;

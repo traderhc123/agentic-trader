@@ -16,6 +16,7 @@ import {
   type PnlSummary,
   type Problem,
   type Proposal,
+  type ProposalApplyReply,
   type StatusResp,
   type Trade,
   type TradePage,
@@ -1101,11 +1102,14 @@ function Blotter({
 // ── code-change proposal ────────────────────────────────────────────────────
 function ProposalPanel({ p, onDone }: { p: Proposal; onDone: () => void }) {
   const [msg, setMsg] = useState("");
+  // the preview the first Apply POST answered with (step 2: confirm it)
+  const [review, setReview] = useState<NonNullable<ProposalApplyReply["preview"]> | null>(null);
   const lines = String(p.diff || "").split("\n");
   // Apply is tied to the diff shown here: the server applies only the change
   // with this sha256, and never one whose diff was cut.
   const sha = p.diff_sha256 || "";
   const blocked = !!p.truncated || !sha;
+  const pending = review && review.diff_sha256 === sha ? review : null;
   return (
     <Panel title="Proposed code change: review before it applies" tone="warn" bodyClass="space-y-3 p-4">
       <p className="m-0 text-sm text-fg2">{p.explanation}</p>
@@ -1140,17 +1144,48 @@ function ProposalPanel({ p, onDone }: { p: Proposal; onDone: () => void }) {
         })}
       </pre>
       <div className="flex flex-wrap items-center gap-2">
-        <Button
-          variant="primary"
-          disabled={blocked}
-          onClick={async () => {
-            setMsg("Applying…");
-            const r = await api<{ reply: string }>("/api/proposal/apply", { diff_sha256: sha });
-            setMsg(r.reply);
-          }}
-        >
-          Apply and restart
-        </Button>
+        {pending ? (
+          <>
+            <Button
+              variant="primary"
+              onClick={async () => {
+                setMsg("Applying…");
+                setReview(null);
+                const r = await api<ProposalApplyReply>("/api/proposal/apply", {
+                  diff_sha256: sha,
+                  confirm: pending.token,
+                });
+                setMsg(r.reply);
+              }}
+            >
+              Confirm: apply{pending.restarts ? " and restart" : ""}
+            </Button>
+            <Button
+              onClick={() => {
+                setReview(null);
+                setMsg("Not applied.");
+              }}
+            >
+              Cancel
+            </Button>
+          </>
+        ) : (
+          <Button
+            variant="primary"
+            disabled={blocked}
+            onClick={async () => {
+              setMsg("Checking…");
+              // step 1: the server checks this change and answers with a preview
+              const r = await api<ProposalApplyReply>("/api/proposal/apply", { diff_sha256: sha });
+              if (r.ok && r.needs_confirm && r.preview) {
+                setReview(r.preview);
+                setMsg("");
+              } else setMsg(r.reply);
+            }}
+          >
+            Apply and restart
+          </Button>
+        )}
         <Button
           onClick={async () => {
             await api("/api/proposal/reject", {});
@@ -1160,6 +1195,12 @@ function ProposalPanel({ p, onDone }: { p: Proposal; onDone: () => void }) {
           Reject
         </Button>
         <span className="text-xs text-muted">Nothing changes until you apply.</span>
+        {pending && (
+          <span role="status" className="text-xs text-warn">
+            Apply {pending.files?.length ?? 0} file{(pending.files?.length ?? 0) === 1 ? "" : "s"}
+            {pending.files?.length ? ` (${pending.files.join(", ")})` : ""}? {(pending.does_not || []).join(" ")}
+          </span>
+        )}
         {msg && (
           <span role="status" className="text-xs text-fg2">
             {msg}

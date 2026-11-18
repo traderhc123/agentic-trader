@@ -204,7 +204,7 @@ def test_applying_is_the_classic_apply_after_confirming(home, app, applying):
     write_cfg(home, BASE)
     c = _running(app)
     _propose()
-    assert c.post("/api/proposal/apply", {"diff_sha256": _sha(c)}) == {
+    assert c.confirmed("/api/proposal/apply", {"diff_sha256": _sha(c)}) == {
         "ok": True, "reply": "Applied 1 file(s)."}
     _propose()
     sha = _sha(c)
@@ -221,7 +221,7 @@ def test_applying_is_the_classic_apply_after_confirming(home, app, applying):
     # the setup server (no agent running): applied, no restart, both ways
     c2 = app()
     _propose()
-    c2.post("/api/proposal/apply", {"diff_sha256": _sha(c2)})
+    c2.confirmed("/api/proposal/apply", {"diff_sha256": _sha(c2)})
     _propose()
     c2.confirmed("/api/v2/proposal/apply", {"diff_sha256": _sha(c2)})
     assert applying[2:] == [False, False]
