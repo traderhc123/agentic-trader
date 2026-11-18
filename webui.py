@@ -4252,7 +4252,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             # finished any more).
             transfer.HANDOFF["by"] = None
             pending.pop("move_hold", None)
-            pending.pop("move_blob", None)
+            _forget_move_file()
 
         def carry_on_here():
             transfer.HANDOFF["hold"] = False
@@ -4755,11 +4755,16 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         import transfer
         with move_lock:
             token = pending.pop("move_hold", None)
-            pending.pop("move_blob", None)
+            _forget_move_file()
             if (token is not None and transfer.HANDOFF.get("by") is token
                     and not _retired_or_handing_off()):
                 transfer.HANDOFF["by"] = None
                 transfer.HANDOFF["hold"] = False
+
+    def _forget_move_file():
+        """Drop the move file made here and what is known about it."""
+        for k in ("move_blob", "move_downloaded", "move_marks"):
+            pending.pop(k, None)
 
     def _retired_or_handing_off():
         """This computer was retired (moved to a server or another computer)
@@ -4775,18 +4780,58 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 return  # finished (this computer is retired) or exported again
             if _retired_or_handing_off():
                 pending.pop("move_hold", None)
-                pending.pop("move_blob", None)
+                _forget_move_file()
                 return  # the hold is a server hand-off's (or for good) now
-            _end_move_hold()
-        msg = ("The move to another computer was not finished within "
-               f"{max(1, round(transfer.MOVE_HOLD_S / 60))} minutes, so the "
-               "agent here carries on trading. The move file you made is out "
-               "of date now: to move, create a new one.")
+            mins = max(1, round(transfer.MOVE_HOLD_S / 60))
+            if pending.get("move_downloaded"):
+                msg = _exits_only_after_unfinished_move(token, mins)
+            else:
+                _end_move_hold()
+                msg = ("The move to another computer was not finished within "
+                       f"{mins} minutes, so the agent here carries on "
+                       "trading. The move file you made is out of date now: "
+                       "to move, create a new one.")
         print(msg)
         try:
             A.notify(cfg, msg)
         except Exception:
             pass
+
+    def _exits_only_after_unfinished_move(token, mins):
+        """The move file was DOWNLOADED but "I saved the file" never came:
+        it may already run on the other computer. This one takes no new
+        entries any more (transfer.mark_exits_only, kept over a restart)
+        but carries on selling the real positions it holds — they are never
+        left with no computer to sell them. A sell the other computer
+        already made is not made again: the adapters read the holdings
+        before every sell. Under move_lock. Returns the owner's message."""
+        import transfer
+        kept = ""
+        A._EXITS_ONLY_RUN["on"] = True   # this run, whatever can be saved
+        try:
+            transfer.mark_exits_only()
+        except OSError as exc:
+            try:  # the owner's Pause does the same, short of a resume
+                A.update_config(lambda c: c.__setitem__("paused", True))
+                kept = (" (saved as a Pause: the 'moved' mark could not be "
+                        f"written: {str(exc)[:80]})")
+            except OSError:
+                kept = (" for now (this could not be saved: after a restart "
+                        "it would take new entries again)")
+        if transfer.HANDOFF.get("by") is token:
+            transfer.HANDOFF["by"] = None
+            transfer.HANDOFF["hold"] = False   # exits and the expiry guard
+        pending.pop("move_hold", None)
+        _forget_move_file()
+        return ("The move to another computer was not finished within "
+                f"{mins} minutes, but the move file was downloaded, so the "
+                "setup may already run there. This computer now takes NO new "
+                "entries" + kept + ", and keeps selling the positions it "
+                "holds on their exit signals (it never sells what the other "
+                "computer already sold). To finish the move: make a new move "
+                "file and press 'I saved the file'. To trade here again "
+                "instead: stop the other computer, then run on THIS "
+                "computer: python agent.py resume-here")
 
     def _move_hold_reaches_expiry_sell():
         """The expiry-day sell time ("H:MM", or the close when the guard is
@@ -4883,6 +4928,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "the move file after today's close (or once that "
                     "position is closed). No move file was made and nothing "
                     "changed.")}
+        marks = transfer.activity_marks()
         try:
             blob = transfer.export_bundle(pw)
         except BaseException as exc:
@@ -4890,7 +4936,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             if isinstance(exc, transfer.TransferError):
                 return {"ok": False, "error": str(exc)}
             raise
+        _forget_move_file()
         pending["move_blob"] = blob
+        pending["move_marks"] = marks
         if token is not None:
             timer = threading.Timer(transfer.MOVE_HOLD_S, _move_hold_expired,
                                     args=(token,))
@@ -4908,7 +4956,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         if not pending.get("move_blob"):
             return False
         if get_status is None:
-            return True
+            # no agent in this process: one run elsewhere since the file was
+            # made (started and stopped again) changed the memory or the log
+            return transfer.activity_marks() == pending.get("move_marks")
         token = pending.get("move_hold")
         return bool(transfer.HANDOFF["hold"]) and (
             token is None or transfer.HANDOFF.get("by") is token)
@@ -4922,6 +4972,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "create the move file first (a file made earlier is out "
                     "of date: the agent here kept trading after it)")}
             blob = pending["move_blob"]
+            # the file can be on another computer from now on: an unfinished
+            # move no longer resumes entries (_exits_only_after_unfinished_move)
+            pending["move_downloaded"] = True
         return RawResponse(blob, "application/octet-stream", {
             "Content-Disposition":
                 f'attachment; filename="{transfer.export_filename()}"'})
@@ -4965,7 +5018,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             if token is not None:  # not retired: the time limit still applies
                 pending["move_hold"] = token
             raise
-        pending.pop("move_blob", None)
+        _forget_move_file()
         if running_here:  # the agent is running: stop it
             CONTROLS["stop"] = True
             note += "; the agent here is stopping"
@@ -6020,7 +6073,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             if which == "live":
                 if llm_policy.entries_blocked(cfg):
                     return {"ok": False, "error": llm_policy.BLOCKED_MSG}
-                if cfg.get("dry_run") is False:
+                if not A._is_dry(cfg):  # saved live, or unset with live history
                     return {"ok": True, "saved": False, "note": "Already LIVE."}
                 if "confirm" in data and data.get("acknowledge") is not True:
                     return {"ok": False, "needs_acknowledge": True, "error": (

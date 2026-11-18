@@ -203,8 +203,8 @@ def test_low_cash_warns_once_a_day_in_live_mode_only(home, notes):
                         RejectingBroker(), object(), cash)
     assert cash["bp"] == 12.5 and cash["warning"] and notes == []
     for _ in range(2):
-        agent._refresh_cash({}, state, lambda s: None, RejectingBroker(),
-                            object(), cash)
+        agent._refresh_cash({"dry_run": False}, state, lambda s: None,
+                            RejectingBroker(), object(), cash)
     assert len(notes) == 1 and "add cash" in notes[0]
 
 

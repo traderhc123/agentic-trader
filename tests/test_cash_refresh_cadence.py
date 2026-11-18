@@ -76,16 +76,17 @@ def test_start_and_resume_read_immediately(home, monkeypatch):
     box = at(monkeypatch, sat)
     cash = {"at": 0.0}
     broker = CountingBroker()
+    LIVE = {"dry_run": False}  # (a missing mode is practice: agent._is_dry)
     # start: nothing read yet -> due
-    assert agent._cash_refresh_due({}, cash, box["t"], sat)
-    agent._refresh_cash({}, {}, lambda s: None, broker, object(), cash)
+    assert agent._cash_refresh_due(LIVE, cash, box["t"], sat)
+    agent._refresh_cash(LIVE, {}, lambda s: None, broker, object(), cash)
     later = sat.replace(minute=5)
-    assert not agent._cash_refresh_due({}, cash, box["t"] + 300, later)
+    assert not agent._cash_refresh_due(LIVE, cash, box["t"] + 300, later)
     # Resume: at once, once
     agent._apply_command("resume")
-    assert agent._cash_refresh_due({}, cash, box["t"] + 300, later)
-    agent._refresh_cash({}, {}, lambda s: None, broker, object(), cash)
-    assert not agent._cash_refresh_due({}, cash, box["t"] + 300, later)
+    assert agent._cash_refresh_due(LIVE, cash, box["t"] + 300, later)
+    agent._refresh_cash(LIVE, {}, lambda s: None, broker, object(), cash)
+    assert not agent._cash_refresh_due(LIVE, cash, box["t"] + 300, later)
     # going live (or back to practice): at once, as before
     assert agent._cash_refresh_due({"dry_run": True}, cash, box["t"] + 300, later)
     assert broker.reads == 2
