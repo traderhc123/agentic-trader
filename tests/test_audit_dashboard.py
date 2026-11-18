@@ -680,14 +680,24 @@ def test_w4_paused_with_no_real_position_does_not_use_up_a_signal_day():
                                        {"positions": {}})
 
 
-def test_w4_pause_says_when_a_paused_agent_still_uses_a_signal_day(home):
+def test_w4_pause_says_a_paused_agent_uses_no_signal_day(home):
     _write_cfg(home, {**LIVE, "source": "agenthc"})
     reply = agent._apply_command("pause")[1]
+    # a paused agent says "off" to the feed: only LIVE uses a signal day
     assert ("While a real position is open the agent still reads the signal "
-            "feed to get its exit signal, which uses a signal day") in reply
+            "feed to get its exit signal; a paused agent tells AgentHC it is "
+            "off, so that uses no signal day, and it buys no day-pass") in reply
     assert "With no real position open it stops reading the feed" in reply
-    paid = {"source": "agenthc", "paused": True}
-    assert "uses a signal day." in agent._pause_note(paid, {"positions": {KEY: REAL_ROW}})
+    # with a prepaid pass the exit signal keeps coming
+    paid = {"source": "agenthc", "paused": True,
+            "feed_pass": {"token": "L402 MAC:pre"}}
+    held = agent._pause_note(paid, {"positions": {KEY: REAL_ROW}})
+    assert "still reads the signal feed" in held and "uses no signal day" in held
+    # wallet only: no day-pass is bought while paused, so none is promised
+    wallet = agent._pause_note({"source": "agenthc", "paused": True},
+                               {"positions": {KEY: REAL_ROW}})
+    assert "does not buy a day-pass while paused" in wallet
+    assert "still reads the signal feed" not in wallet
     assert "uses no signal day" in agent._pause_note(paid, {"positions": {KEY: PAPER_ROW}})
     assert agent._pause_note({**paid, "paused": False}, {"positions": {}}) == ""
     # a feed that costs nothing per day: nothing to say

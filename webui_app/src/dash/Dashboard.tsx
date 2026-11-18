@@ -23,6 +23,7 @@ import {
   type WouldHave,
 } from "../lib/api";
 import { cn } from "../lib/cn";
+import { PRACTICE_BANNER_TEXT } from "../lib/modeText";
 import { copyToClipboard, usePolling } from "../lib/hooks";
 import { cap1, eventWhen, eventWhenParts, hhmm, isToday, localWhen, money, parseContract, parsePositions, shortDate, type Contract } from "../lib/format";
 import { MovePanel } from "./MovePanel";
@@ -340,6 +341,7 @@ export function Dashboard() {
           dryNote={dryNote}
           pauseNote={pauseNote}
           restarting={restarting}
+          agenthc={f["source"] === "agenthc"}
         />
         {conn === "ok" && <ExpiryBanner items={status?.expiry_warnings || []} />}
         <StatusStrip conn={conn} f={f} />
@@ -558,6 +560,7 @@ function ModeBanner({
   dryNote,
   pauseNote,
   restarting,
+  agenthc,
 }: {
   conn: Conn;
   live: boolean;
@@ -567,6 +570,8 @@ function ModeBanner({
   dryNote: string;
   pauseNote: string;
   restarting: boolean;
+  // AgentHC releases practice trades at their exit (release on close)
+  agenthc: boolean;
 }) {
   if (conn === "loading") return <div className="h-10" />;
   const off = conn !== "ok";
@@ -596,6 +601,7 @@ function ModeBanner({
                 <>
                   <b className="text-accent">Dry-run.</b>{" "}
                   {dryNote || "The agent logs every decision but places no orders."}
+                  {agenthc && " " + PRACTICE_BANNER_TEXT}
                 </>
               )}
               {hold && (

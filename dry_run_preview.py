@@ -67,11 +67,21 @@ def _save(data):
         pass
 
 
-def fetch(days=DAYS):
+def _mode(cfg):
+    """The mode the agent tells AgentHC (agent._feed_mode): "off" while
+    paused, else "dry_run" — the preview only runs in practice (wanted)."""
+    import agent
+    return agent._feed_mode(cfg)
+
+
+def fetch(days=DAYS, mode="dry_run"):
     """The free closed-trades list, newest first. Raises on network/HTTP
-    errors (the caller retries later)."""
-    from sources.agenthc_day_trade_ideas import AGENTHC_API, FEED_PATH
-    r = _http.get(f"{AGENTHC_API}{FEED_PATH}/closed", params={"days": days},
+    errors (the caller retries later). Says the agent's `mode` as every
+    read of the feed does (query param `mode` + header X-Agent-Mode)."""
+    from sources.agenthc_day_trade_ideas import AGENTHC_API, FEED_PATH, mode_params
+    extra_params, headers = mode_params(mode)
+    r = _http.get(f"{AGENTHC_API}{FEED_PATH}/closed",
+                  params={"days": days, **extra_params}, headers=headers,
                   timeout=15)
     if r.status_code == 404:
         return None   # server doesn't offer it yet
@@ -126,8 +136,11 @@ def evaluate(cfg, trades):
     return rows[:MAX_ROWS]
 
 
-def refresh(cfg, market_open, now=None, fetcher=fetch):
+def refresh(cfg, market_open, now=None, fetcher=None):
     """Fetch again when due. Never raises. Returns the saved data."""
+    if fetcher is None:
+        def fetcher():
+            return fetch(mode=_mode(cfg))
     now = now or time.time()
     data = load()
     every = REFRESH_MARKET_S if market_open else REFRESH_IDLE_S

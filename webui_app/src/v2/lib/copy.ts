@@ -665,8 +665,12 @@ export function describe(e: Activity, brokerName?: string | null): Described {
     icon: r.icon,
     tag,
     title: r.title(ctx),
-    sub: r.sub(ctx),
-    what: r.what(ctx),
+    // a practice trade AgentHC released at its exit: when it really happened
+    sub: e.practice_note ? `${r.sub(ctx)} · ${e.practice_note}` : r.sub(ctx),
+    what: e.practice_note
+      ? `A practice trade in ${ctx.name}, logged only after it closed (${e.practice_note}). Nothing was sent to ${broker}.` +
+        (e.action === "exit" ? result(ctx) : "")
+      : r.what(ctx),
     why: r.why(ctx),
     can: r.can(ctx),
     go: r.go ?? null,
@@ -864,6 +868,7 @@ export const EXIT_LOSS_WHY: Record<ExitLoss["cause"], string> = {
   pass_unchecked: "the agent could not check your signal pass with AgentHC",
   no_day_pass: "the agent has no day-pass for today",
   day_pass_off: "Recurring day-pass is off, so the agent has no day-pass for today",
+  day_pass_not_live: "the agent is in practice or paused, and only LIVE buys a day-pass, so it has none for today",
   day_pass_short: "the agent's wallet does not hold enough sats for today's day-pass",
   day_pass_failed: "the agent's wallet could not pay for today's day-pass",
   day_pass_undecided: "the agent's wallet has not said whether today's day-pass payment went through",

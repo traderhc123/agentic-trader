@@ -11,6 +11,12 @@ Access is sats-based: the agent auto-buys a ~$50/day Lightning day-pass
 (price floats with Bitcoin's USD price) from its built-in wallet, or uses a
 Premium AgentHC API key. Free aggregate track record (hypothetical, labeled):
 GET https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record
+
+Only LIVE uses signal days. Every read of the feed says the agent's mode
+(feed_mode: query param `mode` and header X-Agent-Mode, the same value):
+"live", "dry_run" (practice) or "off" (paused). AgentHC charges a prepaid
+pass's day, or a Premium key's day, only for "live"; practice and off are
+served without using a day. The wallet buys a day-pass only when live.
 """
 
 import math
@@ -40,6 +46,47 @@ DESCRIPTION = ("AgentHC Agentic Day Trade Ideas — journal events from a "
 
 AGENTHC_API = os.getenv("AGENTHC_API", "https://api.traderhc.com")
 FEED_PATH = "/api/v1/trading/day-trade-ideas"
+
+# The agent's mode, sent with EVERY read of the feed as the query param
+# `mode` and the header MODE_HEADER (the same value). AgentHC charges a
+# signal day (a prepaid pass's day, or a Premium key's day) only for "live";
+# "dry_run" (practice) and "off" (the owner paused the agent) read the feed
+# without using a day. An older AgentHC ignores both, so sending them is
+# always safe. The agent's wallet buys a day-pass only when live
+# (_pass_purchase_allowed).
+FEED_MODES = ("live", "dry_run", "off")
+MODE_HEADER = "X-Agent-Mode"
+
+
+def feed_mode(cfg):
+    """"live", "dry_run" or "off" for this read. The agent's loop works it
+    out from the same helpers its orders use (agent._feed_mode: Pause →
+    off, practice → dry_run, else live) and hands it over as
+    cfg["feed_mode"]. Without that (a caller that isn't the agent's loop),
+    it is read from the settings alone: paused → off, dry_run true →
+    dry_run, else live."""
+    cfg = cfg or {}
+    mode = cfg.get("feed_mode")
+    if mode in FEED_MODES:
+        return mode
+    if cfg.get("paused"):
+        return "off"
+    return "dry_run" if cfg.get("dry_run") is True else "live"
+
+
+def mode_params(mode):
+    """(params, headers) that say `mode` to AgentHC."""
+    return {"mode": mode}, {MODE_HEADER: mode}
+
+
+def _feed_get(cfg, params, headers=None, mode=None):
+    """GET the feed, saying the agent's mode (feed_mode), or `mode` for a
+    read that is only for exits ("off": _real_exits_read). `params` itself
+    is left as it is (_check_window reads its limit)."""
+    extra_params, extra_headers = mode_params(mode or feed_mode(cfg))
+    return _http.get(f"{AGENTHC_API}{FEED_PATH}",
+                     params={**params, **extra_params},
+                     headers={**(headers or {}), **extra_headers}, timeout=15)
 
 
 PASS_PATH = FEED_PATH + "/pass"
@@ -986,7 +1033,16 @@ def _check_window(cfg, state, save_state, body, params, events):
     the no-signal sell time (agent.signal_loss_tick). Never raises."""
     try:
         raw = body.get("events") if isinstance(body, dict) else None
-        raw = raw if isinstance(raw, list) else []
+        raw = [e for e in (raw if isinstance(raw, list) else [])
+               if isinstance(e, dict)]
+        if any(e.get("practice_release") for e in raw):
+            # practice: completed trades, each exit with its entry. AgentHC's
+            # `limit` counts the exits, and an entry keeps its original
+            # (older) time: the window is judged on the exits alone
+            raw = [e for e in raw
+                   if e.get("practice_release") and e.get("event") == "EXITED"]
+            events = [e for e in events
+                      if e.get("practice_release") and e.get("event") == "EXITED"]
         rows = state.get("positions")
         held = sorted(k for k, r in (rows.items() if isinstance(rows, dict) else ())
                       if isinstance(r, dict))
@@ -1042,13 +1098,108 @@ def _check_window(cfg, state, save_state, body, params, events):
         print(f"feed window check failed (non-fatal): {str(exc)[:150]}")
 
 
+def _held_keys(state):
+    rows = (state or {}).get("positions")
+    return ({k for k, r in rows.items() if isinstance(r, dict)}
+            if isinstance(rows, dict) else set())
+
+
+def _event_key(ev):
+    """The ledger's key for this event's contract (agent: state["positions"])."""
+    return f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
+
+
+def _real_exits_read(cfg, state, params, headers):
+    """In practice, while the agent holds a REAL position: (body, exits) of
+    a second read that says mode=off — EXITED events only, never charged,
+    and served to every key or pass that may read practice (and to a
+    Premium key AgentHC won't serve practice to). A practice read gets
+    completed trades only, and AgentHC leaves out an exit whose entry it
+    can no longer pair: the exit of a position bought with real money must
+    not depend on that. None when not in practice, nothing real is held,
+    or the read failed (the practice read still brings the exits it can
+    pair)."""
+    if feed_mode(cfg) != "dry_run" or not _holds_real_position(state):
+        return None
+    try:
+        resp = _feed_get(cfg, params, headers, mode="off")
+        if getattr(resp, "status_code", 0) != 200:
+            return None
+        body = resp.json()
+        exits = [e for e in _parse_events(body)
+                 if e["event"] == "EXITED" and not e.get("practice_release")]
+    except Exception:
+        return None
+    return body, exits
+
+
+def _finish_read(cfg, state, save_state, body, params, events, headers):
+    """After a good read: the window check (_check_window), and in practice
+    with a real position held the exits-only read (_real_exits_read). Its
+    exits for contracts the ledger holds that the practice read left out
+    are added (untagged: they go the usual exit way), and the window is
+    judged on it: it lists every exit, the practice read only those it
+    could pair. Every other exit stays with the practice read (a practice
+    trade is booked from its pair, never from a lone exit)."""
+    got = _real_exits_read(cfg, state, params, headers)
+    if got is None:
+        _check_window(cfg, state, save_state, body, params, events)
+        return events
+    off_body, exits = got
+    _check_window(cfg, state, save_state, off_body, params, exits)
+    have = {e["event_id"] for e in events}
+    held = _held_keys(state)
+    return events + [e for e in exits
+                     if e["event_id"] not in have and _event_key(e) in held]
+
+
+def _refused_mode(resp):
+    """The agent mode AgentHC says it refused ("agent_mode" in a 402 body,
+    or in a 403's detail), or None."""
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    mode = body.get("agent_mode")
+    if mode is None and isinstance(body.get("detail"), dict):
+        mode = body["detail"].get("agent_mode")
+    return mode if mode in FEED_MODES else None
+
+
+PRACTICE_KEY_NOT_SERVED_TEXT = (
+    "AgentHC does not serve practice to your API key: practice reads are "
+    "free only for a key whose own paid tier is Premium or higher (a key "
+    "lifted to Premium by $INTELL holdings is not). Nothing was charged, "
+    "and your key's balance is not the problem. Practice logs no trades "
+    "with this key. While your agent holds a real position it still reads "
+    "that position's exit signals. Go LIVE to trade the signals with the key.")
+
+
+def _practice_not_served(cfg, state, save_state, params, headers):
+    """A Premium key in practice that AgentHC won't serve practice to (it
+    says agent_mode dry_run in the refusal): say so — not that the key's
+    balance is empty — and, while a real position is held, read its exits
+    with mode=off (served to the key, never charged)."""
+    _pass_notice(cfg, state, save_state, "practice_key_notified",
+                 PRACTICE_KEY_NOT_SERVED_TEXT)
+    got = _real_exits_read(cfg, state, params, headers)
+    if got is None:
+        return _no_read("feed_refused")
+    body, exits = got
+    _LAST_POLL.update(access=False, exits=True)   # exits only
+    _check_window(cfg, state, save_state, body, params, exits)
+    held = _held_keys(state)
+    return [e for e in exits if _event_key(e) in held]
+
+
 def _wallet_over_exits_only(cfg, state, save_state):
     """Buy today's wallet day-pass while the prepaid pass only gets exits,
     and read the feed with it. None when it was not bought (the caller
     then reads the exits with the used-up pass)."""
     try:
-        resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
-                         params=_feed_params(cfg, state), timeout=15)
+        resp = _feed_get(cfg, _feed_params(cfg, state))
         if resp.status_code != 402:
             return None
         if not _buy_day_pass(cfg, state, resp.json(), save_state):
@@ -1127,8 +1278,7 @@ def _renew_daypass(cfg, state, save_state):
     if not _pass_purchase_allowed(cfg, state, save_state):
         return
     try:
-        resp = _http.get(f"{AGENTHC_API}{FEED_PATH}",
-                         params=_feed_params(cfg, state), timeout=15)
+        resp = _feed_get(cfg, _feed_params(cfg, state))
         if resp.status_code == 402:
             _buy_day_pass(cfg, state, resp.json(), save_state,
                           running_until=running)
@@ -1192,11 +1342,26 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
     already charged, and never buys a second day-pass the same day (the
     owner paid for today once already) — a lost or refused token is not a
     reason to pay again. Only an owner who set max_autopay_sats_per_day
-    themselves (and has no prepaid pass) allows more, up to that many sats."""
+    themselves (and has no prepaid pass) allows more, up to that many sats.
+
+    Only LIVE buys: practice (dry_run) and a paused agent (off) never buy a
+    day-pass (feed_mode). An owner whose wallet would buy (a wallet and
+    'Recurring day-pass' ON) is told so once a day; with no wallet or
+    Recurring off, going live would buy nothing either, so practice is not
+    named as the reason. Once LIVE (or with nothing to buy), a practice /
+    paused notice still on the dashboard goes."""
+    mode = feed_mode(cfg)
+    wallet_buys = bool(cfg.get("lnbits_url") and cfg.get("day_pass_recurring"))
+    if mode == "live" or not wallet_buys or cfg.get("agenthc_api_key"):
+        _clear_not_live_notice(state, save_state)
     if cfg.get("agenthc_api_key"):
         # A Premium key reads the feed with the key only: a wallet day-pass
         # would never be sent, so buying one only loses sats (poll() tells
         # the owner to top up the key instead).
+        return False
+    if mode != "live":
+        if wallet_buys:
+            _not_live_notice(state, save_state, mode)
         return False
     now = now or _now_et()
     day = now.strftime("%Y-%m-%d")
@@ -1252,6 +1417,47 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
               "OFF — turn ON 'Recurring day-pass' in the wizard Source tab "
               "to let the agent buy it each day.")
     return False
+
+
+PRACTICE_NO_PASS_TEXT = (
+    "Practice never uses a signal day or buys a pass; only LIVE uses days. "
+    "Your agent is in practice (dry-run), so it does not buy a day-pass. "
+    "A signal pass you already have keeps working and is not "
+    "charged for practice. With no pass, the dashboard's practice preview "
+    "shows AgentHC's free list of closed trades and whether your rules would "
+    "have taken each one. Go LIVE to have the wallet buy day-passes again.")
+OFF_NO_PASS_TEXT = (
+    "Your agent is paused, so it does not buy a day-pass, and a "
+    "paused agent never uses a signal day; only LIVE uses days. A signal "
+    "pass you already have still brings the exit signals for the positions "
+    "you hold. Press Resume to trade (and buy day-passes) again.")
+
+
+def _clear_not_live_notice(state, save_state):
+    """Live again (or nothing the wallet would buy): the practice / paused
+    notice is no longer true, so it leaves the dashboard."""
+    changed = state.pop("not_live_pass_notified", None) is not None
+    if state.get("pass_notice") in (PRACTICE_NO_PASS_TEXT, OFF_NO_PASS_TEXT):
+        state.pop("pass_notice", None)
+        changed = True
+    if changed:
+        save_state(state)
+
+
+def _not_live_notice(state, save_state, mode):
+    """Once a day: practice / a paused agent buys no day-pass (printed for
+    the log, and on the dashboard's feed-access line; no push message —
+    nothing is wrong)."""
+    day = time.strftime("%Y-%m-%d")
+    key = f"{mode}:{day}"
+    if state.get("not_live_pass_notified") == key:
+        return
+    state["not_live_pass_notified"] = key
+    text = OFF_NO_PASS_TEXT if mode == "off" else PRACTICE_NO_PASS_TEXT
+    if not state.get("daypass_alert"):
+        state["pass_notice"] = text
+    save_state(state)
+    print(text)
 
 
 def _no_receipt_text(sats):
@@ -1576,7 +1782,13 @@ def _buy_day_pass(cfg, state, body, save_state, running_until=None):
     every try makes the server create one more invoice. An invoice the agent
     refuses to pay is also reported to the owner (once a day): until it is
     sorted out the agent has no pass, so no signals. `running_until`: a renewal
-    while the current pass still runs until then (the alerts say so)."""
+    while the current pass still runs until then (the alerts say so).
+    Never in practice or while paused (feed_mode): nothing is paid and it
+    returns False (every caller asks _pass_purchase_allowed first; this is
+    the last stop)."""
+    if feed_mode(cfg) != "live":
+        _not_live_notice(state, save_state, feed_mode(cfg))
+        return False
     try:
         return _pay_day_pass(cfg, state, body, save_state, running_until)
     except Exception as exc:
@@ -1740,9 +1952,12 @@ def _ended_daypass_exits(cfg, state, save_state):
             or not _holds_real_position(state)):
         return None
     params = _feed_params(cfg, state)
+    # practice: an exits-only read says off (a practice read would bring
+    # only the exits AgentHC can pair, and as practice trades)
+    practice = feed_mode(cfg) == "dry_run"
     try:
-        resp = _http.get(f"{AGENTHC_API}{FEED_PATH}", params=params,
-                         headers={"Authorization": tok["token"]}, timeout=15)
+        resp = _feed_get(cfg, params, {"Authorization": tok["token"]},
+                         mode="off" if practice else None)
         if resp.status_code in (401, 402):
             tok["exits_done"] = True
             save_state(state)
@@ -1755,7 +1970,11 @@ def _ended_daypass_exits(cfg, state, save_state):
         return None
     _LAST_POLL["exits"] = True   # exits only: entry access stays False
     _check_window(cfg, state, save_state, body, params, parsed)
-    return [e for e in parsed if e["event"] == "EXITED"]
+    exits = [e for e in parsed if e["event"] == "EXITED"]
+    if practice:
+        held = _held_keys(state)
+        exits = [e for e in exits if _event_key(e) in held]
+    return exits
 
 
 def _day_pass_loss_code(cfg, state, now=None):
@@ -1763,6 +1982,8 @@ def _day_pass_loss_code(cfg, state, now=None):
     agent's no-signal warning turns into the owner's fix (no request, no
     change; the same order as _pass_purchase_allowed):
     day_pass_undecided  a payment the wallet hasn't decided yet;
+    day_pass_not_live   practice or paused, and the wallet would buy
+                        (a wallet, Recurring ON): only LIVE buys a day-pass;
     day_pass_off        Recurring day-pass is off: the wallet never buys;
     day_pass_short      the last payment failed: not enough sats;
     day_pass_failed     the last payment failed otherwise (wallet down or
@@ -1771,6 +1992,9 @@ def _day_pass_loss_code(cfg, state, now=None):
                         daily cap, the market closed)."""
     if state.get("daypass_pending"):
         return "day_pass_undecided"
+    if (feed_mode(cfg) != "live" and cfg.get("lnbits_url")
+            and cfg.get("day_pass_recurring")):
+        return "day_pass_not_live"
     now = now or _now_et()
     day = now.strftime("%Y-%m-%d")
     if (state.get("pass_charged_day") == day
@@ -1986,8 +2210,7 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             and time.time() - float(daypass.get("refused_at") or 0) < _REFUSED_RETRY_S):
         # AgentHC refused this paid pass a moment ago: offer it again later
         return _no_read("day_pass_refused")
-    resp = _http.get(f"{AGENTHC_API}{FEED_PATH}", params=params,
-                     headers=headers, timeout=15)
+    resp = _feed_get(cfg, params, headers)
     _note_feed_answer(resp)
     if (resp.status_code in (401, 402) and not _retried
             and not cfg.get("agenthc_api_key") and _pass_tokens(cfg)
@@ -2016,6 +2239,11 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             "doesn't clear up, contact AgentHC with "
             "the time of the payment from your wallet's payment list.")
         return _no_read("day_pass_refused")
+    if (resp.status_code in (402, 403) and cfg.get("agenthc_api_key")
+            and feed_mode(cfg) == "dry_run" and _refused_mode(resp) == "dry_run"):
+        # AgentHC serves practice only to a key whose own paid tier is
+        # Premium+: nothing is owed, the balance is fine.
+        return _practice_not_served(cfg, state, save_state, params, headers)
     if resp.status_code == 402 and cfg.get("agenthc_api_key"):
         # The Premium key's balance can't pay for today. The agent never
         # buys a wallet day-pass while a key is set (it would not be sent
@@ -2067,14 +2295,12 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     _entry_read(state, save_state)
     body = resp.json()
     events = _parse_events(body)
-    _check_window(cfg, state, save_state, body, params, events)
-    return events
+    return _finish_read(cfg, state, save_state, body, params, events, headers)
 
 
 def _poll_with_pass(cfg, state, save_state, token, _retried):
     params = _feed_params(cfg, state)
-    resp = _http.get(f"{AGENTHC_API}{FEED_PATH}", params=params,
-                     headers={"Authorization": token}, timeout=15)
+    resp = _feed_get(cfg, params, {"Authorization": token})
     _note_feed_answer(resp)
     if resp.status_code in (401, 402) and not _retried:
         _refresh_pass(cfg, state, save_state, force=True)  # ended/refused: recheck
@@ -2124,7 +2350,8 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
             _pass_notice(cfg, state, save_state, "pass_low_notified",
                          PASS_LOW_TEXT.format(n=left))
     events = _parse_events(body)
-    _check_window(cfg, state, save_state, body, params, events)
+    events = _finish_read(cfg, state, save_state, body, params, events,
+                          {"Authorization": token})
     if exits_only:
         # a used-up pass gets no entries: should the reply carry one anyway
         # (a server bug, a malformed answer), it never reaches the agent
@@ -2211,6 +2438,10 @@ def _parse_events(body):
             }
             if "paper_pnl_pct" in ev:
                 norm["paper_pnl_pct"] = ev["paper_pnl_pct"]
+            if ev.get("practice_release"):
+                # a completed trade released to practice at its exit (a
+                # mode=dry_run read): the agent books it, never trades it
+                norm["practice_release"] = str(ev["practice_release"])[:40]
         except (KeyError, TypeError, ValueError):
             continue
         norm["event_id"] = (f"{norm['event']}|{norm['ticker']}|{norm['expiry']}|"

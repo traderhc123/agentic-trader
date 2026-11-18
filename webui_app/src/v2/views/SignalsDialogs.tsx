@@ -503,7 +503,7 @@ export function RecurringDialog({ page, onClose }: { page: Page; onClose: () => 
       title={title}
       lead={
         next
-          ? `On each market day it reads signals, the agent pays for that day's pass from its wallet (about ${passUsdWords(day)} in sats).`
+          ? `On each market day it reads signals while LIVE, the agent pays for that day's pass from its wallet (about ${passUsdWords(day)} in sats). Practice never uses a signal day or buys a pass; only LIVE uses days.`
           : "The agent never spends from its wallet by itself. It reads signals only with days you buy, or a key."
       }
       cancel="Keep it as it is"

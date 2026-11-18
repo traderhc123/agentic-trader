@@ -243,7 +243,7 @@ export interface Pass {
 
 export interface ExitLoss {
   since: Iso;
-  cause: "pass_ended" | "pass_unpaid" | "pass_unchecked" | "no_day_pass" | "day_pass_off" | "day_pass_short" | "day_pass_failed" | "day_pass_undecided" | "day_pass_refused" | "feed_error" | "feed_not_live" | "feed_refused";
+  cause: "pass_ended" | "pass_unpaid" | "pass_unchecked" | "no_day_pass" | "day_pass_off" | "day_pass_not_live" | "day_pass_short" | "day_pass_failed" | "day_pass_undecided" | "day_pass_refused" | "feed_error" | "feed_not_live" | "feed_refused";
   /** when the agent sells what it holds today because of it (the no-signal sell); null = it won't today */
   sell_at: Iso | null;
   /** true: the agent will sell its positions itself at sell_at unless exit signals come back */
@@ -427,6 +427,8 @@ export interface Activity {
   reason_params: Record<string, string | number>;
   reason_text: string | null;
   hint: string | null;
+  /** a practice trade AgentHC released at its exit: "signal HH:MM → exit HH:MM, logged at exit" (ET); null for every other row */
+  practice_note: string | null;
 }
 
 export interface Results {

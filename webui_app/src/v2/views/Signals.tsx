@@ -207,7 +207,7 @@ function BuyDays({ page, onClose }: { page: Page; onClose: () => void }) {
   return (
     <Dialog
       title="Buy signal days"
-      lead="Each signal day lets your agent read AgentHC's signals for one market day. Unused days carry over."
+      lead="Each signal day lets your agent read AgentHC's signals for one market day. Unused days carry over. Practice never uses a signal day or buys a pass; only LIVE uses days."
       onClose={() => !busy && onClose()}
       foot={
         <>
@@ -597,6 +597,7 @@ export function SignalsView({ page }: { page: Page }) {
                       ? "The agent could not check this pass with AgentHC yet, so it reads no signals until it can. It checks again on each read."
                       : "If access runs out, the agent stops taking new trades."}
             </p>
+            {sells && <p className="small muted">Practice never uses a signal day or buys a pass; only LIVE uses days.</p>}
             {sells && (
               <div style={{ marginTop: 12 }}>
                 <button className="btn btn-primary" data-act="buy-days" aria-haspopup="dialog" disabled={page.link === "lost"} onClick={() => setBuying(true)}>

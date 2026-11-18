@@ -385,9 +385,11 @@ DASH_LINK = ('  <a class="btn btn-ghost" href="/v2" title="A redesigned dashboar
 # the limit), plus audit PR9 (the code-change panel posts the diff_sha256
 # it showed and disables Apply on a cut diff), plus the classic Apply's
 # two-step confirmation (the preview's token is sent back after the owner
-# confirms). #83 changed the classic page's polling; c73dfc2's was
-# 5df4ddc7…, 2c19c0c's af9f3d4c…, d6c8740's 47f24002…, e1dd5ac's 73a1e91c…
-DASH_AT_MAIN = "d45ace5080cdc445ba00db1ecd9d11cd6445e30b55f4dca314498e224125525f"
+# confirms), plus #104's practice banner (with AgentHC, the dry-run banner
+# says practice trades are logged only after they close). #83 changed the
+# classic page's polling; c73dfc2's was 5df4ddc7…, 2c19c0c's af9f3d4c…,
+# d6c8740's 47f24002…, e1dd5ac's 73a1e91c…, 8f4385b's d45ace50…
+DASH_AT_MAIN = "cd9670dc5981bae97356c70c043ed4e73b2f1bc005f7ade41a02b4a8a1ae5687"
 
 
 def test_the_classic_page_only_gains_the_one_link():

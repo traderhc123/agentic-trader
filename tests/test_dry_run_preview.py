@@ -92,10 +92,14 @@ def test_fetch_reads_the_free_endpoint(monkeypatch):
         def json(self):
             return {"trades": TRADES + ["junk"]}
     monkeypatch.setattr(P._http, "get",
-                        lambda url, params=None, timeout=None: seen.update(url=url, params=params) or R())
+                        lambda url, params=None, headers=None, timeout=None:
+                        seen.update(url=url, params=params, headers=headers) or R())
     assert P.fetch() == TRADES
     assert seen["url"].endswith("/api/v1/trading/day-trade-ideas/closed")
-    assert seen["params"] == {"days": 7}
+    # says the agent's mode, like every read of the feed
+    assert seen["params"]["mode"] == "dry_run"
+    assert seen["headers"] == {"X-Agent-Mode": "dry_run"}
+    assert seen["params"] == {"days": 7, "mode": "dry_run"}
 
 
 def test_chat_toggle(home):

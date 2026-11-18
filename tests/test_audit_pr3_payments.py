@@ -92,7 +92,8 @@ def test_key_with_empty_balance_never_buys_a_wallet_day_pass(monkeypatch, clock,
         clock.tick(minutes=10)
     assert paid == []                              # no sats spent
     assert "l402" not in state and "daypass_pending" not in state
-    assert all(h == {"X-API-Key": "k"} for h in feed.sent)
+    # the key only (and the agent's mode: only LIVE uses a day)
+    assert all(h == {"X-API-Key": "k", "X-Agent-Mode": "live"} for h in feed.sent)
     # the owner hears it once a day, in plain words
     assert len(alerts) == 1 and "Top up your key" in alerts[0]
     assert "nothing was paid" in alerts[0]

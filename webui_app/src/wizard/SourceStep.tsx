@@ -218,7 +218,10 @@ export function SourceStep() {
             </p>
             <dl className="m-0 grid grid-cols-3 gap-px overflow-hidden rounded border border-line bg-line text-xs max-sm:grid-cols-1">
               {[
-                ["Billing", "A day is only used when your agent actually receives a trade signal (an entry or an exit) that day. Quiet days are free."],
+                [
+                  "Billing",
+                  "A day is only used when your agent is LIVE and actually receives a trade signal (an entry or an exit) that day. Quiet days are free. Practice never uses a signal day or buys a pass; only LIVE uses days.",
+                ],
                 ["Carry-over", "Unused days carry over when you buy more."],
                 ["Custody", "The agent never holds money. You pay each invoice from your own wallet."],
               ].map(([k, v]) => (
@@ -609,8 +612,8 @@ function AgentWallet({ dayUsd }: { dayUsd: number }) {
               Recurring day-pass: {recurring ? "On" : "Off"}
             </Button>
             <span className="min-w-[220px] flex-1 text-xs text-muted">
-              On = the agent buys each day's ~{passUsdWords(dayUsd)} pass from its wallet automatically (never above your auto-pay cap). Off = it never
-              spends without you.
+              On = the agent buys each day's ~{passUsdWords(dayUsd)} pass from its wallet automatically (never above your auto-pay cap), only while it
+              is LIVE. Off = it never spends without you. Practice never uses a signal day or buys a pass; only LIVE uses days.
             </span>
           </div>
           {capWords && (
