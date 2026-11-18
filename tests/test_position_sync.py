@@ -1665,7 +1665,7 @@ class FakeAlpaca0DTE(FakeAlpaca):
     KEY = "SPY|2026-10-30|752.0|C"
 
 
-def _alpaca(monkeypatch, clock, after_cancel=("pending_cancel", "0"),
+def _alpaca(monkeypatch, clock, after_cancel=("canceled", "0"),
             fake=FakeAlpaca):
     """The real Alpaca adapter on a FakeAlpaca, one trusted row."""
     import types
@@ -1817,21 +1817,37 @@ def test_alpaca_paper_row_blocked_after_switch_to_live_with_startup_client(
     assert st2["positions"][KEY]["acct"] == "alpaca:live"
 
 
-def test_alpaca_exit_with_unconfirmed_cancel_says_check_this_trade(home, clock,
-                                                                   monkeypatch, notes):
-    """The exit's cancel can't be confirmed, so the agent assumes it sold:
-    the report is about the sell (exit_failed) and the alert doesn't claim
-    the trade wasn't placed."""
-    alpaca, http, st, client = _alpaca(monkeypatch, clock, after_cancel=("", "0"))
-    assert handle(st, alpaca, cfg=ALPACA, client=client).startswith("EXIT")
+@pytest.mark.parametrize("after_cancel", [("", "0"), ("pending_cancel", "0")],
+                         ids=["unreadable", "pending_cancel"])
+def test_alpaca_exit_with_unconfirmed_cancel_waits_and_never_sells_twice(
+        home, clock, monkeypatch, notes, after_cancel):
+    """The exit's cancel can't be confirmed (state unreadable, or still
+    pending_cancel): it may still fill — or not. It is neither assumed sold
+    (the row went while the contracts could still be held: a missed exit)
+    nor booked as 0 sold (a second sell on top of it). The row and the exit
+    stay; once Alpaca says it filled, that is the exit, with one sell."""
+    alpaca, http, st, client = _alpaca(monkeypatch, clock, after_cancel=after_cancel)
+    for _ in range(3):
+        with pytest.raises(agent.ExitNotDone):
+            handle(st, alpaca, cfg=ALPACA, client=client)
+        clock.tick(30)
+    assert KEY in st["positions"] and st["positions"][KEY]["qty"] == 2
+    assert len(http.posts) == 1
+    problem = _log(home)[0]
+    assert problem["action"] == "exit_failed" and "may still fill" in problem["reason"]
+    assert all("NOT placed" not in n for n in notes)
+    # it filled after all: the account is flat. The row goes — as the
+    # agent's exit or as a close the account check found — with one sell
+    http.after_cancel, http.held = ("filled", "2"), 0
+    for _ in range(12):
+        clock.tick(30)
+        try:
+            handle(st, alpaca, cfg=ALPACA, client=client)
+        except agent.ExitNotDone:
+            continue
+        break
     assert KEY not in st["positions"] and len(http.posts) == 1
-    problem, exit_row = _log(home)
-    assert problem["action"] == "exit_failed" and exit_row["action"] == "exit"
-    assert "the sell order for 2x" in problem["reason"]
-    (note,) = notes
-    assert note.startswith(f"agentic-trader: check this trade ({CONTRACT}) — "
-                           "Alpaca couldn't confirm whether the sell order")
-    assert "NOT placed" not in note
+    assert [r.get("qty") for r in _log(home) if r["action"] == "exit"] == [2]
 
 
 def test_unfilled_exit_without_holdings_reads_is_logged_as_before(home):

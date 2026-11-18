@@ -705,7 +705,12 @@ def _confirm_after_cancel(monkeypatch, delete_status, after_cancel):
     import broker_events
     _no_waits(monkeypatch)
     states = iter([("accepted", 0)] * alpaca._CONFIRM_TRIES + [after_cancel])
-    monkeypatch.setattr(alpaca, "_order_state", lambda cfg, oid: next(states))
+    last = [None]
+
+    def read(cfg, oid):  # the re-reads after the cancel see the same state
+        last[0] = next(states, last[0])
+        return last[0]
+    monkeypatch.setattr(alpaca, "_order_state", read)
 
     def delete(url, **kw):
         if isinstance(delete_status, Exception):
@@ -719,7 +724,6 @@ def _confirm_after_cancel(monkeypatch, delete_status, after_cancel):
 
 @pytest.mark.parametrize("delete_status, after_cancel", [
     (204, ("canceled", 0)),
-    (204, ("pending_cancel", 0)),     # cancel accepted: it won't fill
     (422, ("expired", 0)),
 ])
 def test_alpaca_confirm_dead_order_reports_what_filled(monkeypatch, delete_status,
@@ -729,19 +733,21 @@ def test_alpaca_confirm_dead_order_reports_what_filled(monkeypatch, delete_statu
 
 
 @pytest.mark.parametrize("delete_status, after_cancel", [
+    (204, ("pending_cancel", 0)),     # cancel accepted, not done: may fill
     (500, ("new", 0)),                # cancel refused, order still working
     (422, ("", 0)),                   # status unreadable (e.g. it filled)
     (204, ("", 0)),
     (RuntimeError("network"), ("", 0)),
-], ids=["cancel-refused", "422-unreadable", "204-unreadable", "cancel-raises"])
-def test_alpaca_confirm_unproven_cancel_assumes_filled_and_says_so(
+], ids=["pending-cancel", "cancel-refused", "422-unreadable", "204-unreadable",
+        "cancel-raises"])
+def test_alpaca_confirm_unproven_sell_cancel_is_left_open(
         monkeypatch, delete_status, after_cancel):
-    """Never report a sell as unfilled while it may still fill: the agent
-    would sell again, and a plain sell on a flat account can open a short."""
+    """Never report a sell as unfilled while it may still fill (the agent
+    would sell again, and a plain sell on a flat account can open a short),
+    nor as sold while it may die (the row would go with the contracts
+    still held): None, and the caller keeps it open (_await_sell)."""
     got, events = _confirm_after_cancel(monkeypatch, delete_status, after_cancel)
-    assert got == 2
-    assert [e["kind"] for e in events] == ["exit_failed"]
-    assert "check your Alpaca dashboard" in events[0]["message"]
+    assert got is None and events == []
 
 
 @pytest.mark.parametrize("mod", ["alpaca", "moomoo"])

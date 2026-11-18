@@ -234,10 +234,132 @@ def test_alpaca_buy_whose_cancel_is_refused_while_working_is_unknown(monkeypatch
     assert got == 2 and [e["kind"] for e in events] == ["order_failed"]
 
 
-def test_alpaca_sell_pending_cancel_is_unchanged(monkeypatch):
-    """Exits keep their behaviour (B7 owns that path): 0 sold, re-sold next
-    loop against what the account still holds."""
-    assert _confirm(monkeypatch, [("pending_cancel", 0)], side="sell")[0] == 0
+def test_alpaca_sell_still_cancelling_is_unknown_not_unsold(monkeypatch):
+    """A sell still pending_cancel after its cancel may still fill: it is
+    not booked as 0 sold (the exit then sold again on top of it), nor —
+    when its state can't be read — as all sold (the row would go while the
+    contracts may still be held). None: the exit waits for Alpaca."""
+    got, events = _confirm(monkeypatch, [("pending_cancel", 0)], side="sell")
+    assert got is None and events == []
+    assert _confirm(monkeypatch, [("", 0)], side="sell")[0] is None
+    assert _confirm(monkeypatch, [("", 0)], side="sell", delete_status=500)[0] is None
+    # the cancel lands on a recheck: what it sold, as before
+    assert _confirm(monkeypatch, [("pending_cancel", 1), ("canceled", 1)],
+                    side="sell")[0] == 1
+    assert _confirm(monkeypatch, [("pending_cancel", 0), ("filled", 2)],
+                    side="sell")[0] == 2
+    assert _confirm(monkeypatch, [("canceled", 0)], side="sell")[0] == 0
+
+
+class SlowSellAlpaca(FakeAlpaca):
+    """Buys fill; the first sell doesn't fill in time and its cancel is
+    accepted (204) but it stays pending_cancel until the test settles it.
+    Later sells fill."""
+
+    def __init__(self, monkeypatch):
+        super().__init__(monkeypatch)
+        self.slow_sells = 1
+
+    def post(self, url, **kw):
+        resp = super().post(url, **kw)
+        order = self.orders[-1]
+        if order["side"] == "sell" and self.slow_sells:
+            self.slow_sells -= 1
+            order.update(status="new", filled_qty="0")
+        return resp
+
+    def delete(self, url, **kw):
+        order = self._find(id=url.rsplit("/", 1)[-1])
+        if order and order["status"] not in ("filled", "canceled"):
+            order["status"] = "pending_cancel"
+        return super().delete(url, **kw)
+
+    def sells(self):
+        return [o for o in self.orders if o["side"] == "sell"]
+
+
+@pytest.mark.parametrize("then", ["fills_late", "partly_fills", "dies"])
+def test_alpaca_sell_left_pending_cancel_is_never_sold_twice(home, no_policy, notes,
+                                                             monkeypatch, then):
+    """THE BUG: the exit's sell read pending_cancel after its cancel and was
+    booked as 0 sold, so the exit sold again while the first could still
+    fill. Now the exit waits until Alpaca says filled or dead: a late fill
+    is the exit; a dead order lets the exit sell again (it can't fill
+    any more)."""
+    api = SlowSellAlpaca(monkeypatch)
+    feed, state = _alpaca_feed()
+    sell = make_event(event="EXITED", event_id="x-1")
+    feed.poll(make_event())
+    assert state["positions"][KEY]["qty"] == 2
+    feed.poll(sell)
+    assert sell["event_id"] not in feed.seen
+    assert api.sells()[0]["status"] == "pending_cancel"
+    assert state["positions"][KEY]["qty"] == 2                    # nothing booked
+    assert order_guard.get(state, KEY)["order_id"] == api.sells()[0]["id"]
+    for _ in range(3):                                            # still cancelling
+        feed.poll(sell)
+    assert len(api.sells()) == 1 and sell["event_id"] not in feed.seen
+    if then == "fills_late":
+        api.sells()[0].update(status="filled", filled_qty="2")
+    elif then == "partly_fills":
+        api.sells()[0].update(status="canceled", filled_qty="1")
+    else:
+        api.sells()[0].update(status="canceled", filled_qty="0")
+    for _ in range(3):
+        feed.poll(sell)
+    assert sell["event_id"] in feed.seen
+    assert order_guard.get(state, KEY) is None
+    exits = [r for r in _log(home) if r["action"] == "exit"]
+    if then == "partly_fills":
+        # the 1x it sold is the exit; the rest is a remainder the agent
+        # re-sells (exit_remainder_tick) — never a second sell of all 2x
+        assert len(api.sells()) == 1 and api.held() == 1
+        assert state["positions"][KEY]["qty"] == 1
+        assert state["positions"][KEY]["exiting"]
+        assert [r.get("qty") for r in exits] == [1]
+        return
+    assert api.held() == 0 and KEY not in state["positions"]
+    # one sell that filled late, or a second one only after the first died
+    assert sum(int(o["filled_qty"]) for o in api.sells()) == 2
+    assert len(api.sells()) == (1 if then == "fills_late" else 2)
+    assert [r.get("qty") for r in exits] == [2]
+
+
+def _cancelling_sell(state, age=0):
+    order_guard.note(state, KEY, "sell", None, 2, OPT, event_id="x-1",
+                     contract="SPY", order_id="s-1")
+    state[order_guard.STATE_KEY][KEY]["at"] = time.time() - age
+
+
+def test_alpaca_cancelling_sell_still_working_is_cancelled_again(monkeypatch):
+    """Its cancel was refused (or never arrived) and the sell still works:
+    the agent asks again each loop — a stale limit sell must not sit
+    until the close — and sends no second sell meanwhile."""
+    state = {"positions": {KEY: {"option_id": OPT, "qty": 2}}}
+    _cancelling_sell(state)
+    deletes = []
+    monkeypatch.setattr(alpaca.requests, "delete",
+                        lambda url, **kw: deletes.append(url))
+    monkeypatch.setattr(alpaca, "_order_state", lambda cfg, oid: ("new", 0))
+    assert alpaca._settle_unconfirmed({}, state, KEY) == "unknown"
+    assert [u.rsplit("/", 1)[-1] for u in deletes] == ["s-1"]
+    monkeypatch.setattr(alpaca, "_order_state", lambda cfg, oid: ("pending_cancel", 0))
+    assert alpaca._settle_unconfirmed({}, state, KEY) == "unknown"
+    assert len(deletes) == 1                   # pending_cancel: just wait
+    assert state["positions"][KEY]["qty"] == 2
+
+
+def test_alpaca_cancelling_sell_given_up_is_never_silent(monkeypatch):
+    state = {"positions": {KEY: {"option_id": OPT, "qty": 2}}}
+    _cancelling_sell(state, age=order_guard.GIVE_UP_S + 60)
+    monkeypatch.setattr(alpaca, "_order_state", lambda cfg, oid: ("", 0))
+    broker_events.begin()
+    assert alpaca._settle_unconfirmed({}, state, KEY) == "clear"
+    events = broker_events.drain()
+    assert order_guard.get(state, KEY) is None
+    assert state["positions"][KEY]["qty"] == 2   # never assumed sold
+    assert [e["kind"] for e in events] == ["exit_failed"]
+    assert "check your alpaca dashboard" in events[0]["message"].lower()
 
 
 # ── Robinhood: blackout-limit buy converted to market ───────────────────────
