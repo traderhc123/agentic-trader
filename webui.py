@@ -4758,7 +4758,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
 
     def _forget_move_file():
         """Drop the move file made here and what is known about it."""
-        for k in ("move_blob", "move_downloaded"):
+        for k in ("move_blob", "move_downloaded", "move_marks"):
             pending.pop(k, None)
 
     def _retired_or_handing_off():
@@ -4916,6 +4916,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "the move file after today's close (or once that "
                     "position is closed). No move file was made and nothing "
                     "changed.")}
+        marks = transfer.activity_marks()
         try:
             blob = transfer.export_bundle(pw)
         except BaseException as exc:
@@ -4925,6 +4926,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             raise
         _forget_move_file()
         pending["move_blob"] = blob
+        pending["move_marks"] = marks
         if token is not None:
             timer = threading.Timer(transfer.MOVE_HOLD_S, _move_hold_expired,
                                     args=(token,))
@@ -4942,7 +4944,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         if not pending.get("move_blob"):
             return False
         if get_status is None:
-            return True
+            # no agent in this process: one run elsewhere since the file was
+            # made (started and stopped again) changed the memory or the log
+            return transfer.activity_marks() == pending.get("move_marks")
         token = pending.get("move_hold")
         return bool(transfer.HANDOFF["hold"]) and (
             token is None or transfer.HANDOFF.get("by") is token)

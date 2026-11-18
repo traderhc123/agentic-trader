@@ -189,6 +189,21 @@ def export_bundle(passphrase):
     return encrypt(buf.getvalue(), passphrase)
 
 
+def activity_marks():
+    """(size, mtime_ns) of the agent's memory and trade log, None for one
+    that isn't there: anything the agent does (a trade, a pass bought, a
+    signal handled, its last save on stop) changes one of them. A move file
+    made while no agent ran here is current while these are unchanged."""
+    out = {}
+    for name in ("state.json", "trades.jsonl"):
+        try:
+            st = os.stat(os.path.join(home(), name))
+            out[name] = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            out[name] = None
+    return out
+
+
 def export_filename():
     return f"agentic-trader-move-{time.strftime('%Y-%m-%d')}{EXTENSION}"
 

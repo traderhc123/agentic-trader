@@ -5,9 +5,17 @@
    on the new computer, both computers then sold the same real positions.
    A downloaded file now retires this computer when the limit runs out (as
    "I saved the file" would); a file that never left it still lifts the
-   hold, as before."""
+   hold, as before.
+2. With no agent in the page's process (the setup wizard), a move file was
+   "current" no matter what: an agent started and stopped elsewhere after
+   the file was made could have traded. Now the memory and the trade log
+   must be unchanged since the file was made."""
+
+import os
+import time
 
 import agent
+import keep_running
 import transfer
 import webui
 from test_audit_pr5 import PW, mover  # noqa: F401  (fixture)
@@ -103,3 +111,51 @@ def test_finish_before_the_limit_is_unchanged(mover, monkeypatch):
     timers.fire()                                  # nothing left to do
     assert transfer.HANDOFF["hold"] is True and transfer.moved_away()
     assert told == []
+
+
+def _wizard(mover, monkeypatch):
+    routes = mover(running=False)
+    monkeypatch.setattr(keep_running, "supervisor_running", lambda: False)
+    assert routes["/api/move/export"](None, {"passphrase": PW})["ok"]
+    return routes
+
+
+def test_wizard_file_is_out_of_date_after_an_agent_ran_elsewhere(
+        mover, home, monkeypatch):
+    """No agent in this process: one started and stopped again since the
+    file was made (it traded, or just saved its memory) leaves the file out
+    of date — this computer is not retired on it."""
+    routes = _wizard(mover, monkeypatch)
+    with open(home / "trades.jsonl", "a", encoding="utf-8") as f:
+        f.write('{"action": "entry", "dry": false}\n')
+    r = routes["/api/move/finish"](None, {})
+    assert r["ok"] is False and "out of date" in r["error"]
+    assert transfer.moved_away() is None
+    d = routes["/api/move/download"](None)
+    assert isinstance(d, dict) and d["ok"] is False
+
+
+def test_wizard_file_with_a_changed_memory_is_out_of_date(mover, home,
+                                                         monkeypatch):
+    routes = _wizard(mover, monkeypatch)
+    st = os.stat(home / "state.json")
+    agent._save(agent.STATE_PATH, {"seen": ["e-9"], "positions": {}},
+                private=True)
+    os.utime(home / "state.json", ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    r = routes["/api/move/finish"](None, {})
+    assert r["ok"] is False and transfer.moved_away() is None
+
+
+def test_wizard_file_nothing_ran_since_finishes(mover, monkeypatch):
+    routes = _wizard(mover, monkeypatch)
+    time.sleep(0.01)
+    assert routes["/api/move/download"](None).body
+    assert routes["/api/move/finish"](None, {})["ok"] is True
+    assert transfer.moved_away()
+
+
+def test_activity_marks_see_a_missing_log(home):
+    marks = transfer.activity_marks()
+    assert set(marks) == {"state.json", "trades.jsonl"}
+    (home / "trades.jsonl").write_text("x\n", encoding="utf-8")
+    assert transfer.activity_marks() != marks
