@@ -4570,11 +4570,23 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
         # another time, and must never sell the main position (positions
         # are keyed by contract alone). Remembered, so they aren't looked
         # at again.
+        # An exit still owed from before other trades were turned off (kept
+        # after a failed sell) obeys the same rule as a fresh one: it never
+        # sells a position it wouldn't sell if it arrived now. Settled.
+        dropped_owed = [ev for ev in owed if ev.get("event_id")
+                        and _not_for_this_book(ev, state)]
+        for ev in dropped_owed:
+            seen.add(ev["event_id"])
+            _mark_seen(state, ev["event_id"], listed)
+            _exit_settled(state, ev["event_id"])
+        if dropped_owed:
+            owed = [ev for ev in owed if ev.get("event_id") not in seen]
         dropped = [ev for ev in new if ev.get("event_id")
                    and _not_for_this_book(ev, state)]
         for ev in dropped:
             seen.add(ev["event_id"])
             _mark_seen(state, ev["event_id"], listed)
+        dropped += dropped_owed
         if dropped:
             print(f"ignored {len(dropped)} \"other trades\" signal(s): "
                   "other trades are off")
@@ -6515,11 +6527,13 @@ def _confirm_broker_switch(cfg, saved_bc):
     tagged) counts as the saved broker's — the agent tags such a row with
     the account it trades on its first read, so after a switch it may try
     to sell it where it isn't held. Rows at the newly picked broker don't
-    warn. Enter (or anything but y) keeps the saved broker."""
+    warn. Enter (or anything but y) keeps the saved broker. The rows are
+    read even when the saved broker is picked again: after a config reset
+    (no broker saved reads as Robinhood) an Alpaca or moomoo row would
+    otherwise be left unmanaged without a word — they are named, with no
+    question (there is no other broker to keep)."""
     old = {"2": "alpaca", "3": "moomoo"}.get(saved_bc, "robinhood")
     new = cfg.get("broker")
-    if new == old:
-        return True
     rows = (_load(STATE_PATH, {}) or {}).get("positions")
     rows = rows if isinstance(rows, dict) else {}
     stranded = {}  # broker -> ([tagged keys], [untagged keys])
@@ -6546,8 +6560,15 @@ def _confirm_broker_switch(cfg, saved_bc):
             else:
                 what = (f"the agent may try to sell {it} at {now}, where "
                         f"{'it is' if one else 'they are'} not held")
-            print(f"After switching to {now} {what} — sell {it} yourself "
-                  f"in the {was} app.")
+            if new == old:
+                print(f"The agent trades at {now}, so it will NOT sell {it} — "
+                      f"sell {it} yourself in the {was} app, or run setup "
+                      f"again and pick {was}.")
+            else:
+                print(f"After switching to {now} {what} — sell {it} yourself "
+                      f"in the {was} app.")
+    if new == old:
+        return True
     ok = input(f"Switch to {now} anyway? [y/N]: ").strip().lower() == "y"
     if not ok:
         print(f"Keeping {_BROKER_NAMES.get(old, old)}.")
