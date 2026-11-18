@@ -211,3 +211,44 @@ def test_untagged_rows_are_not_promised_unsold(home, monkeypatch, capsys):
     assert "1 real position open at Alpaca" in out
     assert "will NOT sell" not in out
     assert "may try to sell it at Robinhood, where it is not held" in out
+
+
+# ── the saved broker picked again: rows elsewhere are still named ───────────
+
+def test_a_config_reset_still_names_rows_at_another_broker(home, monkeypatch,
+                                                           capsys):
+    # config.json lost its broker (reads as Robinhood) while an Alpaca row
+    # is open: Enter keeps Robinhood, and the Alpaca row is named — never
+    # stranded without a word. Nothing to switch away from: no question.
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:live")}}
+    cfg, asked, set_up, out = _drive(home, monkeypatch, capsys,
+                                     {"source": "agenthc"}, broker="",
+                                     state=state)
+    assert cfg["broker"] == "robinhood" and set_up == ["robinhood"]
+    assert not any(p.startswith("Switch to") for p in asked)
+    assert "1 real position open at Alpaca" in out and "NVDA" in out
+    assert "will NOT sell it" in out and "in the Alpaca app" in out
+
+
+def test_re_picking_the_saved_broker_names_rows_left_elsewhere(home, monkeypatch,
+                                                               capsys):
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:live"),
+                           "AAPL|2026-11-21|250.0|P": _real_at("moomoo:real")}}
+    cfg, asked, set_up, out = _drive(home, monkeypatch, capsys,
+                                     {**BASE, "broker": "alpaca"}, broker="",
+                                     state=state)
+    assert cfg["broker"] == "alpaca" and set_up == ["alpaca"]
+    assert not any(p.startswith("Switch to") for p in asked)
+    assert "open at moomoo" in out and "AAPL" in out
+    assert "open at Alpaca" not in out and "NVDA" not in out
+
+
+def test_re_picking_the_saved_broker_with_its_own_rows_says_nothing(
+        home, monkeypatch, capsys):
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:live"),
+                           "AAPL|2026-11-21|250.0|P": dict(UNTAGGED)}}
+    cfg, asked, _, out = _drive(home, monkeypatch, capsys,
+                                {**BASE, "broker": "alpaca"}, broker="2",
+                                state=state)
+    assert cfg["broker"] == "alpaca" and "WARNING" not in out
+    assert not any(p.startswith("Switch to") for p in asked)
