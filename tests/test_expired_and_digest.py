@@ -122,6 +122,28 @@ def test_contracts_an_exit_row_already_counted_are_not_booked_again(morning_afte
     assert x["contract"] == CONTRACT and x["qty"] == 3 and x["est_pnl_usd"] == -300.0
 
 
+def test_contracts_counted_by_a_sell_that_died_are_rebooked_once(morning_after):
+    """2x counted by a sell row at +$50 each whose order died unfilled, plus
+    1x never sold: all three expired. The prune books -$150 for the unsold
+    one and -$200 a piece for the two (total loss less the +$50 counted);
+    a second prune never books them again."""
+    row = {"option_id": "o", "qty": 3, "exit_logged": 2, "exit_logged_pc": 50.0,
+           "entry_mark": 1.5, "opened_event": "e1"}
+    state = {"positions": {KEY: dict(row)}}
+    agent._prune_expired_positions({}, state, lambda s: None)
+    [x] = _exits()
+    assert x["qty"] == 3 and x["est_pnl_usd"] == -550.0
+    assert "never filled" in x["reason"]
+    agent._prune_expired_positions({}, {"positions": {KEY: dict(row)}}, lambda s: None)
+    assert len(_exits()) == 1
+    # a sell still pending at the prune may have filled: only the unsold 1x
+    morning = {"positions": {"QQQ|2026-11-13|600.0|P": {
+        **row, "opened_event": "e2",
+        "pending": {"order_id": "o-1", "side": "sell", "requested": 2}}}}
+    agent._prune_expired_positions({}, morning, lambda s: None)
+    assert [(x["qty"], x["est_pnl_usd"]) for x in _exits()][1] == (1, -150.0)
+
+
 def test_closed_outside_records_are_not_booked(morning_after):
     state = {"positions": {}, "closed_outside": {KEY: {"at": "2026-11-12T15:00:00+00:00",
                                                       "qty": 5, "cause": "sold"}}}

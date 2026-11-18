@@ -1645,7 +1645,8 @@ def _prune_expired_positions(cfg, state, save_state):
 def _expired_exit_row(cfg, key, row):
     """The trade-log exit row for a ledger row that expired still holding
     contracts, or None (nothing left to book: no contracts, or an exit row
-    already counted them — exit_logged).
+    already counted them — exit_logged — and nothing says that sale died
+    unfilled with a known estimate to correct; see `resold` below).
 
     No sale happened, so the estimate is a total loss of what was paid:
     -(entry_mark x qty x 100). Without an entry quote it is logged with no
@@ -1657,7 +1658,20 @@ def _expired_exit_row(cfg, key, row):
     if not isinstance(row, dict):
         return None
     held = _int0(row.get("qty"))
-    qty = held - min(held, _int0(row.get("exit_logged")))
+    logged = min(held, _int0(row.get("exit_logged")))
+    unsold = held - logged
+    entry = _float0(row.get("entry_mark"))
+    # Contracts an exit row already counted (exit_logged) whose sale then
+    # died unfilled (a Robinhood sell that never filled, say): that row
+    # booked them as sold at its quote, but they expired. Re-booked here
+    # as the total loss they are, less what that row counted for them
+    # (exit_logged_pc) — only when that is known, and never while a sell
+    # is still pending (it may have filled at the close).
+    pc = row.get("exit_logged_pc")
+    pend = row.get("pending") if isinstance(row.get("pending"), dict) else {}
+    resold = (logged if logged >= 1 and pend.get("side") != "sell"
+              and 0 < entry < float("inf") and _num_ok(pc) else 0)
+    qty = unsold + resold
     if qty < 1:
         return None
     dry = bool(row.get("dry"))
@@ -1668,11 +1682,14 @@ def _expired_exit_row(cfg, key, row):
         rec["closed_at"] = _iso_at(_close_epoch(cfg, key.split("|")[1]))
     except (ValueError, OverflowError, OSError):
         pass  # no day to put it on: unmeasured, never counted on today
-    entry = _float0(row.get("entry_mark"))
     if "closed_at" in rec and 0 < entry < float("inf"):
-        rec["est_pnl_usd"] = round(-entry * qty * 100, 2)
+        rec["est_pnl_usd"] = round(-entry * unsold * 100
+                                   + (-entry * 100 - float(pc or 0)) * resold, 2)
         rec["reason"] = (f"Expired without a sale — counted as a total loss "
                          f"of the ${entry:.2f} entry quote (estimate)")
+        if resold:
+            rec["reason"] += (f"; {resold}x of it had been counted as sold by "
+                              "a sell order that never filled — corrected")
     else:
         rec["reason"] = ("Expired without a sale — no entry quote was "
                          "recorded, so the loss isn't measured")
@@ -1686,6 +1703,29 @@ def _expired_exit_row(cfg, key, row):
     if book:
         facts["book"] = book
     return _row_facts(rec, cfg, **facts)
+
+
+def _num_ok(v):
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v))
+
+
+def _note_logged_estimate(row, prior, counted, est):
+    """An exit row just counted `counted` more contracts of `row` whose
+    sale is still working (exit_logged): keep, per contract, the P&L the
+    log now holds for all of exit_logged (row["exit_logged_pc"]; an exit
+    with no estimate counted 0). None when it can't be told (contracts an
+    older version, or the ledger check, counted with an unknown
+    estimate): those are never re-booked at expiry (_expired_exit_row)."""
+    prior = prior if isinstance(prior, dict) else {}
+    n0 = _int0(prior.get("exit_logged"))
+    pc0 = prior.get("exit_logged_pc") if n0 >= 1 else 0.0
+    new = (est / counted) if _num_ok(est) else 0.0
+    if n0 >= 1 and not _num_ok(pc0):
+        row["exit_logged_pc"] = None
+        return
+    row["exit_logged_pc"] = round((float(pc0) * n0 + new * counted)
+                                  / (n0 + counted), 4)
 
 
 def _logged_event(event_id):
@@ -3132,6 +3172,7 @@ def _close_outside(cfg, state, save_state, broker, key, target, px, closed_at,
             pos["exit_logged"] = left
         else:
             pos.pop("exit_logged", None)
+            pos.pop("exit_logged_pc", None)
         if ids:
             pos["fill_ids_used"] = (list(snap.get("fill_ids_used") or [])
                                     + list(ids))[-_FILL_IDS_KEPT:]
@@ -4346,6 +4387,12 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                    if counted >= 1 else None)
             if est is not None:
                 record["est_pnl_usd"] = est
+            left = state["positions"].get(pos_key)
+            if (counted >= 1 and isinstance(left, dict)
+                    and _int0(left.get("exit_logged")) >= 1):
+                # a sale still working: what this row counted for those
+                # contracts, should the sale die and the contract expire
+                _note_logged_estimate(left, prior_pos, counted, est)
             if sold >= 1 and counted < sold:
                 # e.g. re-selling an exit's remainder that the first exit
                 # row already counted: the P&L doesn't count it twice
@@ -6423,6 +6470,9 @@ def _adopt(cfg, state, broker, client, oid, key, h, have, tag, c, now_et, now):
         _mark_exiting(row, {"exit_cause": "ledger_check", "event_id": f"ledger|{key}"})
         # the exit that lost them was logged already: no second P&L for them
         row["exit_logged"] = min(target, _int0(row.get("exit_logged")) + add)
+        # ...with an estimate this row doesn't know: never corrected at
+        # expiry (_expired_exit_row)
+        row["exit_logged_pc"] = None
     c["done"] = True
     note = (f"your {name} account holds {h}x, the agent's ledger listed {have} — "
             f"re-added {add}x (its own filled orders: bought {bought}, {sold} "

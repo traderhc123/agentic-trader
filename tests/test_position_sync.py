@@ -1872,6 +1872,41 @@ def test_pending_sell_exit_logs_requested_and_marks_exit_logged(home):
     assert st["positions"][KEY]["exit_logged"] == 2
 
 
+@pytest.mark.parametrize("filled, booked", [(0, -400.0), (1, -200.0)])
+def test_pending_sell_that_dies_then_expires_is_rebooked_as_a_loss(home, filled,
+                                                                  booked):
+    """Follow-up to audit PR7: the exit row counted the working sell at its
+    quote (+$100 for 2x at 2.00 over a 1.50 entry) and exit_logged kept the
+    expiry prune from booking it. The sell then died with nothing (or one)
+    filled and the contract expired: the prune re-books the unsold
+    contracts as the loss they are, less what the exit row counted."""
+    from brokers import robinhood
+
+    def working(pos, state):
+        pos["pending"] = {"order_id": "o-9", "side": "sell", "requested": 2}
+        return True
+    st = _state()
+    handle(st, ScriptedExit(working, mark=2.0))
+    row = st["positions"][KEY]
+    assert row["exit_logged"] == 2 and row["exit_logged_pc"] == 50.0
+    # still pending at the prune: it may have filled at the close — no row
+    assert agent._expired_exit_row({}, KEY, dict(row)) is None
+    robinhood._finalize_pending(st, KEY, filled)     # the sell dies
+    rec = agent._expired_exit_row({}, KEY, st["positions"][KEY])
+    assert rec["qty"] == 2 - filled and rec["est_pnl_usd"] == booked
+    (first,) = _log(home)
+    # sold (if any) at 2.00, the rest lost: the two rows add up to that
+    assert first["est_pnl_usd"] + booked == round(50.0 * filled - 150.0 * (2 - filled), 2)
+
+
+def test_ledger_counted_contracts_with_no_known_estimate_are_not_rebooked(home):
+    """exit_logged from the ledger check (or an older version) carries no
+    estimate this row knows: the prune keeps the old behaviour (no row)."""
+    row = _row(exit_logged=2, exit_logged_pc=None)
+    assert agent._expired_exit_row({}, KEY, row) is None
+    assert agent._expired_exit_row({}, KEY, _row(exit_logged=2)) is None
+
+
 def test_partial_fill_exit_row_qty_is_sold(home):
     def partial(pos, state):
         pos["qty"] = 1
