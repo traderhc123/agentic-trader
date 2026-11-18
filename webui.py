@@ -4468,18 +4468,23 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "diff_sha256": self_edit.diff_sha256(p)}
 
     def proposal_apply(_h, data):
-        """POST /api/proposal/apply [{diff_sha256}]. apply_and_restart
-        always refuses a cut diff or one made against older code; with the
-        sha the page was shown (GET /api/proposal), no other change either.
-        A sha that is sent must be one: never read as "no sha"."""
+        """POST /api/proposal/apply {diff_sha256}: apply only the change
+        whose diff has the sha256 the page was shown (GET /api/proposal), as
+        /v2 does. A body without it (a page loaded before this rule, any
+        other client) applies nothing: the change waiting may not be the one
+        on the owner's screen. apply_and_restart also refuses a cut diff or
+        one made against older code."""
         import re as _re
         import self_edit
-        sha = None
-        if isinstance(data, dict) and "diff_sha256" in data:
-            sha = data["diff_sha256"]
-            if not (isinstance(sha, str) and _re.fullmatch(r"[0-9a-f]{64}", sha)):
-                return {"ok": False, "reply": "diff_sha256 must be the sha256 "
-                        "of the change you reviewed — nothing was applied"}
+        sha = data.get("diff_sha256") if isinstance(data, dict) else None
+        if sha is None:
+            return {"ok": False, "reply": "Nothing was applied: this page "
+                    "didn't say which change you reviewed. Reload the page, "
+                    "read the change again, then press Apply."}
+        if not (isinstance(sha, str) and _re.fullmatch(r"[0-9a-f]{64}", sha)):
+            return {"ok": False, "reply": "diff_sha256 must be the sha256 "
+                    "of the change you reviewed — nothing was applied. "
+                    "Reload the page and review the change again."}
         ok, msg = self_edit.apply_and_restart(restart=get_status is not None,
                                               expect_sha256=sha)
         return {"ok": ok, "reply": msg}
