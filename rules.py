@@ -47,6 +47,51 @@ def _num(value, cast=float):
         return 0
 
 
+def _est(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:
+        return None
+    return float(v)
+
+
+def fold_corrections(trades):
+    """`trades` (log rows, oldest first) with each correction folded into
+    the exit row it corrects, so one position is one result in every
+    win/loss count.
+
+    A correction is an exit row with "corrects": the event_id of an earlier
+    exit row of the same contract and mode that booked a sale whose order
+    then died unfilled, the contracts expiring later (agent._expired_exit_row).
+    That earlier row comes back as a copy carrying the sum of both
+    estimates, and the correction row is left out. A correction whose
+    earlier row isn't among `trades` (a window of the log) stays, still
+    carrying "corrects": its P&L counts, but it is never an exit, a win or
+    a loss of its own. Never changes the rows passed in."""
+    out = list(trades)
+    last = {}  # (dry, contract, event_id) -> index of the latest exit row
+    for i, t in enumerate(out):
+        if not isinstance(t, dict) or t.get("action") != "exit":
+            continue
+        dry, contract = bool(t.get("dry")), t.get("contract")
+        target = t.get("corrects")
+        if not target:
+            last[(dry, contract, t.get("event_id"))] = i
+            continue
+        j = last.get((dry, contract, target))
+        if j is None:
+            continue  # its row isn't here: P&L only (see above)
+        orig, fix = _est(out[j].get("est_pnl_usd")), _est(t.get("est_pnl_usd"))
+        if fix is not None:
+            out[j] = {**out[j], "est_pnl_usd": round((orig or 0.0) + fix, 2)}
+        out[i] = None
+    return [t for t in out if t is not None]
+
+
+def is_correction(t):
+    """An exit row that only corrects an earlier one (fold_corrections):
+    never counted as an exit, a win or a loss of its own."""
+    return isinstance(t, dict) and bool(t.get("corrects"))
+
+
 def exit_results(trades):
     """One estimated P&L (USD) per closed-or-closing position in `trades`
     (log rows, oldest first), in the order each was last sold; None when
@@ -68,7 +113,9 @@ def exit_results(trades):
     rows and add it to this key — or one book's partial exit would merge
     with the other book's exit and two losses would count as one."""
     results, open_ = [], {}
-    for t in trades:
+    for t in fold_corrections(trades):
+        if is_correction(t):
+            continue  # corrects a position sold on an earlier day: not a result
         key = (bool(t.get("dry")), t.get("contract"))
         if t.get("action") == "entry":
             open_.pop(key, None)  # a new position: its exits are its own

@@ -1665,7 +1665,7 @@ class FakeAlpaca0DTE(FakeAlpaca):
     KEY = "SPY|2026-10-30|752.0|C"
 
 
-def _alpaca(monkeypatch, clock, after_cancel=("pending_cancel", "0"),
+def _alpaca(monkeypatch, clock, after_cancel=("canceled", "0"),
             fake=FakeAlpaca):
     """The real Alpaca adapter on a FakeAlpaca, one trusted row."""
     import types
@@ -1817,21 +1817,37 @@ def test_alpaca_paper_row_blocked_after_switch_to_live_with_startup_client(
     assert st2["positions"][KEY]["acct"] == "alpaca:live"
 
 
-def test_alpaca_exit_with_unconfirmed_cancel_says_check_this_trade(home, clock,
-                                                                   monkeypatch, notes):
-    """The exit's cancel can't be confirmed, so the agent assumes it sold:
-    the report is about the sell (exit_failed) and the alert doesn't claim
-    the trade wasn't placed."""
-    alpaca, http, st, client = _alpaca(monkeypatch, clock, after_cancel=("", "0"))
-    assert handle(st, alpaca, cfg=ALPACA, client=client).startswith("EXIT")
+@pytest.mark.parametrize("after_cancel", [("", "0"), ("pending_cancel", "0")],
+                         ids=["unreadable", "pending_cancel"])
+def test_alpaca_exit_with_unconfirmed_cancel_waits_and_never_sells_twice(
+        home, clock, monkeypatch, notes, after_cancel):
+    """The exit's cancel can't be confirmed (state unreadable, or still
+    pending_cancel): it may still fill — or not. It is neither assumed sold
+    (the row went while the contracts could still be held: a missed exit)
+    nor booked as 0 sold (a second sell on top of it). The row and the exit
+    stay; once Alpaca says it filled, that is the exit, with one sell."""
+    alpaca, http, st, client = _alpaca(monkeypatch, clock, after_cancel=after_cancel)
+    for _ in range(3):
+        with pytest.raises(agent.ExitNotDone):
+            handle(st, alpaca, cfg=ALPACA, client=client)
+        clock.tick(30)
+    assert KEY in st["positions"] and st["positions"][KEY]["qty"] == 2
+    assert len(http.posts) == 1
+    problem = _log(home)[0]
+    assert problem["action"] == "exit_failed" and "may still fill" in problem["reason"]
+    assert all("NOT placed" not in n for n in notes)
+    # it filled after all: the account is flat. The row goes — as the
+    # agent's exit or as a close the account check found — with one sell
+    http.after_cancel, http.held = ("filled", "2"), 0
+    for _ in range(12):
+        clock.tick(30)
+        try:
+            handle(st, alpaca, cfg=ALPACA, client=client)
+        except agent.ExitNotDone:
+            continue
+        break
     assert KEY not in st["positions"] and len(http.posts) == 1
-    problem, exit_row = _log(home)
-    assert problem["action"] == "exit_failed" and exit_row["action"] == "exit"
-    assert "the sell order for 2x" in problem["reason"]
-    (note,) = notes
-    assert note.startswith(f"agentic-trader: check this trade ({CONTRACT}) — "
-                           "Alpaca couldn't confirm whether the sell order")
-    assert "NOT placed" not in note
+    assert [r.get("qty") for r in _log(home) if r["action"] == "exit"] == [2]
 
 
 def test_unfilled_exit_without_holdings_reads_is_logged_as_before(home):
@@ -1870,6 +1886,44 @@ def test_pending_sell_exit_logs_requested_and_marks_exit_logged(home):
     (row,) = _log(home)
     assert row["action"] == "exit" and row["qty"] == 2 and row["est_pnl_usd"] == 100.0
     assert st["positions"][KEY]["exit_logged"] == 2
+
+
+@pytest.mark.parametrize("filled, booked", [(0, -400.0), (1, -200.0)])
+def test_pending_sell_that_dies_then_expires_is_rebooked_as_a_loss(home, filled,
+                                                                  booked):
+    """Follow-up to audit PR7: the exit row counted the working sell at its
+    quote (+$100 for 2x at 2.00 over a 1.50 entry) and exit_logged kept the
+    expiry prune from booking it. The sell then died with nothing (or one)
+    filled and the contract expired: the prune re-books the unsold
+    contracts as the loss they are, less what the exit row counted."""
+    from brokers import robinhood
+
+    def working(pos, state):
+        pos["pending"] = {"order_id": "o-9", "side": "sell", "requested": 2}
+        return True
+    st = _state()
+    handle(st, ScriptedExit(working, mark=2.0))
+    row = st["positions"][KEY]
+    assert row["exit_logged"] == 2 and row["exit_logged_pc"] == 50.0
+    # still pending at the prune: it may have filled at the close — no row
+    assert agent._expired_exit_row({}, KEY, dict(row)) is None
+    robinhood._finalize_pending(st, KEY, filled)     # the sell dies
+    rec = agent._expired_exit_row({}, KEY, st["positions"][KEY])
+    assert rec["qty"] == 2 - filled and rec["est_pnl_usd"] == booked
+    (first,) = _log(home)
+    # sold (if any) at 2.00, the rest lost: the two rows add up to that
+    assert first["est_pnl_usd"] + booked == round(50.0 * filled - 150.0 * (2 - filled), 2)
+    # one position, one result: the correction folds into the sale's row
+    assert rec["corrects"] == first["event_id"]
+    assert rules.exit_results([first, rec]) == [first["est_pnl_usd"] + booked]
+
+
+def test_ledger_counted_contracts_with_no_known_estimate_are_not_rebooked(home):
+    """exit_logged from the ledger check (or an older version) carries no
+    estimate this row knows: the prune keeps the old behaviour (no row)."""
+    row = _row(exit_logged=2, exit_logged_pc=None)
+    assert agent._expired_exit_row({}, KEY, row) is None
+    assert agent._expired_exit_row({}, KEY, _row(exit_logged=2)) is None
 
 
 def test_partial_fill_exit_row_qty_is_sold(home):
