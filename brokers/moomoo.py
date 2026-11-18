@@ -32,7 +32,9 @@ state["unconfirmed_orders"] and keeps looking (reconcile). The same lookup
 runs before every buy, so a signal handled again after a crash (before
 state.json was saved) never sends a second buy. moomoo doesn't refuse a
 repeated remark itself: the lookup is what stops the repeat. An order
-OpenD explicitly turns down stays a plain failure.
+OpenD explicitly turns down stays a plain failure once moomoo's order list
+confirms it isn't there; while that list can't be read it is tracked as
+unclear like the rest (an answer the SDK couldn't decode looks the same).
 """
 
 import math
@@ -754,6 +756,27 @@ def execute(cl, cfg, event, state):
                       "but the order is there — using it")
                 return _adopt_order(state, pos_key, event.get("event_id"), code,
                                     contract, found, qty)
+            if found is None:
+                # the order list can't be read: the buy may be at moomoo
+                # all the same (an answer the SDK couldn't decode). Unclear,
+                # not rejected: noted like _Unconfirmed, so reconcile keeps
+                # looking and its exit waits until that is known.
+                order_guard.note(state, pos_key, "buy", key, qty, code,
+                                 event_id=event.get("event_id"),
+                                 contract=contract)
+                print(f"  OpenD reported an error for the buy order ({exc}) "
+                      "and the order list can't be read — NOT sending it "
+                      "again without knowing")
+                broker_events.report(
+                    "order_failed",
+                    f"moomoo answered the buy order for {qty}x {contract} with "
+                    f"an error ({str(exc)[:200]}) and the agent couldn't read "
+                    "your moomoo orders to check whether it went through "
+                    "anyway. It will NOT send this buy again. Check your "
+                    "moomoo app: if the order is there, the agent finds it on "
+                    "its own and manages the position; if it isn't, this "
+                    "trade was missed.", placed=True)
+                return False
             print(f"  ORDER FAILED: {exc}")
             broker_events.report("order_failed",
                                  f"moomoo rejected the buy order: {exc}")

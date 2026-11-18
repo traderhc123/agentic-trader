@@ -444,3 +444,70 @@ def test_same_day_unclear_buy_is_dropped_without_a_history_query(
     moomoo.reconcile(moomoo.client(CFG), CFG, state, lambda s: None)
     assert order_guard.unconfirmed(state) == {} and state["positions"] == {}
     assert not any(isinstance(q, tuple) for q in opend.queries)
+
+
+def _fresh_list_unreadable(opend):
+    """OpenD's cached order list reads (the pre-buy lookup), but asking
+    moomoo itself (refresh_cache=True, the lookup after an error) fails."""
+    real = opend.OpenSecTradeContext
+
+    def ctx(**kw):
+        c = real(**kw)
+        cached = c.order_list_query
+
+        def query(**q):
+            if q.get("refresh_cache") and not opend.orders_ok_fresh:
+                return -1, "disconnected"
+            return cached(**q)
+        c.order_list_query = query
+        return c
+    opend.orders_ok_fresh = False
+    opend.OpenSecTradeContext = ctx
+
+
+def test_buy_error_with_unreadable_order_list_is_tracked_not_rejected(
+        opend, reports):
+    # the order reached moomoo, the SDK couldn't decode the answer, and the
+    # order list can't be read to check: unclear, never "rejected"
+    opend.mode = "timeout"
+    opend.reply = "Error parsing message with type 'Trd_PlaceOrder.Response'"
+    _fresh_list_unreadable(opend)
+    state = {"positions": {}}
+    assert moomoo.execute(None, CFG, _ev(), state) is False
+    assert len(opend.sent) == 1 and len(opend.book) == 1
+    unc = order_guard.get(state, KEY)
+    assert unc and unc["side"] == "buy" and unc["qty"] == 2
+    assert unc["key"] == opend.sent[0]["remark"]
+    assert unc["event_id"] == _ev()["event_id"]
+    assert not any("rejected" in m for _k, m, _kw in reports)
+    assert reports[-1][0] == "order_failed" and reports[-1][2].get("placed")
+    # the exit waits while moomoo can't say
+    with pytest.raises(RuntimeError):
+        moomoo.execute(None, CFG, _ev(event="EXITED", event_id="x1"), state)
+    # no second buy for the signal or the contract meanwhile
+    assert moomoo.execute(None, CFG, _ev(event_id="e2"), state) is False
+    assert len(opend.sent) == 1
+    # once moomoo can be read, reconcile adopts it as the position
+    opend.orders_ok_fresh = True
+    moomoo.reconcile(moomoo.client(CFG), CFG, state, lambda s: None)
+    assert state["positions"][KEY]["order_ids"] == ["mm-1"]
+    assert order_guard.unconfirmed(state) == {}
+    assert len(opend.sent) == 1
+
+
+def test_buy_rejection_with_unreadable_order_list_is_not_called_rejected(
+        opend, reports):
+    # OpenD's words alone can't prove nothing reached moomoo while the list
+    # can't be read: tracked, and dropped once moomoo confirms it isn't there
+    opend.mode, opend.reply = "reject", "insufficient buying power"
+    _fresh_list_unreadable(opend)
+    state = {"positions": {}}
+    assert moomoo.execute(None, CFG, _ev(), state) is False
+    assert order_guard.get(state, KEY)
+    assert not any("rejected" in m for _k, m, _kw in reports)
+    opend.orders_ok_fresh = True
+    state[order_guard.STATE_KEY][KEY]["at"] = (
+        time.time() - order_guard.BUY_KEEP_S - 5)
+    moomoo.reconcile(moomoo.client(CFG), CFG, state, lambda s: None)
+    assert order_guard.unconfirmed(state) == {} and state["positions"] == {}
+    assert len(opend.sent) == 1
