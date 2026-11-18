@@ -4381,12 +4381,21 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         mod = BROKERS.get(str(data.get("broker", "")))
         if mod is None or not callable(getattr(mod, "connect", None)):
             return {"ok": False, "error": "unknown broker"}
+        before = dict(cfg)
         ok, msg = mod.connect(cfg, data.get("values", {}) or {})
         if not ok:
             return {"ok": False, "error": msg}
         pending["broker_last4"] = str(data.get("broker", ""))[:6]
         save_now()
-        return {"ok": True, "note": msg}
+        res = {"ok": True, "note": msg}
+        try:  # real rows left in the other broker, mode or account: named
+            left = A._switch_left_behind(before, cfg)
+        except Exception:
+            left = []
+        if left:
+            res["left_behind"] = [f"{h} {a}" for h, a in left]
+            res["note"] = msg + " — " + " ".join(res["left_behind"])
+        return res
 
     def update_check(_h):
         # "?force=1": the owner asked to check now (else a recent answer)
@@ -5847,12 +5856,18 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             notes = [f"It does not switch between Practice and LIVE: "
                      f"{'Practice' if A._mode(cfg) == 'practice' else 'LIVE'} "
                      "stays.", does_not_trade]
-            if before["id"] and account_tag(cfg) != account_tag(trial):
+            # the real rows it leaves unsold, by name: at another broker, or
+            # in this broker's other mode (paper/live) or another account
+            left = [f"{h} {a}" for h, a in A._switch_left_behind(cfg, trial)]
+            if left:
+                notes.extend(left)
+            elif before["id"] and account_tag(cfg) != account_tag(trial):
                 notes.append("Positions the agent opened in the account it "
                              "uses now are not sold from the new one: look "
                              "after those at your current broker.")
             wait = _two_step("broker_connect", p, data, [_change(
-                "broker", "Broker account", before, after, direction)], notes)
+                "broker", "Broker account", before, after, direction)], notes,
+                bind={"left_behind": left} if left else None)
             fp = _fingerprint()  # what the token was just redeemed against
         if wait:
             return wait
