@@ -5,7 +5,8 @@
    on the new computer, both computers then sold the same real positions.
    A downloaded file now retires this computer when the limit runs out (as
    "I saved the file" would); a file that never left it still lifts the
-   hold, as before.
+   hold, as before. (Later: a downloaded file stops ENTRIES for good, but
+   exits keep running, see the exits-only tests below.)
 2. With no agent in the page's process (the setup wizard), a move file was
    "current" no matter what: an agent started and stopped elsewhere after
    the file was made could have traded. Now the memory and the trade log
@@ -13,6 +14,8 @@
 
 import os
 import time
+
+import pytest
 
 import agent
 import keep_running
@@ -42,6 +45,11 @@ class _Timers:
         fn(*args)
 
 
+@pytest.fixture(autouse=True)
+def _no_exits_only_left_over(monkeypatch):
+    monkeypatch.setitem(agent._EXITS_ONLY_RUN, "on", False)
+
+
 def _told(monkeypatch):
     told = []
     monkeypatch.setattr(agent, "notify",
@@ -49,8 +57,12 @@ def _told(monkeypatch):
     return told
 
 
-def test_a_downloaded_unfinished_move_retires_this_computer(mover,
-                                                            monkeypatch):
+def test_a_downloaded_unfinished_move_stops_entries_but_keeps_exits(
+        mover, monkeypatch):
+    """The file may run on the other computer now, or it may never be
+    imported: this one takes no new entries (for good, also after a
+    restart) but keeps selling what it holds, so no real position is ever
+    left with no computer to sell it."""
     timers = _Timers()
     monkeypatch.setattr(webui.threading, "Timer", timers)
     told = _told(monkeypatch)
@@ -58,19 +70,27 @@ def test_a_downloaded_unfinished_move_retires_this_computer(mover,
     assert routes["/api/move/export"](None, {"passphrase": PW})["ok"]
     assert routes["/api/move/download"](None).body   # the file has left
     timers.fire()                                    # 10 minutes later
-    # the new computer may run the file and sell its positions: this one
-    # never trades again by itself, also not after a restart
-    assert transfer.HANDOFF["hold"] is True
-    assert transfer.moved_away()
-    assert agent._full_hold_note()
-    assert told and "retired" in told[0] and "resume-here" in told[0]
-    # what the owner's chat "resume" says: not here
+    # exits, the expiry guard and the holdings check run again
+    assert transfer.HANDOFF["hold"] is False and not agent._full_hold_note()
+    assert transfer.moved_away() is None
+    # ... but no new entries, and a restart (a new run) keeps it so
+    assert agent._paused({})
+    monkeypatch.setitem(agent._EXITS_ONLY_RUN, "on", False)
+    assert transfer.exits_only() is not None and agent._paused({})
+    assert told and "NO new entries" in told[0] and "resume-here" in told[0]
+    # the owner's Resume can't undo it; resume-here can
     handled, reply = agent._apply_command("resume")
-    assert handled and "resume-here" in reply
-    assert transfer.HANDOFF["hold"] is True
+    assert handled and "resume-here" in reply and agent._paused({})
     # the old file is gone: nothing to download or finish with any more
     r = routes["/api/move/download"](None)
     assert isinstance(r, dict) and r["ok"] is False
+    assert transfer.resume_here() is True
+    assert transfer.exits_only() is None and not agent._paused({})
+
+
+def test_exits_only_never_travels_in_a_move_file(home):
+    transfer.mark_exits_only()
+    assert not transfer._travels("MOVE_EXITS_ONLY")
 
 
 def test_a_file_never_downloaded_still_lifts_the_hold(mover, monkeypatch):
@@ -188,3 +208,103 @@ def test_an_import_clears_the_staged_files_a_killed_import_left(tmp_path,
     assert left == ["state.json.import-bak.tmp"]
     assert (new / "state.json").read_text(encoding="utf-8") == \
         '{"positions": {}}'
+
+
+# ── exits-only: the other computer may already have sold ────────────────────
+
+class _OtherComputerSold:
+    """Alpaca for an account whose contracts the OTHER computer has already
+    sold: no position, and a filled sell_to_close this computer never
+    placed. Records every order this computer sends."""
+
+    def __init__(self, monkeypatch, occ, sold_at):
+        from brokers import alpaca
+        self.occ, self.posts = occ, []
+        self.fill = {"id": "other-pc-1", "symbol": occ, "side": "sell",
+                     "position_intent": "sell_to_close", "status": "filled",
+                     "filled_qty": "2", "filled_avg_price": "1.80",
+                     "filled_at": sold_at}
+        monkeypatch.setattr(alpaca.requests, "post", self.post)
+        monkeypatch.setattr(alpaca.requests, "get", self.get)
+        monkeypatch.setattr(alpaca.requests, "delete",
+                            lambda url, **kw: _Resp(204, {}))
+
+    def post(self, url, **kw):
+        self.posts.append(dict(kw.get("json") or {}))
+        return _Resp(200, {"id": "this-pc-1", "status": "filled"})
+
+    def get(self, url, **kw):
+        if url.endswith("/v2/positions"):
+            return _Resp(200, [])                      # nothing held
+        if url.endswith("/v2/orders"):
+            return _Resp(200, [dict(self.fill)])
+        if "quotes/latest" in url:
+            return _Resp(200, {"quotes": {self.occ: {"ap": 1.9, "bp": 1.8}}})
+        return _Resp(404, {})
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+        self.text = str(body)
+
+    def json(self):
+        return self._body
+
+
+def test_exits_only_never_sells_what_the_other_computer_already_sold(
+        home, monkeypatch):
+    """Downloaded, unfinished move: the other computer imported the file and
+    sold the position; this one gets the exit signal too. It reads the
+    holdings first, so it places no order (no sell to open), and its
+    holdings check then books the row as sold outside it."""
+    from datetime import datetime, timezone
+
+    import broker_events
+    from brokers import account_tag, alpaca
+    from conftest import make_event
+    clock = {"t": datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc).timestamp()}
+    monkeypatch.setattr(agent, "_now", lambda: clock["t"])
+    monkeypatch.setattr(agent, "_et_now", lambda: datetime(
+        2026, 10, 30, 11, 0, tzinfo=agent.MARKET_TZ))
+    monkeypatch.setattr(agent, "_market_open_now", lambda: True)
+    monkeypatch.setattr(agent, "_in_open_rush", lambda: False)
+    monkeypatch.setitem(agent._POS_SYNC, "next_at", 0.0)
+    monkeypatch.setattr(agent, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    broker_events.begin()
+    cfg = {"dry_run": False, "broker": "alpaca", "alpaca_key_id": "k",
+           "alpaca_secret": "s", "contracts_per_trade": 2, "source": "agenthc"}
+    occ, key = "SPY991218C00752000", "SPY|2099-12-18|752.0|C"
+    tag = account_tag(cfg)
+    api = _OtherComputerSold(monkeypatch, occ, "2026-10-30T14:58:00Z")
+    transfer.mark_exits_only()               # the move's 10 minutes ran out
+    st = {"seen": [], "positions": {key: {
+        "option_id": occ, "qty": 2, "opened_event": "open-1", "acct": tag,
+        "entry_mark": 1.5, "opened_at": clock["t"] - 3600,
+        "last_order_at": clock["t"] - 3600, "order_ids": ["this-pc-0"]}},
+        "position_sync": {"proven": {tag: "2026-10-29T15:00:00+00:00"}}}
+    cl = alpaca.client(cfg)
+    # a new signal: no entry here any more
+    agent.handle_event(make_event(ticker="QQQ", expiry="2099-12-18",
+                                  event_id="new-1"), cfg, st, alpaca, cl,
+                       lambda s: None)
+    assert "unfinished move" in agent.handle_event(
+        make_event(ticker="QQQ", expiry="2099-12-18", event_id="new-2"), cfg,
+        st, alpaca, cl, lambda s: None)
+    # the exit signal the other computer already acted on: the holdings are
+    # read before the sell — none held, so no order; the signal is kept
+    exit_ev = make_event(event="EXITED", expiry="2099-12-18", event_id="x-1")
+    with pytest.raises(agent.ExitNotDone):
+        agent.handle_event(exit_ev, cfg, st, alpaca, cl, lambda s: None)
+    assert api.posts == []                   # no buy, and no second sell
+    # the holdings check: two reads apart, then the row is settled as sold
+    agent._sync_positions(cfg, st, lambda s: None, alpaca, cl)
+    clock["t"] += 60
+    agent._sync_positions(cfg, st, lambda s: None, alpaca, cl)
+    assert key not in st["positions"]
+    # the kept signal, tried again: nothing left to sell, still no order
+    agent.handle_event(exit_ev, cfg, st, alpaca, cl, lambda s: None)
+    assert api.posts == []
+    rows = [r for r in agent._read_trade_log() if r.get("manual")]
+    assert rows and rows[-1]["action"] == "exit" and rows[-1]["cause"] == "sold"

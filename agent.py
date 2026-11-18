@@ -2122,8 +2122,24 @@ def _mode(cfg, state=None):
 def _paused(cfg):
     """The owner pressed Pause (saved in config.json, so it survives a
     restart): no NEW entries. Exits, the expiry guard and the broker checks
-    keep running."""
-    return bool((cfg or {}).get("paused"))
+    keep running. The same while a downloaded move file may run on another
+    computer (transfer.exits_only): only `resume-here` ends that."""
+    return bool((cfg or {}).get("paused")) or _move_exits_only()
+
+
+# set by the dashboard for this run when the exits-only mark (and a Pause
+# instead) could not be saved: the run still takes no new entries
+_EXITS_ONLY_RUN = {"on": False}
+
+
+def _move_exits_only():
+    import transfer
+    if _EXITS_ONLY_RUN["on"]:
+        return True
+    try:
+        return transfer.exits_only() is not None
+    except Exception:
+        return False
 
 
 def _feed_paid_per_day(cfg):
@@ -3916,8 +3932,11 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         return None
 
     if ev["event"] == "ENTERED" and _paused(cfg):
-        msg = (f"SKIPPED {contract}: the agent is paused — no new entries "
-               "until you press Resume")
+        msg = (f"SKIPPED {contract}: " + (
+            "an unfinished move — the setup may run on another computer, so "
+            "this one takes no new entries (exits still run; python agent.py "
+            "resume-here ends it)" if _move_exits_only() else
+            "the agent is paused — no new entries until you press Resume"))
         print(msg)
         _log_trade(_row_facts(
             {"action": "skip_paused", "book": book, "event_id": ev["event_id"],
@@ -7297,6 +7316,15 @@ def _command(t, cfg, text):
                 "here by itself.) To run it on this computer again after a "
                 "move: stop or destroy the other copy first, then run: "
                 "python agent.py resume-here")
+        if _move_exits_only():
+            return True, (
+                "Can't resume new entries here: a move file made on this "
+                "computer was downloaded but the move was never finished, so "
+                "the setup may be running on another computer too. This one "
+                "only sells the positions it holds. To finish the move, make "
+                "a new move file and press 'I saved the file'. To trade here "
+                "again instead: stop the other computer first, then run: "
+                "python agent.py resume-here")
         cfg.pop("paused", None)
         _save(CONFIG_PATH, cfg, private=True)
         request_feed_read()  # the feed and buying power at once, not on schedule
@@ -7911,6 +7939,9 @@ def cmd_run(app_window=False):
     mode = _mode_label(cfg, state)
     if _state_held():  # damaged state.json: nothing is ordered at all
         mode += ", ON HOLD — no orders at all until you press Resume"
+    elif _move_exits_only():  # a downloaded move file may run elsewhere
+        mode += (", NO NEW ENTRIES — an unfinished move: exits still run "
+                 "(python agent.py resume-here ends it)")
     elif _paused(cfg):  # saved in config.json: still paused after a restart
         mode += ", PAUSED — no new entries until you press Resume"
     if _is_dry(cfg, state) and _dry_run_note(cfg, state):

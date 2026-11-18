@@ -4779,7 +4779,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 return  # the hold is a server hand-off's (or for good) now
             mins = max(1, round(transfer.MOVE_HOLD_S / 60))
             if pending.get("move_downloaded"):
-                msg = _retire_after_unfinished_move(token, mins)
+                msg = _exits_only_after_unfinished_move(token, mins)
             else:
                 _end_move_hold()
                 msg = ("The move to another computer was not finished within "
@@ -4792,34 +4792,41 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         except Exception:
             pass
 
-    def _retire_after_unfinished_move(token, mins):
+    def _exits_only_after_unfinished_move(token, mins):
         """The move file was DOWNLOADED but "I saved the file" never came:
-        it may already run on the other computer, which sells the real
-        positions it holds. Trading here again would make two computers
-        act on the same contracts, so this one is retired as "I saved the
-        file" would (the hold stays on; MOVED_AWAY keeps a restart from
-        trading). Undone only by the owner: `python agent.py resume-here`.
-        Under move_lock. Returns the message for the owner."""
+        it may already run on the other computer. This one takes no new
+        entries any more (transfer.mark_exits_only, kept over a restart)
+        but carries on selling the real positions it holds — they are never
+        left with no computer to sell them. A sell the other computer
+        already made is not made again: the adapters read the holdings
+        before every sell. Under move_lock. Returns the owner's message."""
         import transfer
+        kept = ""
+        A._EXITS_ONLY_RUN["on"] = True   # this run, whatever can be saved
         try:
-            transfer.mark_moved_away()
-            kept = ""
+            transfer.mark_exits_only()
         except OSError as exc:
-            # the hold alone still stops this run; a restart would trade
-            kept = (f" (the 'moved' mark could not be saved: {str(exc)[:80]}"
-                    " — stop the agent here with: python agent.py stop)")
+            try:  # the owner's Pause does the same, short of a resume
+                A.update_config(lambda c: c.__setitem__("paused", True))
+                kept = (" (saved as a Pause: the 'moved' mark could not be "
+                        f"written: {str(exc)[:80]})")
+            except OSError:
+                kept = (" for now (this could not be saved: after a restart "
+                        "it would take new entries again)")
         if transfer.HANDOFF.get("by") is token:
-            transfer.HANDOFF["by"] = None  # no time limit lifts it any more
+            transfer.HANDOFF["by"] = None
+            transfer.HANDOFF["hold"] = False   # exits and the expiry guard
         pending.pop("move_hold", None)
         _forget_move_file()
         return ("The move to another computer was not finished within "
-                f"{mins} minutes, but the move file was downloaded, so it may "
-                "already be running there. To keep two computers from selling "
-                "the same positions, this computer is now retired: it places "
-                "no orders" + kept + ". If the other computer has the setup, "
-                "you're done. If you did NOT start it there, run on THIS "
-                "computer: python agent.py resume-here — then start the agent "
-                "again, so your open positions are managed.")
+                f"{mins} minutes, but the move file was downloaded, so the "
+                "setup may already run there. This computer now takes NO new "
+                "entries" + kept + ", and keeps selling the positions it "
+                "holds on their exit signals (it never sells what the other "
+                "computer already sold). To finish the move: make a new move "
+                "file and press 'I saved the file'. To trade here again "
+                "instead: stop the other computer, then run on THIS "
+                "computer: python agent.py resume-here")
 
     def _move_hold_reaches_expiry_sell():
         """The expiry-day sell time ("H:MM", or the close when the guard is
@@ -4961,7 +4968,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     "of date: the agent here kept trading after it)")}
             blob = pending["move_blob"]
             # the file can be on another computer from now on: an unfinished
-            # move no longer lifts the hold (_retire_after_unfinished_move)
+            # move no longer resumes entries (_exits_only_after_unfinished_move)
             pending["move_downloaded"] = True
         return RawResponse(blob, "application/octet-stream", {
             "Content-Disposition":

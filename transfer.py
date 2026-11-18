@@ -39,7 +39,7 @@ _SCRYPT = {"n": 2 ** 15, "r": 8, "p": 1, "maxmem": 64 * 1024 * 1024, "dklen": 64
 # Machine-specific or transient files that must not travel.
 _SKIP_NAMES = {
     "agent.lock", "agent.pid", "stop.request", "ui_token", ".acl-locked",
-    "launchd.log", "MOVED_AWAY",
+    "launchd.log", "MOVED_AWAY", "MOVE_EXITS_ONLY",
     # what the background process on THIS computer is doing right now: its
     # pid (never another computer's — `stop` may end that process), its note
     # on the last failed start, a pending "try again", the agent's alive mark
@@ -228,6 +228,37 @@ def mark_moved_away():
     return "start-at-login turned off; this computer won't run the agent again"
 
 
+def _exits_only_path():
+    return os.path.join(home(), "MOVE_EXITS_ONLY")
+
+
+def mark_exits_only():
+    """A dashboard move file was downloaded but the move was never finished
+    (webui): it may run on another computer now. This one takes no NEW
+    entries any more — also after a restart — but keeps selling the real
+    positions it holds on their exit signals and the expiry guard, so a
+    position is never left with no computer to sell it. (The broker
+    adapters read the holdings before every sell: what the other computer
+    already sold is not sold again; the holdings check then settles the
+    row.) Ended by finishing a move (MOVED_AWAY) or `resume-here`."""
+    os.makedirs(home(), exist_ok=True)
+    with open(_exits_only_path(), "w", encoding="utf-8") as f:
+        json.dump({"since": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())}, f)
+
+
+def exits_only():
+    """The marker's contents while this computer only sells (mark_exits_only),
+    else None."""
+    try:
+        with open(_exits_only_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}   # there but unreadable: still no new entries
+    return data if isinstance(data, dict) else {}
+
+
 def moved_away():
     """The marker's contents if this setup was moved away, else None."""
     try:
@@ -238,11 +269,16 @@ def moved_away():
 
 
 def resume_here():
-    try:
-        os.remove(_moved_path())
-        return True
-    except OSError:
-        return False
+    """Run the setup here again: forget MOVED_AWAY and MOVE_EXITS_ONLY.
+    True when either was there."""
+    done = False
+    for p in (_moved_path(), _exits_only_path()):
+        try:
+            os.remove(p)
+            done = True
+        except OSError:
+            pass
+    return done
 
 
 # ── import ───────────────────────────────────────────────────────────────────
