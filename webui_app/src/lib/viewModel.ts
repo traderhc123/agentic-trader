@@ -158,8 +158,8 @@ export interface Agent {
 }
 
 export interface Pause {
-  /** entries = the owner's Pause (exits, expiry guard and broker checks keep running); state_hold / handoff_hold / restarting / stopped = no orders at all */
-  kind: "none" | "entries" | "state_hold" | "handoff_hold" | "restarting" | "stopped";
+  /** entries = the owner's Pause (exits, expiry guard and broker checks keep running); move_exits = the same, because a downloaded move file was never finished (only `python agent.py resume-here` ends it, not Resume); state_hold / handoff_hold / restarting / stopped = no orders at all */
+  kind: "none" | "entries" | "move_exits" | "state_hold" | "handoff_hold" | "restarting" | "stopped";
   scope: "none" | "entries" | "all";
   /** the owner's Pause is saved, whatever `kind` says */
   entries_paused: boolean;
@@ -340,7 +340,7 @@ export interface Capabilities {
 
 export interface Answer {
   state: "yes" | "practice_only" | "not_today" | "paused" | "cant" | "unknown";
-  reason_code: "ok" | "practice_mode" | "nothing_open" | "only_practice_positions" | "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "owner_pause" | "pause_feed_not_read" | "broker_down" | "daily_cap_reached" | "daily_loss_reached" | "position_cap_reached" | "market_closed" | "no_signal_access" | "feed_unreachable" | "ai_needed" | "practice_holds_real_sells" | "pass_unchecked";
+  reason_code: "ok" | "practice_mode" | "nothing_open" | "only_practice_positions" | "agent_stopped" | "agent_not_answering" | "state_hold" | "handoff_hold" | "restarting" | "owner_pause" | "move_exits" | "pause_feed_not_read" | "broker_down" | "daily_cap_reached" | "daily_loss_reached" | "position_cap_reached" | "market_closed" | "no_signal_access" | "feed_unreachable" | "ai_needed" | "practice_holds_real_sells" | "pass_unchecked";
 }
 
 export interface Contract {

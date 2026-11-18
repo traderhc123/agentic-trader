@@ -203,7 +203,7 @@ export function HoldGroups({ page, wide }: { page: Page; wide: boolean }) {
   const note =
     !rp.length || page.stale || !s.real_positions_managed
       ? ""
-      : s.pause.kind === "entries"
+      : s.pause.kind === "entries" || s.pause.kind === "move_exits"
         ? " Still sold while new trades are paused."
         : s.mode === "practice"
           ? " Still sold for real while you practice."

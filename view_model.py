@@ -68,8 +68,8 @@ def Lit(value):
 MAP = ("map",)  # {string: string | number}
 
 MODES = ("live", "practice")
-PAUSE_KINDS = ("none", "entries", "state_hold", "handoff_hold", "restarting",
-               "stopped")
+PAUSE_KINDS = ("none", "entries", "move_exits", "state_hold", "handoff_hold",
+               "restarting", "stopped")
 PAUSE_SCOPES = ("none", "entries", "all")
 # why a real position is not being sold for the owner right now
 UNMANAGED_REASONS = ("agent_stopped", "agent_not_answering", "state_hold",
@@ -82,7 +82,8 @@ ANSWER_STATES = ("yes", "practice_only", "not_today", "paused", "cant",
 ANSWER_REASONS = (
     "ok", "practice_mode", "nothing_open", "only_practice_positions",
     "agent_stopped", "agent_not_answering", "state_hold", "handoff_hold",
-    "restarting", "owner_pause", "pause_feed_not_read", "broker_down",
+    "restarting", "owner_pause", "move_exits", "pause_feed_not_read",
+    "broker_down",
     "daily_cap_reached", "daily_loss_reached", "position_cap_reached",
     "market_closed", "no_signal_access", "feed_unreachable", "ai_needed",
     "practice_holds_real_sells", "pass_unchecked")
@@ -476,8 +477,10 @@ _DOC = {
     "Agent.settings_readable": "false: config.json can't be read right now; "
                                "the values shown are the ones the agent runs on",
     "Pause.kind": "entries = the owner's Pause (exits, expiry guard and broker "
-                  "checks keep running); state_hold / handoff_hold / "
-                  "restarting / stopped = no orders at all",
+                  "checks keep running); move_exits = the same, because a "
+                  "downloaded move file was never finished (only `python "
+                  "agent.py resume-here` ends it, not Resume); state_hold / "
+                  "handoff_hold / restarting / stopped = no orders at all",
     "Pause.entries_paused": "the owner's Pause is saved, whatever `kind` says",
     "Pause.since": "null when it was not recorded",
     "Broker.connected": "null: this broker adapter doesn't report it",
@@ -1771,7 +1774,8 @@ def _capabilities(c, limits, market, signals, positions):
     if stopped:
         opening = stopped
     elif c["entries_paused"]:
-        opening = _answer("paused", "owner_pause")
+        opening = _answer("paused", "move_exits" if c.get("move_exits")
+                          else "owner_pause")
     elif not access:
         opening = _answer("cant", "pass_unchecked" if p["status"] == "unknown"
                           else "no_signal_access")
@@ -1951,7 +1955,7 @@ def _fact_conditions(s, ai_blocked, consent_ok=None):
         out.append("agent_not_answering")
     if pause["kind"] in ("state_hold", "handoff_hold", "restarting"):
         out.append(pause["kind"])
-    elif pause["kind"] == "entries":
+    elif pause["kind"] in ("entries", "move_exits"):
         out.append("paused")
     if not a["settings_readable"]:
         out.append("settings_unreadable")
@@ -2045,19 +2049,25 @@ def build_status(cfg, state, rows, runtime=None, now=None,
     mode = A._mode(cfg, state)
     hold = rt.get("hold") if rt.get("hold") in (
         "state_hold", "handoff_hold", "restarting") else None
-    entries_paused = A._paused(cfg)
+    # an unfinished move (transfer.exits_only): the runtime says so for the
+    # run it describes; otherwise the mark on disk
+    move_exits = (rt["move_exits"] if isinstance(rt.get("move_exits"), bool)
+                  else A._move_exits_only())
+    entries_paused = A._paused(cfg) or move_exits
     if not running:
         kind = "stopped"
     elif hold:
         kind = hold
     else:
-        kind = "entries" if entries_paused else "none"
+        kind = ("move_exits" if move_exits
+                else "entries" if entries_paused else "none")
     pause = {
         "kind": kind,
-        "scope": {"none": "none", "entries": "entries"}.get(kind, "all"),
+        "scope": {"none": "none", "entries": "entries",
+                  "move_exits": "entries"}.get(kind, "all"),
         "entries_paused": entries_paused,
         "since": _iso(rt.get("hold_since")) if kind == "state_hold" else None,
-        "survives_restart": (kind in ("entries", "stopped")
+        "survives_restart": (kind in ("entries", "move_exits", "stopped")
                              or (kind == "state_hold"
                                  and rt.get("hold_recorded") is not False)),
         "can_resume": kind in ("entries", "state_hold"),
@@ -2067,6 +2077,7 @@ def build_status(cfg, state, rows, runtime=None, now=None,
     c = {"cfg": cfg, "state": state, "now_et": now.astimezone(A.MARKET_TZ),
          "running": running, "answering": answering, "hold": hold,
          "mode": mode, "entries_paused": entries_paused,
+         "move_exits": kind == "move_exits",
          "acct": _text((rt.get("broker") or {}).get("account_tag")
                        if isinstance(rt.get("broker"), dict) else None, _NAME),
          "broker_down": broker["connected"] is False,

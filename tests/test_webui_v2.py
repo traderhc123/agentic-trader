@@ -225,6 +225,15 @@ def test_fixture_states_cover_the_states_the_dashboard_shows():
     assert got["paused-new-trades"]["pause"]["kind"] == "entries"
     assert got["state-hold"]["pause"]["kind"] == "state_hold"
     assert got["handoff-hold"]["pause"]["kind"] == "handoff_hold"
+    # an unfinished move: selling only, and Resume is not what ends it
+    sell = got["move-selling-only"]
+    assert sell["pause"]["kind"] == "move_exits"
+    assert sell["pause"]["scope"] == "entries"
+    assert sell["pause"]["can_resume"] is False
+    assert sell["pause"]["survives_restart"] is True
+    assert sell["capabilities"]["opening"]["reason_code"] == "move_exits"
+    assert sell["capabilities"]["closing"]["state"] == "yes"
+    assert any("resume-here" in n["text"] for n in sell["notices"])
     assert got["restarting"]["pause"]["kind"] == "restarting"
     assert got["stopped"]["agent"]["running"] is False
     assert got["not-answering"]["agent"] == {

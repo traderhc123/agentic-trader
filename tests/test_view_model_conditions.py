@@ -81,6 +81,7 @@ def test_fixture_states_carry_the_conditions_their_screens_show():
     expect = {"stopped": "agent_stopped", "not-answering": "agent_not_answering",
               "state-hold": "state_hold", "handoff-hold": "handoff_hold",
               "restarting": "restarting", "paused-new-trades": "paused",
+              "move-selling-only": "paused",
               "broker-disconnected": "broker_down", "low-cash": "low_cash",
               "pass-lapsed": "signal_pass", "pass-exits-only": "signal_pass",
               "pass-unchecked": "signal_pass", "day-pass-refused": "signal_pass",

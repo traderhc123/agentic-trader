@@ -308,3 +308,37 @@ def test_exits_only_never_sells_what_the_other_computer_already_sold(
     assert api.posts == []
     rows = [r for r in agent._read_trade_log() if r.get("manual")]
     assert rows and rows[-1]["action"] == "exit" and rows[-1]["cause"] == "sold"
+
+
+# ── the words the old computer shows while it only sells ────────────────────
+
+def test_selling_only_says_why_and_how_to_end_it(home, monkeypatch):
+    """The owner is told, in the pause note, the chat's answer to Resume
+    and the classic status: selling only, why, and that `python agent.py
+    resume-here` ends it when the move was abandoned or never imported."""
+    note = agent.MOVE_EXITS_NOTE
+    for words in ("Selling only", "takes NO new trades",
+                  "still sells the positions it holds",
+                  "python agent.py resume-here", "never opened the file"):
+        assert words in note, words
+    import view_model
+    assert len(note) <= view_model._TEXT   # a notice is cut to that length
+    assert agent._pause_note({}, {}) == ""
+    transfer.mark_exits_only()
+    assert agent._pause_note({}, {"positions": {}}) == note
+    handled, reply = agent._apply_command("resume")
+    assert handled and reply.endswith(note)
+
+
+def test_selling_only_is_its_own_pause_in_the_dashboard(home):
+    import view_model
+    transfer.mark_exits_only()
+    s = agent.view_snapshot({"running": True})
+    assert s["pause"]["kind"] == "move_exits"
+    assert s["pause"]["can_resume"] is False
+    # without the mark: the owner's own Pause, as before
+    transfer.resume_here()
+    s = agent.view_snapshot({"running": True})
+    assert s["pause"]["kind"] == "none"
+    assert view_model.validate(
+        agent.view_snapshot({"running": True, "move_exits": True})) == []

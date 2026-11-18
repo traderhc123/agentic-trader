@@ -113,6 +113,14 @@ export function MovePanel({ onClose }: { onClose: () => void }) {
         </li>
       </ol>
 
+      <p className="m-0 text-sm text-fg2">
+        <b className="text-fg">Didn't finish?</b> If you download the file but don't press step 3 within 10 minutes, this computer
+        switches to selling only: it takes no new trades, because the setup may already be running on the new computer, but it
+        keeps selling what it holds. If you gave up on the move, or never opened the file on another computer, stop any other
+        copy and run <code className="font-mono">python agent.py resume-here</code> on this computer, then start the agent again.
+        The same command brings back a computer you retired in step 3.
+      </p>
+
       <p className="m-0 border-t border-line pt-3 text-sm text-fg2">
         Bringing a setup <b className="text-fg">to</b> this computer instead?{" "}
         <a href="/setup" className="text-accent">
