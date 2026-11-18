@@ -1344,6 +1344,10 @@ def pnl_summary(cfg=None, state=None, rows=None):
     state = state if state is not None else (_load(STATE_PATH, {}) or {})
     rows = _read_trade_log() if rows is None else rows
     passes, kind, tracked_from, paid, est_days = _pass_day_kinds(cfg, state, rows)
+    import rules
+    # a sale that died before its contract expired is one result: its
+    # expiry correction folds into that exit row (rules.fold_corrections)
+    rows = rules.fold_corrections(rows)
 
     def blank():
         return {"total": 0.0, "exits": 0, "wins": 0, "losses": 0,
@@ -1368,6 +1372,13 @@ def pnl_summary(cfg=None, state=None, rows=None):
                 b["unmeasured"] += 1
             continue
         v = float(v)
+        if rules.is_correction(t):
+            # its exit row is outside these rows: the P&L counts, but it
+            # is no exit, win or loss of its own
+            b["total"] += v
+            b["points"].append({"ts": str(t.get("ts", "")),
+                                "cum": round(b["total"], 2)})
+            continue
         # a partial close leaves the position open: keep its opened day for
         # the exit that follows
         day = ((opened.get(key, "") if t.get("partial") else opened.pop(key, ""))
@@ -1645,7 +1656,8 @@ def _prune_expired_positions(cfg, state, save_state):
 def _expired_exit_row(cfg, key, row):
     """The trade-log exit row for a ledger row that expired still holding
     contracts, or None (nothing left to book: no contracts, or an exit row
-    already counted them — exit_logged).
+    already counted them — exit_logged — and nothing says that sale died
+    unfilled with a known estimate to correct; see `resold` below).
 
     No sale happened, so the estimate is a total loss of what was paid:
     -(entry_mark x qty x 100). Without an entry quote it is logged with no
@@ -1657,7 +1669,24 @@ def _expired_exit_row(cfg, key, row):
     if not isinstance(row, dict):
         return None
     held = _int0(row.get("qty"))
-    qty = held - min(held, _int0(row.get("exit_logged")))
+    logged = min(held, _int0(row.get("exit_logged")))
+    unsold = held - logged
+    entry = _float0(row.get("entry_mark"))
+    # Contracts an exit row already counted (exit_logged) whose sale then
+    # died unfilled (a Robinhood sell that never filled, say): that row
+    # booked them as sold at its quote, but they expired. Re-booked here
+    # as the total loss they are, less what that row counted for them
+    # (exit_logged_pc) — only when that is known, and never while a sell
+    # is still pending (it may have filled at the close).
+    # The correction names that exit row (exit_logged_by): the position is
+    # then one result in every win/loss count (rules.fold_corrections).
+    pc = row.get("exit_logged_pc")
+    by = row.get("exit_logged_by")
+    pend = row.get("pending") if isinstance(row.get("pending"), dict) else {}
+    resold = (logged if logged >= 1 and pend.get("side") != "sell"
+              and 0 < entry < float("inf") and _num_ok(pc)
+              and isinstance(by, str) and by else 0)
+    qty = unsold + resold
     if qty < 1:
         return None
     dry = bool(row.get("dry"))
@@ -1668,11 +1697,15 @@ def _expired_exit_row(cfg, key, row):
         rec["closed_at"] = _iso_at(_close_epoch(cfg, key.split("|")[1]))
     except (ValueError, OverflowError, OSError):
         pass  # no day to put it on: unmeasured, never counted on today
-    entry = _float0(row.get("entry_mark"))
     if "closed_at" in rec and 0 < entry < float("inf"):
-        rec["est_pnl_usd"] = round(-entry * qty * 100, 2)
+        rec["est_pnl_usd"] = round(-entry * unsold * 100
+                                   + (-entry * 100 - float(pc or 0)) * resold, 2)
         rec["reason"] = (f"Expired without a sale — counted as a total loss "
                          f"of the ${entry:.2f} entry quote (estimate)")
+        if resold:
+            rec["corrects"] = by
+            rec["reason"] += (f"; {resold}x of it had been counted as sold by "
+                              "a sell order that never filled — corrected")
     else:
         rec["reason"] = ("Expired without a sale — no entry quote was "
                          "recorded, so the loss isn't measured")
@@ -1686,6 +1719,34 @@ def _expired_exit_row(cfg, key, row):
     if book:
         facts["book"] = book
     return _row_facts(rec, cfg, **facts)
+
+
+def _num_ok(v):
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v))
+
+
+def _note_logged_estimate(row, prior, counted, est, event_id):
+    """An exit row just counted `counted` more contracts of `row` whose
+    sale is still working (exit_logged): keep, per contract, the P&L the
+    log now holds for all of exit_logged (row["exit_logged_pc"]; an exit
+    with no estimate counted 0), and that exit row's event_id
+    (row["exit_logged_by"]: an expiry correction folds into it, so the
+    position stays one result — rules.fold_corrections). pc None when it
+    can't be told (contracts an older version, or the ledger check,
+    counted with an unknown estimate): those are never re-booked at
+    expiry (_expired_exit_row)."""
+    prior = prior if isinstance(prior, dict) else {}
+    if event_id:
+        row["exit_logged_by"] = str(event_id)
+    n0 = _int0(prior.get("exit_logged"))
+    pc0 = prior.get("exit_logged_pc") if n0 >= 1 else 0.0
+    new = (est / counted) if _num_ok(est) else 0.0
+    if n0 >= 1 and not _num_ok(pc0):
+        row["exit_logged_pc"] = None
+        return
+    row["exit_logged_pc"] = round((float(pc0) * n0 + new * counted)
+                                  / (n0 + counted), 4)
 
 
 def _logged_event(event_id):
@@ -1727,7 +1788,9 @@ def _maybe_daily_digest(cfg, state, save_state):
         return
     todays = _et_day_log_rows(day)
     entries = sum(1 for t in todays if t.get("action") == "entry")
-    exits = sum(1 for t in todays if t.get("action") == "exit")
+    # an expiry correction of an earlier sale is not an exit of its own
+    exits = sum(1 for t in todays if t.get("action") == "exit"
+                and not t.get("corrects"))
     vetoes = sum(1 for t in todays if t.get("action") == "policy_veto")
     skipped = sum(1 for t in todays if str(t.get("action", "")).startswith("skip"))
     open_pos = list(state.get("positions", {})) or ["none"]
@@ -2122,8 +2185,24 @@ def _mode(cfg, state=None):
 def _paused(cfg):
     """The owner pressed Pause (saved in config.json, so it survives a
     restart): no NEW entries. Exits, the expiry guard and the broker checks
-    keep running."""
-    return bool((cfg or {}).get("paused"))
+    keep running. The same while a downloaded move file may run on another
+    computer (transfer.exits_only): only `resume-here` ends that."""
+    return bool((cfg or {}).get("paused")) or _move_exits_only()
+
+
+# set by the dashboard for this run when the exits-only mark (and a Pause
+# instead) could not be saved: the run still takes no new entries
+_EXITS_ONLY_RUN = {"on": False}
+
+
+def _move_exits_only():
+    import transfer
+    if _EXITS_ONLY_RUN["on"]:
+        return True
+    try:
+        return transfer.exits_only() is not None
+    except Exception:
+        return False
 
 
 def _feed_paid_per_day(cfg):
@@ -2346,7 +2425,7 @@ def _log_unreadable_skip(cfg, state, save_state, ev, book, contract, why, exc):
         rec = {"action": "skip_log_unreadable", "book": book,
                "event_id": ev.get("event_id"), "contract": contract,
                "reason": f"{why} ({str(exc)[:150]})"}
-        if cfg.get("dry_run"):
+        if _is_dry(cfg, state):
             rec["dry"] = True
         _log_trade(_row_facts(rec, cfg, "daily_cap"))
         _UNREADABLE_SKIPS.append(rec)
@@ -2501,7 +2580,7 @@ def _cash_refresh_due(cfg, cash, now=None, now_et=None):
     (default 3600 — only a deposit changes it then), at once when the owner
     goes live or practice, and on Resume / "check now"."""
     now = _now() if now is None else now
-    if _CASH_NOW["on"] or bool(cfg.get("dry_run")) != cash.get("dry"):
+    if _CASH_NOW["on"] or _is_dry(cfg) != cash.get("dry"):
         return True
     every = CASH_REFRESH_S
     if not _feed_window_now(cfg, now_et):
@@ -2515,12 +2594,12 @@ def _refresh_cash(cfg, state, save_state, broker, client, cash):
     once a day in LIVE mode when it can't cover trades."""
     _CASH_NOW["on"] = False
     cash["at"] = _now()
-    cash["dry"] = bool(cfg.get("dry_run"))
+    cash["dry"] = _is_dry(cfg, state)
     cash["bp"] = _buying_power(broker, client, cfg)
     _alert_if_broker_down(cfg, state, save_state, client)
     warn = _cash_warning(cfg, cash["bp"])
     cash["warning"] = warn
-    if not warn or cfg.get("dry_run"):
+    if not warn or cash["dry"]:
         return
     today = datetime.now(timezone.utc).date().isoformat()
     if state.get("low_cash_notified") == today:
@@ -3132,6 +3211,8 @@ def _close_outside(cfg, state, save_state, broker, key, target, px, closed_at,
             pos["exit_logged"] = left
         else:
             pos.pop("exit_logged", None)
+            pos.pop("exit_logged_pc", None)
+            pos.pop("exit_logged_by", None)
         if ids:
             pos["fill_ids_used"] = (list(snap.get("fill_ids_used") or [])
                                     + list(ids))[-_FILL_IDS_KEPT:]
@@ -3916,8 +3997,11 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         return None
 
     if ev["event"] == "ENTERED" and _paused(cfg):
-        msg = (f"SKIPPED {contract}: the agent is paused — no new entries "
-               "until you press Resume")
+        msg = (f"SKIPPED {contract}: " + (
+            "an unfinished move — the setup may run on another computer, so "
+            "this one takes no new entries (exits still run; python agent.py "
+            "resume-here ends it)" if _move_exits_only() else
+            "the agent is paused — no new entries until you press Resume"))
         print(msg)
         _log_trade(_row_facts(
             {"action": "skip_paused", "book": book, "event_id": ev["event_id"],
@@ -4346,6 +4430,13 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                    if counted >= 1 else None)
             if est is not None:
                 record["est_pnl_usd"] = est
+            left = state["positions"].get(pos_key)
+            if (counted >= 1 and isinstance(left, dict)
+                    and _int0(left.get("exit_logged")) >= 1):
+                # a sale still working: what this row counted for those
+                # contracts, should the sale die and the contract expire
+                _note_logged_estimate(left, prior_pos, counted, est,
+                                      ev.get("event_id"))
             if sold >= 1 and counted < sold:
                 # e.g. re-selling an exit's remainder that the first exit
                 # row already counted: the P&L doesn't count it twice
@@ -4570,11 +4661,23 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
         # another time, and must never sell the main position (positions
         # are keyed by contract alone). Remembered, so they aren't looked
         # at again.
+        # An exit still owed from before other trades were turned off (kept
+        # after a failed sell) obeys the same rule as a fresh one: it never
+        # sells a position it wouldn't sell if it arrived now. Settled.
+        dropped_owed = [ev for ev in owed if ev.get("event_id")
+                        and _not_for_this_book(ev, state)]
+        for ev in dropped_owed:
+            seen.add(ev["event_id"])
+            _mark_seen(state, ev["event_id"], listed)
+            _exit_settled(state, ev["event_id"])
+        if dropped_owed:
+            owed = [ev for ev in owed if ev.get("event_id") not in seen]
         dropped = [ev for ev in new if ev.get("event_id")
                    and _not_for_this_book(ev, state)]
         for ev in dropped:
             seen.add(ev["event_id"])
             _mark_seen(state, ev["event_id"], listed)
+        dropped += dropped_owed
         if dropped:
             print(f"ignored {len(dropped)} \"other trades\" signal(s): "
                   "other trades are off")
@@ -6423,6 +6526,9 @@ def _adopt(cfg, state, broker, client, oid, key, h, have, tag, c, now_et, now):
         _mark_exiting(row, {"exit_cause": "ledger_check", "event_id": f"ledger|{key}"})
         # the exit that lost them was logged already: no second P&L for them
         row["exit_logged"] = min(target, _int0(row.get("exit_logged")) + add)
+        # ...with an estimate this row doesn't know: never corrected at
+        # expiry (_expired_exit_row)
+        row["exit_logged_pc"] = None
     c["done"] = True
     note = (f"your {name} account holds {h}x, the agent's ledger listed {have} — "
             f"re-added {add}x (its own filled orders: bought {bought}, {sold} "
@@ -6515,11 +6621,13 @@ def _confirm_broker_switch(cfg, saved_bc):
     tagged) counts as the saved broker's — the agent tags such a row with
     the account it trades on its first read, so after a switch it may try
     to sell it where it isn't held. Rows at the newly picked broker don't
-    warn. Enter (or anything but y) keeps the saved broker."""
+    warn. Enter (or anything but y) keeps the saved broker. The rows are
+    read even when the saved broker is picked again: after a config reset
+    (no broker saved reads as Robinhood) an Alpaca or moomoo row would
+    otherwise be left unmanaged without a word — they are named, with no
+    question (there is no other broker to keep)."""
     old = {"2": "alpaca", "3": "moomoo"}.get(saved_bc, "robinhood")
     new = cfg.get("broker")
-    if new == old:
-        return True
     rows = (_load(STATE_PATH, {}) or {}).get("positions")
     rows = rows if isinstance(rows, dict) else {}
     stranded = {}  # broker -> ([tagged keys], [untagged keys])
@@ -6546,8 +6654,15 @@ def _confirm_broker_switch(cfg, saved_bc):
             else:
                 what = (f"the agent may try to sell {it} at {now}, where "
                         f"{'it is' if one else 'they are'} not held")
-            print(f"After switching to {now} {what} — sell {it} yourself "
-                  f"in the {was} app.")
+            if new == old:
+                print(f"The agent trades at {now}, so it will NOT sell {it} — "
+                      f"sell {it} yourself in the {was} app, or run setup "
+                      f"again and pick {was}.")
+            else:
+                print(f"After switching to {now} {what} — sell {it} yourself "
+                      f"in the {was} app.")
+    if new == old:
+        return True
     ok = input(f"Switch to {now} anyway? [y/N]: ").strip().lower() == "y"
     if not ok:
         print(f"Keeping {_BROKER_NAMES.get(old, old)}.")
@@ -7297,6 +7412,15 @@ def _command(t, cfg, text):
                 "here by itself.) To run it on this computer again after a "
                 "move: stop or destroy the other copy first, then run: "
                 "python agent.py resume-here")
+        if _move_exits_only():
+            return True, (
+                "Can't resume new entries here: a move file made on this "
+                "computer was downloaded but the move was never finished, so "
+                "the setup may be running on another computer too. This one "
+                "only sells the positions it holds. To finish the move, make "
+                "a new move file and press 'I saved the file'. To trade here "
+                "again instead: stop the other computer first, then run: "
+                "python agent.py resume-here")
         cfg.pop("paused", None)
         _save(CONFIG_PATH, cfg, private=True)
         request_feed_read()  # the feed and buying power at once, not on schedule
@@ -7911,6 +8035,9 @@ def cmd_run(app_window=False):
     mode = _mode_label(cfg, state)
     if _state_held():  # damaged state.json: nothing is ordered at all
         mode += ", ON HOLD — no orders at all until you press Resume"
+    elif _move_exits_only():  # a downloaded move file may run elsewhere
+        mode += (", NO NEW ENTRIES — an unfinished move: exits still run "
+                 "(python agent.py resume-here ends it)")
     elif _paused(cfg):  # saved in config.json: still paused after a restart
         mode += ", PAUSED — no new entries until you press Resume"
     if _is_dry(cfg, state) and _dry_run_note(cfg, state):

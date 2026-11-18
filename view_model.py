@@ -1108,7 +1108,10 @@ def _results(rows, now):
                  "closed": 0, "won": 0, "lost": 0, "unmeasured": 0,
                  "unmeasured_today": 0, "opened_today": 0, "days": {}}
              for k in ("real", "practice", "paper_account")}
-    for t in rows:
+    import rules
+    # a sale that died before its contract expired is one result: its
+    # expiry correction folds into that exit row (rules.fold_corrections)
+    for t in rules.fold_corrections(rows):
         if t.get("action") == "entry":
             # "Today so far · Opened": the ET day this panel describes
             books[_book_key(t)]["opened_today"] += _row_day(t) == today
@@ -1126,13 +1129,20 @@ def _results(rows, now):
             continue
         day = _row_day(t)
         b["total"] += v
-        b["closed"] += 1
-        b["won"] += v > 0
-        b["lost"] += v < 0
         if day == today:
             b["today"] += v
         if week_from <= day <= today:
             b["last_7_days"] += v
+        if rules.is_correction(t):
+            # its exit row is outside these rows: the P&L counts, but it
+            # is no closed trade, win or loss of its own
+            if day:
+                d = b["days"].setdefault(day, {"day": day, "pnl": 0.0, "closed": 0})
+                d["pnl"] += v
+            continue
+        b["closed"] += 1
+        b["won"] += v > 0
+        b["lost"] += v < 0
         if day:
             d = b["days"].setdefault(day, {"day": day, "pnl": 0.0, "closed": 0})
             d["pnl"] += v

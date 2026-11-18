@@ -749,3 +749,83 @@ def test_a_retry_never_stamps_another_signals_row(home, no_policy):
                                  "opened_event": "old-in"}}}
     run(b, state, ev("ENTERED", "main", "m-in"))
     assert "book" not in state["positions"][KEY]
+
+
+# ── whatever the setting: a row's book is matched, on every path ──────────
+
+OFF = {**LIVE, "include_other_trades": False}
+
+
+def poll(b, state, events, cfg, feed_read=True):
+    agent._handle_feed_events(events, cfg, state, b, object(), lambda s: None,
+                              feed_read=feed_read)
+
+
+@pytest.mark.parametrize("row", [{"book": "shadow", "track": "other"},
+                                 {"track": "other"}])  # a row of audit PR2
+def test_main_exit_never_sells_an_other_trades_row_with_other_trades_off(
+        home, no_policy, notes, row):
+    """Through the whole poll: the main pick's exit doesn't sell the
+    other-trades row, with or without "book" on it (a row stamped with the
+    track alone takes the track's book), and its own exit still does."""
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2, **row}},
+             "seen": []}
+    poll(b, state, [ev("EXITED", "main", "m-out")], OFF)
+    assert b.sells == [] and state["positions"][KEY]["qty"] == 2
+    assert agent._exits_to_retry(state) == []
+    poll(b, state, [ev("EXITED", "other", "o-out")], OFF)
+    assert b.sells == [("o-out", 2, 2)] and state["positions"] == {}
+
+
+@pytest.mark.parametrize("cfg", [LIVE, OFF])
+def test_a_main_row_stamped_with_its_track_alone_is_held_for_its_own_exit(
+        home, no_policy, notes, cfg):
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2,
+                                 "track": "main"}}, "seen": []}
+    poll(b, state, [ev("EXITED", "other", "o-out")], cfg)
+    assert b.sells == [] and state["positions"][KEY]["qty"] == 2
+    poll(b, state, [ev("EXITED", "main", "m-out")], cfg)
+    assert b.sells == [("m-out", 2, 2)] and state["positions"] == {}
+
+
+# ── an exit owed from before other trades were turned off ─────────────────
+
+@pytest.mark.parametrize("row", [{}, {"track": "main"}, {"book": "main"}])
+def test_an_owed_other_trades_exit_never_sells_after_other_trades_go_off(
+        home, no_policy, notes, row):
+    """An "other trades" exit for a contract held for the main pick (or by a
+    row that doesn't say) failed at the broker while other trades were on
+    and was kept to retry. The owner turns other trades off: the retry obeys
+    the same rule as a fresh exit — no order — and is settled."""
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2, **row}},
+             "seen": [], "exits_to_retry": [ev("EXITED", "other", "o-out")]}
+    for _ in range(2):
+        poll(b, state, [], OFF, feed_read=False)
+    assert b.sells == [] and state["positions"][KEY]["qty"] == 2
+    assert agent._exits_to_retry(state) == []
+    assert "o-out" in state["seen"]
+    poll(b, state, [ev("EXITED", "main", "m-out")], OFF)
+    assert b.sells == [("m-out", 2, 2)] and state["positions"] == {}
+
+
+def test_an_owed_other_trades_exit_still_sells_its_own_row_after_off(
+        home, no_policy, notes):
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2,
+                                 "book": "shadow", "track": "other"}},
+             "seen": [], "exits_to_retry": [ev("EXITED", "other", "o-out")]}
+    poll(b, state, [], OFF, feed_read=False)
+    assert b.sells == [("o-out", 2, 2)] and state["positions"] == {}
+    assert agent._exits_to_retry(state) == []
+
+
+def test_an_owed_main_exit_is_never_dropped_with_other_trades_off(
+        home, no_policy, notes):
+    b = Book()
+    state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2}},
+             "seen": [], "exits_to_retry": [ev("EXITED", "main", "m-out")]}
+    poll(b, state, [], OFF, feed_read=False)
+    assert b.sells == [("m-out", 2, 2)] and state["positions"] == {}

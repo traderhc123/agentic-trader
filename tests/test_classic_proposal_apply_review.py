@@ -2,8 +2,9 @@
 /api/proposal/apply, which /dash and the built-in page both use) is held
 to the same review rules as /v2: never a change made against older code
 (it would write the old whole file back over an update), never a change
-whose diff was too large to show whole, and, when the page sends the
-diff_sha256 it was shown, never any other change. Each test here failed
+whose diff was too large to show whole, and never any other change than
+the one whose diff_sha256 the page was shown (a request without it applies
+nothing). Each test here failed
 on origin/main and passes on the fix.
 
 Hermetic: no broker, wallet, AI, AgentHC or network; self_edit works on a
@@ -78,7 +79,8 @@ def test_classic_route_refuses_a_stale_change(home, app, repo):
     c = app()
     _stage([("helper_mod.py", "A = 1\n", "A = 2\n")])
     (repo / "helper_mod.py").write_text(UPDATED, encoding="utf-8")
-    r = c.post("/api/proposal/apply", {})  # a client that sends no sha
+    sha = c.get("/api/proposal")["diff_sha256"]
+    r = c.post("/api/proposal/apply", {"diff_sha256": sha})
     assert r["ok"] is False and "changed since" in r["reply"]
     assert (repo / "helper_mod.py").read_text(encoding="utf-8") == UPDATED
     assert self_edit.current() is not None
@@ -88,8 +90,9 @@ def test_classic_route_refuses_a_truncated_change(home, app, repo):
     write_cfg(home, BASE)
     c = app()
     _stage([("big_a.py", "", BIG), ("big_b.py", "", BIG)])
-    assert c.get("/api/proposal")["truncated"] is True
-    r = c.post("/api/proposal/apply", {})
+    shown = c.get("/api/proposal")
+    assert shown["truncated"] is True
+    r = c.post("/api/proposal/apply", {"diff_sha256": shown["diff_sha256"]})
     assert r["ok"] is False and "too large" in r["reply"]
     assert sorted(p.name for p in repo.iterdir()) == ["helper_mod.py"]
 
@@ -118,6 +121,26 @@ def test_classic_route_binds_apply_to_the_diff_it_showed(home, app, repo):
     assert r["ok"] is True, r
     assert (repo / "helper_mod.py").read_text(encoding="utf-8") == "A = 3\n"
 
+
+
+@pytest.mark.parametrize("body", [{}, {"diff_sha256": None}, {"other": 1}])
+def test_classic_route_refuses_an_apply_without_the_reviewed_sha(
+        home, app, repo, body):
+    """A page loaded before the sha rule (or any client) that doesn't say
+    which change it showed applies nothing, and is told to reload."""
+    import self_edit
+    write_cfg(home, BASE)
+    c = app()
+    _stage([("helper_mod.py", "A = 1\n", "A = 2\n")])
+    r = c.post("/api/proposal/apply", body)
+    assert r["ok"] is False and "Nothing was applied" in r["reply"]
+    assert "Reload the page" in r["reply"]
+    assert (repo / "helper_mod.py").read_text(encoding="utf-8") == "A = 1\n"
+    assert self_edit.current() is not None  # still waiting, untouched
+    # the same change, applied once the page sends the sha it showed
+    sha = c.get("/api/proposal")["diff_sha256"]
+    assert c.post("/api/proposal/apply", {"diff_sha256": sha})["ok"] is True
+    assert (repo / "helper_mod.py").read_text(encoding="utf-8") == "A = 2\n"
 
 # ── the built-in classic page ──
 

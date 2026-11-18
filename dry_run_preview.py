@@ -42,7 +42,8 @@ def _path():
 def wanted(cfg):
     """Only in dry-run and only for the AgentHC source (it's AgentHC's
     journal). Owner can turn it off with `preview off`."""
-    return (bool(cfg.get("dry_run")) and cfg.get("source", "agenthc") == "agenthc"
+    import agent  # the mode the agent trades in (unset: agent._is_dry)
+    return (agent._is_dry(cfg) and cfg.get("source", "agenthc") == "agenthc"
             and cfg.get("dry_run_preview", True) is not False)
 
 
