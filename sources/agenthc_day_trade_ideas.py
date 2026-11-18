@@ -1239,15 +1239,23 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
     themselves (and has no prepaid pass) allows more, up to that many sats.
 
     Only LIVE buys: practice (dry_run) and a paused agent (off) never buy a
-    day-pass (feed_mode) — the owner is told so once a day."""
+    day-pass (feed_mode). An owner whose wallet would buy (a wallet and
+    'Recurring day-pass' ON) is told so once a day; with no wallet or
+    Recurring off, going live would buy nothing either, so practice is not
+    named as the reason. Once LIVE (or with nothing to buy), a practice /
+    paused notice still on the dashboard goes."""
+    mode = feed_mode(cfg)
+    wallet_buys = bool(cfg.get("lnbits_url") and cfg.get("day_pass_recurring"))
+    if mode == "live" or not wallet_buys or cfg.get("agenthc_api_key"):
+        _clear_not_live_notice(state, save_state)
     if cfg.get("agenthc_api_key"):
         # A Premium key reads the feed with the key only: a wallet day-pass
         # would never be sent, so buying one only loses sats (poll() tells
         # the owner to top up the key instead).
         return False
-    mode = feed_mode(cfg)
     if mode != "live":
-        _not_live_notice(state, save_state, mode)
+        if wallet_buys:
+            _not_live_notice(state, save_state, mode)
         return False
     now = now or _now_et()
     day = now.strftime("%Y-%m-%d")
@@ -1317,6 +1325,17 @@ OFF_NO_PASS_TEXT = (
     "paused agent never uses a signal day; only LIVE uses days. A signal "
     "pass you already have still brings the exit signals for the positions "
     "you hold. Press Resume to trade (and buy day-passes) again.")
+
+
+def _clear_not_live_notice(state, save_state):
+    """Live again (or nothing the wallet would buy): the practice / paused
+    notice is no longer true, so it leaves the dashboard."""
+    changed = state.pop("not_live_pass_notified", None) is not None
+    if state.get("pass_notice") in (PRACTICE_NO_PASS_TEXT, OFF_NO_PASS_TEXT):
+        state.pop("pass_notice", None)
+        changed = True
+    if changed:
+        save_state(state)
 
 
 def _not_live_notice(state, save_state, mode):
@@ -1849,7 +1868,8 @@ def _day_pass_loss_code(cfg, state, now=None):
     agent's no-signal warning turns into the owner's fix (no request, no
     change; the same order as _pass_purchase_allowed):
     day_pass_undecided  a payment the wallet hasn't decided yet;
-    day_pass_not_live   practice or paused: only LIVE buys a day-pass;
+    day_pass_not_live   practice or paused, and the wallet would buy
+                        (a wallet, Recurring ON): only LIVE buys a day-pass;
     day_pass_off        Recurring day-pass is off: the wallet never buys;
     day_pass_short      the last payment failed: not enough sats;
     day_pass_failed     the last payment failed otherwise (wallet down or
@@ -1858,7 +1878,8 @@ def _day_pass_loss_code(cfg, state, now=None):
                         daily cap, the market closed)."""
     if state.get("daypass_pending"):
         return "day_pass_undecided"
-    if feed_mode(cfg) != "live":
+    if (feed_mode(cfg) != "live" and cfg.get("lnbits_url")
+            and cfg.get("day_pass_recurring")):
         return "day_pass_not_live"
     now = now or _now_et()
     day = now.strftime("%Y-%m-%d")

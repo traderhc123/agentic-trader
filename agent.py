@@ -2150,7 +2150,8 @@ def _dry_run_note(cfg, state):
                 f"{'its' if one else 'their'} exit signal arrives"
                 + (f", or on {'its' if one else 'their'} expiry day if still "
                    "open then (expiry guard)" if guard_on else "")
-                + ". No new real trades will be placed.")
+                + ". No new real trades will be placed."
+                + _with_space(_no_pass_exits_note(cfg, state, "in practice")))
     return (head + f"In dry-run I will NOT sell {'it' if one else 'them'} — "
             f"sell {'it' if one else 'them'} in your broker app. No new real "
             "trades will be placed.")
@@ -2239,6 +2240,37 @@ PRACTICE_DAYS_NOTE = ("Practice never uses a signal day or buys a pass; only "
                       "LIVE uses days.")
 
 
+def _with_space(note):
+    return (" " + note) if note else ""
+
+
+def _no_pass_exits_note(cfg, state, why):
+    """Paused or in practice (`why`: "paused" / "in practice") with a real
+    position open on the paid-per-day feed and no prepaid signal days: the
+    only pass left is the wallet's day-pass, which is bought only when LIVE
+    (sources.agenthc_day_trade_ideas._pass_purchase_allowed). Once a running
+    one ends, the exit signal may not come (the ended day-pass's exits read
+    is all that is left), and the no-signal sell closes the position before
+    the close. In the owner's words ("" in every other case: then a prepaid
+    pass, or a Premium key, keeps bringing the exit signals)."""
+    if not (_feed_paid_per_day(cfg) and _real_positions(state)):
+        return ""
+    from sources import agenthc_day_trade_ideas as hc
+    if hc._pass_tokens(cfg):
+        return ""
+    undo = "resume" if why == "paused" else "go live"
+    head = ("Your agent holds a real position and has no prepaid signal days, "
+            f"and its wallet does not buy a day-pass while {why}. Once a "
+            "day-pass it has ends, its exit signal may not arrive")
+    at = _et_hhmm(cfg, "signal_loss_sell_et", SIGNAL_LOSS_DEFAULT)
+    if at is None:
+        return (head + ", and the no-signal sell is switched off: "
+                f"{_BUY_DAYS} or {undo}, or watch the position and sell it "
+                "yourself in your broker app.")
+    return (head + ": the agent then sells it by its no-signal sell at "
+            f"{_hm(at)} ET, unless you {_BUY_DAYS} or {undo}.")
+
+
 def _pause_skips_feed(cfg, state):
     """Paused with no REAL position open, on a feed that is paid per day:
     don't read the feed. There is no exit order to wait for, and a read
@@ -2258,6 +2290,9 @@ def _pause_note(cfg, state):
     if not _paused(cfg) or not _feed_paid_per_day(cfg):
         return ""
     if _real_positions(state):
+        wallet = _no_pass_exits_note(cfg, state, "paused")
+        if wallet:
+            return wallet
         return ("While a real position is open the agent still reads the "
                 "signal feed to get its exit signal. A paused agent tells "
                 "AgentHC it is off, so this uses no signal day, and it does "
@@ -7551,11 +7586,14 @@ def _command(t, cfg, text):
     if t == "pause":
         cfg["paused"] = True
         _save(CONFIG_PATH, cfg, private=True)
+        # wallet only, with a real position open: no exit signal is promised
+        wallet = _no_pass_exits_note(cfg, _load(STATE_PATH, {}) or {}, "paused")
         return True, ("Paused — no new entries. Exit signals, the expiry "
                       "guard and the broker checks keep running for positions "
                       "you already have. The agent stays paused, also after a "
                       "restart, until you say 'resume'."
-                      + (" While a real position is open the agent still "
+                      + ((" " + wallet) if wallet else
+                         " While a real position is open the agent still "
                          "reads the signal feed to get its exit signal; a "
                          "paused agent tells AgentHC it is off, so that uses "
                          "no signal day, and it buys no day-pass. With no "
@@ -7658,10 +7696,13 @@ def _command(t, cfg, text):
                           + " (Say 'policy off' to remove it.)")
         cfg["dry_run"] = False
         _save(CONFIG_PATH, cfg, private=True)
+        paper = (_broker_name(cfg) == "alpaca" and cfg.get("alpaca_paper", True))
         return True, ("Dry-run OFF — the agent will place REAL orders from now on."
                       + (" Only LIVE uses signal days: each market day the "
-                         "agent receives a signal now uses one (practice "
-                         "never did)." if _feed_paid_per_day(cfg) else ""))
+                         "agent receives a signal now uses one."
+                         + (" Alpaca paper trading with Live selected counts "
+                            "as LIVE: it uses signal days too." if paper else "")
+                         if _feed_paid_per_day(cfg) else ""))
     if t.startswith("set budget"):
         val = _command_number(t, "set budget")
         if val is None or val <= 0:

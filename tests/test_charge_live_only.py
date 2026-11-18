@@ -15,6 +15,7 @@ agent). AgentHC charges a signal day only for "live". On this side:
 """
 import json
 import time
+from datetime import timedelta
 
 import pytest
 
@@ -334,3 +335,171 @@ def test_no_signal_warning_names_the_not_live_cause():
     assert "day_pass_not_live" in view_model.EXIT_LOSS_CAUSES
     assert "only LIVE buys a day-pass" in agent._SIGNAL_LOSS_WHY["day_pass_not_live"]
     assert agent._signal_loss_fix({}, "day_pass_not_live")
+
+
+# ── review follow-ups ───────────────────────────────────────────────────────
+
+WALLET_ONLY = {"source": "agenthc", "lnbits_url": "https://w",
+               "day_pass_recurring": True}
+
+
+def _real_state():
+    return {"seen": [], "positions": {KEY: {"option_id": "stub", "qty": 1}}}
+
+
+def test_paused_wallet_only_with_a_real_position_is_told_exits_may_stop(
+        home, monkeypatch, clock):
+    """Paused (or in practice) with a real position and only the wallet's
+    day-pass: no new day-pass is bought, so no exit signal is promised —
+    the owner is told the no-signal sell closes it unless they buy signal
+    days or resume / go live."""
+    cfg = {**WALLET_ONLY, "dry_run": False, "paused": True}
+    note = agent._pause_note(cfg, _real_state())
+    assert "has no prepaid signal days" in note
+    assert "does not buy a day-pass while paused" in note
+    assert "no-signal sell at 15:30 ET" in note and "or resume" in note
+    assert "still reads the signal feed" not in note
+    # the pause reply says the same
+    (home / "config.json").write_text(json.dumps(
+        {**WALLET_ONLY, "dry_run": False}), encoding="utf-8")
+    (home / "state.json").write_text(json.dumps(_real_state()), encoding="utf-8")
+    reply = agent._apply_command("pause")[1]
+    assert "does not buy a day-pass while paused" in reply
+    assert "still reads the signal feed to get its exit signal" not in reply
+    # and dry-run (the dashboard's / reply's dry-run note)
+    agent._apply_command("resume")
+    reply = agent._apply_command("dry on")[1]
+    assert "does not buy a day-pass while in practice" in reply
+    assert "or go live" in reply
+    # the no-signal sell switched off: sell it yourself
+    off = agent._pause_note({**cfg, "signal_loss_sell_et": "off"}, _real_state())
+    assert "switched off" in off and "sell it yourself" in off
+
+
+def test_a_prepaid_pass_or_key_keeps_the_exit_signal_promise(home, clock):
+    real = _real_state()
+    cfg = {**WALLET_ONLY, "dry_run": False, "paused": True,
+           "feed_pass": {"token": PASS_TOK}}
+    assert "still reads the signal feed" in agent._pause_note(cfg, real)
+    assert agent._no_pass_exits_note(cfg, real, "paused") == ""
+    keyed = {**WALLET_ONLY, "agenthc_api_key": "k"}
+    assert agent._no_pass_exits_note(keyed, real, "paused") == ""
+    # no real position: nothing to say
+    assert agent._no_pass_exits_note(WALLET_ONLY, {"positions": {}}, "paused") == ""
+
+
+def test_paused_wallet_only_no_running_pass_drives_the_no_signal_sell(
+        home, monkeypatch, clock, capsys):
+    """No running day-pass (and the ended one already said it has no
+    exits): poll reads nothing, the cause is day_pass_not_live, and the
+    no-signal warning names it and the fix."""
+    feed, wallet = Recorder(), Wallet()
+    _setup(monkeypatch, feed, wallet)
+    state = _real_state()
+    cfg = {**WALLET_ONLY, "dry_run": False, "paused": True, "feed_mode": "off"}
+    assert hc.poll(cfg, state, lambda s: None) == []
+    assert feed.requests == [] and wallet.paid == []
+    assert not hc.had_exit_access()
+    assert hc.exit_loss_reason() == "day_pass_not_live"
+    sent_msgs = []
+    monkeypatch.setattr(agent, "notify",
+                        lambda c, msg, **k: sent_msgs.append(msg))
+    agent._note_exit_source(cfg, state, lambda s: None, "lost",
+                            hc.exit_loss_reason(), now_et=WED_1030)
+    assert state["signal_loss"]["cause"] == "day_pass_not_live"
+    later = WED_1030 + timedelta(seconds=agent.SIGNAL_LOSS_WARN_S + 60)
+    agent.signal_loss_tick(cfg, state, lambda s: None, None, None,
+                           now_et=later)
+    assert sent_msgs, "no no-signal warning went out"
+    assert "only LIVE buys a day-pass" in sent_msgs[0]
+    assert "buy signal days" in sent_msgs[0]
+
+
+@pytest.mark.parametrize("extra", [
+    {},                                                  # fresh install
+    {"lnbits_url": "https://w"},                         # wallet, Recurring off
+    {"day_pass_recurring": True}])                       # Recurring, no wallet
+def test_practice_without_a_buying_wallet_does_not_blame_practice(
+        monkeypatch, clock, capsys, extra):
+    feed = Recorder()
+    _setup(monkeypatch, feed, None)
+    state = {}
+    cfg = {**extra, "feed_mode": "dry_run"}
+    assert hc.poll(cfg, state, lambda s: None) == []
+    out = capsys.readouterr().out
+    assert hc.PRACTICE_NO_PASS_TEXT not in out
+    assert state.get("pass_notice") != hc.PRACTICE_NO_PASS_TEXT
+    assert hc.exit_loss_reason() != "day_pass_not_live"
+    if not extra.get("day_pass_recurring"):
+        assert hc._day_pass_loss_code(cfg, state) == "day_pass_off"
+
+
+def test_going_live_takes_the_practice_notice_off(monkeypatch, clock):
+    feed, wallet = Recorder(), Wallet()
+    _setup(monkeypatch, feed, wallet)
+    state = {}
+    hc.poll({**WALLET_ONLY, "feed_mode": "dry_run"}, state, lambda s: None)
+    assert state["pass_notice"] == hc.PRACTICE_NO_PASS_TEXT
+    # live, Recurring off: nothing is bought and the notice is gone
+    live_off = {"lnbits_url": "https://w", "feed_mode": "live"}
+    assert hc.poll(live_off, state, lambda s: None) == []
+    assert "pass_notice" not in state and "not_live_pass_notified" not in state
+    # paused, then live with the wallet buying: gone as well
+    hc.poll({**WALLET_ONLY, "feed_mode": "off"}, state, lambda s: None)
+    assert state["pass_notice"] == hc.OFF_NO_PASS_TEXT
+    assert hc.poll({**WALLET_ONLY, "feed_mode": "live"}, state, lambda s: None)
+    assert state.get("pass_notice") not in (hc.PRACTICE_NO_PASS_TEXT,
+                                            hc.OFF_NO_PASS_TEXT)
+
+
+def test_another_problem_notice_is_left_alone(monkeypatch, clock):
+    state = {"pass_notice": hc.PASS_RUN_OUT_TEXT}
+    hc._clear_not_live_notice(state, lambda s: None)
+    assert state["pass_notice"] == hc.PASS_RUN_OUT_TEXT
+
+
+# ── _feed_mode: the paths that decide whether a live agent is charged ──────
+
+def test_feed_mode_unset_or_settled_live_is_live(home, monkeypatch):
+    """Settings that never chose a mode on a setup that has traded live run
+    LIVE (agent._is_dry): the feed must hear "live", or a live agent would
+    stop paying for its signals."""
+    monkeypatch.setattr(agent, "_SETTLED_DRY", {"dry": False, "warned": False})
+    assert agent._feed_mode({}) == "live"
+    monkeypatch.setattr(agent, "_SETTLED_DRY", {"dry": None, "warned": False})
+    assert agent._feed_mode({}, _real_state()) == "live"
+    assert agent._feed_mode({"dry_run": None}, _real_state()) == "live"
+    (home / "trades.jsonl").write_text(json.dumps(
+        {"action": "entry", "dry": False}) + "\n", encoding="utf-8")
+    assert agent._feed_mode({}, {"positions": {}}) == "live"
+    # settled practice stays practice
+    monkeypatch.setattr(agent, "_SETTLED_DRY", {"dry": True, "warned": False})
+    assert agent._feed_mode({}) == "dry_run"
+
+
+def test_feed_mode_selling_only_after_a_move_is_off(home, monkeypatch):
+    import transfer
+    monkeypatch.setattr(transfer, "exits_only", lambda: {"at": 1})
+    assert agent._feed_mode({"dry_run": False}, _real_state()) == "off"
+
+
+def test_the_loop_says_live_for_an_unset_mode_with_a_real_position(
+        home, monkeypatch, sent, loop_clock):
+    monkeypatch.setattr(agent, "_SETTLED_DRY", {"dry": None, "warned": False})
+    seen = []
+    run_loop(home, monkeypatch, _real_state(), [[], []], clock=loop_clock,
+             source=_recording_source(seen), config={})
+    assert seen == ["live", "live"]
+
+
+def test_go_live_reply_no_history_claim_and_alpaca_paper(home):
+    (home / "config.json").write_text(json.dumps(
+        {"source": "agenthc", "dry_run": True}), encoding="utf-8")
+    reply = agent._apply_command("go live")[1]
+    assert "practice never did" not in reply
+    assert "Alpaca paper" not in reply
+    (home / "config.json").write_text(json.dumps(
+        {"source": "agenthc", "dry_run": True, "broker": "alpaca",
+         "alpaca_paper": True}), encoding="utf-8")
+    reply = agent._apply_command("go live")[1]
+    assert "Alpaca paper trading with Live selected counts as LIVE" in reply
