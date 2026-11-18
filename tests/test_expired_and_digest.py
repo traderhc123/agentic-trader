@@ -122,26 +122,77 @@ def test_contracts_an_exit_row_already_counted_are_not_booked_again(morning_afte
     assert x["contract"] == CONTRACT and x["qty"] == 3 and x["est_pnl_usd"] == -300.0
 
 
+def _sale_that_died():
+    """The exit row a working sell logged on Friday: 2x at +$50 each (sold
+    at 2.00 over a 1.50 entry, an estimate). Its order then died unfilled."""
+    agent._log_trade({"action": "exit", "event_id": "x1", "contract": CONTRACT,
+                      "dry": False, "qty": 2, "est_pnl_usd": 100.0,
+                      "closed_at": "2026-11-13T19:00:00+00:00"})
+
+
 def test_contracts_counted_by_a_sell_that_died_are_rebooked_once(morning_after):
     """2x counted by a sell row at +$50 each whose order died unfilled, plus
     1x never sold: all three expired. The prune books -$150 for the unsold
     one and -$200 a piece for the two (total loss less the +$50 counted);
     a second prune never books them again."""
+    _entry()
+    _sale_that_died()
     row = {"option_id": "o", "qty": 3, "exit_logged": 2, "exit_logged_pc": 50.0,
-           "entry_mark": 1.5, "opened_event": "e1"}
+           "exit_logged_by": "x1", "entry_mark": 1.5, "opened_event": "e1"}
     state = {"positions": {KEY: dict(row)}}
     agent._prune_expired_positions({}, state, lambda s: None)
-    [x] = _exits()
+    x = _exits()[-1]
     assert x["qty"] == 3 and x["est_pnl_usd"] == -550.0
-    assert "never filled" in x["reason"]
+    assert x["corrects"] == "x1" and "never filled" in x["reason"]
     agent._prune_expired_positions({}, {"positions": {KEY: dict(row)}}, lambda s: None)
-    assert len(_exits()) == 1
+    assert len(_exits()) == 2
     # a sell still pending at the prune may have filled: only the unsold 1x
     morning = {"positions": {"QQQ|2026-11-13|600.0|P": {
         **row, "opened_event": "e2",
         "pending": {"order_id": "o-1", "side": "sell", "requested": 2}}}}
     agent._prune_expired_positions({}, morning, lambda s: None)
-    assert [(x["qty"], x["est_pnl_usd"]) for x in _exits()][1] == (1, -150.0)
+    last = _exits()[-1]
+    assert (last["qty"], last["est_pnl_usd"]) == (1, -150.0) and "corrects" not in last
+    # no exit row named (an older version's row): nothing re-booked for it
+    agent._prune_expired_positions({}, {"positions": {"IWM|2026-11-13|200.0|C": {
+        **{k: v for k, v in row.items() if k != "exit_logged_by"}, "qty": 2}}},
+        lambda s: None)
+    assert len(_exits()) == 3
+
+
+def test_a_dead_sale_that_expired_is_one_loss_in_every_count(morning_after,
+                                                             monkeypatch):
+    """The sale was booked as a win (+$100), its order died, the 2x expired:
+    one position, one LOSS of -$300 (the $1.50 entry x 2 x 100) — in the
+    dashboard's all-time P&L, Results (/v2), the losing-streak rule, the AI
+    policy check's counts and the daily digest. Never a win plus a loss."""
+    _entry()
+    _sale_that_died()
+    state = {"positions": {KEY: {"option_id": "o", "qty": 2, "exit_logged": 2,
+                                 "exit_logged_pc": 50.0, "exit_logged_by": "x1",
+                                 "entry_mark": 1.5, "opened_event": "e1"}}}
+    agent._prune_expired_positions({}, state, lambda s: None)
+    assert [x["est_pnl_usd"] for x in _exits()] == [100.0, -400.0]   # the log
+    s = agent.pnl_summary({}, {}, None)["live"]
+    assert (s["total"], s["exits"], s["wins"], s["losses"]) == (-300.0, 1, 0, 1)
+    assert sum(d["exits"] for d in s["days"]) == 1
+    res = view_model._results(_rows(), datetime(2026, 11, 16, 15, tzinfo=timezone.utc))
+    real = res["real"]
+    assert (real["total"], real["closed"], real["won"], real["lost"]) == (-300.0, 1, 0, 1)
+    assert [(d["day"], d["pnl"], d["closed"]) for d in real["days"]] == [
+        (EXP, -300.0, 1)]
+    assert rules.exit_results(_rows()) == [-300.0]
+    assert rules.loss_streak(_rows()) == 1
+    # a window of the log without the sale's row: P&L only, never a result
+    corr = [t for t in _rows() if t.get("corrects")]
+    assert rules.exit_results(corr) == []
+    s = agent.pnl_summary({}, {}, corr)["live"]
+    assert (s["total"], s["exits"], s["wins"], s["losses"]) == (-400.0, 0, 0, 0)
+    res = view_model._results(corr, datetime(2026, 11, 16, 15, tzinfo=timezone.utc))
+    assert (res["real"]["total"], res["real"]["closed"], res["real"]["lost"]) == (-400.0, 0, 0)
+    # Monday's digest: the correction is not an exit of its own
+    sent, _ = _digest(monkeypatch, datetime(2026, 11, 16, 21, 30, tzinfo=timezone.utc))
+    assert "0 exits" in sent[-1]
 
 
 def test_closed_outside_records_are_not_booked(morning_after):

@@ -1344,6 +1344,10 @@ def pnl_summary(cfg=None, state=None, rows=None):
     state = state if state is not None else (_load(STATE_PATH, {}) or {})
     rows = _read_trade_log() if rows is None else rows
     passes, kind, tracked_from, paid, est_days = _pass_day_kinds(cfg, state, rows)
+    import rules
+    # a sale that died before its contract expired is one result: its
+    # expiry correction folds into that exit row (rules.fold_corrections)
+    rows = rules.fold_corrections(rows)
 
     def blank():
         return {"total": 0.0, "exits": 0, "wins": 0, "losses": 0,
@@ -1368,6 +1372,13 @@ def pnl_summary(cfg=None, state=None, rows=None):
                 b["unmeasured"] += 1
             continue
         v = float(v)
+        if rules.is_correction(t):
+            # its exit row is outside these rows: the P&L counts, but it
+            # is no exit, win or loss of its own
+            b["total"] += v
+            b["points"].append({"ts": str(t.get("ts", "")),
+                                "cum": round(b["total"], 2)})
+            continue
         # a partial close leaves the position open: keep its opened day for
         # the exit that follows
         day = ((opened.get(key, "") if t.get("partial") else opened.pop(key, ""))
@@ -1667,10 +1678,14 @@ def _expired_exit_row(cfg, key, row):
     # as the total loss they are, less what that row counted for them
     # (exit_logged_pc) — only when that is known, and never while a sell
     # is still pending (it may have filled at the close).
+    # The correction names that exit row (exit_logged_by): the position is
+    # then one result in every win/loss count (rules.fold_corrections).
     pc = row.get("exit_logged_pc")
+    by = row.get("exit_logged_by")
     pend = row.get("pending") if isinstance(row.get("pending"), dict) else {}
     resold = (logged if logged >= 1 and pend.get("side") != "sell"
-              and 0 < entry < float("inf") and _num_ok(pc) else 0)
+              and 0 < entry < float("inf") and _num_ok(pc)
+              and isinstance(by, str) and by else 0)
     qty = unsold + resold
     if qty < 1:
         return None
@@ -1688,6 +1703,7 @@ def _expired_exit_row(cfg, key, row):
         rec["reason"] = (f"Expired without a sale — counted as a total loss "
                          f"of the ${entry:.2f} entry quote (estimate)")
         if resold:
+            rec["corrects"] = by
             rec["reason"] += (f"; {resold}x of it had been counted as sold by "
                               "a sell order that never filled — corrected")
     else:
@@ -1710,14 +1726,19 @@ def _num_ok(v):
             and math.isfinite(v))
 
 
-def _note_logged_estimate(row, prior, counted, est):
+def _note_logged_estimate(row, prior, counted, est, event_id):
     """An exit row just counted `counted` more contracts of `row` whose
     sale is still working (exit_logged): keep, per contract, the P&L the
     log now holds for all of exit_logged (row["exit_logged_pc"]; an exit
-    with no estimate counted 0). None when it can't be told (contracts an
-    older version, or the ledger check, counted with an unknown
-    estimate): those are never re-booked at expiry (_expired_exit_row)."""
+    with no estimate counted 0), and that exit row's event_id
+    (row["exit_logged_by"]: an expiry correction folds into it, so the
+    position stays one result — rules.fold_corrections). pc None when it
+    can't be told (contracts an older version, or the ledger check,
+    counted with an unknown estimate): those are never re-booked at
+    expiry (_expired_exit_row)."""
     prior = prior if isinstance(prior, dict) else {}
+    if event_id:
+        row["exit_logged_by"] = str(event_id)
     n0 = _int0(prior.get("exit_logged"))
     pc0 = prior.get("exit_logged_pc") if n0 >= 1 else 0.0
     new = (est / counted) if _num_ok(est) else 0.0
@@ -1767,7 +1788,9 @@ def _maybe_daily_digest(cfg, state, save_state):
         return
     todays = _et_day_log_rows(day)
     entries = sum(1 for t in todays if t.get("action") == "entry")
-    exits = sum(1 for t in todays if t.get("action") == "exit")
+    # an expiry correction of an earlier sale is not an exit of its own
+    exits = sum(1 for t in todays if t.get("action") == "exit"
+                and not t.get("corrects"))
     vetoes = sum(1 for t in todays if t.get("action") == "policy_veto")
     skipped = sum(1 for t in todays if str(t.get("action", "")).startswith("skip"))
     open_pos = list(state.get("positions", {})) or ["none"]
@@ -3173,6 +3196,7 @@ def _close_outside(cfg, state, save_state, broker, key, target, px, closed_at,
         else:
             pos.pop("exit_logged", None)
             pos.pop("exit_logged_pc", None)
+            pos.pop("exit_logged_by", None)
         if ids:
             pos["fill_ids_used"] = (list(snap.get("fill_ids_used") or [])
                                     + list(ids))[-_FILL_IDS_KEPT:]
@@ -4392,7 +4416,8 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                     and _int0(left.get("exit_logged")) >= 1):
                 # a sale still working: what this row counted for those
                 # contracts, should the sale die and the contract expire
-                _note_logged_estimate(left, prior_pos, counted, est)
+                _note_logged_estimate(left, prior_pos, counted, est,
+                                      ev.get("event_id"))
             if sold >= 1 and counted < sold:
                 # e.g. re-selling an exit's remainder that the first exit
                 # row already counted: the P&L doesn't count it twice

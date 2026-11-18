@@ -1913,6 +1913,9 @@ def test_pending_sell_that_dies_then_expires_is_rebooked_as_a_loss(home, filled,
     (first,) = _log(home)
     # sold (if any) at 2.00, the rest lost: the two rows add up to that
     assert first["est_pnl_usd"] + booked == round(50.0 * filled - 150.0 * (2 - filled), 2)
+    # one position, one result: the correction folds into the sale's row
+    assert rec["corrects"] == first["event_id"]
+    assert rules.exit_results([first, rec]) == [first["est_pnl_usd"] + booked]
 
 
 def test_ledger_counted_contracts_with_no_known_estimate_are_not_rebooked(home):
