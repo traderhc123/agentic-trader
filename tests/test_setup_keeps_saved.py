@@ -21,11 +21,12 @@ DRY = {"option_id": "dry", "qty": 1, "dry": True}
 
 
 def _drive(home, monkeypatch, capsys, cfg, broker="", switch="", scope="",
-           state=None):
+           state=None, sets=None):
     """Run cmd_setup against `cfg` with brokers, wallet, notifications and
     the AI policy step stubbed. Answers go by prompt: `broker`, `switch`
     (the switch confirmation) and `scope` (AgentHC signal scope); every
     other question gets Enter, except the sizing ones (fixed contracts).
+    `sets`: what the stubbed broker step writes (paper or live, keys).
     Returns (saved config, prompts asked, brokers set up, printed text)."""
     from sources import agenthc_day_trade_ideas as hc
     (home / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
@@ -39,7 +40,8 @@ def _drive(home, monkeypatch, capsys, cfg, broker="", switch="", scope="",
     set_up = []
     for name, mod in agent.BROKERS.items():
         monkeypatch.setattr(mod, "setup",
-                            lambda c, _n=name: set_up.append(_n) or c)
+                            lambda c, _n=name: set_up.append(_n)
+                            or {**c, **(sets or {})})
     asked = []
     scope_asked = []
 
@@ -152,11 +154,17 @@ def _real_at(acct):
     return {**REAL, "acct": acct}
 
 
+RH_TAG = __import__("brokers").account_tag({"broker": "robinhood"})
+LIVE_ALPACA = {**BASE, "broker": "alpaca", "alpaca_paper": False}
+
+
 def test_rows_already_at_the_picked_broker_ask_nothing(home, monkeypatch, capsys):
     # saved Alpaca, but the open row is a Robinhood row (left from an
     # earlier switch): switching to Robinhood is what lets the agent manage
     # it again — no warning, and Enter must not keep Alpaca
-    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("robinhood:abc")}}
+    # (the row's tag is the Robinhood account the stubbed setup leaves on:
+    # another Robinhood account would be a switch of its own)
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at(RH_TAG)}}
     cfg, asked, set_up, out = _drive(home, monkeypatch, capsys,
                                      {**BASE, "broker": "alpaca"},
                                      broker="1", state=state)
@@ -235,7 +243,7 @@ def test_re_picking_the_saved_broker_names_rows_left_elsewhere(home, monkeypatch
     state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:live"),
                            "AAPL|2026-11-21|250.0|P": _real_at("moomoo:real")}}
     cfg, asked, set_up, out = _drive(home, monkeypatch, capsys,
-                                     {**BASE, "broker": "alpaca"}, broker="",
+                                     LIVE_ALPACA, broker="",
                                      state=state)
     assert cfg["broker"] == "alpaca" and set_up == ["alpaca"]
     assert not any(p.startswith("Switch to") for p in asked)
@@ -248,7 +256,129 @@ def test_re_picking_the_saved_broker_with_its_own_rows_says_nothing(
     state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:live"),
                            "AAPL|2026-11-21|250.0|P": dict(UNTAGGED)}}
     cfg, asked, _, out = _drive(home, monkeypatch, capsys,
-                                {**BASE, "broker": "alpaca"}, broker="2",
+                                LIVE_ALPACA, broker="2",
                                 state=state)
     assert cfg["broker"] == "alpaca" and "WARNING" not in out
     assert not any(p.startswith("Switch to") for p in asked)
+
+
+# ── paper <-> live within one broker: rows left in the other mode ───────────
+
+PAPER_ALPACA = {**BASE, "broker": "alpaca", "alpaca_paper": True,
+                "alpaca_key_id": "paper-key", "alpaca_secret": "paper-secret"}
+TO_LIVE = {"alpaca_paper": False, "alpaca_key_id": "live-key",
+           "alpaca_secret": "live-secret"}
+
+
+def test_going_live_names_the_paper_rows_and_enter_keeps_paper(
+        home, monkeypatch, capsys):
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:paper")}}
+    cfg, asked, set_up, out = _drive(home, monkeypatch, capsys, PAPER_ALPACA,
+                                     broker="", switch="", state=state,
+                                     sets=TO_LIVE)
+    assert set_up == ["alpaca"]
+    assert any(p.startswith("Switch to Alpaca live anyway? [y/N]") for p in asked)
+    assert "1 open position in your Alpaca paper account: NVDA" in out
+    assert "After switching to Alpaca live the agent will NOT sell it" in out
+    assert "Keeping your saved broker settings (Alpaca paper)." in out
+    # the whole broker step is undone: keys and mode as saved
+    assert cfg["alpaca_paper"] is True
+    assert (cfg["alpaca_key_id"], cfg["alpaca_secret"]) == ("paper-key",
+                                                            "paper-secret")
+
+
+def test_going_live_goes_ahead_on_yes(home, monkeypatch, capsys):
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:paper"),
+                           "AAPL|2026-11-21|250.0|P": _real_at("alpaca:paper")}}
+    cfg, asked, _, out = _drive(home, monkeypatch, capsys, PAPER_ALPACA,
+                                switch="y", state=state, sets=TO_LIVE)
+    assert "2 open positions in your Alpaca paper account" in out
+    assert cfg["alpaca_paper"] is False and cfg["alpaca_key_id"] == "live-key"
+
+
+def test_going_to_paper_only_warns(home, monkeypatch, capsys):
+    # the safe direction is never blocked: the live rows are named, no question
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:live")}}
+    cfg, asked, _, out = _drive(home, monkeypatch, capsys, LIVE_ALPACA,
+                                state=state, sets={"alpaca_paper": True})
+    assert not any(p.startswith("Switch to") for p in asked)
+    assert "1 open position in your Alpaca live account: NVDA" in out
+    assert "the agent will NOT sell it" in out and "in the Alpaca app" in out
+    assert cfg["alpaca_paper"] is True
+
+
+def test_moomoo_going_real_asks_too(home, monkeypatch, capsys):
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("moomoo:paper")}}
+    cfg, asked, _, out = _drive(home, monkeypatch, capsys,
+                                {**BASE, "broker": "moomoo", "moomoo_paper": True},
+                                state=state, sets={"moomoo_paper": False})
+    assert any(p.startswith("Switch to moomoo real anyway?") for p in asked)
+    assert "in your moomoo paper account" in out
+    assert cfg["moomoo_paper"] is True
+
+
+def test_another_robinhood_account_asks(home, monkeypatch, capsys):
+    from brokers import account_tag
+    old = account_tag({"broker": "robinhood", "robinhood_account": "111"})
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at(old)}}
+    cfg, asked, _, out = _drive(home, monkeypatch, capsys,
+                                {**BASE, "broker": "robinhood",
+                                 "robinhood_account": "111"},
+                                state=state, sets={"robinhood_account": "222"})
+    assert any(p.startswith("Switch to this Robinhood account anyway?")
+               for p in asked)
+    assert "in another Robinhood account" in out
+    assert cfg["robinhood_account"] == "111"
+
+
+def test_untagged_rows_are_not_promised_unsold_on_a_mode_switch(
+        home, monkeypatch, capsys):
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": dict(UNTAGGED)}}
+    cfg, asked, _, out = _drive(home, monkeypatch, capsys, PAPER_ALPACA,
+                                switch="y", state=state, sets=TO_LIVE)
+    assert "will NOT sell" not in out
+    assert ("may try to sell it in your Alpaca live account, where it is "
+            "not held") in out
+    assert cfg["alpaca_paper"] is False
+
+
+@pytest.mark.parametrize("state", [
+    None, {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:live")}},
+    {"positions": {"NVDA|2026-11-21|200.0|C": dict(DRY)}}])
+def test_a_mode_switch_without_rows_left_behind_asks_nothing(
+        home, monkeypatch, capsys, state):
+    cfg, asked, _, out = _drive(home, monkeypatch, capsys, PAPER_ALPACA,
+                                state=state, sets=TO_LIVE)
+    assert not any(p.startswith("Switch to") for p in asked)
+    assert "WARNING" not in out and cfg["alpaca_paper"] is False
+
+
+def test_a_new_broker_in_live_mode_names_its_paper_rows(home, monkeypatch,
+                                                        capsys):
+    # saved Robinhood; Alpaca paper rows left from earlier: picking Alpaca
+    # is no broker warning (the rows are there), but going live strands
+    # them. Enter keeps everything as saved — Robinhood included.
+    state = {"positions": {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:paper")}}
+    cfg, asked, set_up, out = _drive(home, monkeypatch, capsys,
+                                     {**BASE, "broker": "robinhood"},
+                                     broker="2", state=state, sets=TO_LIVE)
+    assert set_up == ["alpaca"]
+    assert [p for p in asked if p.startswith("Switch to")] == [
+        "Switch to Alpaca live anyway? [y/N]: "]
+    assert cfg["broker"] == "robinhood" and "alpaca_key_id" not in cfg
+
+
+# ── the dashboard's broker connect names them too ──────────────────────────
+
+def test_switch_left_behind_covers_both_brokers_and_modes(home):
+    import agent as A
+    rows = {"NVDA|2026-11-21|200.0|C": _real_at("alpaca:paper"),
+            "AAPL|2026-11-21|250.0|P": _real_at("moomoo:real"),
+            "MSFT|2026-11-21|400.0|C": _real_at("alpaca:live")}
+    saved = {"broker": "alpaca", "alpaca_paper": True}
+    lines = A._switch_left_behind(saved, {**saved, "alpaca_paper": False}, rows)
+    text = " ".join(h + " " + a for h, a in lines)
+    assert "in your Alpaca paper account: NVDA" in text
+    assert "open at moomoo: AAPL" in text and "MSFT" not in text
+    assert A._switch_left_behind(saved, saved, {
+        "NVDA|2026-11-21|200.0|C": _real_at("alpaca:paper")}) == []

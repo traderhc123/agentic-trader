@@ -375,6 +375,39 @@ def test_broker_connect_is_the_classic_handler_after_confirming(home, app, monke
     assert read_cfg(home) == start
 
 
+def test_a_paper_to_live_switch_names_the_rows_it_leaves_unsold(home, app,
+                                                               monkeypatch):
+    """Alpaca paper -> live: the agent never sells a row tagged with the
+    other mode. The /v2 preview names it (and binds the list), the classic
+    connect's answer names it too; neither changes what happens to it."""
+    from brokers import alpaca
+    monkeypatch.setattr(alpaca, "verify", lambda cfg: (True, "connected (test)"))
+    rows = {"positions": {"NVDA|2026-11-21|200.0|C": {
+        "option_id": "abc", "qty": 2, "live": True, "acct": "alpaca:paper"}}}
+    (home / "state.json").write_text(json.dumps(rows), encoding="utf-8")
+    write_cfg(home, BASE)
+    c = app()
+    data = {"broker": "alpaca", "values": {"alpaca_key_id": "AKNEWKEY000111222",
+                                           "alpaca_secret": "NEWSECRET000111222333",
+                                           "alpaca_paper": False}}
+    first = c.post("/api/v2/broker/connect", data)
+    notes = " ".join(first["preview"]["does_not"])
+    assert "1 open position in your Alpaca paper account: NVDA" in notes
+    assert "After switching to Alpaca live the agent will NOT sell it" in notes
+    assert c.confirmed("/api/v2/broker/connect", data)["ok"] is True
+    write_cfg(home, BASE)
+    r = c.post("/api/broker/connect", data)
+    assert r["ok"] is True and r["left_behind"] and "NVDA" in r["note"]
+    # back to paper: warned the same way, never refused
+    paper = {"broker": "alpaca", "values": {**data["values"], "alpaca_paper": True}}
+    rows["positions"]["NVDA|2026-11-21|200.0|C"]["acct"] = "alpaca:live"
+    (home / "state.json").write_text(json.dumps(rows), encoding="utf-8")
+    r = c.post("/api/broker/connect", paper)
+    assert r["ok"] is True and "in your Alpaca live account" in r["note"]
+    assert read_cfg(home)["alpaca_paper"] is True
+    assert json.loads((home / "state.json").read_text(encoding="utf-8")) == rows
+
+
 def test_pass_buy_is_the_classic_handler_after_confirming(home, app, monkeypatch):
     from sources import agenthc_day_trade_ideas as hc
     bought = []
