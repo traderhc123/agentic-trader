@@ -1026,7 +1026,7 @@ def test_ended_day_pass_still_reads_exits_for_a_real_position(monkeypatch):
     state = _ended_state()
     events = agenthc.poll({}, state, lambda s: None)
     assert [e["event"] for e in events] == ["EXITED"]   # never an entry
-    assert srv.calls == [{"Authorization": ENDED}]
+    assert srv.calls == [{"Authorization": ENDED, "X-Agent-Mode": "live"}]
     assert agenthc.had_access() is False
     assert _exit_flag() == (True, "")
     assert "exits_done" not in state["l402"]

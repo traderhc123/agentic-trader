@@ -808,8 +808,9 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     day</b>, or 5 signal days for ~<span data-pass-usd="5">$225</span>, priced in sats.</p>
     <div class="facts">
      <div><h4>Billing</h4>A day
-     is only used when your agent actually receives a trade signal (an entry or
-     an exit) that day; quiet days are free.</div>
+     is only used when your agent is LIVE and actually receives a trade signal
+     (an entry or an exit) that day; quiet days are free. Practice never uses
+     a signal day or buys a pass; only LIVE uses days.</div>
      <div><h4>Carry-over</h4>Unused days carry over when you buy more.</div>
      <div><h4>Custody</h4>The agent never
      holds money. You pay each invoice from your own wallet.</div>

@@ -290,7 +290,7 @@ def test_other_trades_on_reads_enough_to_keep_a_main_exit(home, monkeypatch, no_
     _loop(cfg, state, b, srv, monkeypatch)
     assert key not in state["positions"]          # the main exit was read
     assert hc.had_exit_access() is True
-    assert srv.asked[-1] == {"limit": MAX, "track": "all"}
+    assert srv.asked[-1] == {"limit": MAX, "track": "all", "mode": "live"}
 
 
 def test_limit_main_only_is_small_unless_after_a_gap(monkeypatch):
@@ -382,7 +382,7 @@ def test_first_read_of_every_track_is_no_gap_by_itself(home, monkeypatch, no_pol
     state["positions"][f"WULF|{FAR}|15.0|C"] = {"option_id": "stub", "qty": 1,
                                                 "track": "other"}
     _loop(cfg, state, b, srv, monkeypatch)
-    assert srv.asked[-1] == {"limit": MAX, "track": "all"}
+    assert srv.asked[-1] == {"limit": MAX, "track": "all", "mode": "live"}
     assert hc.had_exit_access() is True and "feed_gap" not in state
     assert not any("may have been missed" in t for t in told)
 

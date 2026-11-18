@@ -2221,6 +2221,24 @@ def _feed_paid_per_day(cfg):
             and not cfg.get("agenthc_api_key"))
 
 
+def _feed_mode(cfg, state=None):
+    """What the agent tells the signal feed it is on every read (AgentHC
+    charges a signal day only for "live"; sources.agenthc_day_trade_ideas
+    .feed_mode): "off" while the owner's Pause is on (_paused: the saved
+    Pause, which an automatic stop also sets, or a move that left this
+    computer selling only) — also while it still reads exits for a real
+    position it holds; "dry_run" in practice (_is_dry, the mode the orders
+    use); else "live"."""
+    if _paused(cfg):
+        return "off"
+    return "dry_run" if _is_dry(cfg, state) else "live"
+
+
+# Said wherever practice or the signal passes are explained.
+PRACTICE_DAYS_NOTE = ("Practice never uses a signal day or buys a pass; only "
+                      "LIVE uses days.")
+
+
 def _pause_skips_feed(cfg, state):
     """Paused with no REAL position open, on a feed that is paid per day:
     don't read the feed. There is no exit order to wait for, and a read
@@ -2241,7 +2259,9 @@ def _pause_note(cfg, state):
         return ""
     if _real_positions(state):
         return ("While a real position is open the agent still reads the "
-                "signal feed to get its exit signal, which uses a signal day.")
+                "signal feed to get its exit signal. A paused agent tells "
+                "AgentHC it is off, so this uses no signal day, and it does "
+                "not buy a day-pass.")
     return ("No real position is open, so the agent is not reading the signal "
             "feed: the pause uses no signal day.")
 
@@ -5092,6 +5112,8 @@ _SIGNAL_LOSS_WHY = {
     "no_day_pass": "the agent has no day-pass for today",
     "day_pass_off": ("Recurring day-pass is off, so the agent has no day-pass "
                      "for today"),
+    "day_pass_not_live": ("the agent is in practice or paused, and only LIVE "
+                          "buys a day-pass, so it has none for today"),
     "day_pass_short": ("the agent's wallet does not hold enough sats for "
                        "today's day-pass"),
     "day_pass_failed": "the agent's wallet could not pay for today's day-pass",
@@ -5110,6 +5132,9 @@ _SIGNAL_LOSS_FIX = {
     "pass_ended": _BUY_DAYS,
     "pass_unpaid": _BUY_DAYS,
     "no_day_pass": _BUY_DAYS,
+    # a prepaid pass reads the exits in practice and while paused without
+    # using a signal day
+    "day_pass_not_live": _BUY_DAYS,
     "day_pass_short": ("add sats to the agent's wallet (dashboard → Settings "
                        "→ Signal source)"),
     "day_pass_failed": ("check the agent's wallet in the dashboard (Settings "
@@ -7531,12 +7556,12 @@ def _command(t, cfg, text):
                       "you already have. The agent stays paused, also after a "
                       "restart, until you say 'resume'."
                       + (" While a real position is open the agent still "
-                         "reads the signal feed to get its exit signal, which "
-                         "uses a signal day (or buys a day-pass, if you turned "
-                         "that on). With no real position open it stops "
-                         "reading the feed, so the pause costs nothing; dry-run "
-                         "(paper) positions are then not updated until you "
-                         "resume."
+                         "reads the signal feed to get its exit signal; a "
+                         "paused agent tells AgentHC it is off, so that uses "
+                         "no signal day, and it buys no day-pass. With no "
+                         "real position open it stops reading the feed, so "
+                         "the pause costs nothing; dry-run (paper) positions "
+                         "are then not updated until you resume."
                          if _feed_paid_per_day(cfg) else ""))
     if t == "resume":
         import transfer
@@ -7623,16 +7648,20 @@ def _command(t, cfg, text):
         cfg["dry_run"] = True
         _save(CONFIG_PATH, cfg, private=True)
         note = _dry_run_note(cfg, _load(STATE_PATH, {}) or {})
-        return True, ("Dry-run ON — " + note if note else
-                      "Dry-run ON — new signals are only logged; no real "
-                      "trades will be placed.")
+        days = (" " + PRACTICE_DAYS_NOTE) if _feed_paid_per_day(cfg) else ""
+        return True, (("Dry-run ON — " + note if note else
+                       "Dry-run ON — new signals are only logged; no real "
+                       "trades will be placed.") + days)
     if t in ("dry off", "dry-run off", "go live"):
         if llm_policy.entries_blocked(cfg):
             return True, ("Not going live: " + llm_policy.BLOCKED_MSG
                           + " (Say 'policy off' to remove it.)")
         cfg["dry_run"] = False
         _save(CONFIG_PATH, cfg, private=True)
-        return True, "Dry-run OFF — the agent will place REAL orders from now on."
+        return True, ("Dry-run OFF — the agent will place REAL orders from now on."
+                      + (" Only LIVE uses signal days: each market day the "
+                         "agent receives a signal now uses one (practice "
+                         "never did)." if _feed_paid_per_day(cfg) else ""))
     if t.startswith("set budget"):
         val = _command_number(t, "set budget")
         if val is None or val <= 0:
@@ -8355,7 +8384,11 @@ def cmd_run(app_window=False):
                 else:
                     FEED_GATE["now"] = False
                     try:
-                        events = source.poll(cfg, state, save_state)
+                        # the mode this read says to the feed (only LIVE
+                        # uses a signal day or buys a day-pass)
+                        events = source.poll(
+                            {**cfg, "feed_mode": _feed_mode(cfg, state)},
+                            state, save_state)
                     except Exception as exc:
                         _loop_note_poll(source, None, exc)  # (dashboard)
                         # no exit signal can be read: before any re-raise.

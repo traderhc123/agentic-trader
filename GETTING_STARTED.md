@@ -240,8 +240,9 @@ docker run -d --name agentic-trader --restart on-failure -v agentic-trader-data:
 - **Prepaid feed access**: for the AgentHC feed, buy 1 signal day (~$50) or 5
   signal days (~$225) in the wizard with one Lightning payment from the wallet you
   already use —
-  the agent holds no money. A day is only used when your agent receives a
-  trade signal (entry or exit) that day; quiet days are free. You're notified
+  the agent holds no money. A day is only used when your agent is LIVE and
+  receives a trade signal (entry or exit) that day; quiet days are free.
+  Practice never uses a signal day or buys a pass; only LIVE uses days. You're notified
   when 2 days are left; buying more carries unused days over. A size can be
   briefly off sale while the server's Lightning node refills capacity after a
   large purchase, and the 5-day pass (≈$225) may exceed some wallets'

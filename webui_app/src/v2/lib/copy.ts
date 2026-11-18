@@ -864,6 +864,7 @@ export const EXIT_LOSS_WHY: Record<ExitLoss["cause"], string> = {
   pass_unchecked: "the agent could not check your signal pass with AgentHC",
   no_day_pass: "the agent has no day-pass for today",
   day_pass_off: "Recurring day-pass is off, so the agent has no day-pass for today",
+  day_pass_not_live: "the agent is in practice or paused, and only LIVE buys a day-pass, so it has none for today",
   day_pass_short: "the agent's wallet does not hold enough sats for today's day-pass",
   day_pass_failed: "the agent's wallet could not pay for today's day-pass",
   day_pass_undecided: "the agent's wallet has not said whether today's day-pass payment went through",

@@ -173,6 +173,11 @@ so open positions can close. You're notified when 2 days are left; buying
 more carries unused days over. A pass is valid for at most about twice its
 length in market days.
 
+**Practice never uses a signal day or buys a pass; only LIVE uses days.**
+Every read of the feed tells AgentHC the agent's mode (`live`, `dry_run` for
+practice, or `off` while paused); AgentHC uses a signal day only for `live`,
+and the agent's wallet buys a day-pass only while it is live.
+
 **Advanced: daily auto-pay from a wallet the agent controls.** The agent
 keeps an LNbits wallet and buys a 24-hour pass each market day (only when you
 turn *Recurring day-pass* ON). Set it up under *Advanced* in the wizard, or
@@ -287,9 +292,11 @@ Each phone gets its own token (stored here only as a SHA-256 hash).
   signals, the expiry guard and the broker checks keep running for positions
   you already have, and the agent stays paused after a restart until you
   press Resume. (On the pay-per-day AgentHC feed: while a real position is
-  open, a paused agent still reads the feed to get its exit signal, which
-  uses a signal day. With no real position open it stops reading the feed,
-  so the pause costs nothing; dry-run positions are not updated meanwhile.)
+  open, a paused agent still reads the feed to get its exit signal; it tells
+  AgentHC it is off, so that uses no signal day, and it buys no day-pass.
+  With no real position open it stops reading the feed, so the pause costs
+  nothing; dry-run positions are not updated meanwhile.) Practice never
+  uses a signal day or buys a pass; only LIVE uses days.
   **Dry-run** stops *new real trades* only — a position the agent already
   bought with a real order is still sold for real when its exit signal
   arrives; the dashboard tells you how many such positions are open before
