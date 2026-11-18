@@ -466,9 +466,10 @@ def test_running_loop_serves_a_live_view_model(home, monkeypatch, no_policy):
         "state": "not_today", "reason_code": "daily_cap_reached"}
     # the old status, from the same run, is what it was
     assert old["mode"] == "LIVE" and old["paused"] is False
+    assert old["selling_only"] is False
     assert old["fields"]["entries today"] == "1 / cap 1"
-    assert set(old) == {"mode", "paused", "hold", "pause_note", "restarting",
-                        "real_positions", "dry_run_note", "fields",
+    assert set(old) == {"mode", "paused", "hold", "selling_only",
+                        "pause_note", "restarting", "real_positions", "dry_run_note", "fields",
                         "cash_warning", "expiry_warnings", "problems",
                         "budget_hints", "would_have"}
     # loop 2: the feed could not be read

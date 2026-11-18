@@ -2195,6 +2195,15 @@ def _paused(cfg):
 _EXITS_ONLY_RUN = {"on": False}
 
 
+# What the old computer says while it only sells (transfer.exits_only):
+# the dashboards' notice and pause note, and the chat's answer to Resume.
+MOVE_EXITS_NOTE = (
+    "Selling only: a move file made here was downloaded but the move wasn't "
+    "finished, so the setup may run on another computer. This one takes NO "
+    "new trades but still sells the positions it holds. Gave up on the move, "
+    "or never opened the file elsewhere? Run: python agent.py resume-here")
+
+
 def _move_exits_only():
     import transfer
     if _EXITS_ONLY_RUN["on"]:
@@ -2226,6 +2235,8 @@ def _pause_skips_feed(cfg, state):
 def _pause_note(cfg, state):
     """What a pause means for the paid signal feed right now, in the owner's
     words ("" when not paused, or the feed costs nothing per day)."""
+    if _move_exits_only():
+        return MOVE_EXITS_NOTE
     if not _paused(cfg) or not _feed_paid_per_day(cfg):
         return ""
     if _real_positions(state):
@@ -7540,14 +7551,7 @@ def _command(t, cfg, text):
                 "move: stop or destroy the other copy first, then run: "
                 "python agent.py resume-here")
         if _move_exits_only():
-            return True, (
-                "Can't resume new entries here: a move file made on this "
-                "computer was downloaded but the move was never finished, so "
-                "the setup may be running on another computer too. This one "
-                "only sells the positions it holds. To finish the move, make "
-                "a new move file and press 'I saved the file'. To trade here "
-                "again instead: stop the other computer first, then run: "
-                "python agent.py resume-here")
+            return True, "Can't resume new trades here. " + MOVE_EXITS_NOTE
         cfg.pop("paused", None)
         _save(CONFIG_PATH, cfg, private=True)
         request_feed_read()  # the feed and buying power at once, not on schedule
@@ -8022,6 +8026,9 @@ def cmd_run(app_window=False):
             # shows pause_note instead of what the owner's Pause means.
             "paused": _paused(c) or bool(_full_hold_note()),
             "hold": bool(_full_hold_note()),
+            # a downloaded move file was never finished: no new entries,
+            # exits still run; only `resume-here` ends it (pause_note says so)
+            "selling_only": _move_exits_only(),
             "pause_note": _full_hold_note() or _pause_note(c, st),
             # an update or a move is about to restart the agent: until then
             # it reads no signals and places no orders
@@ -8102,6 +8109,9 @@ def cmd_run(app_window=False):
                     for w in signal_loss_banner(
                         c, st, paused=bool(_full_hold_note()),
                         acct=_status_acct(c))]
+            if _move_exits_only():
+                out.append({"level": "warn", "code": "move_exits_only",
+                            "text": MOVE_EXITS_NOTE})
             if cash.get("warning"):
                 out.append({"level": "warn", "code": "low_cash",
                             "condition": "low_cash", "text": cash["warning"]})
@@ -8121,6 +8131,7 @@ def cmd_run(app_window=False):
             "heartbeat_at": LOOP.get("beat_at"),
             "wait_s": LOOP.get("wait_s"),
             "hold": hold, "hold_since": hold_since,
+            "move_exits": _move_exits_only(),
             "hold_recorded": hold_recorded,
             "poll_at": LOOP.get("poll_at"), "poll_ok": LOOP.get("poll_ok"),
             "signal_at": LOOP.get("signal_at"),
@@ -8163,8 +8174,8 @@ def cmd_run(app_window=False):
     if _state_held():  # damaged state.json: nothing is ordered at all
         mode += ", ON HOLD — no orders at all until you press Resume"
     elif _move_exits_only():  # a downloaded move file may run elsewhere
-        mode += (", NO NEW ENTRIES — an unfinished move: exits still run "
-                 "(python agent.py resume-here ends it)")
+        mode += (", SELLING ONLY — an unfinished move: no new trades, exits "
+                 "still run (python agent.py resume-here ends it)")
     elif _paused(cfg):  # saved in config.json: still paused after a restart
         mode += ", PAUSED — no new entries until you press Resume"
     if _is_dry(cfg, state) and _dry_run_note(cfg, state):

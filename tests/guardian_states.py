@@ -54,6 +54,11 @@ def runtime(**over):
     return rt
 
 
+def _move_note():
+    import agent
+    return agent.MOVE_EXITS_NOTE
+
+
 def _pass_state(days_left=13, status="active"):
     from sources import agenthc_day_trade_ideas as hc
     return {"pass_status": {hc._token_id("fixture-pass"): {
@@ -279,6 +284,12 @@ STATES = {
                            hold_since="2026-11-09T18:02:00+00:00")),
     "handoff-hold": (LIVE, _state(True), _history(True),
                      runtime(hold="handoff_hold")),
+    # the old computer after a downloaded move file was never finished: it
+    # takes no new trades, sells what it holds, Resume can't end it
+    "move-selling-only": (LIVE, _state(True), _history(True),
+                          runtime(move_exits=True, notices=[{
+                              "level": "warn", "code": "move_exits_only",
+                              "text": _move_note()}])),
     "restarting": (LIVE, _state(True), _history(True),
                    runtime(hold="restarting")),
     "limit-hit": (LIVE, _state(True, _AMD_POS),

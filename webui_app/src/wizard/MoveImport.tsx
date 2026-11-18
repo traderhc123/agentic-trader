@@ -42,7 +42,7 @@ export function MoveImport({ running = false }: { running?: boolean }) {
       if (!r.ok) return setMsg(err(r.error || "Import failed."));
       setMsg(
         ok(
-          "Your setup is here. It starts in dry-run: no new trades. Real positions you moved over are still sold on their exit signal, so make sure the old computer is off first. Then say 'dry off' in the dashboard" +
+          "Your setup is here. It starts in dry-run: no new trades. Real positions you moved over are still sold on their exit signal, so make sure the old computer is off first (it stops trading by itself once the move is finished there; 'python agent.py resume-here' on it is only for going back). Then say 'dry off' in the dashboard" +
             (r.was_live ? " to go live again." : " when you're ready.") +
             (r.restarting ? " Your agent is restarting with it…" : " Opening the last step…"),
         ),
@@ -91,6 +91,11 @@ export function MoveImport({ running = false }: { running?: boolean }) {
           <Field htmlFor="mv-pass" label="Passphrase">
             <Input id="mv-pass" type="password" autoComplete="off" value={pw} onChange={(e) => setPw(e.target.value)} onKeyDown={(e) => e.key === "Enter" && run()} />
           </Field>
+          <p className="m-0 text-xs text-muted">
+            Not moving after all? Leave this file unopened and run <code className="font-mono">python agent.py resume-here</code> on the old
+            computer, then start its agent again. Use it there when the move was abandoned, or when the file was downloaded but never
+            opened here: that computer then takes no new trades and only sells what it holds, until you run it.
+          </p>
           <div className="flex flex-wrap items-center gap-3">
             <Button variant="primary" onClick={() => run()} disabled={busy}>
               Open move file

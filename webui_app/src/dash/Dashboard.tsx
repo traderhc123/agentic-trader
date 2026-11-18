@@ -222,6 +222,8 @@ export function Dashboard() {
   const pauseNote = status?.pause_note || "";
   // a full hold (damaged memory file, move to a server): no orders at all, not the owner's Pause
   const hold = !!status?.hold;
+  // an unfinished move: sells what it holds, no new entries (not the owner's Pause)
+  const sellingOnly = !!status?.selling_only;
   const restarting = !!status?.restarting;
   const f = status?.fields || {};
   const rail = conn === "ok" ? (paused ? "paused" : live ? "live" : "dry") : conn === "loading" ? "none" : "off";
@@ -242,7 +244,7 @@ export function Dashboard() {
             ) : (
               <Pill className="max-sm:hidden">Market closed</Pill>
             )}
-            {paused && <Pill tone="warn">{hold ? "On hold" : "Paused"}</Pill>}
+            {paused && <Pill tone="warn">{hold ? "On hold" : sellingOnly ? "Selling only" : "Paused"}</Pill>}
           </>
         ) : conn === "loading" ? null : (
           <Pill tone="bad">{conn === "off" ? "Agent not running" : "Agent unreachable"}</Pill>
@@ -329,7 +331,16 @@ export function Dashboard() {
       </ConfirmDialog>
 
       <main className="mx-auto max-w-[1440px] px-6 pb-10 pt-5 max-sm:px-4 max-sm:pt-4">
-        <ModeBanner conn={conn} live={live} paused={paused} hold={hold} dryNote={dryNote} pauseNote={pauseNote} restarting={restarting} />
+        <ModeBanner
+          conn={conn}
+          live={live}
+          paused={paused}
+          hold={hold}
+          sellingOnly={sellingOnly}
+          dryNote={dryNote}
+          pauseNote={pauseNote}
+          restarting={restarting}
+        />
         {conn === "ok" && <ExpiryBanner items={status?.expiry_warnings || []} />}
         <StatusStrip conn={conn} f={f} />
         {conn === "ok" && <WhyNoTrades warning={status?.cash_warning || ""} problems={status?.problems || []} hints={status?.budget_hints || []} live={live} onCommand={send} />}
@@ -543,6 +554,7 @@ function ModeBanner({
   live,
   paused,
   hold,
+  sellingOnly,
   dryNote,
   pauseNote,
   restarting,
@@ -551,6 +563,7 @@ function ModeBanner({
   live: boolean;
   paused: boolean;
   hold: boolean;
+  sellingOnly: boolean;
   dryNote: string;
   pauseNote: string;
   restarting: boolean;
@@ -591,7 +604,13 @@ function ModeBanner({
                   <b className="text-warn">On hold:</b> {pauseNote || "the agent places no orders at all."}
                 </>
               )}
-              {paused && !hold && (
+              {paused && !hold && sellingOnly && (
+                <>
+                  {" "}
+                  <b className="text-warn">Selling only:</b> {pauseNote || "a move was not finished, so this computer takes no new trades. Exits keep running."}
+                </>
+              )}
+              {paused && !hold && !sellingOnly && (
                 <>
                   {" "}
                   <b className="text-warn">Paused:</b> no new entries. Exit signals and the expiry guard keep running for

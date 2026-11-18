@@ -61,6 +61,9 @@ export interface StatusResp {
   /** a full hold, not the owner's Pause: no orders at all, exits included (damaged memory file,
    *  or the setup is being moved to a server). `pause_note` then says which and what to do. */
   hold?: boolean;
+  /** a downloaded move file was never finished: no new entries, but exits keep running.
+   *  Resume doesn't end it; `python agent.py resume-here` does. `pause_note` says why. */
+  selling_only?: boolean;
   /** real (not dry-run) positions the agent holds now */
   real_positions?: number;
   /** what dry-run does with those positions, in plain words ("" when there are none) */

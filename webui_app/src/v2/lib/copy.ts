@@ -709,6 +709,8 @@ const SHARED: Partial<Record<Answer["reason_code"], (s: Status) => string>> = {
   handoff_hold: () =>
     "This setup is being moved to another computer or a server, so the agent here places no orders.",
   restarting: () => "The agent is about to restart (an update or a move). It places no orders until it is back.",
+  move_exits: () =>
+    "Selling only: a move file was downloaded but the move was not finished, so this computer takes no new trades. It still sells what it holds. If you gave up on the move, run python agent.py resume-here on this computer.",
   pause_feed_not_read: () =>
     "New trades are paused and no real position is open, so the agent is not reading the signal feed. The pause uses no signal day; practice positions are not updated until you resume.",
 };
