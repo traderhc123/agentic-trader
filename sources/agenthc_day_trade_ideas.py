@@ -1032,7 +1032,11 @@ def _check_window(cfg, state, save_state, body, params, events):
     the no-signal sell time (agent.signal_loss_tick). Never raises."""
     try:
         raw = body.get("events") if isinstance(body, dict) else None
-        raw = raw if isinstance(raw, list) else []
+        # a completed trade released to practice keeps its original times
+        # (hours or days old by design): no gap is judged from it
+        raw = [e for e in (raw if isinstance(raw, list) else [])
+               if not (isinstance(e, dict) and e.get("practice_release"))]
+        events = [e for e in events if not e.get("practice_release")]
         rows = state.get("positions")
         held = sorted(k for k, r in (rows.items() if isinstance(rows, dict) else ())
                       if isinstance(r, dict))
@@ -2319,6 +2323,10 @@ def _parse_events(body):
             }
             if "paper_pnl_pct" in ev:
                 norm["paper_pnl_pct"] = ev["paper_pnl_pct"]
+            if ev.get("practice_release"):
+                # a completed trade released to practice at its exit (a
+                # mode=dry_run read): the agent books it, never trades it
+                norm["practice_release"] = str(ev["practice_release"])[:40]
         except (KeyError, TypeError, ValueError):
             continue
         norm["event_id"] = (f"{norm['event']}|{norm['ticker']}|{norm['expiry']}|"

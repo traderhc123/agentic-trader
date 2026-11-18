@@ -665,8 +665,12 @@ export function describe(e: Activity, brokerName?: string | null): Described {
     icon: r.icon,
     tag,
     title: r.title(ctx),
-    sub: r.sub(ctx),
-    what: r.what(ctx),
+    // a practice trade AgentHC released at its exit: when it really happened
+    sub: e.practice_note ? `${r.sub(ctx)} · ${e.practice_note}` : r.sub(ctx),
+    what: e.practice_note
+      ? `A practice trade in ${ctx.name}, logged only after it closed (${e.practice_note}). Nothing was sent to ${broker}.` +
+        (e.action === "exit" ? result(ctx) : "")
+      : r.what(ctx),
     why: r.why(ctx),
     can: r.can(ctx),
     go: r.go ?? null,

@@ -1,6 +1,7 @@
 // From a Status to what the screen says. Pure functions, no React, no
-// imports that exist at run time except ./format and ./copy, so the Node
-// tests can run every fixture state through them.
+// imports that exist at run time except ./format, ./copy and
+// ../../lib/modeText (plain strings), so the Node tests can run every
+// fixture state through them.
 //
 // The honesty rules, in code:
 //   - the mode band comes from `mode` only, the run-state block from `pause`
@@ -14,6 +15,7 @@ import type { Activity, Book, Condition, Iso, Notice, Position, Status } from ".
 import { GUARD_STILL, UNMANAGED_FALLBACK, UNMANAGED_SHORT, UNMANAGED_WHY, answerWhy, describe, exitLossWhy, leftToday, nextSay, own, sellsFor, sizeEach, type Go, type IconName, type NextSay } from "./copy.ts";
 import { hintWords, v2Words } from "./settings.ts";
 import { contractName, etDayKey, etTime, etWhen, dayLong, plural, span, secondsBetween, usd } from "./format.ts";
+import { PRACTICE_BANNER_TEXT } from "../../lib/modeText.ts";
 
 /** How this page is connected to the agent. Independent of mode and pause.
  *    ok       a fresh snapshot, and the agent's loop is answering
@@ -150,7 +152,8 @@ export function bandModel(s: Status, l: Link): BandModel {
         (s.mode_explicit ? "" : " The settings never chose a mode; the agent treats that as LIVE."),
     ];
   } else {
-    let rest = " New trades are only recorded.";
+    // AgentHC releases practice trades at their exit (release on close)
+    let rest = s.signals.source === "agenthc" ? ` ${PRACTICE_BANNER_TEXT}` : " New trades are only recorded.";
     if (n && s.real_positions_managed)
       rest += ` Your ${plural(n, "real position")} ${their(n, "is", "are")} still sold for real on ${their(n, "its exit signal", "their exit signals")}.`;
     else if (n) rest += ` ${notSoldNow(s, true)}`;

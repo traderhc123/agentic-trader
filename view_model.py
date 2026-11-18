@@ -411,6 +411,7 @@ def _types():
             "reason_params": MAP,
             "reason_text": Opt("str"),
             "hint": Opt("str"),
+            "practice_note": Opt("str"),
         },
         "Results": {
             "real": Ref("Book"),
@@ -548,6 +549,9 @@ _DOC = {
     "Activity.fill_price": "per share, only when the broker reported the fill",
     "Activity.quote_price": "per-share quote the estimate used",
     "Activity.stopped_at_check": "the entry check that stopped it",
+    "Activity.practice_note": "a practice trade AgentHC released at its exit: "
+                              "\"signal HH:MM → exit HH:MM, logged at exit\" "
+                              "(ET); null for every other row",
     "Book.today": "estimated result of trades closed today (ET)",
     "Book.last_7_days": "the last 7 calendar days (ET), today included",
     "Book.unmeasured_today": "sales today (ET) with no estimate: not in "
@@ -1025,7 +1029,24 @@ def activity_row(row):
         "reason_params": _reason_params(row, ui, action),
         "reason_text": _text(row.get("reason")),
         "hint": _text(row.get("hint")),
+        "practice_note": _practice_note(row),
     }
+
+
+def _practice_note(row):
+    """agent._practice_when for a practice trade released at its exit, or
+    None (any other row, or times that can't be read)."""
+    import agent as A
+    if row.get("practice_release") is not True:
+        return None
+    t_in = _utc(row.get("signal_at")) if isinstance(row.get("signal_at"), str) else None
+    t_out = _utc(row.get("exit_at")) if isinstance(row.get("exit_at"), str) else None
+    if t_in is None or t_out is None:
+        return None
+    try:
+        return A._practice_when(t_in, t_out)
+    except Exception:
+        return None
 
 
 def _clean_rows(rows):

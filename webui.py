@@ -1004,6 +1004,11 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div class="stack">
    <label class="check"><input type="checkbox" id="sf-dry" checked onchange="sfDryChanged()"><span>Start in
    <b>dry-run</b> mode (log actions, place no orders — recommended)</span></label>
+   <p class="note" id="sf-mode-text">With AgentHC signals: Practice mode logs each trade only after it
+   closes — with the time AgentHC entered and exited and its recorded result — sized to your budget and
+   rules. It never uses a signal day or buys a pass. Live mode trades signals in real time and uses one
+   signal day on each trading day you receive signals. An Alpaca paper-trading account with Live selected
+   is LIVE: it receives the signals in real time and uses signal days too.</p>
    <div class="notice" id="sf-live-warn" role="alert" style="display:none"><b>LIVE mode:</b> the agent
    will send real orders with real money to your broker — your decision, not advice.</div>
   </div>
@@ -2266,7 +2271,9 @@ function spark(points){
     '<path d="'+d+'" fill="none" stroke="'+col+'" stroke-width="1.75" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>';
   wrap.style.display='';
 }
-function setMode(kind,live,paused,note,pauseNote,restarting,hold){
+// agent.PRACTICE_MODE_TEXT for the one-line banner (AgentHC: release on close)
+const PRACTICE_BANNER='Each trade is logged only after it closes — with the time AgentHC entered and exited and its recorded result — sized to your budget and rules. Practice never uses a signal day or buys a pass.';
+function setMode(kind,live,paused,note,pauseNote,restarting,hold,agenthc){
   // kind: 'ok' | 'off' | 'unreachable'
   // #modebar is a live region polled every 5s: only touch the DOM when the
   // text actually changes, or screen readers re-announce it on every poll.
@@ -2276,8 +2283,10 @@ function setMode(kind,live,paused,note,pauseNote,restarting,hold){
   if(kind==='unreachable'){put('modebar off','<b>Can\\'t reach the agent on this computer</b> — is it still running?');return;}
   put('modebar '+(live?'live':'dry')+(paused?' paused':''),
     (live?'<b>LIVE.</b> Real orders with real money are sent to your broker.':
-    note?'<b>Dry-run.</b> '+esc(note):
+    (note?'<b>Dry-run.</b> '+esc(note):
     '<b>Dry-run.</b> The agent logs every decision but places no orders.')+
+    // AgentHC releases practice trades at their exit (release on close)
+    (agenthc?' '+PRACTICE_BANNER:''))+
     (hold?' <b class="pz">On hold</b> — '+esc(pauseNote||'the agent places no orders at all.'):
      paused?' <b class="pz">Paused</b> — no new entries. Exit signals and the expiry guard keep'+
       ' running for positions you already have. Stays paused, also after a restart, until you press Resume.'+
@@ -2312,7 +2321,7 @@ async function refresh(){
     mk.className='pill'+(open?' open':'');mk.style.display='';
     $('b-paused').style.display=s.paused?'':'none';
     $('b-paused').textContent=s.hold?'On hold':'Paused';
-    setMode('ok',live,!!s.paused,note,s.pause_note||'',!!s.restarting,!!s.hold);
+    setMode('ok',live,!!s.paused,note,s.pause_note||'',!!s.restarting,!!s.hold,f['source']==='agenthc');
     const qp=$('q-pause');
     qp.innerHTML=s.paused?ICON('play')+'Resume':ICON('pause')+'Pause';
     qp.dataset.cmd=s.paused?'resume':'pause';qp.className=s.paused?'btn-primary':'';

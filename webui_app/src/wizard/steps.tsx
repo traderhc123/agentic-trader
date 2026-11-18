@@ -6,6 +6,7 @@ import { ChoiceRow, Field, Input, Select, Textarea } from "../components/ui/fiel
 import { Msg, err, info, ok, type MsgT } from "../components/ui/tag";
 import { api, type WizardState } from "../lib/api";
 import { mdLite } from "../lib/md";
+import { ALPACA_PAPER_LIVE_TEXT, LIVE_MODE_TEXT, PRACTICE_MODE_TEXT } from "../lib/modeText";
 import { Block, Notice, StepCard, useWiz } from "./Wizard";
 import { returnTo } from "../lib/returnTo";
 
@@ -738,6 +739,9 @@ export function SafetyStep() {
         <ChoiceRow type="checkbox" id="sf-dry" checked={dry} onChange={setDry} tone={dry ? "accent" : "live"}>
           Start in <b className="text-fg">dry-run</b> mode (log actions, place no orders; recommended)
         </ChoiceRow>
+        <p className="text-sm text-fg2" id="sf-mode-text">
+          With AgentHC signals: {PRACTICE_MODE_TEXT} {LIVE_MODE_TEXT} {ALPACA_PAPER_LIVE_TEXT}
+        </p>
         {!dry && (
           <Notice tone="live" role="alert">
             <b>LIVE mode:</b> the agent will send real orders with real money to your broker. Your decision, not advice.

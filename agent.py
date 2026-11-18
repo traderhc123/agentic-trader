@@ -932,8 +932,11 @@ def _append_trade_rows(path, rows):
         raise
 
 
-def _log_trade(record):
-    record["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+def _log_trade(record, ts=None):
+    """Append one row. `ts`: when its event happened, when that is not now
+    (a practice trade released at its exit is dated at its signal and exit
+    times: _book_practice_trade); else now."""
+    record["ts"] = ts or datetime.now(timezone.utc).isoformat(timespec="seconds")
     path = TRADES_PATH
     waiting = [x for x in _UNWRITTEN if x[0] == path]
     try:
@@ -1111,12 +1114,27 @@ def _et_day(ts):
     return d.astimezone(MARKET_TZ).date().isoformat()
 
 
+def _row_dt(t):
+    """When a trade-log row's event happened (a close found in the account:
+    when its sale filled, else the row's ts), as an aware datetime, or
+    None."""
+    try:
+        d = datetime.fromisoformat(str(t.get("closed_at") or t.get("ts") or ""))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
 _POLICY_ROWS_SHOWN = 50
 _POLICY_EARLIER_SHOWN = 20
 
 
-def _policy_view(dry, strict=False):
+def _policy_view(dry, strict=False, now=None, rows_in=None):
     """What the AI policy check is shown: (rows, context).
+
+    now / rows_in (a practice trade released at its exit, checked as of its
+    signal time): the view at `now` (ET), from `rows_in` instead of the log,
+    leaving out every row later than `now`.
 
     rows: today's entry and exit rows (ET market day; a close found in the
     account counts on the day it filled) of the mode the agent is in only,
@@ -1132,15 +1150,21 @@ def _policy_view(dry, strict=False):
     window. strict: as for _entries_today."""
     import collections
     import rules
-    now = _et_now()
+    cut = now
+    now = now or _et_now()
     today = now.date().isoformat()
     rows = []
     earlier = collections.deque(maxlen=_POLICY_EARLIER_SHOWN)
     # one pass over the whole log; the substrings are only a cheap pre-filter
-    for t in _todays_log_rows(('"entry"', '"exit"'), strict):
+    for t in (_todays_log_rows(('"entry"', '"exit"'), strict)
+              if rows_in is None else rows_in):
         if (t.get("action") not in ("entry", "exit")
                 or bool(t.get("dry")) != bool(dry)):
             continue
+        if cut is not None:
+            at = _row_dt(t)
+            if at is None or at > cut:
+                continue
         day = _et_day(t.get("closed_at") or t.get("ts", ""))
         if day == today:
             rows.append(t)
@@ -2220,6 +2244,11 @@ def _feed_paid_per_day(cfg):
     prepaid signal day or buys a day-pass."""
     return (cfg.get("source", "agenthc") == "agenthc"
             and not cfg.get("agenthc_api_key"))
+
+
+def _agenthc_source(cfg):
+    """The AgentHC feed (a pass, a day-pass or a Premium key)."""
+    return (cfg or {}).get("source", "agenthc") == "agenthc"
 
 
 def _feed_mode(cfg, state=None):
@@ -4749,9 +4778,18 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
                   "other trades are off")
             new = [ev for ev in new if ev.get("event_id") not in seen]
             save_state(state)
+    released = [ev for ev in new if _practice_release(ev)]
+    if released:
+        # practice: completed trades, released at their exit (never bought
+        # or sold; no stale / backlog / already-exited check applies). The
+        # exit of a contract the ledger holds comes back to go the usual way.
+        new = [ev for ev in new if not _practice_release(ev)]
+        new += _practice_release_events(released, cfg, state, broker, client,
+                                        save_state, listed, seen)
     # with other trades off, a shadow-book exit doesn't end a main entry
     known = [ev for ev in events
-             if not off or str(ev.get("track", "main")) == "main"] + owed
+             if not _practice_release(ev)
+             and (not off or str(ev.get("track", "main")) == "main")] + owed
     batch = (owed + [ev for ev in new if ev.get("event") == "EXITED"]
              + [ev for ev in new if ev.get("event") != "EXITED"])
     for ev in batch:
@@ -4800,6 +4838,329 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
         _mark_seen(state, eid, listed)
         _exit_settled(state, eid)
         save_state(state)
+
+
+# ── practice: completed trades, released at their exit ─────────────────────
+# OPERATOR DECISION (2026-11-18): only LIVE agents are charged a signal day,
+# and practice gets nothing tradable in real time. A read that says
+# mode=dry_run gets completed trades only ("release on close"): each EXITED
+# with its paired ENTERED (same contract and track, an overnight carry
+# too), both with their ORIGINAL occurred_at and tagged "practice_release":
+# "on_close". Never an entry whose trade is still open.
+#
+# The agent books each pair as ONE completed practice trade the moment it
+# arrives:
+#   - two rows, both "dry" and "practice_release": the entry dated at the
+#     signal (ENTERED occurred_at), the exit at the exit (EXITED
+#     occurred_at), each saying "signal HH:MM → exit HH:MM, logged at exit";
+#   - checked as of the SIGNAL time, pairs in entry-time order: the expiry
+#     guard time, the daily entry cap, max open positions (practice trades
+#     open at that moment), max daily loss, your rules (0DTE judged on the
+#     signal's day) and the AI policy (shown the entry only, and the log as
+#     it stood then);
+#   - sized by the per-trade budget as it is NOW, in dollars (no price is
+#     published to practice, so no contract count): P&L = amount ×
+#     paper_pnl_pct / 100; an exit without paper_pnl_pct (near worthless, a
+#     synthetic exit) is booked as −100%, "exited near worthless; no price
+#     published";
+#   - never an open practice row: practice can't block a live buy, hold a
+#     slot, or meet the expiry guard or the no-signal sell;
+#   - booked once: every row of a pair names its exit ("practice_exit"),
+#     so a restart before state.json was saved finds it in the log.
+# A release whose exit is for a contract the ledger holds (a real position
+# the agent still sells in practice, or a practice row from before this
+# version) goes the usual way instead: that exit closes that row.
+# Halves of a pair that arrive in different reads wait in
+# state["practice_held"] (the newest PRACTICE_HELD_KEPT, PRACTICE_HELD_DAYS).
+
+PRACTICE_HELD_KEPT = 200
+PRACTICE_HELD_DAYS = 10
+PRACTICE_NO_PRICE = "exited near worthless; no price published"
+
+# What practice and LIVE mean, in the owner's words: wherever the mode is
+# chosen or explained (setup, the dashboards, 'dry on' / 'go live', the docs).
+PRACTICE_MODE_TEXT = (
+    "Practice mode logs each trade only after it closes — with the time "
+    "AgentHC entered and exited and its recorded result — sized to your "
+    "budget and rules. It never uses a signal day or buys a pass.")
+LIVE_MODE_TEXT = ("Live mode trades signals in real time and uses one signal "
+                  "day on each trading day you receive signals.")
+ALPACA_PAPER_LIVE_TEXT = (
+    "An Alpaca paper-trading account with Live selected is LIVE: it receives "
+    "the signals in real time and uses signal days too.")
+
+
+def _practice_release(ev):
+    """A completed trade AgentHC released to practice at its exit."""
+    return isinstance(ev, dict) and bool(ev.get("practice_release"))
+
+
+def _iso_utc(t):
+    return t.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _practice_when(t_in, t_out):
+    """'signal 10:02 → exit 14:31, logged at exit' (ET; with the dates
+    when the trade was carried overnight)."""
+    a, b = t_in.astimezone(MARKET_TZ), t_out.astimezone(MARKET_TZ)
+    if a.date() == b.date():
+        return (f"signal {a.hour:02d}:{a.minute:02d} → exit "
+                f"{b.hour:02d}:{b.minute:02d}, logged at exit")
+    return (f"signal {_MONTHS[a.month - 1]} {a.day} {a.hour:02d}:{a.minute:02d}"
+            f" → exit {_MONTHS[b.month - 1]} {b.day} "
+            f"{b.hour:02d}:{b.minute:02d}, logged at exit")
+
+
+def _practice_held(state):
+    held = state.get("practice_held")
+    return ([e for e in held if isinstance(e, dict) and e.get("event_id")]
+            if isinstance(held, list) else [])
+
+
+def _same_trade_side(a, b):
+    """Same contract and the same track."""
+    return (_same_contract(a, b)
+            and str(a.get("track", "main")) == str(b.get("track", "main")))
+
+
+def _practice_pairs(held):
+    """[(entry, exit)]: each exit, oldest first, with the latest entry of its
+    contract and track at or before it that no earlier exit took."""
+    exits = sorted((e for e in held if e.get("event") == "EXITED"),
+                   key=lambda e: _occurred_at(e))
+    entries = [e for e in held if e.get("event") == "ENTERED"]
+    used, pairs = set(), []
+    for x in exits:
+        t_out, best = _occurred_at(x), None
+        for e in entries:
+            if e["event_id"] in used or not _same_trade_side(e, x):
+                continue
+            t_in = _occurred_at(e)
+            if t_in <= t_out and (best is None or t_in > _occurred_at(best)):
+                best = e
+        if best is not None:
+            used.add(best["event_id"])
+            pairs.append((best, x))
+    return pairs
+
+
+def _practice_exit_is_held(ev, state, cfg):
+    """The ledger holds this exit's contract for its book: the usual exit
+    path closes that row (a real position is sold)."""
+    if ev.get("event") != "EXITED" or not _valid_event(ev):
+        return False
+    key = f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
+    row = (state.get("positions") or {}).get(key)
+    return row is not None and not _other_books_row(row, ev, cfg)
+
+
+def _practice_release_events(released, cfg, state, broker, client, save_state,
+                             listed, seen):
+    """Book the completed trades of one read (see above). Returns the exits
+    to run the usual way (the ledger holds their contract); everything else
+    is remembered as handled here."""
+    held = _practice_held(state)
+    ids = {e["event_id"] for e in held}
+    fresh = [ev for ev in released
+             if ev.get("event_id") and ev["event_id"] not in seen
+             and ev["event_id"] not in ids]
+    routed = [ev for ev in fresh if _practice_exit_is_held(ev, state, cfg)]
+
+    def opened_held(ev):
+        # the entry of a position the ledger holds, whose exit goes the
+        # usual way: nothing to book
+        return ev.get("event") == "ENTERED" and any(
+            _same_trade_side(ev, x) and _occurred_at(x) is not None
+            and _occurred_at(ev) <= _occurred_at(x) for x in routed)
+    held = [e for e in held if _occurred_at(e) is not None and not opened_held(e)]
+    for ev in fresh:
+        if ev in routed:
+            continue
+        seen.add(ev["event_id"])
+        _mark_seen(state, ev["event_id"], listed)
+        if (not _valid_event(ev) or ev.get("event") not in ("ENTERED", "EXITED")
+                or _occurred_at(ev) is None or opened_held(ev)):
+            continue
+        held.append(dict(ev))
+        ids.add(ev["event_id"])
+    pairs = sorted(_practice_pairs(held), key=lambda p: _occurred_at(p[0]))
+    rows = None
+    if pairs:
+        try:
+            rows = _practice_rows()
+        except TradeLogUnreadable as exc:
+            # kept: booked once the log can be read (the caps count from it)
+            print("practice trades not booked yet: the trade log can't be "
+                  f"read [{str(exc)[:150]}]")
+            pairs = []
+    for entry, x in pairs:
+        try:
+            outcome = _book_practice_trade(entry, x, cfg, state, save_state,
+                                           broker, client, rows)
+        except Exception as exc:
+            print(f"practice trade not booked (will retry): {str(exc)[:200]}")
+            continue
+        done = (entry["event_id"], x["event_id"])
+        held = [e for e in held if e["event_id"] not in done]
+        state["practice_held"] = held
+        save_state(state)
+        if outcome:
+            notify(cfg, f"agentic-trader: {outcome}")
+    now = datetime.now(timezone.utc).timestamp()
+    keep = PRACTICE_HELD_DAYS * 86400
+    held = [e for e in held
+            if now - _occurred_at(e).timestamp() <= keep][-PRACTICE_HELD_KEPT:]
+    if held:
+        state["practice_held"] = held
+    else:
+        state.pop("practice_held", None)
+    save_state(state)
+    return routed
+
+
+def _practice_rows():
+    """Every practice row of the trade log (a full scan, as the caps count;
+    raises TradeLogUnreadable when the log exists but can't be read)."""
+    return [t for t in _todays_log_rows(('"dry": true',), strict=True)
+            if isinstance(t, dict) and t.get("dry") is True]
+
+
+def _practice_amount(ecfg, broker, client):
+    """(dollars, words): the per-trade size NOW, as the dollars a practice
+    trade risks. No price is published to practice, so a fixed contract
+    count has no dollar amount (None)."""
+    mode = str(ecfg.get("sizing_mode") or "contracts")
+    if mode == "percent":
+        ecfg, skip = _resolve_percent(ecfg, broker, client)
+        if skip:
+            return None, skip.replace(" — skipped", "")
+        mode = "budget"
+    if mode == "budget":
+        try:
+            usd = round(float(ecfg.get("budget_per_trade_usd") or 0), 2)
+        except (TypeError, ValueError):
+            usd = 0.0
+        if usd > 0 and math.isfinite(usd):
+            return usd, f"${usd:,.2f} budget"
+        return None, "no per-trade budget set"
+    n = _int0(ecfg.get("contracts_per_trade")) or 1
+    return None, (f"{n} contract{'' if n == 1 else 's'} per trade: no price is "
+                  "published to practice, so no dollar result")
+
+
+def _practice_entry_check(entry, cfg, state, rows, t_in):
+    """The entry checks as of the signal time `t_in`, from the practice rows
+    of the log as they stood then. None when it passes, else (kind, why,
+    check, params, code)."""
+    import rules
+    et = t_in.astimezone(MARKET_TZ)
+    if _paused(cfg):
+        return ("skip_paused", "the agent is paused — no new entries until "
+                "you press Resume", "not_paused", None, None)
+    guard_at = _past_expiry_guard(cfg, entry["expiry"], et)
+    if guard_at is not None:
+        return ("skip_rule", f"expired that day, past the expiry guard time "
+                f"({_hm(guard_at)} ET)", "before_expiry_guard",
+                {"guard_et": _hm(guard_at)}, "past_expiry_guard")
+    trades = sorted(((d, t) for t in rows
+                     if t.get("action") in ("entry", "exit")
+                     for d in (_row_dt(t),) if d is not None and d <= t_in),
+                    key=lambda p: p[0])
+    before = [t for _d, t in trades]
+    day = t_in.astimezone(timezone.utc).date()
+    today_rows = [t for d, t in trades if d.astimezone(timezone.utc).date() == day]
+    cap = int(cfg.get("max_entries_per_day", 5))
+    if sum(1 for t in today_rows if t.get("action") == "entry") >= cap:
+        return ("skip_daily_cap", f"daily entry cap reached ({cap})",
+                "daily_cap", {"cap": cap}, None)
+    pos_cap = int(cfg.get("max_open_positions", 10))
+    n_open = _open_in_mode(state, True) + sum(
+        1 for t in before if t.get("action") == "entry"
+        and t.get("practice_release")
+        and (_occurred_at({"occurred_at": t.get("exit_at")}) or t_in) > t_in)
+    if n_open >= pos_cap:
+        return ("skip_position_cap", f"max open positions reached ({pos_cap}) "
+                f"— {n_open} practice position{'' if n_open == 1 else 's'} "
+                "were open at the signal", "position_cap",
+                {"max_open": pos_cap}, None)
+    loss_cap = float(cfg.get("max_daily_loss_usd") or 0)
+    if loss_cap > 0:
+        pnl = sum(float(t["est_pnl_usd"]) for t in today_rows
+                  if t.get("action") == "exit"
+                  and isinstance(t.get("est_pnl_usd"), (int, float)))
+        if -pnl >= loss_cap:
+            return ("skip_daily_loss", f"max daily loss reached (est. "
+                    f"${-pnl:,.0f} of ${loss_cap:,.0f})", "daily_loss",
+                    {"max_loss_usd": loss_cap, "loss_usd": round(-pnl, 2)}, None)
+    ok, why, code, params = rules.check_detail(cfg, entry, today_rows, now=et)
+    if not ok:
+        return ("skip_rule", f"{why} (your rules)", "your_rules", params, code)
+    rows_shown, ctx = _policy_view(True, now=et, rows_in=before)
+    ev = {k: v for k, v in entry.items() if k != "practice_release"}
+    verdict = llm_policy.evaluate(cfg, ev, rows_shown, context=ctx)
+    if not verdict["act"] and verdict.get("ai_problem"):
+        return ("skip_ai_needed", verdict["reason"], "written_rules", None, None)
+    if not verdict["act"]:
+        return ("policy_veto", verdict["reason"], "written_rules", None, None)
+    return None
+
+
+def _book_practice_trade(entry, x, cfg, state, save_state, broker, client, rows):
+    """Book one completed practice trade (or the check that stopped it).
+    Returns the line to send, or None when it was booked before."""
+    if any(t.get("practice_exit") == x["event_id"] for t in rows):
+        return None   # booked before a restart that lost state.json's note
+    contract = (f"{entry['ticker']} {entry['expiry']} ${entry['strike']} "
+                f"{entry['type']}")
+    book = "main" if str(entry.get("track", "main")) == "main" else "shadow"
+    t_in, t_out = _occurred_at(entry), _occurred_at(x)
+    when = _practice_when(t_in, t_out)
+    common = {"contract": contract, "dry": True, "practice_release": True,
+              "practice_exit": x["event_id"], "signal_at": _iso_utc(t_in),
+              "exit_at": _iso_utc(t_out),
+              "logged_at": _iso_utc(datetime.now(timezone.utc))}
+    stop = _practice_entry_check(entry, cfg, state, rows, t_in)
+    if stop is not None:
+        kind, why, check, params, code = stop
+        rec = {"action": kind, "event_id": entry["event_id"], "book": book,
+               "reason": f"practice — {when}: {why}", **common}
+        _log_trade(_row_facts(rec, cfg, check, params=params, code=code),
+                   ts=_iso_utc(t_in))
+        rows.append(rec)
+        if kind == "skip_ai_needed":
+            _notify_ai_problem_once(cfg, state, save_state, contract, why)
+        msg = f"[PRACTICE] SKIPPED {contract} ({when}): {why}"
+        print(msg)
+        return msg
+    amount, size_words = _practice_amount(_sizing_cfg(cfg, entry), broker, client)
+    pct = x.get("paper_pnl_pct")
+    no_price = (isinstance(pct, bool) or not isinstance(pct, (int, float))
+                or not math.isfinite(pct))
+    pct = -100.0 if no_price else float(pct)
+    pnl = round(amount * pct / 100.0, 2) if amount else None
+    result = (f"{PRACTICE_NO_PRICE} (counted as −100%)" if no_price
+              else f"recorded result {pct:+.1f}%")
+    sized = {"amount_usd": amount} if amount else {}
+    entry_row = {"action": "entry", "event_id": entry["event_id"],
+                 "reason": f"practice — {when} · {size_words}",
+                 **sized, **common}
+    exit_row = {"action": "exit", "event_id": x["event_id"],
+                "reason": f"practice — {when} · {result}",
+                "pnl_pct": pct, **sized, **common}
+    if pnl is not None:
+        exit_row["est_pnl_usd"] = pnl
+    if no_price:
+        exit_row["no_price"] = True
+    facts = {"book": "main" if book == "main" else "other", "sent": False,
+             "filled": False}
+    _log_trade(_row_facts(entry_row, cfg, **facts), ts=_iso_utc(t_in))
+    _log_trade(_row_facts(exit_row, cfg, **facts), ts=_iso_utc(t_out))
+    rows.extend([entry_row, exit_row])
+    money = (f", {'+' if pnl >= 0 else '−'}${abs(pnl):,.2f} on ${amount:,.2f}"
+             if pnl is not None else "")
+    msg = f"[PRACTICE] {contract}: {when} — {result}{money}"
+    print(msg)
+    return msg
 
 
 # ── expiry guard ─────────────────────────────────────────────────────────────
@@ -6899,6 +7260,11 @@ def cmd_setup():
     _ask_sizing(cfg)
 
     print("\n== Step 4/4: Safety rails & extras ==")
+    if _agenthc_source(cfg):
+        print(PRACTICE_MODE_TEXT)
+        print(LIVE_MODE_TEXT)
+        if _broker_name(cfg) == "alpaca" and cfg.get("alpaca_paper", True):
+            print(ALPACA_PAPER_LIVE_TEXT)
     dry = input("Start in DRY-RUN mode (log actions, place NO orders — "
                 "recommended for the first days)? [Y/n]: ").strip().lower()
     cfg["dry_run"] = dry != "n"
@@ -7686,10 +8052,13 @@ def _command(t, cfg, text):
         cfg["dry_run"] = True
         _save(CONFIG_PATH, cfg, private=True)
         note = _dry_run_note(cfg, _load(STATE_PATH, {}) or {})
-        days = (" " + PRACTICE_DAYS_NOTE) if _feed_paid_per_day(cfg) else ""
-        return True, (("Dry-run ON — " + note if note else
-                       "Dry-run ON — new signals are only logged; no real "
-                       "trades will be placed.") + days)
+        if _agenthc_source(cfg):
+            # AgentHC releases practice trades at their exit (release on close)
+            return True, ("Dry-run ON — " + (note or "no real trades will be "
+                                             "placed.") + " " + PRACTICE_MODE_TEXT)
+        return True, ("Dry-run ON — " + note if note else
+                      "Dry-run ON — new signals are only logged; no real "
+                      "trades will be placed.")
     if t in ("dry off", "dry-run off", "go live"):
         if llm_policy.entries_blocked(cfg):
             return True, ("Not going live: " + llm_policy.BLOCKED_MSG
@@ -7698,11 +8067,9 @@ def _command(t, cfg, text):
         _save(CONFIG_PATH, cfg, private=True)
         paper = (_broker_name(cfg) == "alpaca" and cfg.get("alpaca_paper", True))
         return True, ("Dry-run OFF — the agent will place REAL orders from now on."
-                      + (" Only LIVE uses signal days: each market day the "
-                         "agent receives a signal now uses one."
-                         + (" Alpaca paper trading with Live selected counts "
-                            "as LIVE: it uses signal days too." if paper else "")
-                         if _feed_paid_per_day(cfg) else ""))
+                      + (" " + LIVE_MODE_TEXT
+                         + (" " + ALPACA_PAPER_LIVE_TEXT if paper else "")
+                         if _agenthc_source(cfg) else ""))
     if t.startswith("set budget"):
         val = _command_number(t, "set budget")
         if val is None or val <= 0:

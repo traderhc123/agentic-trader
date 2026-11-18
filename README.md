@@ -173,10 +173,27 @@ so open positions can close. You're notified when 2 days are left; buying
 more carries unused days over. A pass is valid for at most about twice its
 length in market days.
 
-**Practice never uses a signal day or buys a pass; only LIVE uses days.**
+**Practice mode logs each trade only after it closes — with the time AgentHC
+entered and exited and its recorded result — sized to your budget and rules.
+It never uses a signal day or buys a pass. Live mode trades signals in real
+time and uses one signal day on each trading day you receive signals.** An
+Alpaca paper-trading account with Live selected is LIVE: it receives the
+signals in real time and uses signal days too.
+
 Every read of the feed tells AgentHC the agent's mode (`live`, `dry_run` for
 practice, or `off` while paused); AgentHC uses a signal day only for `live`,
-and the agent's wallet buys a day-pass only while it is live.
+and the agent's wallet buys a day-pass only while it is live. In practice
+AgentHC sends completed trades only ("release on close"): each arrives at its
+exit with its original signal and exit times, and the agent books it then as
+one practice trade — checked against your rules, AI policy and limits as of
+the signal time, sized to your per-trade budget in dollars, with AgentHC's
+recorded result (an exit with no published price counts as −100%: "exited
+near worthless; no price published"). Activity shows it as "signal HH:MM →
+exit HH:MM, logged at exit". Practice never opens a position, so it never
+holds a slot or blocks a live trade. Paused (`off`), the agent gets exit
+signals only, to close real positions it holds. Without a pass or key,
+practice shows AgentHC's free list of closed trades instead (the dry-run
+preview).
 
 **Advanced: daily auto-pay from a wallet the agent controls.** The agent
 keeps an LNbits wallet and buys a 24-hour pass each market day (only when you

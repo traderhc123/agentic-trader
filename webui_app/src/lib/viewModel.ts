@@ -427,6 +427,8 @@ export interface Activity {
   reason_params: Record<string, string | number>;
   reason_text: string | null;
   hint: string | null;
+  /** a practice trade AgentHC released at its exit: "signal HH:MM → exit HH:MM, logged at exit" (ET); null for every other row */
+  practice_note: string | null;
 }
 
 export interface Results {

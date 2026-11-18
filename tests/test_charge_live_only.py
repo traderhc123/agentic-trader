@@ -316,18 +316,25 @@ def test_a_paused_agent_reading_exits_for_a_real_position_says_off(
 # ── what the owner is told ──────────────────────────────────────────────────
 
 def test_dry_on_and_go_live_replies_say_only_live_uses_days(home):
+    """The operator's description (2026-11-18), word for word."""
+    assert agent.PRACTICE_MODE_TEXT == (
+        "Practice mode logs each trade only after it closes — with the time "
+        "AgentHC entered and exited and its recorded result — sized to your "
+        "budget and rules. It never uses a signal day or buys a pass.")
+    assert agent.LIVE_MODE_TEXT == (
+        "Live mode trades signals in real time and uses one signal day on "
+        "each trading day you receive signals.")
     (home / "config.json").write_text(json.dumps(
         {"source": "agenthc", "dry_run": False}), encoding="utf-8")
     reply = agent._apply_command("dry on")[1]
-    assert agent.PRACTICE_DAYS_NOTE in reply
-    assert agent.PRACTICE_DAYS_NOTE == ("Practice never uses a signal day or "
-                                        "buys a pass; only LIVE uses days.")
+    assert agent.PRACTICE_MODE_TEXT in reply
     reply = agent._apply_command("go live")[1]
-    assert "Only LIVE uses signal days" in reply
-    # a feed that costs nothing per day: nothing to say
+    assert agent.LIVE_MODE_TEXT in reply
+    # another source: no release on close, no signal days
     (home / "config.json").write_text(json.dumps(
         {"source": "manual", "dry_run": False}), encoding="utf-8")
-    assert agent.PRACTICE_DAYS_NOTE not in agent._apply_command("dry on")[1]
+    assert agent.PRACTICE_MODE_TEXT not in agent._apply_command("dry on")[1]
+    assert agent.LIVE_MODE_TEXT not in agent._apply_command("go live")[1]
 
 
 def test_no_signal_warning_names_the_not_live_cause():
@@ -492,6 +499,19 @@ def test_the_loop_says_live_for_an_unset_mode_with_a_real_position(
     assert seen == ["live", "live"]
 
 
+def test_an_alpaca_paper_account_with_live_selected_reads_as_live(
+        home, monkeypatch, clock):
+    """It receives the signals in real time, so it is LIVE and is charged:
+    the paper-trading account changes nothing about the mode it says."""
+    cfg = {"source": "agenthc", "broker": "alpaca", "alpaca_paper": True,
+           "dry_run": False, "feed_pass": {"token": PASS_TOK}}
+    assert agent._feed_mode(cfg) == "live"
+    feed = Recorder()
+    _setup(monkeypatch, feed, Wallet())
+    hc.poll({**cfg, "feed_mode": agent._feed_mode(cfg)}, {}, lambda s: None)
+    _says(feed.feed_reads(), "live")
+
+
 def test_go_live_reply_no_history_claim_and_alpaca_paper(home):
     (home / "config.json").write_text(json.dumps(
         {"source": "agenthc", "dry_run": True}), encoding="utf-8")
@@ -502,4 +522,5 @@ def test_go_live_reply_no_history_claim_and_alpaca_paper(home):
         {"source": "agenthc", "dry_run": True, "broker": "alpaca",
          "alpaca_paper": True}), encoding="utf-8")
     reply = agent._apply_command("go live")[1]
-    assert "Alpaca paper trading with Live selected counts as LIVE" in reply
+    assert agent.ALPACA_PAPER_LIVE_TEXT in reply
+    assert "receives the signals in real time and uses signal days" in reply
