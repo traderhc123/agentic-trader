@@ -114,6 +114,7 @@ export interface BandModel {
 const RUN: Record<Status["pause"]["kind"], Run> = {
   none: { kind: "ok", icon: null, text: "Running", long: "" },
   entries: { kind: "paused", icon: "pause", text: "Paused", long: ": no new trades" },
+  move_exits: { kind: "paused", icon: "pause", text: "Selling only", long: ": a move was not finished" },
   state_hold: { kind: "paused", icon: "pause", text: "On hold", long: ": everything stopped" },
   handoff_hold: { kind: "paused", icon: "pause", text: "Being moved", long: ": everything stopped" },
   restarting: { kind: "paused", icon: "pause", text: "Restarting", long: ": no orders for a moment" },
@@ -318,6 +319,14 @@ export interface Note {
 
 /** Where a condition is dealt with in /v2 (null: the band's own buttons, or
  *  nothing the owner can do here). */
+/** The old computer after an unfinished move (pause kind move_exits): why it
+ *  only sells, and the one command that ends it. */
+export const MOVE_EXITS_LEAD =
+  "A move file made on this computer was downloaded, but the move was not finished, so this setup may already be running on another computer. " +
+  "This one still sells the positions it holds on their exit signals and before expiry, and never sells what the other computer already sold. " +
+  "To finish the move, make a new move file and press I saved the file. " +
+  "If you gave up on the move, or never opened the file on another computer: stop any other copy, then run python agent.py resume-here on this computer and start the agent again. Resume does not end it.";
+
 export const CONDITION_GO: Record<NoteCode, Go | null> = {
   link_lost: null,
   agent_stopped: null,
@@ -683,6 +692,12 @@ export function statement(s: Status, l: Link): Statement {
     return {
       h: `Your agent can't reach ${b}, so it can't buy or sell${live ? "" : " for real"}.`,
       lead: "It is still running and still receiving signals. Connect the broker again and it goes straight back on watch.",
+      empty: false,
+    };
+  if (s.pause.kind === "move_exits")
+    return {
+      h: "Selling only: this computer takes no new trades. It still sells what you hold.",
+      lead: MOVE_EXITS_LEAD,
       empty: false,
     };
   if (s.pause.kind === "entries")

@@ -455,6 +455,12 @@ export function MoveDialog({ page, onClose }: { page: Page; onClose: () => void 
           <FieldError id={`${id}-e`} text={err} />
         </li>
       </ol>
+      <p className="small">
+        Didn't finish? If you download the file but don't retire this computer within 10 minutes, it switches to selling only: no new trades,
+        because the setup may already be running on the new computer, but it keeps selling what it holds. If you gave up on the move, or never
+        opened the file on another computer, stop any other copy and run python agent.py resume-here on this computer, then start the agent again.
+        The same command brings back a retired computer.
+      </p>
       <section className="subsec">
         <h4>Or move to a new cloud server</h4>
         <p className="small">

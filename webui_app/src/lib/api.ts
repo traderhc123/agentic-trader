@@ -61,6 +61,9 @@ export interface StatusResp {
   /** a full hold, not the owner's Pause: no orders at all, exits included (damaged memory file,
    *  or the setup is being moved to a server). `pause_note` then says which and what to do. */
   hold?: boolean;
+  /** a downloaded move file was never finished: no new entries, but exits keep running.
+   *  Resume doesn't end it; `python agent.py resume-here` does. `pause_note` says why. */
+  selling_only?: boolean;
   /** real (not dry-run) positions the agent holds now */
   real_positions?: number;
   /** what dry-run does with those positions, in plain words ("" when there are none) */
@@ -218,6 +221,23 @@ export interface Proposal {
   truncated?: boolean;
   /** sha256 of the whole diff; Apply posts it back so only this change applies */
   diff_sha256?: string;
+}
+/** POST /api/proposal/apply. Two steps, as on /v2: the first answer (no
+ *  `confirm` sent) is a preview with a single-use token; the change is
+ *  applied only by the POST that sends {diff_sha256, confirm: token}. */
+export interface ProposalApplyReply {
+  ok: boolean;
+  reply: string;
+  needs_confirm?: boolean;
+  preview?: {
+    token: string;
+    diff_sha256: string;
+    files?: string[];
+    warnings?: string[];
+    does_not?: string[];
+    restarts?: boolean;
+    expires_in_s?: number;
+  };
 }
 export interface WizardState {
   disclaimer: string;

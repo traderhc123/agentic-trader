@@ -2195,6 +2195,15 @@ def _paused(cfg):
 _EXITS_ONLY_RUN = {"on": False}
 
 
+# What the old computer says while it only sells (transfer.exits_only):
+# the dashboards' notice and pause note, and the chat's answer to Resume.
+MOVE_EXITS_NOTE = (
+    "Selling only: a move file made here was downloaded but the move wasn't "
+    "finished, so the setup may run on another computer. This one takes NO "
+    "new trades but still sells the positions it holds. Gave up on the move, "
+    "or never opened the file elsewhere? Run: python agent.py resume-here")
+
+
 def _move_exits_only():
     import transfer
     if _EXITS_ONLY_RUN["on"]:
@@ -2226,6 +2235,8 @@ def _pause_skips_feed(cfg, state):
 def _pause_note(cfg, state):
     """What a pause means for the paid signal feed right now, in the owner's
     words ("" when not paused, or the feed costs nothing per day)."""
+    if _move_exits_only():
+        return MOVE_EXITS_NOTE
     if not _paused(cfg) or not _feed_paid_per_day(cfg):
         return ""
     if _real_positions(state):
@@ -6612,6 +6623,124 @@ def _expiry_setting(arg, default):
 
 # ── commands ─────────────────────────────────────────────────────────────────
 
+def _ledger_real_rows():
+    """The ledger's rows (state.json), for the switch warnings: {} when
+    there are none or it can't be read."""
+    rows = (_load(STATE_PATH, {}) or {}).get("positions")
+    return rows if isinstance(rows, dict) else {}
+
+
+def _account_words(tag, current=False):
+    """An account tag for the owner: "Alpaca paper", "moomoo real", or
+    "this"/"another" Robinhood account (its tag is a hash of the number)."""
+    name, _, ident = str(tag).partition(":")
+    words = _BROKER_NAMES.get(name, name)
+    if name == "robinhood":
+        return f"{'this' if current else 'another'} {words} account"
+    return f"{words} {ident}" if ident else words
+
+
+def _rows_left_behind(rows, new, untagged_at, by_account=False):
+    """The real ledger rows a switch leaves where the agent no longer
+    trades — it never sells a row whose acct tag names another account
+    (_check_before_exit: "blocked"). {where: ([tagged keys], [untagged
+    keys])}. A row with no tag (from before rows were tagged) counts as
+    `untagged_at` (None: left out); the agent tags such a row with the
+    account it trades on its first read, so it may try to sell it there.
+
+    by_account=False: `new` is a broker name, rows group by the broker
+    their tag names, and rows at `new` are not left behind.
+    by_account=True: `new` is an account tag (account_tag), only rows at
+    its broker are looked at (a broker switch names the others), grouped
+    by their own tag: another mode (paper/live) or another account."""
+    out = {}
+    for k in _real_positions({"positions": rows}):
+        acct = str((rows.get(k) or {}).get("acct") or "")
+        tag = acct or untagged_at
+        if not tag:
+            continue
+        broker = tag.split(":", 1)[0]
+        if by_account:
+            if broker != str(new).split(":", 1)[0] or tag == new:
+                continue
+            where = tag
+        else:
+            if broker == new:
+                continue
+            where = broker
+        out.setdefault(where, ([], []))[0 if acct else 1].append(k)
+    return out
+
+
+def _left_behind_lines(left, now, by_account=False, same=False):
+    """What to tell the owner about the rows _rows_left_behind found, as
+    (headline, advice) pairs. `now`: where the agent will trade (a broker
+    name, or an account tag when by_account). same: nothing is being
+    switched (the saved broker picked again): how to manage them."""
+    def at(where, current=False):
+        if not by_account:
+            return f"at {_BROKER_NAMES.get(where, where)}"
+        if where.startswith("robinhood:"):
+            return f"in {_account_words(where, current)}"
+        return f"in your {_account_words(where)} account"
+    now_words = (_account_words(now, True) if by_account
+                 else _BROKER_NAMES.get(now, now))
+    out = []
+    for where, (tagged, untagged) in left.items():
+        app = _BROKER_NAMES.get(where.split(":", 1)[0], where)
+        for keys in (tagged, untagged):
+            if not keys:
+                continue
+            one = len(keys) == 1
+            it = "it" if one else "them"
+            # (a broker paper account is not real money: no "real" there)
+            head = (f"WARNING: you have {len(keys)} "
+                    f"{'open position' if by_account else 'real position'}"
+                    f"{'' if one else 's'} {'' if by_account else 'open '}"
+                    f"{at(where)}: "
+                    f"{', '.join(_contract_label(k) for k in keys)}.")
+            if keys is tagged:
+                what = f"the agent will NOT sell {it}"
+            else:
+                what = (f"the agent may try to sell {it} {at(now, True)}, "
+                        f"where {'it is' if one else 'they are'} not held")
+            if same:
+                advice = (f"The agent trades at {now_words}, so it will NOT "
+                          f"sell {it} — sell {it} yourself in the {app} app, "
+                          f"or run setup again and pick {app}.")
+            else:
+                advice = (f"After switching to {now_words} {what} — sell {it} "
+                          f"yourself in the {app} app.")
+            out.append((head, advice))
+    return out
+
+
+def _print_left_behind(lines):
+    for head, advice in lines:
+        print(f"\n{head}")
+        print(advice)
+
+
+def _switch_left_behind(saved, new_cfg, rows=None):
+    """The (headline, advice) pairs for every real row a change from the
+    `saved` config to `new_cfg` leaves where the agent won't sell it: rows
+    at another broker, and rows at the new broker in its other mode
+    (paper/live) or another account. For the dashboard's broker connect,
+    which knows both at once (the terminal setup asks them one at a time:
+    _confirm_broker_switch, _confirm_account_switch)."""
+    from brokers import account_tag
+    rows = _ledger_real_rows() if rows is None else rows
+    old_b = str(saved.get("broker") or "robinhood")
+    new_b = str(new_cfg.get("broker") or "robinhood")
+    out = _left_behind_lines(_rows_left_behind(rows, new_b, old_b), new_b,
+                             same=old_b == new_b)
+    old_t, new_t = account_tag(saved), account_tag(new_cfg)
+    out += _left_behind_lines(
+        _rows_left_behind(rows, new_t, old_t if old_b == new_b else None,
+                          by_account=True), new_t, by_account=True)
+    return out
+
+
 def _confirm_broker_switch(cfg, saved_bc):
     """Terminal setup: True to go ahead with the broker just picked. The
     agent never sells a real row whose account tag names another broker
@@ -6628,44 +6757,45 @@ def _confirm_broker_switch(cfg, saved_bc):
     question (there is no other broker to keep)."""
     old = {"2": "alpaca", "3": "moomoo"}.get(saved_bc, "robinhood")
     new = cfg.get("broker")
-    rows = (_load(STATE_PATH, {}) or {}).get("positions")
-    rows = rows if isinstance(rows, dict) else {}
-    stranded = {}  # broker -> ([tagged keys], [untagged keys])
-    for k in _real_positions({"positions": rows}):
-        acct = str((rows.get(k) or {}).get("acct") or "")
-        at = acct.split(":", 1)[0] if acct else old
-        if at != new:
-            stranded.setdefault(at, ([], []))[0 if acct else 1].append(k)
-    if not stranded:
+    left = _rows_left_behind(_ledger_real_rows(), new, old)
+    if not left:
         return True
-    now = _BROKER_NAMES.get(new, new)
-    for at, (tagged, untagged) in stranded.items():
-        was = _BROKER_NAMES.get(at, at)
-        for keys in (tagged, untagged):
-            if not keys:
-                continue
-            one = len(keys) == 1
-            it = "it" if one else "them"
-            print(f"\nWARNING: you have {len(keys)} real position"
-                  f"{'' if one else 's'} open at {was}: "
-                  f"{', '.join(_contract_label(k) for k in keys)}.")
-            if keys is tagged:
-                what = f"the agent will NOT sell {it}"
-            else:
-                what = (f"the agent may try to sell {it} at {now}, where "
-                        f"{'it is' if one else 'they are'} not held")
-            if new == old:
-                print(f"The agent trades at {now}, so it will NOT sell {it} — "
-                      f"sell {it} yourself in the {was} app, or run setup "
-                      f"again and pick {was}.")
-            else:
-                print(f"After switching to {now} {what} — sell {it} yourself "
-                      f"in the {was} app.")
+    _print_left_behind(_left_behind_lines(left, new, same=new == old))
     if new == old:
         return True
+    now = _BROKER_NAMES.get(new, new)
     ok = input(f"Switch to {now} anyway? [y/N]: ").strip().lower() == "y"
     if not ok:
         print(f"Keeping {_BROKER_NAMES.get(old, old)}.")
+    return ok
+
+
+def _confirm_account_switch(cfg, saved):
+    """Terminal setup, after the broker's own step (keys, paper or live):
+    True to keep the account it set. A switch within one broker — paper to
+    live or back (Alpaca, moomoo), another Robinhood account — leaves the
+    rows opened in the other one unsold, as a broker switch does
+    (_confirm_broker_switch): they are named the same way. A switch to a
+    paper account (the safe direction) only warns; any other asks, and
+    Enter (or anything but y) keeps the saved settings. `saved`: the
+    config before the broker step; its untagged rows count as its
+    account's when it is at the same broker."""
+    from brokers import account_tag
+    new, old = account_tag(cfg), account_tag(saved)
+    untagged_at = old if old.split(":", 1)[0] == new.split(":", 1)[0] else None
+    left = _rows_left_behind(_ledger_real_rows(), new, untagged_at,
+                             by_account=True)
+    if not left:
+        return True
+    _print_left_behind(_left_behind_lines(left, new, by_account=True))
+    if new.endswith(":paper"):
+        return True  # paper trading: never blocked, only warned
+    now = _account_words(new, True)
+    ok = input(f"Switch to {now} anyway? [y/N]: ").strip().lower() == "y"
+    if not ok:
+        print("Keeping your saved broker settings"
+              + (f" ({_account_words(old, True)})" if saved.get("broker") else "")
+              + ".")
     return ok
 
 
@@ -6692,11 +6822,19 @@ def cmd_setup():
     # Enter keeps the broker that is saved (re-running setup to change a key
     # must not switch an Alpaca or moomoo owner to Robinhood)
     saved_bc = {"alpaca": "2", "moomoo": "3"}.get(str(cfg.get("broker")), "1")
+    saved = dict(cfg)  # the broker settings Enter keeps
     bc = input(f"Choose [1-3, default {saved_bc}]: ").strip() or saved_bc
     cfg["broker"] = {"2": "alpaca", "3": "moomoo"}.get(bc, "robinhood")
     if not _confirm_broker_switch(cfg, saved_bc):
         cfg["broker"] = {"2": "alpaca", "3": "moomoo"}.get(saved_bc, "robinhood")
     cfg = BROKERS[cfg["broker"]].setup(cfg)
+    if not _confirm_account_switch(cfg, saved):
+        # back to what was saved before this step: keys, paper or live
+        for k in set(cfg) | set(saved):
+            if k in saved:
+                cfg[k] = saved[k]
+            else:
+                cfg.pop(k, None)
 
     _ask_sizing(cfg)
 
@@ -7413,14 +7551,7 @@ def _command(t, cfg, text):
                 "move: stop or destroy the other copy first, then run: "
                 "python agent.py resume-here")
         if _move_exits_only():
-            return True, (
-                "Can't resume new entries here: a move file made on this "
-                "computer was downloaded but the move was never finished, so "
-                "the setup may be running on another computer too. This one "
-                "only sells the positions it holds. To finish the move, make "
-                "a new move file and press 'I saved the file'. To trade here "
-                "again instead: stop the other computer first, then run: "
-                "python agent.py resume-here")
+            return True, "Can't resume new trades here. " + MOVE_EXITS_NOTE
         cfg.pop("paused", None)
         _save(CONFIG_PATH, cfg, private=True)
         request_feed_read()  # the feed and buying power at once, not on schedule
@@ -7895,6 +8026,9 @@ def cmd_run(app_window=False):
             # shows pause_note instead of what the owner's Pause means.
             "paused": _paused(c) or bool(_full_hold_note()),
             "hold": bool(_full_hold_note()),
+            # a downloaded move file was never finished: no new entries,
+            # exits still run; only `resume-here` ends it (pause_note says so)
+            "selling_only": _move_exits_only(),
             "pause_note": _full_hold_note() or _pause_note(c, st),
             # an update or a move is about to restart the agent: until then
             # it reads no signals and places no orders
@@ -7975,6 +8109,9 @@ def cmd_run(app_window=False):
                     for w in signal_loss_banner(
                         c, st, paused=bool(_full_hold_note()),
                         acct=_status_acct(c))]
+            if _move_exits_only():
+                out.append({"level": "warn", "code": "move_exits_only",
+                            "text": MOVE_EXITS_NOTE})
             if cash.get("warning"):
                 out.append({"level": "warn", "code": "low_cash",
                             "condition": "low_cash", "text": cash["warning"]})
@@ -7994,6 +8131,7 @@ def cmd_run(app_window=False):
             "heartbeat_at": LOOP.get("beat_at"),
             "wait_s": LOOP.get("wait_s"),
             "hold": hold, "hold_since": hold_since,
+            "move_exits": _move_exits_only(),
             "hold_recorded": hold_recorded,
             "poll_at": LOOP.get("poll_at"), "poll_ok": LOOP.get("poll_ok"),
             "signal_at": LOOP.get("signal_at"),
@@ -8036,8 +8174,8 @@ def cmd_run(app_window=False):
     if _state_held():  # damaged state.json: nothing is ordered at all
         mode += ", ON HOLD — no orders at all until you press Resume"
     elif _move_exits_only():  # a downloaded move file may run elsewhere
-        mode += (", NO NEW ENTRIES — an unfinished move: exits still run "
-                 "(python agent.py resume-here ends it)")
+        mode += (", SELLING ONLY — an unfinished move: no new trades, exits "
+                 "still run (python agent.py resume-here ends it)")
     elif _paused(cfg):  # saved in config.json: still paused after a restart
         mode += ", PAUSED — no new entries until you press Resume"
     if _is_dry(cfg, state) and _dry_run_note(cfg, state):

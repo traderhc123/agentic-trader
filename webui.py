@@ -2399,9 +2399,16 @@ async function refresh(){
 let propSha='';
 async function propApply(){
   $('prop-msg').textContent='applying…';
-  // only the change this panel shows (the server refuses any other)
-  const r=await api('/api/proposal/apply',{diff_sha256:propSha});
-  $('prop-msg').textContent=r.reply;
+  // only the change this panel shows (the server refuses any other), in two
+  // steps as on /v2: the first answer is a preview with a single-use token
+  const sha=propSha;
+  const r=await api('/api/proposal/apply',{diff_sha256:sha});
+  if(!(r.ok&&r.needs_confirm&&r.preview)){$('prop-msg').textContent=r.reply;return;}
+  const pv=r.preview,files=(pv.files||[]).join(', ');
+  if(!window.confirm('Apply this code change'+(pv.restarts?' and restart the agent':'')+'? Files: '+(files||'none')+'. '+(pv.does_not||[]).join(' '))){
+    $('prop-msg').textContent='Not applied.';return;}
+  const done=await api('/api/proposal/apply',{diff_sha256:sha,confirm:pv.token});
+  $('prop-msg').textContent=done.reply;
 }
 async function propReject(){await api('/api/proposal/reject',{});refresh();}
 let chatStarted=false;
@@ -4381,12 +4388,21 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         mod = BROKERS.get(str(data.get("broker", "")))
         if mod is None or not callable(getattr(mod, "connect", None)):
             return {"ok": False, "error": "unknown broker"}
+        before = dict(cfg)
         ok, msg = mod.connect(cfg, data.get("values", {}) or {})
         if not ok:
             return {"ok": False, "error": msg}
         pending["broker_last4"] = str(data.get("broker", ""))[:6]
         save_now()
-        return {"ok": True, "note": msg}
+        res = {"ok": True, "note": msg}
+        try:  # real rows left in the other broker, mode or account: named
+            left = A._switch_left_behind(before, cfg)
+        except Exception:
+            left = []
+        if left:
+            res["left_behind"] = [f"{h} {a}" for h, a in left]
+            res["note"] = msg + " — " + " ".join(res["left_behind"])
+        return res
 
     def update_check(_h):
         # "?force=1": the owner asked to check now (else a recent answer)
@@ -4472,7 +4488,10 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         whose diff has the sha256 the page was shown (GET /api/proposal), as
         /v2 does. A body without it (a page loaded before this rule, any
         other client) applies nothing: the change waiting may not be the one
-        on the owner's screen. apply_and_restart also refuses a cut diff or
+        on the owner's screen. As on /v2, the first POST only answers with
+        a preview and a single-use token (needs_confirm); the change is
+        applied by the POST that sends {diff_sha256, confirm: token} back
+        (_proposal_two_step). apply_and_restart also refuses a cut diff or
         one made against older code."""
         import re as _re
         import self_edit
@@ -4485,7 +4504,15 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"ok": False, "reply": "diff_sha256 must be the sha256 "
                     "of the change you reviewed — nothing was applied. "
                     "Reload the page and review the change again."}
-        ok, msg = self_edit.apply_and_restart(restart=get_status is not None,
+        # the same review gate and two-step confirmation as /v2 (its own
+        # route, so a token is only ever good for this route and this sha)
+        wait, restarts = _proposal_two_step("classic_proposal_apply", sha, data)
+        if wait:
+            if wait.get("needs_confirm"):
+                return {**wait, "reply": "Confirm to apply this change and "
+                        "restart. Nothing was applied yet."}
+            return {"ok": False, "reply": wait.get("error", "Nothing was applied.")}
+        ok, msg = self_edit.apply_and_restart(restart=restarts,
                                               expect_sha256=sha)
         return {"ok": ok, "reply": msg}
 
@@ -5847,12 +5874,18 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             notes = [f"It does not switch between Practice and LIVE: "
                      f"{'Practice' if A._mode(cfg) == 'practice' else 'LIVE'} "
                      "stays.", does_not_trade]
-            if before["id"] and account_tag(cfg) != account_tag(trial):
+            # the real rows it leaves unsold, by name: at another broker, or
+            # in this broker's other mode (paper/live) or another account
+            left = [f"{h} {a}" for h, a in A._switch_left_behind(cfg, trial)]
+            if left:
+                notes.extend(left)
+            elif before["id"] and account_tag(cfg) != account_tag(trial):
                 notes.append("Positions the agent opened in the account it "
                              "uses now are not sold from the new one: look "
                              "after those at your current broker.")
             wait = _two_step("broker_connect", p, data, [_change(
-                "broker", "Broker account", before, after, direction)], notes)
+                "broker", "Broker account", before, after, direction)], notes,
+                bind={"left_behind": left} if left else None)
             fp = _fingerprint()  # what the token was just redeemed against
         if wait:
             return wait
@@ -6237,6 +6270,54 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"ok": False, "error": msg}
         return {"ok": True, "note": msg}
 
+    def _proposal_two_step(route, sha, data):
+        """The review gate both Apply routes share (/api/v2/proposal/apply
+        and the classic /api/proposal/apply): the pending change must be the
+        one whose whole diff has sha256 `sha` (as GET /api/proposal showed
+        it), shown in full and made against the files as they are now. Then
+        the two-step confirmation: the first POST answers with a preview and
+        a single-use token for exactly this sha (_two_step on `route`); only
+        the POST that sends it back goes ahead. Returns (None, restarts) to
+        apply, else ({"ok": False, "error": ...} or the preview, None)."""
+        import self_edit
+        prop = self_edit.current()
+        if not isinstance(prop, dict):
+            return {"ok": False, "error": "No code change is waiting. Nothing "
+                    "was changed."}, None
+        if self_edit.diff_truncated(prop):
+            return {"ok": False, "error": "This change is too large to show "
+                    "here in full, so part of it was never shown and it can't "
+                    "be applied from this page. Reject it and ask for a "
+                    "smaller change. Nothing was changed."}, None
+        if self_edit.diff_sha256(prop) != sha:
+            return {"ok": False, "error": "The code change waiting is not the "
+                    "one you reviewed. Read it again. Nothing was changed."}, None
+        stale = self_edit.base_problem(prop)
+        if stale:
+            return {"ok": False, "error": f"This change can't be applied: "
+                    f"{stale}. Reject it and ask again. Nothing was changed."}, None
+        files = [str(ch.get("path", ""))[:200] for ch in prop.get("changes", [])
+                 if isinstance(ch, dict)]
+        restarts = get_status is not None
+        with A.CONFIG_LOCK:
+            wait = _two_step(route, {"diff_sha256": sha}, data, [_change(
+                "code", "The agent's code", "as it is now",
+                f"{len(files)} file{'s' if len(files) != 1 else ''} changed by "
+                "the AI helper", "neutral")], [
+                "It does not switch between Practice and LIVE, and does not "
+                "change any setting.",
+                "Files the agent may never rewrite (its agreement check, safety "
+                "rails, order code and this dashboard's server) are refused: "
+                "then nothing is applied and the change is thrown away.",
+                "If the new code does not compile or load, every file is put "
+                "back as it was and nothing restarts."],
+                extra={"diff_sha256": sha, "files": files[:50],
+                       "warnings": [str(w)[:300] for w in prop.get("warnings", [])][:20],
+                       "restarts": restarts})
+        if wait:
+            return wait, None
+        return None, restarts
+
     @_v2
     def v2_proposal_apply(data):
         """POST /api/v2/proposal/apply {diff_sha256}: apply the pending code
@@ -6252,40 +6333,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 or not _re.fullmatch(r"[0-9a-f]{64}", sha):
             raise _Invalid("diff_sha256 must be the sha256 of the change you "
                            "reviewed. Nothing was changed.")
-        prop = self_edit.current()
-        if not isinstance(prop, dict):
-            return {"ok": False, "error": "No code change is waiting. Nothing "
-                    "was changed."}
-        if self_edit.diff_truncated(prop):
-            return {"ok": False, "error": "This change is too large to show "
-                    "here in full, so part of it was never shown and it can't "
-                    "be applied from this page. Reject it and ask for a "
-                    "smaller change. Nothing was changed."}
-        if self_edit.diff_sha256(prop) != sha:
-            return {"ok": False, "error": "The code change waiting is not the "
-                    "one you reviewed. Read it again. Nothing was changed."}
-        stale = self_edit.base_problem(prop)
-        if stale:
-            return {"ok": False, "error": f"This change can't be applied: "
-                    f"{stale}. Reject it and ask again. Nothing was changed."}
-        files = [str(ch.get("path", ""))[:200] for ch in prop.get("changes", [])
-                 if isinstance(ch, dict)]
-        restarts = get_status is not None
-        with A.CONFIG_LOCK:
-            wait = _two_step("proposal_apply", p, data, [_change(
-                "code", "The agent's code", "as it is now",
-                f"{len(files)} file{'s' if len(files) != 1 else ''} changed by "
-                "the AI helper", "neutral")], [
-                "It does not switch between Practice and LIVE, and does not "
-                "change any setting.",
-                "Files the agent may never rewrite (its agreement check, safety "
-                "rails, order code and this dashboard's server) are refused: "
-                "then nothing is applied and the change is thrown away.",
-                "If the new code does not compile or load, every file is put "
-                "back as it was and nothing restarts."],
-                extra={"diff_sha256": sha, "files": files[:50],
-                       "warnings": [str(w)[:300] for w in prop.get("warnings", [])][:20],
-                       "restarts": restarts})
+        wait, restarts = _proposal_two_step("proposal_apply", sha, data)
         if wait:
             return wait
         # the classic apply, held to the reviewed diff where it reads the file
