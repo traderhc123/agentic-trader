@@ -6061,7 +6061,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             if which == "live":
                 if llm_policy.entries_blocked(cfg):
                     return {"ok": False, "error": llm_policy.BLOCKED_MSG}
-                if cfg.get("dry_run") is False:
+                if not A._is_dry(cfg):  # saved live, or unset with live history
                     return {"ok": True, "saved": False, "note": "Already LIVE."}
                 if "confirm" in data and data.get("acknowledge") is not True:
                     return {"ok": False, "needs_acknowledge": True, "error": (

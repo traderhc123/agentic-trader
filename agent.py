@@ -2346,7 +2346,7 @@ def _log_unreadable_skip(cfg, state, save_state, ev, book, contract, why, exc):
         rec = {"action": "skip_log_unreadable", "book": book,
                "event_id": ev.get("event_id"), "contract": contract,
                "reason": f"{why} ({str(exc)[:150]})"}
-        if cfg.get("dry_run"):
+        if _is_dry(cfg, state):
             rec["dry"] = True
         _log_trade(_row_facts(rec, cfg, "daily_cap"))
         _UNREADABLE_SKIPS.append(rec)
@@ -2501,7 +2501,7 @@ def _cash_refresh_due(cfg, cash, now=None, now_et=None):
     (default 3600 — only a deposit changes it then), at once when the owner
     goes live or practice, and on Resume / "check now"."""
     now = _now() if now is None else now
-    if _CASH_NOW["on"] or bool(cfg.get("dry_run")) != cash.get("dry"):
+    if _CASH_NOW["on"] or _is_dry(cfg) != cash.get("dry"):
         return True
     every = CASH_REFRESH_S
     if not _feed_window_now(cfg, now_et):
@@ -2515,12 +2515,12 @@ def _refresh_cash(cfg, state, save_state, broker, client, cash):
     once a day in LIVE mode when it can't cover trades."""
     _CASH_NOW["on"] = False
     cash["at"] = _now()
-    cash["dry"] = bool(cfg.get("dry_run"))
+    cash["dry"] = _is_dry(cfg, state)
     cash["bp"] = _buying_power(broker, client, cfg)
     _alert_if_broker_down(cfg, state, save_state, client)
     warn = _cash_warning(cfg, cash["bp"])
     cash["warning"] = warn
-    if not warn or cfg.get("dry_run"):
+    if not warn or cash["dry"]:
         return
     today = datetime.now(timezone.utc).date().isoformat()
     if state.get("low_cash_notified") == today:

@@ -272,3 +272,53 @@ def test_safety_note_and_move_report_the_mode_the_agent_trades_in(
         return transfer.import_bundle(blob, "correct horse battery")
     assert move([PRACTICE_ROW])["was_live"] is False   # never traded live
     assert move([PRACTICE_ROW, LIVE_ROW])["was_live"] is True
+
+
+def _live_history(home):
+    (home / "trades.jsonl").write_text(json.dumps(LIVE_ROW) + "\n",
+                                       encoding="utf-8")
+
+
+def test_dry_run_preview_follows_the_mode_the_agent_trades_in(home):
+    """Follow-up: dry_run_preview read a missing key as live (preview off)
+    while the agent traded in practice."""
+    import dry_run_preview
+    cfg = {"source": "agenthc"}
+    assert dry_run_preview.wanted(cfg) is True
+    _live_history(home)
+    assert dry_run_preview.wanted(cfg) is False
+    assert dry_run_preview.wanted({**cfg, "dry_run": True}) is True
+
+
+def test_low_cash_is_not_a_live_warning_for_a_never_chosen_practice_setup(
+        home, monkeypatch):
+    """Follow-up: the buying-power refresh read a missing key as live: a
+    practice setup got the daily LIVE low-cash alert, and every loop saw a
+    mode change (refresh at once)."""
+    told = []
+    monkeypatch.setattr(agent, "notify", lambda *a, **k: told.append(a))
+    monkeypatch.setattr(agent, "_buying_power", lambda *a, **k: 10.0)
+    monkeypatch.setattr(agent, "_alert_if_broker_down", lambda *a, **k: None)
+    cfg, state, cash = {"source": "manual"}, {"positions": {}}, {}
+    agent._refresh_cash(cfg, state, lambda s: None, None, None, cash)
+    assert cash["dry"] is True and cash["warning"]
+    assert "low_cash_notified" not in state and told == []
+    assert agent._cash_refresh_due(cfg, cash) is False
+    _live_history(home)                 # this setup has traded live: LIVE
+    agent._refresh_cash(cfg, state, lambda s: None, None, None, cash)
+    assert cash["dry"] is False and state.get("low_cash_notified")
+
+
+def test_v2_go_live_is_already_live_for_a_live_history_setup(home, app):  # noqa: F811
+    """Follow-up: /v2 set_mode live asked for a live confirmation for a
+    setup that already trades live (never chosen, live history); a never
+    chosen practice setup still needs it."""
+    unset = {k: v for k, v in BASE.items() if k != "dry_run"}
+    write_cfg(home, unset)
+    c = app(lambda: {"mode": "DRY-RUN", "fields": {}}, lambda: [],
+            agent._apply_command, lambda: agent._load(agent.CONFIG_PATH, {}))
+    r = c.post("/api/v2/command", {"action": "set_mode", "mode": "live"})
+    assert r.get("needs_confirm") is True, r
+    _live_history(home)
+    r = c.post("/api/v2/command", {"action": "set_mode", "mode": "live"})
+    assert r.get("ok") is True and r.get("note") == "Already LIVE.", r
