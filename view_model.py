@@ -120,6 +120,8 @@ _KIND_CODES = {
     "order_failed": "order_rejected", "entry_unfilled": "order_not_filled",
     "broker_no_order": "broker_no_order", "exit_failed": "exit_failed",
     "exit_partial": "exit_partial",
+    # the agent installed an update by itself (auto_update): no order
+    "code_update": "code_updated",
 }
 # more exact codes the agent records on the row (agent._row_facts "code"), or
 # that follow from a recorded cause
@@ -988,7 +990,8 @@ def activity_row(row):
             # owner's (or the broker's) order, not one the agent sent
             sent = not row.get("dry") and not row.get("manual")
         elif action.startswith("skip_") or action in ("policy_veto",
-                                                      "ledger_adopt"):
+                                                      "ledger_adopt",
+                                                      "code_update"):
             sent = False
     if filled is None and known:
         if sent is False and not row.get("manual"):

@@ -160,7 +160,7 @@ export function Wizard() {
           <aside className="sticky top-[72px] max-lg:static max-lg:contents">
             <Stepper cur={cur} maxUnlocked={maxUnlocked} doneSet={doneSet} goStep={goStep} />
             <div className="mt-4 rounded-md border border-line p-3 max-lg:order-3 max-lg:mt-0">
-              <UpdateBox />
+              <UpdateBox auto={st?.auto_update} />
             </div>
           </aside>
 

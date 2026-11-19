@@ -230,6 +230,17 @@ export const REASONS: Record<ReasonCode, Entry> = {
     why: (c) => withNote(c, "Your broker account and the agent's records disagreed, and the agent's own filled orders settled it."),
     can: nothing,
   },
+  code_updated: {
+    cat: "other",
+    icon: "info",
+    title: () => "The agent updated itself",
+    sub: () => "Automatic update installed. No order was placed",
+    what: (c) => withNote(c, "The agent installed an official update by itself and restarted onto it. No order was placed."),
+    why: () =>
+      "Automatic updates are on. They install only between 8 PM and 8 AM ET or on weekends, when no order is being placed, and only a version that has been out for at least two hours.",
+    can: () => "Nothing needed. To install updates yourself instead, turn Automatic updates off in Settings.",
+    go: "settings",
+  },
   paused: {
     cat: "limit",
     icon: "pause",
@@ -1054,6 +1065,16 @@ export const UPDATE = {
   installedPlain: "Update installed.",
   agentSaid: (text: string) => `The agent said: ${text}`,
   slow: "The agent has not come back on the new version yet. If it could not restart, it sends you a message saying what to do. Reload this page to see where it stands.",
+
+  // the Automatic updates row (config "auto_update", off by default)
+  autoLabel: "Automatic updates",
+  autoText:
+    "Installs official updates automatically between 8 PM and 8 AM ET or on weekends, only when no order is being placed. Off by default.",
+  autoUnknown: "Not known: this version of the agent doesn't say. Updates are installed only when you press Update.",
+  autoLastOk: (at: string | null, text: string | null) =>
+    `Last automatic update${at ? ` (${etWhen(at)})` : ""}: ${text || "installed"}.`,
+  autoLastFailed: (at: string | null, text: string | null) =>
+    `The last automatic update${at ? ` (${etWhen(at)})` : ""} did not go through: ${text || "no reason given"}. It tries again the next night.`,
 
   // the quiet line under Settings
   rowLabel: "Updates",

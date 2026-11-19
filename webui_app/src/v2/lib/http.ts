@@ -164,6 +164,7 @@ export const API = {
   moveFinish: "/api/v2/move/finish",
   moveDeploy: "/api/v2/move/deploy",
   code: "/api/v2/settings/code",
+  updates: "/api/v2/settings/updates",
   source: "/api/v2/settings/source",
   signals: "/api/v2/settings/signals",
   recurring: "/api/v2/wallet/recurring",

@@ -19,6 +19,8 @@ Robinhood's trading MCP).
                              # doesn't stop it; restarts itself if it crashes
     python agent.py stop     # stop the background agent
     python agent.py autostart on|off|status   # start at every login
+    python agent.py auto-update on|off|status # install official updates by
+                             # itself, 8 PM-8 AM ET or weekends (off by default)
     python agent.py status   # running?, config, wallet balance, open positions
     python agent.py check-positions   # read-only: open positions next to
                              # what your broker account holds right now
@@ -8183,6 +8185,12 @@ def _command(t, cfg, text):
                       "Open at login OFF — the agent still starts at login; open "
                       "the dashboard yourself (bookmark http://127.0.0.1:"
                       "8721/dash — you stay signed in).")
+    if t in _AUTO_UPDATE_SAYS:
+        import auto_update
+        if t.endswith(" on") or t.endswith(" off"):
+            cfg[auto_update.KEY] = t.endswith(" on")
+            _save(CONFIG_PATH, cfg, private=True)
+        return True, auto_update.describe(cfg, HOME, _install_kind())
     if t in ("preview on", "preview off"):
         cfg["dry_run_preview"] = t.endswith("on")
         _save(CONFIG_PATH, cfg, private=True)
@@ -8754,6 +8762,17 @@ def cmd_run(app_window=False):
         print(f"dashboard not started ({exc}) — trading continues; "
               "retrying every 5 min")
     dash = {"at": time.time(), "fails": 0}
+    # automatic updates (off unless the owner turned them on): their own
+    # thread, so a slow GitHub never holds up this loop
+    try:
+        import auto_update
+
+        def _disk_cfg():
+            return _load(CONFIG_PATH, {}) or {}
+        auto_update.Runner(_disk_cfg, webui.auto_update_backend(_disk_cfg),
+                           HOME).start()
+    except Exception as exc:
+        print(f"automatic updates not started ({str(exc)[:120]})")
     # older start-at-login entries don't open the dashboard / may point at
     # an old folder — bring them up to date (no-op when current or off)
     if keep_running.refresh_autostart():
@@ -9935,6 +9954,38 @@ def cmd_autostart(action):
         print("Change: python agent.py autostart on|off")
 
 
+# "auto update on|off" (and "auto update" alone: how it stands), in the chat
+_AUTO_UPDATE_SAYS = tuple(
+    w + s for w in ("auto update", "auto-update", "auto updates", "autoupdate",
+                    "automatic updates")
+    for s in ("", " on", " off"))
+
+
+def _install_kind():
+    """"git" or "snapshot" (zip install): how updates are installed here."""
+    try:
+        import webui
+        return webui._auto_update_kind()
+    except Exception:
+        return None
+
+
+def cmd_auto_update(action):
+    """python agent.py auto-update on|off|status: the config key
+    "auto_update" (auto_update.py). A running agent reads it from
+    config.json every minute: no restart needed."""
+    import auto_update
+    if action in ("on", "off"):
+        with CONFIG_LOCK:
+            cfg = _read_config()
+            cfg[auto_update.KEY] = action == "on"
+            _save(CONFIG_PATH, cfg, private=True)
+    else:
+        cfg = _load(CONFIG_PATH, {}) or {}
+    print(auto_update.describe(cfg, HOME, _install_kind()))
+    print("Change: python agent.py auto-update on|off")
+
+
 def _is_ready():
     """Consent accepted AND a source + broker are configured."""
     if not consent_ok():
@@ -10013,6 +10064,8 @@ def main():
         cmd_supervise()
     elif cmd == "autostart":
         cmd_autostart(sys.argv[2] if len(sys.argv) > 2 else "status")
+    elif cmd == "auto-update":
+        cmd_auto_update(sys.argv[2] if len(sys.argv) > 2 else "status")
     elif cmd == "status":
         cmd_status()
     elif cmd == "check-positions":

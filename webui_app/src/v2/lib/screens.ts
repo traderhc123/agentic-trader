@@ -53,6 +53,7 @@ export type ActionId =
   | "autostart"
   | "open-at-login"
   | "keep-awake"
+  | "auto-update"
   | "move"
   | "start"
   | "stop"
@@ -99,6 +100,7 @@ export const ACTION_HOME: Record<ActionId, Home> = {
   autostart: "settings",
   "open-at-login": "settings",
   "keep-awake": "settings",
+  "auto-update": "settings",
   move: "settings",
   start: "settings",
   stop: "settings",
@@ -199,7 +201,7 @@ export function screenOf(view: View, s: Status, l: Link): Screen {
   }
   else if (view === "settings") {
     links.push("signals");
-    controls.push("broker", "ai", "alerts", "autostart", "open-at-login", "keep-awake", "move", "theme", "dashboard", "classic");
+    controls.push("broker", "ai", "alerts", "autostart", "open-at-login", "keep-awake", "auto-update", "move", "theme", "dashboard", "classic");
     controls.push("self-edit", "proposal", "proposal-request", "netcheck", "report", "tip", "agreement");
     controls.push(s.agent.running ? "stop" : "start");
   }

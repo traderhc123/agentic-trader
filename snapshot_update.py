@@ -9,7 +9,10 @@ Same rules as the git path (webui.check_code_updates / pull_code_updates):
     head of the official branch. A commit id is never taken on the browser's
     word: GitHub serves any commit of any fork under the official repo's
     download address, so "whatever SHA the page sends" would be "any code";
-  - nothing is installed automatically.
+  - nothing is installed automatically, unless the owner turned on
+    automatic updates (auto_update.py, off by default): that calls check()
+    and then pull() of the commit check() found, like the button, and
+    only once that commit has been the newest for two hours.
 
 The install is all-or-nothing. The whole snapshot is first written to
 `.update-staging/`; only then are files swapped in, and if any swap fails

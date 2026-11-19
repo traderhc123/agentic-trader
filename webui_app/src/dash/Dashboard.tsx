@@ -951,6 +951,10 @@ function rowOf(x: Trade) {
   } else if (a === "exit") {
     kind = "out";
     verb = "Exited";
+  } else if (a === "code_update") {
+    // automatic update (auto_update): no order
+    verb = "Updated";
+    detail = note || "The agent installed an official update by itself";
   } else {
     detail = cap1(SKIPS[a] || a.replace(/_/g, " ")) + (note ? ` — ${note}` : "");
   }
@@ -1256,6 +1260,7 @@ function ConsolePanel({ msgs, send }: { msgs: ChatMsg[]; send: (t: string) => vo
           ["autostart", "start at login?"],
           ["open at login on", "open dashboard at login"],
           ["keep awake on", "keep awake"],
+          ["auto update", "automatic updates?"],
           ["why did you skip the last signal?", "why the last skip?"],
         ].map(([cmd, label]) => (
           <Button key={label} size="sm" className="font-mono text-fg2" onClick={() => send(cmd)}>
