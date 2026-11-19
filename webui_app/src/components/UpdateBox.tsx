@@ -2,12 +2,57 @@ import { RefreshCw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api, apiTimed } from "../lib/api";
 import { cn } from "../lib/cn";
+import type { AutoUpdate } from "../lib/settingsApi";
 import { Button } from "./ui/button";
+
+const AUTO_TEXT =
+  "Installs official updates automatically between 8 PM and 8 AM ET or on weekends, only when no order is being placed. Off by default.";
+
+function autoWords(a: AutoUpdate | null | undefined): string {
+  if (!a) return AUTO_TEXT;
+  let t = a.text || AUTO_TEXT;
+  if (a.last) t += ` Last automatic update (${a.last.at_et || a.last.at || ""}): ${a.last.ok ? "" : "FAILED: "}${a.last.text || ""}.`;
+  if (a.on && a.note) t += ` ${a.note}`;
+  return t;
+}
+
+/** Automatic updates (off by default): the same switch as /v2 Settings,
+ *  saved through the same route. */
+function AutoUpdateToggle({ auto }: { auto?: AutoUpdate | null }) {
+  const [now, setNow] = useState<AutoUpdate | null>(auto ?? null);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+  const [lead, setLead] = useState("");
+  useEffect(() => setNow(auto ?? null), [auto]);
+  const flip = async (on: boolean) => {
+    setSaving(true);
+    setErr("");
+    const r = await apiTimed("/api/v2/settings/updates", { auto_update: on }, 30000);
+    setSaving(false);
+    if (!r.ok) return setErr(r.error || "not saved");
+    const a = (r.settings && r.settings.updates) as AutoUpdate | null | undefined;
+    if (a) setNow(a);
+    setLead(a ? (a.on ? "Saved: on. " : "Saved: off. ") : "Saved. ");
+  };
+  return (
+    <div className="space-y-1">
+      <label className="flex cursor-pointer items-center gap-2 text-fg2">
+        <input type="checkbox" checked={!!now?.on} disabled={saving || auto == null} onChange={(e) => flip(e.target.checked)} />
+        Install updates automatically
+      </label>
+      <span className="block [overflow-wrap:anywhere]">
+        {lead}
+        {autoWords(now)}
+      </span>
+      {err && <span className="block whitespace-pre-line text-down">{err}</span>}
+    </div>
+  );
+}
 
 /** Update button: never silent. A ticking "checking… 12s" while the server
  *  works, a hard timeout, and every failure shown in words. Installs only the
  *  exact reviewed commit (`expect`). */
-export function UpdateBox({ className, compact }: { className?: string; compact?: boolean }) {
+export function UpdateBox({ className, compact, auto }: { className?: string; compact?: boolean; auto?: AutoUpdate | null }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [secs, setSecs] = useState(0);
   const [res, setRes] = useState<{ kind: "ok" | "err"; text: string; summary?: string; target?: string } | null>(null);
@@ -104,6 +149,7 @@ export function UpdateBox({ className, compact }: { className?: string; compact?
           )}
         </div>
       )}
+      <AutoUpdateToggle auto={auto} />
     </div>
   );
 }

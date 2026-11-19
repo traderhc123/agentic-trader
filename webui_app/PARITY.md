@@ -249,6 +249,7 @@ Input for the 4a.5 test (`tests/test_v2_parity.py::test_every_route_has_a_v2_cal
 | `/api/v2/move/finish` | POST | retire this computer after the move file is saved (two-step, P-68) | /v2 Settings → This computer → Move | v2 |
 | `/api/v2/move/deploy` | POST | move to a new cloud server (two-step, P-69) | /v2 Settings → This computer → Move | v2 |
 | `/api/v2/settings/code` | POST | let the AI helper propose code changes (self_edit_enabled, P-77) | /v2 Settings → Code changes | v2 |
+| `/api/v2/settings/updates` | POST | automatic updates on / off (auto_update, off by default; also the classic setup page's switch beside Check for updates) | /v2 Settings → This computer → Automatic updates | v2 |
 | `/api/v2/proposal/request` | POST | ask the AI helper for a code change: self_edit.propose, never apply_command (P-78) | /v2 Settings → Code changes | v2 |
 | `/api/v2/proposal/apply` | POST | apply the reviewed code change and restart (two-step, bound to the sha256 of the diff shown, P-75) | /v2 Settings → Code changes | v2 |
 | `/api/v2/settings/source` | POST | signal source (two-step) or, alone, the subscription key (direct, write-only), through the classic source save (P-42, P-44) | /v2 Signals & pass → Signal source | v2 |
@@ -285,6 +286,7 @@ Every route below is registered in `W.routes_get`/`W.routes_post`, so it inherit
 | `POST /api/v2/settings/signals {scope, dry_run_preview}` | source_scope(); chat 'preview on\|off' key | two-step when scope is sent | P-43, P-49 |
 | `POST /api/v2/settings/source {source, url, agenthc_key}` | helper split out of source() | two-step | P-42, P-44 |
 | `POST /api/v2/settings/code {self_edit_enabled}` | same key as chat 'self-edit on\|off' | direct | P-77 |
+| `POST /api/v2/settings/updates {auto_update}` | same key as chat 'auto update on\|off' and `agent.py auto-update on\|off` | direct (not money) | P-72 |
 | `POST /api/v2/proposal/request {request}` | self_edit.propose | direct (proposing changes nothing) | P-78 |
 | `POST /api/v2/proposal/apply` | self_edit.apply_and_restart; token bound to sha256(diff) | two-step | P-75 |
 | `POST /api/v2/move/finish` | move_finish | two-step | P-68 |

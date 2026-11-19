@@ -72,6 +72,8 @@ export interface SettingsView {
   /** the no-signal sell (the chat's "no-signal sell"); null: not known */
   no_signal: NoSignal | null;
   code: { self_edit_enabled: boolean };
+  /** automatic updates (config "auto_update", off by default); null: not known */
+  updates?: AutoUpdate | null;
   /** the agreement on file (its text: GET /api/v2/agreement) */
   consent: Consent;
   ai: {
@@ -117,6 +119,27 @@ export interface SettingsView {
 }
 
 export type Dashboard = "classic" | "v2";
+
+/** Automatic updates (auto_update.status): off unless the owner turns them on. */
+export interface AutoUpdate {
+  on: boolean;
+  /** what the switch does, in the agent's words */
+  text: string;
+  /** how this install updates: "git", or "snapshot" (a zip install) */
+  kind: "git" | "snapshot" | null;
+  /** the last automatic install, or try */
+  last: {
+    at: string | null;
+    /** `at` in Eastern time, as the agent words it ("Fri 2026-11-20 03:00 ET") */
+    at_et?: string | null;
+    ok: boolean | null;
+    text: string | null;
+    from: string | null;
+    to: string | null;
+  } | null;
+  /** what it is waiting for now (a version cooling off, a failed check) */
+  note: string | null;
+}
 
 export interface Expiry {
   sell_et: string | null;

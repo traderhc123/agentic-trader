@@ -11,7 +11,7 @@ import { FieldError, ReviewDialog, SettingsDoubt, Switch, askPreview } from "../
 import { brokerLabel } from "../lib/derive";
 import { API, getJson, send } from "../lib/http";
 import { CLASSIC, RH_OPTIONS_URL, SETUP_FROM_V2, agreementWords, brokerName, brokerWarning, etClockWords, expiryAlertPayload, setupUnfinished, signInOutcome } from "../lib/settings";
-import { badgeFor, updateLine } from "../lib/update";
+import { autoUpdateWords, badgeFor, updateLine } from "../lib/update";
 import { UPDATE } from "../lib/copy";
 import { UNKNOWN, etDayKey, etTime, etWhen, usd } from "../lib/format";
 import { Dialog, Icon, Stamp } from "../ui";
@@ -565,6 +565,33 @@ function UpdateRow({ page }: { page: Page }) {
   );
 }
 
+/** Automatic updates (off by default): saves straight away. Not money: an
+ *  update changes no setting, rule, mode or position. */
+function AutoUpdateSwitch({ page }: { page: Page }) {
+  const v = page.settings.view;
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const save = async (next: boolean) => {
+    setBusy(true);
+    setErr("");
+    const r = await send(API.updates, { auto_update: next });
+    if (!r.ok) {
+      setBusy(false);
+      return setErr(r.error);
+    }
+    const nv = await page.settings.reload();
+    setBusy(false);
+    const now = nv?.updates ? nv.updates.on : null;
+    page.say(true, `Saved. ${UPDATE.autoLabel}: ${now == null ? "not read back yet" : now ? "on" : "off"}.`);
+  };
+  return (
+    <>
+      <Switch act="auto-update" label={UPDATE.autoLabel} on={v?.updates ? v.updates.on : null} busy={busy} disabled={!!cantEdit(page) || (!!v && !v.updates)} onChange={save} />
+      <FieldError id="auto-update-e" text={err} />
+    </>
+  );
+}
+
 /** Let the AI helper propose code changes: saves straight away (proposing
  *  changes nothing; applying is two steps). */
 function SelfEditSwitch({ page }: { page: Page }) {
@@ -786,6 +813,7 @@ export function SettingsView({ page }: { page: Page }) {
           }
         />
         <UpdateRow page={page} />
+        <Row label={UPDATE.autoLabel} exp={!v ? UNKNOWN : autoUpdateWords(v.updates)} act={<AutoUpdateSwitch page={page} />} />
         <Row
           label="Move to another computer"
           exp="Packs this setup into one passphrase-locked file for the other computer, or moves it to a new cloud server, then retires this computer so the two never both trade."

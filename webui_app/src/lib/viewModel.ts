@@ -52,6 +52,7 @@ export const REASON_CODES = [
   "broker_no_order",
   "exit_failed",
   "exit_partial",
+  "code_updated",
   "past_expiry_guard",
   "exit_already_arrived",
   "rule_not_in_list",

@@ -1,5 +1,6 @@
 // Same-origin JSON calls to the agent's own server (127.0.0.1 only).
 // The session cookie rides along automatically.
+import type { AutoUpdate } from "./settingsApi";
 
 export type Json = Record<string, any>;
 
@@ -268,6 +269,8 @@ export interface WizardState {
   policy_on?: boolean;
   running?: boolean;
   keep_awake?: boolean;
+  /** automatic updates (off by default); null: not known */
+  auto_update?: AutoUpdate | null;
   /** mode and limits as saved now; null = never set (first setup) */
   dry_run?: boolean | null;
   max_entries_per_day?: number | null;

@@ -142,6 +142,11 @@ def _settings(tab):
         "no_signal": {"sell_et": _no_signal(cfg), "today_et": _no_signal(cfg),
                       "default": "15:30", "allowed": ["09:30", "15:59"]},
         "code": {"self_edit_enabled": bool(cfg.get("self_edit_enabled"))},
+        "updates": {"on": cfg.get("auto_update") is True, "kind": "git",
+                    "text": "Installs official updates automatically between "
+                            "8 PM and 8 AM ET or on weekends, only when no "
+                            "order is being placed. Off by default.",
+                    "last": None, "note": None},
         "consent": {"accepted": True, "on_file": True,
                     "accepted_at": "2026-10-01T12:00:00+00:00",
                     "terms_version": "fixture", "current_terms_version": "fixture"},
@@ -368,6 +373,9 @@ def _v2_post(tab, path, data):
                 f"its status and recent trades. You asked: {q[:200]}"}
     if path == "/api/v2/settings/code":
         cfg["self_edit_enabled"] = bool(data.get("self_edit_enabled"))
+        return {"ok": True, "saved": True}
+    if path == "/api/v2/settings/updates":
+        cfg["auto_update"] = data.get("auto_update") is True
         return {"ok": True, "saved": True}
     if path == "/api/v2/proposal/request":
         tab["proposal"] = True

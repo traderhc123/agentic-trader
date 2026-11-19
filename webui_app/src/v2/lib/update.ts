@@ -22,6 +22,7 @@
 //   a diverged checkout (local commits) reports
 //     behind>0 like any other; the agent refuses the
 //     pull ("cannot fast-forward") and that is shown -> no retry, no button after
+import type { AutoUpdate } from "../../lib/settingsApi";
 import { UPDATE } from "./copy.ts";
 import { browserFetch, postJson, type Fetch } from "./http.ts";
 
@@ -182,6 +183,17 @@ export function updateLine(check: Check, phase: Phase, detail = ""): { text: str
     case "available":
       return { text: UPDATE.available(check.offer.count), review: true };
   }
+}
+
+/** The Automatic updates row: what the switch does, the last automatic
+ *  install (or failure, shown until the next one), and what it waits for. */
+export function autoUpdateWords(a: AutoUpdate | null | undefined): string {
+  if (!a) return UPDATE.autoUnknown;
+  let t = a.text || UPDATE.autoText;
+  const last = a.last;
+  if (last) t += ` ${last.ok ? UPDATE.autoLastOk(last.at, last.text) : UPDATE.autoLastFailed(last.at, last.text)}`;
+  if (a.on && a.note) t += ` ${a.note}`;
+  return t;
 }
 
 /** After a pull that restarts the agent: is the agent back, on the new code?

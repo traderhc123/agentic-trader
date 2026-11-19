@@ -709,6 +709,8 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <button onclick="checkUpdates()" id="upd-btn"><svg class="i"><use href="#i-refresh"/></svg>Check for updates</button>
   <button onclick="pullUpdates()" id="upd-pull" class="btn-primary" style="display:none">Pull latest code</button>
   <span id="upd-msg" class="muted"></span>
+  <label class="check"><input type="checkbox" id="upd-auto" onchange="setAutoUpdate(this.checked)"><span>Install updates automatically</span></label>
+  <span id="upd-auto-msg" class="muted">Installs official updates automatically between 8 PM and 8 AM ET or on weekends, only when no order is being placed. Off by default.</span>
  </div>
 </aside>
 
@@ -1268,6 +1270,28 @@ async function checkUpdates(){
     ' from github.com/traderhc123/agentic-trader</span>');
   document.getElementById('upd-pull').style.display='';
 }
+// Automatic updates (off by default): the switch, and what the last one did
+function autoUpdLine(a){
+  if(!a)return '';
+  let t=a.text||'';
+  if(a.last)t+=' Last automatic update ('+(a.last.at_et||a.last.at||'')+'): '+(a.last.ok?'':'FAILED: ')+(a.last.text||'')+'.';
+  if(a.on&&a.note)t=[t,a.note].join(' ');  // shown with textContent
+  return t;
+}
+function showAutoUpdate(a,lead){
+  if(!a)return;
+  document.getElementById('upd-auto').checked=!!a.on;
+  document.getElementById('upd-auto-msg').textContent=(lead||'')+autoUpdLine(a);
+}
+async function setAutoUpdate(on){
+  const box=document.getElementById('upd-auto');box.disabled=true;
+  const r=await updCall('/api/v2/settings/updates',{auto_update:on},30000);
+  box.disabled=false;
+  if(!r.ok){box.checked=!on;
+    document.getElementById('upd-auto-msg').innerHTML='<span class="err">'+esc(r.error||'not saved')+'</span>';return;}
+  const a=r.settings&&r.settings.updates;
+  showAutoUpdate(a,a&&a.on?'Saved: on. ':'Saved: off. ');
+}
 let updTarget='';
 async function pullUpdates(){
   updBusy('installing');
@@ -1431,6 +1455,7 @@ async function passSizes(){
 async function boot(){
   poll(passSizes,900000);  // at once, then every 15 min while visible
   const st=await api('/api/state');
+  showAutoUpdate(st.auto_update);
   document.getElementById('disclaimer').innerHTML=mdLite(st.disclaimer);
   const notes=st.notes||{};
   if(st.consent){done('s-consent');restoredNote('s-consent',notes.consent||'Agreement signed — on file');}
@@ -4049,6 +4074,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             # the agent itself is serving this page (vs. the setup wizard)
             "running": get_status is not None,
             "keep_awake": cfg.get("keep_awake", True) is not False,
+            # automatic updates: the switch beside "Check for updates"
+            "auto_update": _auto_update_view(cfg),
             # the mode and limits as they are set now (None = never set), so
             # the Safety form shows them instead of its own defaults
             "dry_run": (bool(cfg["dry_run"]) if cfg.get("dry_run") is not None
@@ -4442,43 +4469,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         ok, note = pull_code_updates(expect=expect)
         if not ok:
             return {"ok": False, "error": note}
-        import os
-        # New code may carry new dependencies (e.g. qrcode) — a pull without
-        # a dep install restarts onto ImportErrors or silently-degraded
-        # features. Fail-soft: a pip failure never blocks the update.
-        note += _install_requirements()
-        if os.getenv("AGENT_UPDATE_NO_RESTART"):
-            # Test/automation escape hatch — never re-exec the test runner.
-            return {"ok": True, "note": note + " — restart skipped "
-                    "(AGENT_UPDATE_NO_RESTART)"}
-        # Restart onto the new code in BOTH modes (running agent AND the
-        # standalone setup wizard) so server + UI changes apply immediately —
-        # a pulled webui.py otherwise keeps serving the old page from memory.
-        # Re-exec the exact original invocation (agent.py run / agent.py
-        # setup / …); config lives on disk and the wizard restores completed
-        # steps, so a setup-mode restart is safe. The page polls /api/state
-        # and reloads itself once the server is back.
-        import sys
-        import time as _time
-        # Stop new event polls so an in-flight order can finish its atomic
-        # state save before the exec; all durable state (config, positions,
-        # seen-events, trade log, daily cap) already lives on disk. The hold
-        # is in memory only, so polling resumes automatically after the
-        # restart (and the owner's own Pause, in config.json, is untouched).
-        # Long enough for the restart to wait for an order that is still
-        # being placed; released at once if the restart gives up.
-        import platform_compat
-        hold_orders(_HOLD_S + platform_compat.ORDER_WAIT_SECONDS)
-
-        def _restart():
-            _time.sleep(3.0)  # response flush
-            # waits for an order that is still being placed (never restarts
-            # in the middle of one)
-            _restart_after_update(list(sys.argv))
-        threading.Thread(target=_restart, daemon=True).start()
-        return {"ok": True, "restarting": True,
-                "note": note + " — restarting with the new code; this page "
-                "will reload in a few seconds"}
+        # dependencies, hold, restart: the same steps as automatic updates
+        return _restart_onto_update(note)
 
     def proposal_get(_h):
         import self_edit
@@ -5431,6 +5423,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "expiry": _expiry_view(),
             "no_signal": _no_signal_view(),
             "code": {"self_edit_enabled": bool(cfg.get("self_edit_enabled"))},
+            "updates": _auto_update_view(cfg),
             "consent": _consent_view(),
             "ai": {"connected": bool(ai), "provider": ai.get("provider"),
                    "name": ai.get("name"), "model": ai.get("model"),
@@ -6254,6 +6247,22 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"ok": True, "saved": True, "settings": _settings_view()}
 
     @_v2
+    def v2_updates(data):
+        """POST /api/v2/settings/updates {auto_update: true|false}: automatic
+        updates (auto_update; the chat's "auto update on|off"). Not money:
+        an update changes no setting, rule, mode or position. Also the
+        classic setup page's switch."""
+        p = _v2_payload(data, ("auto_update",))
+        if set(p) != {"auto_update"} or not isinstance(p["auto_update"], bool):
+            raise _Invalid("Send auto_update: true or false. Nothing was "
+                           "changed.")
+        with A.CONFIG_LOCK:
+            _sync()
+            cfg["auto_update"] = p["auto_update"]
+            save()
+            return {"ok": True, "saved": True, "settings": _settings_view()}
+
+    @_v2
     def v2_proposal_request(data):
         """POST /api/v2/proposal/request: ask the AI helper to write a code
         change (the chat's "code: …"), by calling self_edit.propose itself:
@@ -6756,6 +6765,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/v2/move/finish": v2_move_finish,
                      "/api/v2/move/deploy": v2_move_deploy,
                      "/api/v2/settings/code": v2_code,
+                     "/api/v2/settings/updates": v2_updates,
                      "/api/v2/proposal/request": v2_proposal_request,
                      "/api/v2/proposal/apply": v2_proposal_apply,
                      "/api/v2/settings/source": v2_source,
@@ -7169,14 +7179,18 @@ def restart_after_self_edit(argv, port=None):
         "To load the change, restart it", port=port, quiet=False)
 
 
-def pull_code_updates(expect=None):
+def pull_code_updates(expect=None, older_ok=False):
     """Fetch origin and fast-forward to the upstream. Returns (ok, message).
     Fetches itself — never assume check_code_updates ran first (a stale
     origin/<branch> ref would merge cleanly and report success without
     actually updating). --ff-only so local commits/self-edits are never
     merged over silently — a diverged tree is reported, not resolved.
     `expect` (the `target` from check_code_updates) pins the exact commit the
-    user reviewed: if the remote moved since, nothing is installed."""
+    user reviewed: if the remote moved since, nothing is installed.
+    older_ok (automatic updates, git only): `expect` may also be an older
+    commit of the same official branch — one it has had for two hours while
+    newer ones arrived (auto_update); a commit not on that branch is
+    refused all the same."""
     _forget_update_check()  # whatever happens, the next check asks again
     problem = _install_write_problem()
     if problem:
@@ -7196,18 +7210,332 @@ def pull_code_updates(expect=None):
             return False, err
         upstream = _update_upstream()
         head = _git(["rev-parse", upstream]).stdout.strip()
+        to = head
         if expect and head != expect:
-            return False, ("the remote changed since you checked — press "
-                           "'Check for code updates' again and review the "
-                           "new commit list")
-        r = _git(["merge", "--ff-only", head or upstream], timeout=120)
+            if not (older_ok and _on_branch(expect, upstream)):
+                return False, ("the remote changed since you checked — press "
+                               "'Check for code updates' again and review the "
+                               "new commit list")
+            to = expect
+        r = _git(["merge", "--ff-only", to or upstream], timeout=120)
         if r.returncode != 0:
             err = (r.stderr or r.stdout).strip()[:200]
             return False, ("cannot fast-forward (local changes or diverged "
                            f"history): {err}")
-        return True, f"updated to {upstream}"
+        return True, (f"updated to {upstream}" if to == head
+                      else f"updated to {to[:12]} on {upstream}")
     except Exception as exc:
         return False, str(exc)[:200]
+
+
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+
+
+def _on_branch(sha, upstream):
+    """True when full commit id `sha` is on `upstream` (it or an ancestor
+    of its head)."""
+    sha = str(sha or "").strip().lower()
+    if not _FULL_SHA.match(sha):
+        return False
+    return _git(["merge-base", "--is-ancestor", sha, upstream]).returncode == 0
+
+
+def _restart_onto_update(note, install_deps=True):
+    """After a pull that went through (the Update button and automatic
+    updates alike): install new dependencies, put the heartbeat on hold and
+    restart onto the new code. Returns the Update button's answer.
+    install_deps=False: they were installed already (automatic updates
+    install them, and prove the new code loads, before getting here)."""
+    import os
+    import sys
+    import time as _time
+    import platform_compat
+    # New code may carry new dependencies (e.g. qrcode) — a pull without
+    # a dep install restarts onto ImportErrors or silently-degraded
+    # features. Fail-soft: a pip failure never blocks the update.
+    if install_deps:
+        note += _install_requirements()
+    if os.getenv("AGENT_UPDATE_NO_RESTART"):
+        # Test/automation escape hatch — never re-exec the test runner.
+        return {"ok": True, "note": note + " — restart skipped "
+                "(AGENT_UPDATE_NO_RESTART)"}
+    # Restart onto the new code in BOTH modes (running agent AND the
+    # standalone setup wizard) so server + UI changes apply immediately —
+    # a pulled webui.py otherwise keeps serving the old page from memory.
+    # Re-exec the exact original invocation (agent.py run / agent.py
+    # setup / …); config lives on disk and the wizard restores completed
+    # steps, so a setup-mode restart is safe. The page polls /api/state
+    # and reloads itself once the server is back.
+    # Stop new event polls so an in-flight order can finish its atomic
+    # state save before the exec; all durable state (config, positions,
+    # seen-events, trade log, daily cap) already lives on disk. The hold
+    # is in memory only, so polling resumes automatically after the
+    # restart (and the owner's own Pause, in config.json, is untouched).
+    # Long enough for the restart to wait for an order that is still
+    # being placed; released at once if the restart gives up.
+    hold_orders(_HOLD_S + platform_compat.ORDER_WAIT_SECONDS)
+
+    def _restart():
+        _time.sleep(3.0)  # response flush
+        # waits for an order that is still being placed (never restarts
+        # in the middle of one)
+        _restart_after_update(list(sys.argv))
+    threading.Thread(target=_restart, daemon=True).start()
+    return {"ok": True, "restarting": True,
+            "note": note + " — restarting with the new code; this page "
+            "will reload in a few seconds"}
+
+
+class _AutoUpdateBackend:
+    """What auto_update.tick needs from the running agent: the Update
+    button's own check, pull and restart, the order guard, the trade log
+    and the owner's notifications."""
+
+    def __init__(self, get_cfg=None):
+        self.get_cfg = get_cfg
+
+    def _cfg(self):
+        try:
+            return (self.get_cfg() if self.get_cfg else None) or {}
+        except Exception:
+            return {}
+
+    def busy(self):
+        """Why nothing may be installed right now, or None."""
+        import platform_compat
+        if CONTROLS.get("stop"):
+            return "the agent is stopping"
+        if setup_replaced() or orders_held():
+            return "a restart is already under way"
+        try:
+            import transfer
+            if transfer.HANDOFF.get("hold"):
+                return "a move to another computer is under way"
+        except Exception:
+            pass
+        # an order that was sent to the broker and is not saved yet holds
+        # this lock (agent._order_in_flight, the order reconcile)
+        if not platform_compat.ORDER_LOCK.acquire(blocking=False):
+            return "an order is being placed"
+        platform_compat.ORDER_LOCK.release()
+        return None
+
+    def hold(self):
+        """Put the heartbeat on hold (no new orders) for the whole install,
+        then make sure no order is still being placed. Why not, or None
+        (and then the hold is on until finish() or release())."""
+        import platform_compat
+        why = self.busy()
+        if why:
+            return why
+        hold_orders(_AUTO_UPDATE_HOLD_S)
+        # an order that started before the hold took effect
+        if not platform_compat.ORDER_LOCK.acquire(blocking=False):
+            release_orders()
+            return "an order is being placed"
+        platform_compat.ORDER_LOCK.release()
+        return None
+
+    def release(self):
+        release_orders()
+
+    def check(self):
+        return check_code_updates(force=True)
+
+    def local_changes(self):
+        """Why this install has changes of its own that an automatic update
+        must not install over, or None. Stricter than the Update button:
+        git's --ff-only carries uncommitted edits along when the update
+        doesn't touch the same files, and a zip update overwrites them."""
+        if _snapshot_mode():
+            import snapshot_update
+            if snapshot_update.self_edited_since_install(_repo_dir(),
+                                                         _agent_home()):
+                return ("this install has code changes you approved "
+                        "(self-edits) since its last update; an automatic "
+                        "update would overwrite them. Update from the "
+                        "dashboard instead")
+            return None
+        r = _git(["status", "--porcelain", "--untracked-files=normal"])
+        if r.returncode != 0:
+            return ("could not read this install's git status: "
+                    + (r.stderr or r.stdout).strip()[:150])
+        mine = []
+        for line in r.stdout.splitlines():
+            name = line[3:].strip().strip('"')
+            # untracked: only Python files count (a .venv/ or a log is fine)
+            if line.startswith("??") and not name.endswith(".py"):
+                continue
+            if name:
+                mine.append(name)
+        if mine:
+            return ("this install has local changes ("
+                    + ", ".join(mine[:3]) + (", ..." if len(mine) > 3 else "")
+                    + "); automatic updates never install over them. Update "
+                    "from the dashboard instead")
+        head = _git(["rev-parse", "HEAD"]).stdout.strip().lower()
+        if not _on_branch(head, _update_upstream()):
+            return ("this install has commits of its own that are not on the "
+                    "official branch (cannot fast-forward: local changes or "
+                    "diverged history). Update from the dashboard instead")
+        return None
+
+    def candidates(self, check, shas):
+        """Of `shas` (newest first), the ones that could be installed: on
+        the official branch and not already installed. A checkout that has
+        diverged keeps them: local_changes() (and pull's --ff-only) then
+        refuse, and that failure is shown and told, not waited on."""
+        if _snapshot_mode():
+            # the zip install installs only what its own check just found
+            # at the head of the official branch
+            target = str(check.get("target") or "").lower()
+            return [s for s in shas if s == target]
+        upstream = str(check.get("upstream") or "") or _update_upstream()
+        head = _git(["rev-parse", "HEAD"]).stdout.strip().lower()
+        out = []
+        for s in shas:
+            if (s != head and _on_branch(s, upstream)
+                    and _git(["merge-base", "--is-ancestor", s,
+                              "HEAD"]).returncode != 0):
+                out.append(s)
+        return out
+
+    def changes(self, sha, check):
+        """(installed short id, new short id, first line of each change)."""
+        if _snapshot_mode():
+            import snapshot_update
+            old = snapshot_update.installed_commit(_repo_dir())[:7] or "unknown"
+            subjects = []
+            for line in str(check.get("summary") or "").splitlines():
+                m = re.match(r"^[0-9a-f]{7,40} (.+)$", line.strip())
+                if m:
+                    subjects.append(m.group(1)[:120])
+            return old, sha[:7], subjects
+        old = _git(["rev-parse", "--short=7", "HEAD"]).stdout.strip() or "unknown"
+        log = _git(["log", "--no-decorate", "--format=%s", "-50",
+                    f"HEAD..{sha}"])
+        subjects = [x[:120] for x in log.stdout.splitlines() if x.strip()]
+        return old, sha[:7], subjects
+
+    def prepare(self):
+        """What is installed now, for verify() and rollback()."""
+        snap = _snapshot_mode()
+        if snap:
+            import snapshot_update
+            head = snapshot_update.installed_commit(_repo_dir())
+        else:
+            head = _git(["rev-parse", "HEAD"]).stdout.strip().lower()
+            if not _FULL_SHA.match(head):
+                raise RuntimeError("could not read the installed commit")
+        return {"snapshot": snap, "head": head, "req": _requirements_bytes()}
+
+    def pull(self, sha):
+        return pull_code_updates(expect=sha, older_ok=True)
+
+    def _changed(self, prep):
+        if prep["snapshot"]:
+            import snapshot_update
+            return snapshot_update.last_changed(_repo_dir())
+        r = _git(["diff", "--name-only", prep["head"], "HEAD"])
+        return [x.strip() for x in r.stdout.splitlines() if x.strip()]
+
+    def verify(self, prep):
+        """(problem or None, note) after the pull: new Python packages
+        installed when requirements.txt changed (a failure counts here,
+        unlike the Update button's fail-soft install), then agent, webui and
+        the changed modules imported in a separate process (self_edit's
+        check). Nothing restarts onto code that does not load."""
+        note = ""
+        if _requirements_bytes() != prep["req"]:
+            note = _install_requirements()
+            if "FAILED" in note or "skipped" in note:
+                return ("the new version needs Python packages that could "
+                        "not be installed (pip install -r requirements.txt)",
+                        note)
+        return self._import_problem(self._changed(prep)), note
+
+    def _import_problem(self, paths):
+        import self_edit
+        return self_edit._import_problem(paths)
+
+    def rollback(self, prep):
+        """Put back the version prepare() saw. (ok, message)"""
+        if prep["snapshot"]:
+            import snapshot_update
+            return snapshot_update.undo_last(_repo_dir())
+        r = _git(["reset", "--keep", prep["head"]], timeout=120)
+        head = _git(["rev-parse", "HEAD"]).stdout.strip().lower()
+        if r.returncode != 0 or head != prep["head"]:
+            return False, ((r.stderr or r.stdout).strip()[:200]
+                           or "git reset did not go back")
+        return True, f"put back {prep['head'][:7]}"
+
+    def finish(self, note):
+        # the packages were installed (and the code checked) by verify()
+        _restart_onto_update(note, install_deps=False)
+
+    def log(self, row):
+        try:
+            import agent as A
+            A._log_trade(row)
+        except Exception as exc:
+            print(f"auto update: activity row not written ({str(exc)[:120]})")
+
+    def notify(self, text):
+        try:
+            import agent as A
+            A.notify(self._cfg(), text)
+        except Exception:
+            pass
+
+
+# an automatic install keeps the heartbeat on hold for at most this long: the
+# fetch, the merge, a package install and the import check (each has its own
+# timeout); finish() replaces it with the restart's own hold
+_AUTO_UPDATE_HOLD_S = 20 * 60
+
+
+def _requirements_bytes():
+    import os
+    try:
+        with open(os.path.join(_repo_dir(), "requirements.txt"), "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _agent_home():
+    import os
+    try:
+        import agent as A
+        return A.HOME
+    except Exception:
+        return os.path.expanduser(os.getenv("AGENT_HOME", "~/.agentic-trader"))
+
+
+def auto_update_backend(get_cfg=None):
+    return _AutoUpdateBackend(get_cfg)
+
+
+def _auto_update_kind():
+    try:
+        return "snapshot" if _snapshot_mode() else "git"
+    except Exception:
+        return None
+
+
+def auto_update_status(cfg):
+    """The dashboards' view of automatic updates (auto_update.status)."""
+    import auto_update
+    return auto_update.status(cfg, _agent_home(), _auto_update_kind())
+
+
+def _auto_update_view(cfg):
+    """auto_update_status, or None when it can't be read (never raises)."""
+    try:
+        return auto_update_status(cfg)
+    except Exception:
+        return None
 
 
 def _leave_after_import(exc):
@@ -7279,8 +7607,8 @@ _V2_ASK_SYSTEM = (
     "at once, the most contracts in one trade, the expiry-day sell time "
     "and which signals to take in Rules & limits; the signal source, signal "
     "days and the payment wallet in Signals & pass; the broker, AI helper, "
-    "alerts, start at login, stopping or starting the agent and code changes "
-    "in Settings. Never give investment advice; you may explain what the "
+    "alerts, start at login, stopping or starting the agent, automatic "
+    "updates and code changes in Settings. Never give investment advice; you may explain what the "
     "agent did and why (per its logs). Be concise and plain-spoken.")
 
 
@@ -7323,7 +7651,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "percent N, other sizing same, other trades on|off, "
                 "set positions N (most positions open at once), "
                 "set max contracts N (most contracts one trade buys), "
-                "set cap N (new trades per day), stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N, set autopay cap N|auto). Never give investment advice; you may "
+                "set cap N (new trades per day), stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, auto update on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N, set autopay cap N|auto). Never give investment advice; you may "
                 "explain what the agent did and why (per its logs). Be "
                 "concise and plain-spoken."),
             support.scrub(

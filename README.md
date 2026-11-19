@@ -248,6 +248,37 @@ Each phone gets its own token (stored here only as a SHA-256 hash).
 `python agent.py devices` lists paired phones; `python agent.py devices revoke
 <id>` cuts one off. Set `AGENT_REMOTE=0` to switch the phone API off entirely.
 
+## 🔄 Updates
+
+The dashboard shows **Update available** when there is a newer version; you
+review the list of changes and press Update. Nothing is installed by itself
+unless you turn on **automatic updates** (off by default):
+
+- Settings → This computer → *Automatic updates* (or the switch under *Check
+  for updates* on the setup page), the chat command `auto update on|off`, or
+  `python agent.py auto-update on|off|status` (config key `"auto_update": true`).
+- It installs official updates automatically between 8 PM and 8 AM ET or on
+  weekends (and market holidays), only when no order is being placed. Open
+  positions are kept, as with the Update button.
+- Only a version that has been on the official repository's branch for at
+  least two hours (as seen by your agent), only from
+  github.com/traderhc123/agentic-trader, and only as a fast-forward. If you
+  changed the code yourself (an approved code change, an edited file, a
+  commit of your own) it installs nothing and tells you: update from the
+  dashboard instead.
+- Before restarting, the new version must load (new Python packages
+  installed, the agent imported in a separate process); if it doesn't, the
+  previous version is put back and the agent keeps running it.
+- At most one try a night (nights run noon to noon ET, so a weekend or
+  holiday can have one a day). After an install the agent restarts, adds an
+  *Updated itself* line to Activity (the built-in fallback page,
+  `?ui=classic`, lists it as a skipped code update) and sends your alerts
+  (old → new version and the changes). If an install fails, the dashboard
+  shows why and it tries again the next night (on a weekend or holiday, the
+  next day).
+- Zip installs (no git) install only the newest version, once it has been
+  the newest for two hours.
+
 ## How it works
 
 - Every `poll_seconds` (default 30) the agent polls the configured source for
