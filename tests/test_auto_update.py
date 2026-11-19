@@ -19,6 +19,8 @@ import auto_update as au
 import view_model as vm
 import webui
 
+from test_snapshot_update import (  # noqa: F401
+    SHA_NEW, SHA_OLD, _Resp, _zip, install)
 from test_v2_settings_api import (  # noqa: F401
     BASE, app, read_cfg, write_cfg)
 
@@ -46,6 +48,10 @@ class Fake:
         self.busy_why = busy
         self.pull_answer = pull
         self.snapshot = snapshot
+        self.local = None                      # local_changes()
+        self.verify_answer = (None, "")        # verify()
+        self.rollback_answer = (True, "put back")
+        self.held = False
         self.calls = []
         self.rows, self.notes = [], []
 
@@ -53,9 +59,24 @@ class Fake:
         self.calls.append("busy")
         return self.busy_why
 
+    def hold(self):
+        why = self.busy()  # like the real one: busy, then the hold
+        if why:
+            return why
+        self.calls.append("hold")
+        self.held = True
+        return None
+
+    def release(self):
+        self.calls.append("release")
+        self.held = False
+
     def check(self):
         self.calls.append("check")
         return dict(self.res)
+
+    def local_changes(self):
+        return self.local
 
     def candidates(self, check, shas):
         if self.snapshot:
@@ -65,9 +86,21 @@ class Fake:
     def changes(self, sha, check):
         return "1111111", sha[:7], ["fix one thing", "fix another"]
 
+    def prepare(self):
+        return {"head": "1" * 40}
+
     def pull(self, sha):
+        assert self.held, "the heartbeat is put on hold before any file changes"
         self.calls.append(("pull", sha))
         return self.pull_answer
+
+    def verify(self, prep):
+        self.calls.append("verify")
+        return self.verify_answer
+
+    def rollback(self, prep):
+        self.calls.append("rollback")
+        return self.rollback_answer
 
     def finish(self, note):
         self.calls.append("finish")
@@ -79,8 +112,8 @@ class Fake:
         self.notes.append(text)
 
 
-def run(cfg, fake, home, when):
-    return au.tick(cfg, fake, str(home), now=when.timestamp(), now_et=when)
+def run(cfg, fake, home, when, **kw):
+    return au.tick(cfg, fake, str(home), now=when.timestamp(), now_et=when, **kw)
 
 
 def pulls(fake):
@@ -101,6 +134,18 @@ def pulls(fake):
 ])
 def test_window(when, ok):
     assert au.in_window({}, when) is ok
+
+
+@pytest.mark.parametrize("when,ok", [
+    (et(2026, 11, 20, 7, 29), True),     # trading day: starts until 07:30
+    (et(2026, 11, 20, 7, 30), False),    # ... not in the last 30 minutes
+    (et(2026, 11, 20, 7, 59), False),
+    (et(2026, 11, 21, 7, 45), True),     # Saturday: no margin needed
+    (et(2026, 11, 19, 20, 0), True),
+    (et(2026, 11, 19, 19, 59), False),
+])
+def test_may_start_stops_before_the_trading_day(when, ok):
+    assert au.may_start({}, when) is ok
 
 
 def test_owner_holiday_counts():
@@ -448,7 +493,306 @@ def test_git_refuses_local_changes_like_the_update_button(repos):
     _commit(install, "local\n", "my own change")
     b = webui.auto_update_backend()
     res = b.check()
-    assert b.candidates(res, [v2]) == []  # not ahead of what is installed
+    # kept as a candidate, so the refusal is shown and told (not "waiting")
+    assert b.candidates(res, [v2]) == [v2]
+    assert "commits of its own" in b.local_changes()
     ok, msg = b.pull(v2)
     assert not ok and "fast-forward" in msg
     assert (install / "f.txt").read_text() == "local\n"
+
+
+# ── after the review: checks before the restart, put back, local changes ─────
+
+LATER = et(2026, 11, 19, 23, 0)  # two and a half hours after THU_2030
+
+
+def _cooled(f, home):
+    """A first tick that sees A, so it may install two hours later."""
+    assert run(ON, f, home, THU_2030) == "waiting"
+
+
+def test_heartbeat_is_held_before_the_pull_and_handed_to_the_restart(tmp_path):
+    f = Fake()
+    _cooled(f, tmp_path)
+    assert run(ON, f, tmp_path, LATER) == "installed"
+    # Fake.pull asserts the hold; the restart (finish) takes it over
+    assert f.held and "release" not in f.calls
+    assert f.calls.index("hold") < f.calls.index(("pull", A))
+    assert f.calls.index("verify") < f.calls.index("finish")
+
+
+def test_new_code_that_does_not_load_is_put_back_and_not_announced(tmp_path):
+    f = Fake()
+    _cooled(f, tmp_path)
+    f.verify_answer = ("the new code does not load — agent: ImportError: x", "")
+    assert run(ON, f, tmp_path, LATER) == "failed"
+    assert "rollback" in f.calls and "finish" not in f.calls
+    assert f.rows == []  # no "Updated itself" row
+    assert len(f.notes) == 1 and "updated itself" not in f.notes[0]
+    assert "previous version (1111111) was put back" in f.notes[0]
+    assert not f.held and f.calls[-1] == "release"
+    last = au.status(ON, str(tmp_path))["last"]
+    assert last["ok"] is False and "ImportError" in last["text"]
+
+
+def test_a_failed_put_back_is_told_plainly(tmp_path):
+    f = Fake()
+    _cooled(f, tmp_path)
+    f.verify_answer = ("the new code does not load — x", "")
+    f.rollback_answer = (False, "disk full")
+    assert run(ON, f, tmp_path, LATER) == "failed"
+    assert "could NOT be put back (disk full)" in f.notes[0]
+    assert "Nothing was changed" not in f.notes[0]
+
+
+def test_an_error_after_the_pull_puts_the_previous_version_back(tmp_path):
+    f = Fake()
+    _cooled(f, tmp_path)
+
+    def boom(prep):
+        raise OSError("pip went away")
+    f.verify = boom
+    assert run(ON, f, tmp_path, LATER) == "failed"
+    assert "rollback" in f.calls and f.rows == [] and not f.held
+    assert "pip went away" in au.status(ON, str(tmp_path))["last"]["text"]
+
+
+def test_an_error_before_the_pull_is_shown_and_told(tmp_path):
+    f = Fake()
+    _cooled(f, tmp_path)
+
+    def boom(sha, check):
+        raise subprocess.TimeoutExpired("git", 60)
+    f.changes = boom
+    assert run(ON, f, tmp_path, LATER) == "failed"
+    assert pulls(f) == [] and "rollback" not in f.calls and not f.held
+    st = au.load(str(tmp_path))
+    assert st["night"] == "2026-11-19" and st["note"] is None
+    assert st["last"]["ok"] is False and "stopped part-way" in st["last"]["text"]
+    assert len(f.notes) == 1
+
+
+def test_local_changes_are_refused_shown_and_told_once(tmp_path):
+    f = Fake()
+    _cooled(f, tmp_path)
+    f.local = ("this install has local changes (rules.py); automatic "
+               "updates never install over them")
+    assert run(ON, f, tmp_path, LATER) == "failed"
+    assert pulls(f) == [] and not f.held and len(f.notes) == 1
+    assert "local changes" in au.status(ON, str(tmp_path))["last"]["text"]
+    assert run(ON, f, tmp_path, et(2026, 11, 20, 21, 0)) == "failed"
+    assert pulls(f) == [] and len(f.notes) == 1  # the same refusal: told once
+
+
+def test_the_window_is_asked_again_right_before_the_install(tmp_path):
+    """A tick that starts in time but whose check runs past 08:00 on a
+    trading day installs nothing."""
+    f = Fake()
+    assert run(ON, f, tmp_path, et(2026, 11, 20, 5, 0)) == "waiting"  # Friday
+    late = et(2026, 11, 20, 8, 1).timestamp()
+    assert run(ON, f, tmp_path, et(2026, 11, 20, 7, 20),
+               clock=lambda: late) == "outside"
+    assert pulls(f) == [] and "release" in f.calls and not f.held
+    assert au.load(str(tmp_path)).get("night") is None  # not used up
+
+
+def test_no_install_when_the_night_cannot_be_written(tmp_path, monkeypatch):
+    f = Fake()
+    _cooled(f, tmp_path)
+    real = au.save
+    monkeypatch.setattr(au, "save", lambda home, st: False if st.get("night")
+                        else real(home, st))
+    mem = {}
+    assert run(ON, f, tmp_path, LATER, mem=mem) == "save_failed"
+    assert pulls(f) == [] and not f.held
+    # remembered in memory: not tried again tonight, nothing told
+    assert run(ON, f, tmp_path, et(2026, 11, 19, 23, 1), mem=mem) == "done_tonight"
+    assert f.notes == []
+
+
+def test_an_unwritable_notes_file_does_not_mean_a_check_every_minute(tmp_path, monkeypatch):
+    monkeypatch.setattr(au, "save", lambda home, st: False)
+    f = Fake()
+    mem = {}
+    assert run(ON, f, tmp_path, THU_2030, mem=mem) == "waiting"
+    for m in range(31, 60):
+        assert run(ON, f, tmp_path, et(2026, 11, 19, 20, m), mem=mem) == "not_due"
+    assert f.calls.count("check") == 1
+
+
+def test_a_check_that_raises_still_waits_before_the_next(tmp_path):
+    f = Fake()
+    _cooled(f, tmp_path)
+
+    def boom(check, shas):
+        raise subprocess.TimeoutExpired("git", 60)
+    f.candidates = boom
+    assert run(ON, f, tmp_path, LATER) == "error"
+    assert run(ON, f, tmp_path, et(2026, 11, 19, 23, 1)) == "not_due"
+    assert f.calls.count("check") == 2
+
+
+def test_describe_words_the_last_install_once_in_eastern_time(tmp_path):
+    f = Fake()
+    _cooled(f, tmp_path)
+    assert run(ON, f, tmp_path, LATER) == "installed"
+    assert au.status(ON, str(tmp_path))["last"]["at_et"] == "Thu 2026-11-19 23:00 ET"
+    line = au.describe(ON, str(tmp_path), "git")
+    assert "installed Installed" not in line
+    assert ("Last automatic update (Thu 2026-11-19 23:00 ET): "
+            f"Installed 1111111 → {A[:7]}.") in line
+
+
+def test_chat_question_shows_the_status(home):
+    agent._save(agent.CONFIG_PATH, {"source": "manual"})
+    for q in ("auto update?", "automatic updates?", "auto-update ?"):
+        handled, reply = agent._apply_command(q)
+        assert handled and reply.startswith("Auto update: off."), q
+    assert "auto_update" not in agent._load(agent.CONFIG_PATH)
+
+
+def test_cli_status_prints_on_a_cp1252_console(home, monkeypatch):
+    import io
+    import sys
+    agent._save(agent.CONFIG_PATH, {"source": "manual", "auto_update": True})
+    au.save(str(home), {"last": {"at": "2026-11-20T04:00:00+00:00", "ok": True,
+                                 "text": "Installed 1111111 → 2222222"}})
+    buf = io.BytesIO()
+    out = io.TextIOWrapper(buf, encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+    agent.cmd_auto_update("status")
+    out.flush()
+    text = buf.getvalue().decode("cp1252")
+    assert "Installed 1111111 ? 2222222" in text and "Change:" in text
+
+
+def test_backend_hold_puts_the_heartbeat_on_hold(monkeypatch):
+    import platform_compat
+    import threading
+    b = webui.auto_update_backend()
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    monkeypatch.setitem(webui.CONTROLS, "stop", False)
+    assert b.hold() is None and webui.orders_held()
+    b.release()
+    assert not webui.orders_held()
+    # an order that holds the lock: no hold is left behind
+    got, done = threading.Event(), threading.Event()
+
+    def order():
+        with platform_compat.ORDER_LOCK:
+            got.set()
+            done.wait(5)
+    t = threading.Thread(target=order)
+    t.start()
+    got.wait(5)
+    try:
+        assert b.hold() == "an order is being placed"
+        assert not webui.orders_held()
+    finally:
+        done.set()
+        t.join()
+
+
+def test_git_refuses_uncommitted_edits_a_fast_forward_would_carry(repos):
+    """--ff-only keeps an edited file the update doesn't touch: the Update
+    button allows that, an automatic update does not."""
+    author, install = repos
+    (author / "g.txt").write_text("g\n")
+    _git(author, "add", "g.txt")
+    _git(author, "commit", "-qm", "g")
+    _git(author, "push", "-q", "origin", "main")
+    b = webui.auto_update_backend()
+    assert b.check()["ok"]
+    assert b.local_changes() is None
+    (install / "f.txt").write_text("my edit\n")
+    assert "local changes (f.txt)" in b.local_changes()
+    (install / "f.txt").write_text("v1\n")
+    # an untracked venv or log is fine; an untracked Python file is not
+    (install / ".venv").mkdir()
+    (install / ".venv" / "x.py").write_text("")
+    (install / "agent.log").write_text("x")
+    assert b.local_changes() is None
+    (install / "mine.py").write_text("x = 1\n")
+    assert "mine.py" in b.local_changes()
+
+
+def test_a_diverged_install_is_a_told_failure_not_endless_waiting(repos, tmp_path, monkeypatch):
+    author, install = repos
+    v2 = _commit(author, "v2\n", "v2")
+    _git(author, "push", "-q", "origin", "main")
+    _git(install, "config", "user.email", "t@t")
+    _git(install, "config", "user.name", "t")
+    _commit(install, "local\n", "my own change")
+    h = tmp_path / "h"
+    au.save(str(h), {"seen": {v2: THU_2030.timestamp() - au.COOL_OFF_S}})
+    monkeypatch.setitem(webui.CONTROLS, "hold_until", 0.0)
+    monkeypatch.setitem(webui.CONTROLS, "stop", False)
+    b = webui.auto_update_backend()
+    told = []
+    monkeypatch.setattr(b, "notify", told.append)
+    assert au.tick(ON, b, str(h), now=THU_2030.timestamp(), now_et=THU_2030) == "failed"
+    last = au.status(ON, str(h))["last"]
+    assert last["ok"] is False and "commits of its own" in last["text"]
+    assert len(told) == 1 and not webui.orders_held()
+    assert (install / "f.txt").read_text() == "local\n"
+
+
+def test_git_rollback_puts_the_previous_commit_back(repos, monkeypatch):
+    author, install = repos
+    v1 = _git(install, "rev-parse", "HEAD")
+    v2 = _commit(author, "v2\n", "v2: breaks the import")
+    _git(author, "push", "-q", "origin", "main")
+    b = webui.auto_update_backend()
+    assert b.check()["ok"]
+    prep = b.prepare()
+    assert prep["head"] == v1 and prep["snapshot"] is False
+    assert b.pull(v2)[0]
+    asked = []
+    monkeypatch.setattr(b, "_import_problem", lambda paths: asked.append(paths)
+                        or "the new code does not load — agent: ImportError: x")
+    problem, note = b.verify(prep)
+    assert "does not load" in problem and asked == [["f.txt"]] and note == ""
+    ok, msg = b.rollback(prep)
+    assert ok, msg
+    assert _git(install, "rev-parse", "HEAD") == v1
+    assert (install / "f.txt").read_text() == "v1\n"
+
+
+def test_snapshot_undo_puts_every_file_back(install, monkeypatch):
+    import os
+    import snapshot_update as su
+    (install / su.VERSION_FILE).write_text(SHA_OLD)
+    monkeypatch.setattr(su, "_get", lambda url, **k: _Resp(content=_zip(
+        {"agent.py": "new agent\n", "keep.py": "same\n", "sub/new.py": "x\n"})))
+    ok, note = su.pull(str(install), SHA_NEW)
+    assert ok, note
+    assert sorted(su.last_changed(str(install))) == sorted(
+        ["agent.py", os.path.join("sub", "new.py")])
+    ok, msg = su.undo_last(str(install))
+    assert ok, msg
+    assert (install / "agent.py").read_bytes() == b"old agent\n"
+    assert not (install / "sub" / "new.py").exists()
+    assert (install / su.VERSION_FILE).read_text().strip() == SHA_OLD
+    assert su.undo_last(str(install))[0] is False  # once
+
+
+def test_snapshot_self_edits_since_the_install_are_local_changes(tmp_path, monkeypatch):
+    import os
+    import snapshot_update as su
+    repo, h = tmp_path / "r", tmp_path / "h"
+    repo.mkdir()
+    assert not su.self_edited_since_install(str(repo), str(h))
+    edit = h / "backups" / "20261119-010000"
+    edit.mkdir(parents=True)
+    assert su.self_edited_since_install(str(repo), str(h))  # version unknown
+    version = repo / su.VERSION_FILE
+    version.write_text(SHA_NEW)
+    os.utime(edit, (1000, 1000))
+    os.utime(version, (2000, 2000))
+    assert not su.self_edited_since_install(str(repo), str(h))
+    os.utime(edit, (3000, 3000))
+    assert su.self_edited_since_install(str(repo), str(h))
+    monkeypatch.setattr(webui, "_snapshot_mode", lambda: True)
+    monkeypatch.setattr(webui, "_repo_dir", lambda: str(repo))
+    monkeypatch.setattr(webui, "_agent_home", lambda: str(h))
+    assert "self-edits" in webui.auto_update_backend().local_changes()

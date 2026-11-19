@@ -8068,7 +8068,8 @@ def _apply_command(text):
 _SHOW_COMMANDS = ("status", "rules", "my rules", "show rules", "autostart",
                   "start at login", "expiry guard", "expiry alert",
                   "autopay cap", "max contracts", "contract cap",
-                  "max contracts per trade")
+                  "max contracts per trade", "auto update", "auto-update",
+                  "auto updates", "autoupdate", "automatic updates")
 
 
 def _autopay_cap_command(t, cfg):
@@ -9975,6 +9976,7 @@ def cmd_auto_update(action):
     "auto_update" (auto_update.py). A running agent reads it from
     config.json every minute: no restart needed."""
     import auto_update
+    import platform_compat
     if action in ("on", "off"):
         with CONFIG_LOCK:
             cfg = _read_config()
@@ -9982,8 +9984,10 @@ def cmd_auto_update(action):
             _save(CONFIG_PATH, cfg, private=True)
     else:
         cfg = _load(CONFIG_PATH, {}) or {}
-    print(auto_update.describe(cfg, HOME, _install_kind()))
-    print("Change: python agent.py auto-update on|off")
+    # safe_print: the line has "→" in it after an install, and a redirected
+    # Windows stdout (cp1252) can't print that
+    platform_compat.safe_print(auto_update.describe(cfg, HOME, _install_kind()))
+    platform_compat.safe_print("Change: python agent.py auto-update on|off")
 
 
 def _is_ready():

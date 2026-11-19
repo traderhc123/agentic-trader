@@ -11,7 +11,7 @@ const AUTO_TEXT =
 function autoWords(a: AutoUpdate | null | undefined): string {
   if (!a) return AUTO_TEXT;
   let t = a.text || AUTO_TEXT;
-  if (a.last) t += ` Last automatic update ${a.last.at || ""}: ${a.last.ok ? "" : "FAILED: "}${a.last.text || ""}.`;
+  if (a.last) t += ` Last automatic update (${a.last.at_et || a.last.at || ""}): ${a.last.ok ? "" : "FAILED: "}${a.last.text || ""}.`;
   if (a.on && a.note) t += ` ${a.note}`;
   return t;
 }

@@ -262,12 +262,20 @@ unless you turn on **automatic updates** (off by default):
   positions are kept, as with the Update button.
 - Only a version that has been on the official repository's branch for at
   least two hours (as seen by your agent), only from
-  github.com/traderhc123/agentic-trader, and only as a fast-forward: local
-  changes are never merged over, exactly as with the Update button.
-- At most one install a night. Afterwards the agent restarts, adds an
-  *Updated* line to Activity and sends your alerts (old → new version and the
-  changes). If an install fails, the dashboard shows why and it tries again
-  the next night.
+  github.com/traderhc123/agentic-trader, and only as a fast-forward. If you
+  changed the code yourself (an approved code change, an edited file, a
+  commit of your own) it installs nothing and tells you: update from the
+  dashboard instead.
+- Before restarting, the new version must load (new Python packages
+  installed, the agent imported in a separate process); if it doesn't, the
+  previous version is put back and the agent keeps running it.
+- At most one try a night (nights run noon to noon ET, so a weekend or
+  holiday can have one a day). After an install the agent restarts, adds an
+  *Updated itself* line to Activity (the built-in fallback page,
+  `?ui=classic`, lists it as a skipped code update) and sends your alerts
+  (old → new version and the changes). If an install fails, the dashboard
+  shows why and it tries again the next night (on a weekend or holiday, the
+  next day).
 - Zip installs (no git) install only the newest version, once it has been
   the newest for two hours.
 

@@ -44,6 +44,9 @@ _SKIP = {".venv", ".git", "__pycache__", BACKUP_DIR, STAGING_DIR}
 # the official branch. In memory on purpose: nothing on disk (or sent by the
 # page) can name a commit to install; after a restart, check again.
 _CHECKED = {}
+# install folder -> what this process's last pull() changed, so an automatic
+# update whose new code does not load can be put back (undo_last)
+_LAST = {}
 _MAX_ZIP_BYTES = 50 * 1024 * 1024
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 
@@ -147,6 +150,7 @@ def pull(repo_dir, expect):
     if not any(rel == "agent.py" for _m, rel in members):
         return False, "update archive doesn't look like agentic-trader — not installed"
 
+    previous = installed_commit(repo_dir)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup = os.path.join(repo_dir, BACKUP_DIR, stamp)
     staging = os.path.join(repo_dir, STAGING_DIR)
@@ -211,9 +215,81 @@ def pull(repo_dir, expect):
                        "and was undone — the agent is still on the version "
                        "it had")
     shutil.rmtree(staging, ignore_errors=True)
+    _LAST[_key(repo_dir)] = {
+        "backup": backup, "stamp": stamp, "previous": previous,
+        "files": [(rel, had_old) for rel, _staged, _dest, had_old in todo]}
     changed = len(todo)
     backed = sum(1 for _rel, _staged, _dest, had_old in todo if had_old)
     note = f"updated to {expect[:12]} ({changed} file(s) changed"
     if backed:
         note += f"; previous versions saved in {BACKUP_DIR}/{stamp}"
     return True, note + ")"
+
+
+def last_changed(repo_dir):
+    """The files (relative paths) this process's last pull() changed."""
+    rec = _LAST.get(_key(repo_dir)) or {}
+    return [rel for rel, _had_old in rec.get("files") or []]
+
+
+def undo_last(repo_dir):
+    """Put back what this process's last pull() changed: the previous
+    version of every file (from .update-backup/<stamp>), files it added
+    removed, and the previous .installed_commit. Returns (ok, message)."""
+    rec = _LAST.pop(_key(repo_dir), None)
+    if not rec:
+        return False, "there is no update of this run to undo"
+    stuck = []
+    for rel, had_old in reversed(rec["files"]):
+        dest = os.path.join(repo_dir, rel)
+        try:
+            if had_old:
+                shutil.copy2(os.path.join(rec["backup"], rel), dest)
+            elif os.path.exists(dest):
+                os.unlink(dest)
+        except OSError:
+            stuck.append(rel)
+    version = os.path.join(repo_dir, VERSION_FILE)
+    try:
+        if rec["previous"]:
+            tmp = version + ".update-tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(rec["previous"] + "\n")
+            os.replace(tmp, version)
+        elif os.path.exists(version):
+            os.unlink(version)
+    except OSError:
+        stuck.append(VERSION_FILE)
+    if stuck:
+        return False, (f"these files could not be put back: "
+                       f"{', '.join(stuck[:10])}; their previous versions are "
+                       f"in {BACKUP_DIR}/{rec['stamp']}")
+    return True, f"put back {rec['previous'][:7] or 'the previous version'}"
+
+
+def self_edited_since_install(repo_dir, home):
+    """True when an owner-approved code change (self_edit keeps a backup
+    folder per change under AGENT_HOME/backups) was made after the installed
+    version was written: an update would overwrite it. Without a recorded
+    version, any self-edit counts."""
+    try:
+        since = os.path.getmtime(os.path.join(repo_dir, VERSION_FILE))
+    except OSError:
+        since = None
+    root = os.path.join(home, "backups")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return False
+    for name in names:
+        full = os.path.join(root, name)
+        if not os.path.isdir(full):
+            continue
+        if since is None:
+            return True
+        try:
+            if os.path.getmtime(full) >= since:
+                return True
+        except OSError:
+            return True
+    return False

@@ -128,7 +128,15 @@ export interface AutoUpdate {
   /** how this install updates: "git", or "snapshot" (a zip install) */
   kind: "git" | "snapshot" | null;
   /** the last automatic install, or try */
-  last: { at: string | null; ok: boolean | null; text: string | null; from: string | null; to: string | null } | null;
+  last: {
+    at: string | null;
+    /** `at` in Eastern time, as the agent words it ("Fri 2026-11-20 03:00 ET") */
+    at_et?: string | null;
+    ok: boolean | null;
+    text: string | null;
+    from: string | null;
+    to: string | null;
+  } | null;
   /** what it is waiting for now (a version cooling off, a failed check) */
   note: string | null;
 }

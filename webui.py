@@ -1274,7 +1274,7 @@ async function checkUpdates(){
 function autoUpdLine(a){
   if(!a)return '';
   let t=a.text||'';
-  if(a.last)t+=' Last automatic update '+(a.last.at||'')+': '+(a.last.ok?'':'FAILED: ')+(a.last.text||'')+'.';
+  if(a.last)t+=' Last automatic update ('+(a.last.at_et||a.last.at||'')+'): '+(a.last.ok?'':'FAILED: ')+(a.last.text||'')+'.';
   if(a.on&&a.note)t=[t,a.note].join(' ');  // shown with textContent
   return t;
 }
@@ -7240,10 +7240,12 @@ def _on_branch(sha, upstream):
     return _git(["merge-base", "--is-ancestor", sha, upstream]).returncode == 0
 
 
-def _restart_onto_update(note):
+def _restart_onto_update(note, install_deps=True):
     """After a pull that went through (the Update button and automatic
     updates alike): install new dependencies, put the heartbeat on hold and
-    restart onto the new code. Returns the Update button's answer."""
+    restart onto the new code. Returns the Update button's answer.
+    install_deps=False: they were installed already (automatic updates
+    install them, and prove the new code loads, before getting here)."""
     import os
     import sys
     import time as _time
@@ -7251,7 +7253,8 @@ def _restart_onto_update(note):
     # New code may carry new dependencies (e.g. qrcode) — a pull without
     # a dep install restarts onto ImportErrors or silently-degraded
     # features. Fail-soft: a pip failure never blocks the update.
-    note += _install_requirements()
+    if install_deps:
+        note += _install_requirements()
     if os.getenv("AGENT_UPDATE_NO_RESTART"):
         # Test/automation escape hatch — never re-exec the test runner.
         return {"ok": True, "note": note + " — restart skipped "
@@ -7317,12 +7320,71 @@ class _AutoUpdateBackend:
         platform_compat.ORDER_LOCK.release()
         return None
 
+    def hold(self):
+        """Put the heartbeat on hold (no new orders) for the whole install,
+        then make sure no order is still being placed. Why not, or None
+        (and then the hold is on until finish() or release())."""
+        import platform_compat
+        why = self.busy()
+        if why:
+            return why
+        hold_orders(_AUTO_UPDATE_HOLD_S)
+        # an order that started before the hold took effect
+        if not platform_compat.ORDER_LOCK.acquire(blocking=False):
+            release_orders()
+            return "an order is being placed"
+        platform_compat.ORDER_LOCK.release()
+        return None
+
+    def release(self):
+        release_orders()
+
     def check(self):
         return check_code_updates(force=True)
 
+    def local_changes(self):
+        """Why this install has changes of its own that an automatic update
+        must not install over, or None. Stricter than the Update button:
+        git's --ff-only carries uncommitted edits along when the update
+        doesn't touch the same files, and a zip update overwrites them."""
+        if _snapshot_mode():
+            import snapshot_update
+            if snapshot_update.self_edited_since_install(_repo_dir(),
+                                                         _agent_home()):
+                return ("this install has code changes you approved "
+                        "(self-edits) since its last update; an automatic "
+                        "update would overwrite them. Update from the "
+                        "dashboard instead")
+            return None
+        r = _git(["status", "--porcelain", "--untracked-files=normal"])
+        if r.returncode != 0:
+            return ("could not read this install's git status: "
+                    + (r.stderr or r.stdout).strip()[:150])
+        mine = []
+        for line in r.stdout.splitlines():
+            name = line[3:].strip().strip('"')
+            # untracked: only Python files count (a .venv/ or a log is fine)
+            if line.startswith("??") and not name.endswith(".py"):
+                continue
+            if name:
+                mine.append(name)
+        if mine:
+            return ("this install has local changes ("
+                    + ", ".join(mine[:3]) + (", ..." if len(mine) > 3 else "")
+                    + "); automatic updates never install over them. Update "
+                    "from the dashboard instead")
+        head = _git(["rev-parse", "HEAD"]).stdout.strip().lower()
+        if not _on_branch(head, _update_upstream()):
+            return ("this install has commits of its own that are not on the "
+                    "official branch (cannot fast-forward: local changes or "
+                    "diverged history). Update from the dashboard instead")
+        return None
+
     def candidates(self, check, shas):
-        """Of `shas` (newest first), the ones a fast-forward can install:
-        on the official branch and ahead of what is installed."""
+        """Of `shas` (newest first), the ones that could be installed: on
+        the official branch and not already installed. A checkout that has
+        diverged keeps them: local_changes() (and pull's --ff-only) then
+        refuse, and that failure is shown and told, not waited on."""
         if _snapshot_mode():
             # the zip install installs only what its own check just found
             # at the head of the official branch
@@ -7333,8 +7395,8 @@ class _AutoUpdateBackend:
         out = []
         for s in shas:
             if (s != head and _on_branch(s, upstream)
-                    and _git(["merge-base", "--is-ancestor", head or "HEAD",
-                              s]).returncode == 0):
+                    and _git(["merge-base", "--is-ancestor", s,
+                              "HEAD"]).returncode != 0):
                 out.append(s)
         return out
 
@@ -7355,11 +7417,62 @@ class _AutoUpdateBackend:
         subjects = [x[:120] for x in log.stdout.splitlines() if x.strip()]
         return old, sha[:7], subjects
 
+    def prepare(self):
+        """What is installed now, for verify() and rollback()."""
+        snap = _snapshot_mode()
+        if snap:
+            import snapshot_update
+            head = snapshot_update.installed_commit(_repo_dir())
+        else:
+            head = _git(["rev-parse", "HEAD"]).stdout.strip().lower()
+            if not _FULL_SHA.match(head):
+                raise RuntimeError("could not read the installed commit")
+        return {"snapshot": snap, "head": head, "req": _requirements_bytes()}
+
     def pull(self, sha):
         return pull_code_updates(expect=sha, older_ok=True)
 
+    def _changed(self, prep):
+        if prep["snapshot"]:
+            import snapshot_update
+            return snapshot_update.last_changed(_repo_dir())
+        r = _git(["diff", "--name-only", prep["head"], "HEAD"])
+        return [x.strip() for x in r.stdout.splitlines() if x.strip()]
+
+    def verify(self, prep):
+        """(problem or None, note) after the pull: new Python packages
+        installed when requirements.txt changed (a failure counts here,
+        unlike the Update button's fail-soft install), then agent, webui and
+        the changed modules imported in a separate process (self_edit's
+        check). Nothing restarts onto code that does not load."""
+        note = ""
+        if _requirements_bytes() != prep["req"]:
+            note = _install_requirements()
+            if "FAILED" in note or "skipped" in note:
+                return ("the new version needs Python packages that could "
+                        "not be installed (pip install -r requirements.txt)",
+                        note)
+        return self._import_problem(self._changed(prep)), note
+
+    def _import_problem(self, paths):
+        import self_edit
+        return self_edit._import_problem(paths)
+
+    def rollback(self, prep):
+        """Put back the version prepare() saw. (ok, message)"""
+        if prep["snapshot"]:
+            import snapshot_update
+            return snapshot_update.undo_last(_repo_dir())
+        r = _git(["reset", "--keep", prep["head"]], timeout=120)
+        head = _git(["rev-parse", "HEAD"]).stdout.strip().lower()
+        if r.returncode != 0 or head != prep["head"]:
+            return False, ((r.stderr or r.stdout).strip()[:200]
+                           or "git reset did not go back")
+        return True, f"put back {prep['head'][:7]}"
+
     def finish(self, note):
-        _restart_onto_update(note)
+        # the packages were installed (and the code checked) by verify()
+        _restart_onto_update(note, install_deps=False)
 
     def log(self, row):
         try:
@@ -7376,6 +7489,30 @@ class _AutoUpdateBackend:
             pass
 
 
+# an automatic install keeps the heartbeat on hold for at most this long: the
+# fetch, the merge, a package install and the import check (each has its own
+# timeout); finish() replaces it with the restart's own hold
+_AUTO_UPDATE_HOLD_S = 20 * 60
+
+
+def _requirements_bytes():
+    import os
+    try:
+        with open(os.path.join(_repo_dir(), "requirements.txt"), "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _agent_home():
+    import os
+    try:
+        import agent as A
+        return A.HOME
+    except Exception:
+        return os.path.expanduser(os.getenv("AGENT_HOME", "~/.agentic-trader"))
+
+
 def auto_update_backend(get_cfg=None):
     return _AutoUpdateBackend(get_cfg)
 
@@ -7390,12 +7527,7 @@ def _auto_update_kind():
 def auto_update_status(cfg):
     """The dashboards' view of automatic updates (auto_update.status)."""
     import auto_update
-    try:
-        import agent as A
-        home = A.HOME
-    except Exception:
-        home = os.path.expanduser(os.getenv("AGENT_HOME", "~/.agentic-trader"))
-    return auto_update.status(cfg, home, _auto_update_kind())
+    return auto_update.status(cfg, _agent_home(), _auto_update_kind())
 
 
 def _auto_update_view(cfg):
