@@ -3,6 +3,7 @@
 //
 //   Source         POST /api/v2/settings/source {source, url}: two steps
 //   Which signals  POST /api/v2/settings/signals {scope}: two steps
+//   Swing trades   POST /api/v2/settings/signals {swing}: two steps
 //   Key            POST /api/v2/settings/source {agenthc_key}: saved straight
 //                  away, never shown again (only "set, ending 1234")
 //   Make / replace the agent's wallet   POST /api/v2/wallet/create: two steps
@@ -18,6 +19,7 @@ import { passPriceUsd, passUsdWords } from "../../lib/settingsApi";
 import { FieldError, ReviewDialog, askPreview } from "../Forms";
 import { API, getJson, send } from "../lib/http";
 import { readAddress, readSats, scopeWords, sourceWords } from "../lib/settings";
+import { SWING_LINE } from "../lib/copy";
 import { count, plural, usd } from "../lib/format";
 import { Dialog, Icon } from "../ui";
 import type { Page } from "../App";
@@ -162,6 +164,38 @@ export function ScopeDialog({ page, onClose }: { page: Page; onClose: () => void
       onClose={onClose}
       onDone={async () => {
         await saved(page, (nv) => `Saved. Signals: ${scopeWords(nv.signals.include_other_trades ? "all" : "main").toLowerCase()}.`);
+        onClose();
+      }}
+    />
+  );
+}
+
+/** Swing trades on or off: the server's preview of the switch, then confirm.
+ *  Only the owner turns them on (this dialog, or "swing trades on" in the
+ *  chat); an assistant's setup plan cannot. */
+export function SwingDialog({ page, onClose }: { page: Page; onClose: () => void }) {
+  const v = page.settings.view as SettingsView;
+  const next = !v.signals.include_swing_trades;
+  const payload = { swing: next };
+  const ask = usePreview(API.signals, payload);
+  if (ask.kind !== "review") return <Asking title="Swing trades" ask={ask} onClose={onClose} />;
+  return (
+    <ReviewDialog
+      path={API.signals}
+      payload={payload}
+      first={ask.preview}
+      title={next ? "Take swing trades?" : "Stop taking swing trades?"}
+      lead={
+        next
+          ? `${SWING_LINE} Each one is sold on its own exit signal, usually days later, and holds a position slot until then. Included in your signal days.`
+          : "The agent stops opening swing trades. Swing trades it already holds are still sold on their exit signals."
+      }
+      cancel="Keep it as it is"
+      confirm={next ? "Take swing trades" : "Stop swing trades"}
+      live={page.s.mode === "live"}
+      onClose={onClose}
+      onDone={async () => {
+        await saved(page, (nv) => `Saved. Swing trades: ${nv.signals.include_swing_trades ? "on" : "off"}.`);
         onClose();
       }}
     />

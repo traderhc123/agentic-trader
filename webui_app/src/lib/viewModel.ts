@@ -228,6 +228,7 @@ export interface WouldHaveRow {
   exit_kind: string | null;
   would_take: boolean;
   skip_reason: string | null;
+  book: "main" | "other" | "swing" | null;
 }
 
 export interface Pass {
@@ -307,7 +308,7 @@ export interface Limits {
 }
 
 export interface BudgetHint {
-  book: "main" | "other";
+  book: "main" | "other" | "swing";
   budget: number;
   skipped: number;
   min_cost: number;
@@ -366,7 +367,7 @@ export interface Position {
   /** the agent's own tag for the broker account; never an account number */
   account: string | null;
   /** null for a position opened before this was recorded */
-  book: "main" | "other" | null;
+  book: "main" | "other" | "swing" | null;
   expires_today: boolean;
   pending: "buy" | "sell" | null;
   next: NextAction;
@@ -406,7 +407,7 @@ export interface Activity {
   known: boolean;
   contract: Contract | null;
   contract_text: string | null;
-  book: "main" | "other" | null;
+  book: "main" | "other" | "swing" | null;
   /** which book the row belongs to; null = not recorded */
   real: boolean | null;
   /** true: the order went to a broker's paper-trading account (not real money); null = not recorded */
@@ -443,6 +444,46 @@ export interface Results {
   paid_days: {
     real: PaidDays | null;
     practice: PaidDays | null;
+  };
+  /** each signal category apart (main pick, other trades, swing trades): positions open now and estimated closed-trade results, real money, practice and a broker's paper-trading account never added together. Rows that don't say their category (older versions) are in none */
+  by_signal: {
+    main: SignalBook;
+    other: SignalBook;
+    swing: SignalBook;
+  };
+}
+
+export interface SignalBook {
+  label: string;
+  /** the agent takes this category's new entries now */
+  on: boolean;
+  /** its trades are held for days by design (swing) */
+  multi_day: boolean;
+  /** positions of this category open now */
+  open: {
+    real: number;
+    practice: number;
+    paper_account: number;
+  };
+  today: {
+    real: number;
+    practice: number;
+    paper_account: number;
+  };
+  total: {
+    real: number;
+    practice: number;
+    paper_account: number;
+  };
+  closed: {
+    real: number;
+    practice: number;
+    paper_account: number;
+  };
+  unmeasured: {
+    real: number;
+    practice: number;
+    paper_account: number;
   };
 }
 

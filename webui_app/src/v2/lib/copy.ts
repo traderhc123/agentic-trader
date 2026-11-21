@@ -14,6 +14,15 @@ import type { Activity, Answer, CheckId, ExitLoss, NextAction, Position, ReasonC
 import { clip, contractName, etTime, etWhen, plural, usd } from "./format.ts";
 
 export type Cat = "trade" | "limit" | "problem" | "other";
+
+/** The three signal categories (the agent's books), by their dashboard name. */
+export type SignalBook = "main" | "other" | "swing";
+export const BOOK_LABEL: Record<SignalBook, string> = { main: "Main pick", other: "Other trades", swing: "Swing Trade" };
+/** A position's, an activity row's or a preview row's category: "not recorded"
+ *  for a row from before categories were recorded. */
+export const bookLabel = (b: SignalBook | null | undefined): string => (b ? BOOK_LABEL[b] : "not recorded");
+/** What swing trades are, in one line (the Signals switch says it). */
+export const SWING_LINE = "Rare multi-day calls after a VIX spike; holds up to 5 trading days.";
 export type TagKind = "real" | "prac" | "paper" | "none" | "nobuy" | "unk";
 export type Go = "rules" | "settings" | "signals" | "holdings";
 export type IconName =
@@ -87,7 +96,7 @@ interface Entry {
 const skipped = (c: Ctx) => `A signal to buy ${c.name} arrived and the agent did not act on it. No order was sent.`;
 const nothing = () => "Nothing needed.";
 const ownLimit = "Nothing needed. This is your own limit doing its job.";
-const bookWord = (e: Activity) => (e.book === "other" ? "other trades" : e.book === "main" ? "main pick" : "");
+const bookWord = (e: Activity) => (e.book ? BOOK_LABEL[e.book].toLowerCase() : "");
 const withNote = (c: Ctx, lead: string) => (c.note ? `${lead} ${c.note}` : lead);
 /** "paper-account" for an order the row records as sent to a broker's
  *  paper-trading account, else "real" */

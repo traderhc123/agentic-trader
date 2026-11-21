@@ -85,6 +85,11 @@ and apply them in one step. Order:
    the agent never sells from an account it is no longer connected to, so
    they should close the agent's open positions in the current account
    before you apply the plan, or be ready to close them in their broker app.
+   **Swing trades** (`source.include_swing_trades`: AgentHC's rare
+   multi-day calls after a VIX spike, held up to 5 trading days) are the
+   owner's own switch: a plan may leave them off or turn them off, never on.
+   If the human wants them, tell them to turn on **Swing trades** in the
+   dashboard (Signals) or say `swing trades on` in the dashboard chat.
 5. **Hand the `owner_steps` to the human.** Plans can never do these; the
    human does them in the wizard: log in to Robinhood (if chosen), buy and
    pay for AgentHC signal days from their own wallet (if the AgentHC feed),
@@ -132,7 +137,8 @@ This walks through, in order:
      they already use (Cash App, Strike, Phoenix…). ~$50 per signal day
      (5 days for ~$225), priced in sats; a day is only used when the agent
      receives an entry or exit that day (quiet days free; "other trades" signals count only if
-     they chose main + other). The agent holds no money. You never pay it
+     they chose main + other; swing trades are included at no extra cost, and a swing
+     trade's exit arrives even after the days run out). The agent holds no money. You never pay it
      for them.
      Paying constitutes acceptance of the feed terms (stated with the
      invoice).

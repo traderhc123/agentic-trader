@@ -5,13 +5,14 @@
 import { useId, useState } from "react";
 import type { Activity, Position, Status } from "../../lib/viewModel";
 import { askAgent } from "../lib/http";
-import { answerLook, answerWhy, describe, sellsHow, type Go } from "../lib/copy";
+import { SWING_LINE, answerLook, answerWhy, bookLabel, describe, sellsHow, type Go } from "../lib/copy";
 import { notesOn, todayHasDay, todayLimitsLink } from "../lib/screens";
 import {
   brokerLabel,
   dayBooks,
   dayTally,
   dayWhole,
+  holdSplit,
   nextFor,
   paidFor,
   practicePositions,
@@ -161,13 +162,14 @@ function HoldRow({ p, page, wide }: { p: Position; page: Page; wide: boolean }) 
   const name = contractName(p.contract, p.label);
   const expires = p.contract ? `expires ${dayLong(p.contract.expiry)}` : "expiry not known";
   const paid = p.entry_cost_usd != null ? usd(p.entry_cost_usd) : UNKNOWN;
-  const label = `${name}, ${p.real ? "real money" : "practice"}, ${plural(p.qty, "contract")}, ${p.entry_cost_usd != null ? `${paid} paid` : "amount paid not known"}, ${expires}${p.expires_today ? ", today" : ""}. ${nx.text}`;
+  const label = `${name}${p.book === "swing" ? ", swing trade" : ""}, ${p.real ? "real money" : "practice"}, ${plural(p.qty, "contract")}, ${p.entry_cost_usd != null ? `${paid} paid` : "amount paid not known"}, ${expires}${p.expires_today ? ", today" : ""}. ${nx.text}`;
   const today = etDayKey(s.as_of);
   return (
     <li className={`hrow ${p.real ? "real" : "prac"}`}>
       <button data-pos={p.id} onClick={() => page.openPos(p.id)} aria-label={label}>
         <span className="h-name">
           <b>{name}</b>
+          {p.book === "swing" && <span className="flag flag-swing">Swing Trade</span>}
           {p.expires_today && <ExpiresFlag />}
           <small>
             {plural(p.qty, "contract")}, {expires}
@@ -192,6 +194,30 @@ function HoldRow({ p, page, wide }: { p: Position; page: Page; wide: boolean }) 
         </span>
       </button>
     </li>
+  );
+}
+
+/** One money group's positions, each signal category in its own list when
+ *  the group holds a swing trade or more than one category (holdSplit). */
+function HoldLists({ ps, page, wide }: { ps: Position[]; page: Page; wide: boolean }) {
+  return (
+    <>
+      {holdSplit(ps).map(({ book, list }) => (
+        <div key={String(book)} className={`hcat ${book === "swing" ? "hcat-swing" : ""}`} data-book={book ?? "none"}>
+          {book !== "all" && (
+            <div className="hsub">
+              <b>{bookLabel(book)}</b>
+              {book === "swing" && <small>{SWING_LINE}</small>}
+            </div>
+          )}
+          <ul className={`hlist ${wide ? "wide" : ""}`}>
+            {list.map((p) => (
+              <HoldRow key={p.id} p={p} page={page} wide={wide} />
+            ))}
+          </ul>
+        </div>
+      ))}
+    </>
   );
 }
 
@@ -227,11 +253,7 @@ export function HoldGroups({ page, wide }: { page: Page; wide: boolean }) {
               {note}
             </span>
           </div>
-          <ul className={`hlist ${wide ? "wide" : ""}`}>
-            {rp.map((p) => (
-              <HoldRow key={p.id} p={p} page={page} wide={wide} />
-            ))}
-          </ul>
+          <HoldLists ps={rp} page={page} wide={wide} />
         </div>
       )}
       {pp.length > 0 && (
@@ -240,11 +262,7 @@ export function HoldGroups({ page, wide }: { page: Page; wide: boolean }) {
             <Tag kind="prac" />
             <span>{pp.length} pretend, only in the agent's records. No order is ever sent.</span>
           </div>
-          <ul className={`hlist ${wide ? "wide" : ""}`}>
-            {pp.map((p) => (
-              <HoldRow key={p.id} p={p} page={page} wide={wide} />
-            ))}
-          </ul>
+          <HoldLists ps={pp} page={page} wide={wide} />
         </div>
       )}
     </>

@@ -921,6 +921,26 @@ def _token_status(state, token):
 #     A full window whose oldest event is newer than the last good read
 #     may still have dropped one: _check_window keeps the no-signal sell
 #     armed for what was held then (state["feed_gap"]).
+# Swing trades (track "swing", a third category next to the main pick and
+# "other trades"): AgentHC's rare multi-day calls after a VIX spike, held up
+# to SWING_HOLD_SESSIONS trading sessions. The owner opts in
+# (include_swing_trades, off by default); the feed has no "main + swing"
+# read, so with swing on the agent reads track=all and drops other-trades
+# entries itself while "other trades" is off (agent._handle_feed_events).
+# A swing EXIT is owed to whoever got its ENTRY even after the pass ends:
+# while a real swing position is held, a pass that has ended is still
+# offered for exits only, saying mode=off (never charged, nothing bought:
+# _ended_pass_exits).
+SWING_TRACK = "swing"
+SWING_HOLD_SESSIONS = 5
+
+
+def _track_book(track):
+    """The agent's book for a raw track: "main", "swing" or "shadow"."""
+    t = str(track or "main")
+    return t if t in ("main", SWING_TRACK) else "shadow"
+
+
 FEED_LIMIT = 20          # main pick only, read every loop: plenty
 FEED_LIMIT_MAX = 100     # the most AgentHC lists in one answer
 FEED_GAP_S = 300         # longer than this since the last good read: a gap
@@ -931,15 +951,16 @@ def _row_track(row):
     one in the id of the event that opened it (only a non-main AgentHC id
     ends in "|<track>": ENTERED|T|expiry|strike|type|occurred_at[|track]),
     else None (a row that doesn't say: a practice row of an older version).
-    Its "book" (agent per-book exits: "main" | "shadow") wins over a track
-    that contradicts it, as in the agent (agent._row_book / _row_track)."""
+    Its "book" (agent per-book exits: "main" | "shadow" | "swing") wins over
+    a track that contradicts it, as in the agent (agent._row_book /
+    _row_track)."""
     track, book = row.get("track"), row.get("book")
-    book = book if book in ("main", "shadow") else None
+    book = book if book in ("main", "shadow", SWING_TRACK) else None
     if (isinstance(track, str) and track
-            and (book is None or (track == "main") == (book == "main"))):
+            and (book is None or _track_book(track) == book)):
         return track
     if book is not None:
-        return "main" if book == "main" else "other"
+        return {"main": "main", SWING_TRACK: SWING_TRACK}.get(book, "other")
     opened = row.get("opened_event")
     if isinstance(opened, str) and opened:
         parts = opened.split("|")
@@ -955,6 +976,29 @@ def held_as_other(row):
     exit is let through for it — as before tracks were remembered."""
     track = _row_track(row) if isinstance(row, dict) else None
     return track is not None and track != "main"
+
+
+def held_track(row):
+    """The raw track a ledger row was opened from (_row_track), or None
+    (a row that doesn't say: the main pick)."""
+    return _row_track(row) if isinstance(row, dict) else None
+
+
+def held_as_swing(row):
+    """True for a ledger row known to come from swing trades."""
+    return held_track(row) == SWING_TRACK
+
+
+def _holds_real_swing(state):
+    """The ledger holds a swing position bought with a real order (the
+    reading of _holds_real_position)."""
+    rows = (state or {}).get("positions")
+    for row in (rows.values() if isinstance(rows, dict) else ()):
+        if (isinstance(row, dict) and held_as_swing(row)
+                and (row.get("live") is True or (
+                    not row.get("dry") and row.get("option_id") != "dry"))):
+            return True
+    return False
 
 
 def _holds_other_track(state):
@@ -977,8 +1021,13 @@ def _last_read(state):
 
 
 def _feed_params(cfg, state):
-    """{"limit", "track"} for the next read of the feed."""
-    track = ("all" if cfg.get("include_other_trades") or _holds_other_track(state)
+    """{"limit", "track"} for the next read of the feed: every track while
+    "other trades" or swing trades are on (AgentHC has no "main + swing"
+    read: the agent drops the tracks it doesn't take) or a non-main position
+    or owed exit is held, else the main pick only."""
+    track = ("all" if (cfg.get("include_other_trades")
+                       or cfg.get("include_swing_trades")
+                       or _holds_other_track(state))
              else "main")
     last = _last_read(state).get("local")
     gap = (not isinstance(last, (int, float)) or isinstance(last, bool)
@@ -1944,10 +1993,17 @@ def _ended_daypass_exits(cfg, state, save_state):
     of trades entered while it ran). Returns its EXITED events (never an
     entry), or None: nothing to offer, or AgentHC answered with an error.
     A 401/402 means it doesn't (an older server: one invoice, once), so the
-    token is not offered again."""
+    token is not offered again — except while a real swing position is
+    held: its exit is owed days later, so it is offered again every
+    _OWED_EXITS_RETRY_S."""
     tok = (state or {}).get("l402")
+    done = isinstance(tok, dict) and tok.get("exits_done")
+    if done and _holds_real_swing(state) and (
+            time.time() - float(tok.get("exits_done_at") or 0)
+            >= _OWED_EXITS_RETRY_S):
+        done = False   # a swing exit is still owed: ask again
     if (cfg.get("agenthc_api_key") or not isinstance(tok, dict)
-            or not tok.get("token") or tok.get("exits_done")
+            or not tok.get("token") or done
             or float(tok.get("expires_at") or 0) > time.time()
             or not _holds_real_position(state)):
         return None
@@ -1960,6 +2016,7 @@ def _ended_daypass_exits(cfg, state, save_state):
                          mode="off" if practice else None)
         if resp.status_code in (401, 402):
             tok["exits_done"] = True
+            tok["exits_done_at"] = time.time()
             save_state(state)
             return None
         if resp.status_code != 200:
@@ -1975,6 +2032,60 @@ def _ended_daypass_exits(cfg, state, save_state):
         held = _held_keys(state)
         exits = [e for e in exits if _event_key(e) in held]
     return exits
+
+
+# Prepaid pass statuses that once gave signal days and no longer read the
+# feed (AgentHC's answer), and how often a refused owed-exits read is tried
+# again (a server that doesn't owe them yet may start to).
+_ENDED_PASS = ("expired", "used_up")
+_OWED_EXITS_RETRY_S = 3600
+
+
+def _ended_pass_exits(cfg, state, save_state):
+    """While a REAL swing position is held and no prepaid pass reads the
+    feed any more: offer the newest pass that ended for its exits only
+    (AgentHC owes a swing trade's exit to whoever got its entry, even days
+    after the pass ends). The read says mode=off: never charged, and the
+    wallet buys nothing. Returns its EXITED events (never an entry), or
+    None: nothing to offer, or AgentHC answered with an error (refused:
+    asked again in _OWED_EXITS_RETRY_S)."""
+    if cfg.get("agenthc_api_key") or not _holds_real_swing(state):
+        return None
+    cache = state.setdefault("pass_status", {})
+    now = time.time()
+    best, best_until = None, -1.0
+    for token in _pass_tokens(cfg):
+        rec = cache.get(_token_id(token))
+        if not isinstance(rec, dict) or rec.get("status") not in _ENDED_PASS:
+            continue
+        if now - float(rec.get("owed_refused_at") or 0) < _OWED_EXITS_RETRY_S:
+            continue
+        until = float(rec.get("until_ts") or 0)
+        if until > best_until:
+            best, best_until = token, until
+    if best is None:
+        return None
+    params = _feed_params(cfg, state)
+    rec = cache[_token_id(best)]
+    try:
+        resp = _feed_get(cfg, params, {"Authorization": best}, mode="off")
+        if resp.status_code in (401, 402, 403):
+            rec["owed_refused_at"] = now
+            save_state(state)
+            return None
+        if resp.status_code != 200:
+            return None
+        body = resp.json()
+        parsed = _parse_events(body)
+    except Exception:
+        return None
+    if rec.pop("owed_refused_at", None) is not None:
+        save_state(state)
+    _LAST_POLL["exits"] = True   # exits only: entry access stays False
+    _check_window(cfg, state, save_state, body, params, parsed)
+    held = _held_keys(state)
+    return [e for e in parsed
+            if e["event"] == "EXITED" and _event_key(e) in held]
 
 
 def _day_pass_loss_code(cfg, state, now=None):
@@ -2012,8 +2123,12 @@ def _day_pass_loss_code(cfg, state, now=None):
 
 
 def _no_day_pass(cfg, state, save_state):
-    """No wallet day-pass to read with (and none bought now)."""
+    """No wallet day-pass to read with (and none bought now): the exits of
+    what it still holds, with the day-pass that ended or a prepaid pass
+    that ended (a swing position's exit), else nothing."""
     got = _ended_daypass_exits(cfg, state, save_state)
+    if got is None:
+        got = _ended_pass_exits(cfg, state, save_state)
     return got if got is not None else _no_read(_day_pass_loss_code(cfg, state))
 
 
@@ -2144,7 +2259,9 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     Signal scope (config `include_other_trades`, default False): the main
     daily pick only, or main + AgentHC's "other trades" journal (its wider
     shadow book — several entries a day; your daily entry cap and budget
-    still apply per trade).
+    still apply per trade). Swing trades (config `include_swing_trades`,
+    default False, the owner's own switch): AgentHC's rare multi-day calls
+    after a VIX spike, held up to SWING_HOLD_SESSIONS trading sessions.
     """
     # until the feed is actually read (below)
     _LAST_POLL.update(access=False, exits=False, why="")
@@ -2188,7 +2305,9 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
                 return _no_read("pass_unpaid")  # invoice shown, not paid yet
             _pass_notice(cfg, state, save_state, "pass_expired_notified",
                          PASS_RUN_OUT_TEXT)
-            return _no_read("pass_ended")
+            # a swing position bought while the pass ran still gets its exit
+            got = _ended_pass_exits(cfg, state, save_state)
+            return got if got is not None else _no_read("pass_ended")
         # else: fall through to the wallet's daily auto-pay
     if (not _retried and not undecided and not cfg.get("agenthc_api_key")
             and _live_daypass(state)):
@@ -2466,6 +2585,12 @@ def setup(cfg):
     saved = "2" if cfg.get("include_other_trades") else "1"
     scope = input(f"Choose [1/2, default {saved}]: ").strip() or saved
     cfg["include_other_trades"] = scope == "2"
+    print("Swing trades: rare multi-day calls after a VIX spike; holds up to "
+          f"{SWING_HOLD_SESSIONS} trading days.")
+    saved = "y" if cfg.get("include_swing_trades") else "n"
+    swing = (input(f"Take swing trades too? [y/n, default {saved}]: ").strip()
+             .lower() or saved)
+    cfg["include_swing_trades"] = swing.startswith("y")
     print(f"  1) Lightning day-pass — the agent pays "
           f"~{usd_words(day_pass_price()['usd'])}/day in sats from its")
     print("     own wallet, no account needed (recommended for agents)")

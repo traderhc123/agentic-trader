@@ -5,7 +5,7 @@
 // the order the agent runs them, with "stopped here".
 import { useMemo, useState } from "react";
 import type { Activity as Row, Status } from "../../lib/viewModel";
-import { checkLabel, describe, type Cat, type Described } from "../lib/copy";
+import { bookLabel, checkLabel, describe, type Cat, type Described } from "../lib/copy";
 import { dayWhole, problemGroups } from "../lib/derive";
 import { contractName, count, dayLong, etDayKey, etTime, etWhen, plural, signed, tone, usd } from "../lib/format";
 import { Drawer, Icon, Stamp, Tag } from "../ui";
@@ -311,7 +311,7 @@ export function EventDrawer({ e, page, onClose }: { e: Row; page: Page; onClose:
       "Contract",
       `${contractName(e.contract, e.contract_text)}${e.contract ? `, expires ${dayLong(e.contract.expiry)}` : ""}`,
     ],
-    ["Signal type", e.book === "other" ? "Other trades" : e.book === "main" ? "Main pick" : "not recorded"],
+    ["Signal type", bookLabel(e.book)],
     ["Agent mode then", e.mode_at_time === "live" ? "LIVE" : e.mode_at_time === "practice" ? "Practice" : "not recorded"],
     ["Money", d.money],
   ];

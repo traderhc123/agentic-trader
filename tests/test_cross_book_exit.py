@@ -548,13 +548,17 @@ def test_other_trades_switched_off_still_holds_their_row_for_its_own_exit(
     ({"book": "shadow"}, True), ({"book": "main"}, False),
     ({"track": "other"}, True), ({"track": "swing"}, True),
     ({"book": "main", "track": "other"}, False),
-    ({"book": "shadow", "track": "main"}, True), ({}, False)])
+    ({"book": "shadow", "track": "main"}, True), ({}, False),
+    ({"book": "swing"}, True), ({"book": "swing", "track": "swing"}, True),
+    ({"book": "swing", "track": "other"}, True)])
 def test_the_source_and_the_agent_agree_on_a_rows_book(row, other):
     """One model: the feed reads every track for exactly the rows the agent
-    holds for an "other trades" exit."""
+    holds for a non-main exit ("other trades" or swing trades), and both
+    agree which of the two it is."""
     from sources import agenthc_day_trade_ideas as hc
     assert hc.held_as_other(row) is other
-    assert (agent._row_book(row) == "shadow") is other
+    assert (agent._row_book(row) in ("shadow", "swing")) is other
+    assert hc.held_as_swing(row) is (agent._row_book(row) == "swing")
 
 
 def test_main_pick_row_is_still_held_with_other_trades_off(home, no_policy):
@@ -574,20 +578,21 @@ def test_other_sources_send_any_track_so_their_rows_stay_per_book(
     assert b.sells == []
 
 
-# ── two non-main tracks are both "other trades", but never one book ────────
+# ── two non-main tracks (other than swing) are both "other trades", but
+# never one book ("swing" is a book of its own: test_swing_track.py) ──────
 
 def test_entry_records_the_raw_track(home, no_policy):
     b, state = Book(), {"positions": {}}
-    run(b, state, ev("ENTERED", "swing", "s-in"))
+    run(b, state, ev("ENTERED", "momentum", "x-in"))
     row = state["positions"][KEY]
-    assert row["book"] == "shadow" and row["track"] == "swing"
+    assert row["book"] == "shadow" and row["track"] == "momentum"
 
 
 def test_an_exit_of_another_non_main_track_does_not_sell(home, no_policy):
     b, state = Book(), {"positions": {}}
     run(b, state, ev("ENTERED", "other", "o-in"))
-    out = run(b, state, ev("EXITED", "swing", "s-out"))
-    assert "no order placed" in out and 'track "swing"' in out
+    out = run(b, state, ev("EXITED", "momentum", "x-out"))
+    assert "no order placed" in out and 'track "momentum"' in out
     assert b.sells == [] and state["positions"][KEY]["qty"] == 2
     assert run(b, state, ev("EXITED", "other", "o-out")) == f"EXIT: {CONTRACT}"
     assert b.sells == [("o-out", 2, 2)]
@@ -596,7 +601,7 @@ def test_an_exit_of_another_non_main_track_does_not_sell(home, no_policy):
 def test_a_shadow_row_without_a_track_closes_on_any_non_main_exit(home, no_policy):
     b = Book()
     state = {"positions": {KEY: {"option_id": "opt-1", "qty": 2, "book": "shadow"}}}
-    assert run(b, state, ev("EXITED", "swing", "s-out")) == f"EXIT: {CONTRACT}"
+    assert run(b, state, ev("EXITED", "momentum", "x-out")) == f"EXIT: {CONTRACT}"
 
 
 def test_a_track_that_contradicts_the_book_is_ignored(home, no_policy):

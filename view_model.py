@@ -33,6 +33,10 @@ import re
 from datetime import datetime, timedelta, timezone
 
 SCHEMA_VERSION = 2
+
+# The signal categories (the agent's books): the main pick, "other trades"
+# (the shadow journal) and swing trades (multi-day calls after a VIX spike).
+SIGNAL_BOOKS = ("main", "other", "swing")
 TS_PATH = "webui_app/src/lib/viewModel.ts"
 ACTIVITY_LIMIT = 50      # trade-log rows in a status payload
 ACTIVITY_LIMIT_MAX = 200
@@ -191,8 +195,9 @@ def aliases():
 
 def _types():
     checks = Ref("CheckId")
-    book = Enum("main", "other")
+    book = Enum(*SIGNAL_BOOKS)
     per_book = lambda t: {"real": t, "practice": t}  # noqa: E731
+    per_money = lambda t: {"real": t, "practice": t, "paper_account": t}  # noqa: E731
     return {
         "Status": {
             "schema": Lit(SCHEMA_VERSION),
@@ -284,6 +289,7 @@ def _types():
             "exit_kind": Opt("str"),
             "would_take": "bool",
             "skip_reason": Opt("str"),
+            "book": Opt(book),
         },
         "Pass": {
             "kind": Enum(*PASS_KINDS),
@@ -422,6 +428,17 @@ def _types():
             "signal_cost": Ref("SignalCost"),
             "paid_days": {"real": Opt(Ref("PaidDays")),
                           "practice": Opt(Ref("PaidDays"))},
+            "by_signal": {b: Ref("SignalBook") for b in SIGNAL_BOOKS},
+        },
+        "SignalBook": {
+            "label": "str",
+            "on": "bool",
+            "multi_day": "bool",
+            "open": per_money("int"),
+            "today": per_money("num"),
+            "total": per_money("num"),
+            "closed": per_money("int"),
+            "unmeasured": per_money("int"),
         },
         "Book": {
             "today": "num",
@@ -563,6 +580,15 @@ _DOC = {
                          "instead (Limits.used_today)",
     "Results.real": "orders the agent sent to a real-money account (or one "
                     "not recorded as a paper-trading account)",
+    "Results.by_signal": "each signal category apart (main pick, other "
+                         "trades, swing trades): positions open now and "
+                         "estimated closed-trade results, real money, "
+                         "practice and a broker's paper-trading account "
+                         "never added together. Rows that don't say their "
+                         "category (older versions) are in none",
+    "SignalBook.on": "the agent takes this category's new entries now",
+    "SignalBook.multi_day": "its trades are held for days by design (swing)",
+    "SignalBook.open": "positions of this category open now",
     "Results.paper_account": "orders filled in a broker's paper-trading "
                              "account (recorded on each line since this "
                              "version): not real money",
@@ -903,8 +929,8 @@ def _known_kinds():
 
 def _book_of(row, ui):
     b = ui.get("book") or row.get("book")
-    if b == "main":
-        return "main"
+    if b in ("main", "swing"):
+        return b
     return "other" if b in ("other", "shadow") else None
 
 
@@ -1185,6 +1211,58 @@ def _results(rows, now):
     return books
 
 
+SIGNAL_LABELS = {"main": "Main pick", "other": "Other trades",
+                 "swing": "Swing Trade"}
+
+
+def _by_signal(cfg, positions, rows, now):
+    """Results.by_signal: each signal category's open positions (the
+    Status positions, whose book falls back to their entry row's) and
+    estimated closed-trade results, apart (_results' rules: a row belongs
+    to the money book its "dry" / paper fact says; an expiry correction
+    folds into its sale)."""
+    import agent as A
+    import rules
+    today = _et_day(now)
+    zero = {"real": 0, "practice": 0, "paper_account": 0}
+    out = {b: {"label": SIGNAL_LABELS[b],
+               "on": b == "main" or not A._track_off(
+                   cfg, "other" if b == "other" else A.SWING_TRACK),
+               "multi_day": b == "swing",
+               "open": dict(zero), "today": {k: 0.0 for k in zero},
+               "total": {k: 0.0 for k in zero}, "closed": dict(zero),
+               "unmeasured": dict(zero)} for b in SIGNAL_BOOKS}
+    for p in positions:
+        b = p.get("book")
+        if b not in out:
+            continue
+        acct = p.get("account")
+        money = ("practice" if not p.get("real") else "paper_account"
+                 if isinstance(acct, str) and acct.endswith(":paper") else "real")
+        out[b]["open"][money] += 1
+    for t in rules.fold_corrections(rows):
+        if t.get("action") != "exit":
+            continue
+        b = _book_of(t, _facts(t))
+        if b is None:
+            continue
+        money = _book_key(t)
+        v = _pnl(t.get("est_pnl_usd"))
+        if v is None:
+            if not A._counted_before(t):
+                out[b]["unmeasured"][money] += 1
+            continue
+        out[b]["total"][money] += v
+        if _row_day(t) == today:
+            out[b]["today"][money] += v
+        if not rules.is_correction(t):
+            out[b]["closed"][money] += 1
+    for rec in out.values():
+        for k in ("today", "total"):
+            rec[k] = {m: round(v, 2) for m, v in rec[k].items()}
+    return out
+
+
 def _signal_cost(cfg, state, rows, now):
     import agent as A
     applies = A._feed_paid_per_day(cfg)
@@ -1341,7 +1419,7 @@ def _budget_hints(cfg, rows, now):
         if None in vals.values() or None in ints.values():
             continue
         out.append({"book": "other" if h.get("book") in ("shadow", "other")
-                    else "main",
+                    else "main",  # swing trades are sized like the main pick
                     "budget": round(vals["budget"], 2),
                     "skipped": ints["skipped"],
                     "min_cost": round(vals["min_cost"], 2),
@@ -1400,6 +1478,7 @@ def _would_have(v):
             "exit_kind": _text(r.get("exit_kind"), 40),
             "would_take": r.get("would_take") is True,
             "skip_reason": _text(r.get("skip_reason")),
+            "book": r.get("book") if r.get("book") in SIGNAL_BOOKS else None,
         })
     count = {k: max(0, _int(v.get(k), 0) or 0)
              for k in ("days", "would_take", "wins", "breakeven", "losses")}
@@ -1574,8 +1653,8 @@ def _position(key, row, opened, c):
         "account": _text(row.get("acct"), _NAME) if real else None,
         # the ledger row's own book (what its exits follow) first, then
         # the book its newest entry row was logged under
-        "book": ({"main": "main", "shadow": "other"}.get(A._row_book(row))
-                 or (ui.get("book") if ui.get("book") in ("main", "other")
+        "book": (A._UI_BOOK.get(A._row_book(row))
+                 or (ui.get("book") if ui.get("book") in SIGNAL_BOOKS
                      else None)),
         "expires_today": (contract is not None and contract["expiry"]
                           == c["now_et"].date().isoformat()),
@@ -2170,7 +2249,8 @@ def build_status(cfg, state, rows, runtime=None, now=None,
         "positions": pos,
         "activity": activity_page(rows, limit=activity_limit, _checked=True),
         "results": {**_results(rows, now),
-                    "signal_cost": _signal_cost(cfg, state, rows, now)},
+                    "signal_cost": _signal_cost(cfg, state, rows, now),
+                    "by_signal": _by_signal(cfg, pos, rows, now)},
         "notices": notices,
         "proposal": _proposal(rt.get("proposal")),
     }

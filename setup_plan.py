@@ -19,6 +19,9 @@ dashboard):
     policy. The owner switches to dry-run first (`dry on`), the plan is
     applied, and the owner goes live again (`dry off`) after checking it
   - turning on self-edit
+  - turning on swing trades (AgentHC's rare multi-day calls after a VIX
+    spike; the owner's own switch: dashboard → Signals, or `swing trades
+    on`). A plan may leave them off or turn them off
   - logging in to Robinhood (OAuth in the owner's browser)
   - paying for the feed (the owner pays the invoice from their own wallet)
 
@@ -33,7 +36,8 @@ ALLOWED_TOP = {"source", "feed_access", "ai", "broker", "sizing", "safety",
                "notifications", "policy", "rules"}
 
 EXAMPLE_PLAN = {
-    "source": {"type": "agenthc", "include_other_trades": False},
+    "source": {"type": "agenthc", "include_other_trades": False,
+               "include_swing_trades": False},
     "ai": {"provider": "anthropic", "api_key": "sk-ant-…", "model": "claude-opus-4-8"},
     "broker": {"type": "alpaca", "alpaca_key_id": "…", "alpaca_secret": "…",
                "alpaca_paper": True},
@@ -49,6 +53,12 @@ EXAMPLE_PLAN = {
     "rules": {"tickers": ["SPY", "QQQ"], "sides": "calls", "skip_0dte": True,
               "loss_streak": 2},
 }
+
+SWING_OWNER_ONLY = (
+    "source.include_swing_trades: swing trades (rare multi-day calls after a "
+    "VIX spike; holds up to 5 trading days) can only be turned on by the "
+    "owner — dashboard → Signals → Swing trades, or `swing trades on` in "
+    "the dashboard chat (a plan may leave them off or turn them off)")
 
 _FORBIDDEN = {
     "dry_run": "going live is the owner's own decision — they say `dry off` "
@@ -200,6 +210,8 @@ def _live_increases(cfg, new, broker_changed, home=None, policy=None):
     if new.get("include_other_trades") and not cfg.get("include_other_trades"):
         out.append("take every trade on the feed instead of only the main "
                    "pick")
+    if new.get("include_swing_trades") and not cfg.get("include_swing_trades"):
+        out.append("take swing trades (multi-day holds)")
     out.extend(_looser_rules(cfg, new))
     if isinstance(policy, str) and policy.strip() and home:
         # A policy only ever skips entries, so a first policy is never
@@ -277,6 +289,14 @@ def apply(plan, cfg, consent_ok, home):
                 new["source_url"] = str(src.get("url", "")).strip()
             if kind == "agenthc":
                 new["include_other_trades"] = bool(src.get("include_other_trades", False))
+                swing = src.get("include_swing_trades")
+                if swing not in (None, False, True):
+                    errors.append("source.include_swing_trades must be true or "
+                                  "false")
+                elif swing and not cfg.get("include_swing_trades"):
+                    errors.append(SWING_OWNER_ONLY)
+                elif swing is False:
+                    new["include_swing_trades"] = False
             applied.append(f"signal source: {kind}")
 
     fa = plan.get("feed_access") or {}

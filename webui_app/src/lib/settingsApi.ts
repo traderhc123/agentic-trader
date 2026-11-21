@@ -102,6 +102,9 @@ export interface SettingsView {
   signals: {
     source: string | null;
     include_other_trades: boolean;
+    /** swing trades (rare multi-day calls after a VIX spike) are taken; off
+     *  by default, and only the owner turns them on */
+    include_swing_trades: boolean;
     /** practice mode's "what it would have taken" preview is on */
     dry_run_preview: boolean;
     recurring: boolean;

@@ -6,7 +6,9 @@ signal feed. It reads AgentHC's free list of recently CLOSED paper trades
 an open position) and checks each one against YOUR built-in rules (tickers,
 calls/puts, min strike, no 0DTE, loss stop). The dashboard lists every trade
 as "would take" or "your rules would skip it (why)", with AgentHC's paper
-P&L.
+P&L. A row of a category the owner doesn't take (a swing trade with swing
+trades off, an "other trades" row with those off: the row's "track") is
+left out; a swing row is labelled as one.
 
 Limits, shown on the dashboard: these are closed trades only, so they show
 up after the exit, not in real time; your AI policy (if any), daily caps and
@@ -101,7 +103,10 @@ def evaluate(cfg, trades):
     """Each closed trade → a dashboard row with this setup's verdict. Walks
     oldest first so the loss-stop rule sees the earlier paper exits of the
     same day (as the live agent would)."""
+    import agent  # which categories the owner takes (agent._track_off)
     rows, today_log, day = [], [], None
+    trades = [t for t in trades
+              if not agent._track_off(cfg, str(t.get("track") or "main"))]
     for t in sorted(trades, key=lambda x: str(x.get("entry_time") or x.get("date"))):
         d = str(t.get("date") or "")[:10]
         if d != day:
@@ -131,6 +136,8 @@ def evaluate(cfg, trades):
             "exit_kind": t.get("exit_kind") or "",
             "would_take": ok,
             "skip_reason": why,
+            "book": {"main": "main", "swing": "swing"}.get(
+                agent._track_category(t.get("track")), "other"),
         })
     rows.reverse()   # newest first for the dashboard
     return rows[:MAX_ROWS]

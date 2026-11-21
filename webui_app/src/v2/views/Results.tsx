@@ -5,7 +5,8 @@
 import { useMemo, useState } from "react";
 import type { Book, Status } from "../../lib/viewModel";
 import { type ChartModel, type Range, RANGES, chartModel, isRange } from "../lib/chart";
-import { PAPER_BOOK_CAPTION, bookToday, bookTodayNote, paidMark, realBookCaption } from "../lib/derive";
+import { PAPER_BOOK_CAPTION, bookToday, bookTodayNote, paidMark, realBookCaption, signalRows, type SignalRow } from "../lib/derive";
+import { SWING_LINE } from "../lib/copy";
 import { dayLong, etDayKey, plural, signed, tone } from "../lib/format";
 import { Stamp, Tag } from "../ui";
 import type { Page } from "../App";
@@ -143,6 +144,82 @@ function BookPanel({ k, B, cap, page }: { k: "real" | "practice" | "paper"; B: B
   );
 }
 
+type Money = "real" | "practice" | "paper_account";
+const MONEY_WORDS: Record<Money, string> = { real: "Real money", practice: "Practice", paper_account: "Paper account" };
+
+/** Each signal category apart: the main pick, other trades and swing trades
+ *  never share a number, and real money, practice and a broker's paper
+ *  account stay in their own columns. */
+export function SignalPanel({ page, monies }: { page: Page; monies: Money[] }) {
+  const s = page.s;
+  const rows = signalRows(s, "real");
+  if (!rows.length) return null;
+  const byMoney = Object.fromEntries(monies.map((m) => [m, new Map(signalRows(s, m).map((r) => [r.book, r]))])) as Record<
+    Money,
+    Map<SignalRow["book"], SignalRow>
+  >;
+  const cell = (m: Money, r: SignalRow) => {
+    const x = byMoney[m].get(r.book);
+    if (!x || (!x.closed && !x.unmeasured && !x.total))
+      return (
+        <td key={m} className="r muted">
+          none
+        </td>
+      );
+    return (
+      <td key={m} className={`r ${tone(x.total)}`}>
+        <b>{signed(x.total)}</b>
+        <small>
+          {plural(x.closed, "trade")} closed{x.today ? `, today ${signed(x.today)}` : ""}
+          {x.unmeasured ? `, ${plural(x.unmeasured, "sale")} not measured` : ""}
+        </small>
+      </td>
+    );
+  };
+  return (
+    <section className={`panel ${page.stale ? "stale" : ""}`} data-panel="by-signal">
+      <div className="ph">
+        <h2>By signal type</h2>
+        <span className="meta">Main pick, other trades and swing trades, each on its own</span>
+      </div>
+      <div className="tbl-wrap stale-c">
+        <table className="tbl tbl-days">
+          <caption className="sr">Results by signal type, each money book in its own column</caption>
+          <thead>
+            <tr>
+              <th scope="col">Signal type</th>
+              <th scope="col" className="r">
+                Open now
+              </th>
+              {monies.map((m) => (
+                <th key={m} scope="col" className="r">
+                  {MONEY_WORDS[m]}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => {
+              const open = monies.reduce((n, m) => n + (byMoney[m].get(r.book)?.open ?? 0), 0);
+              return (
+                <tr key={r.book} data-book={r.book}>
+                  <th scope="row">
+                    {r.label}
+                    {!r.on && <small className="sig-off">Off: new ones are not taken (Signals page)</small>}
+                    {r.on && r.multiDay && <small>{SWING_LINE}</small>}
+                  </th>
+                  <td className="r">{open ? plural(open, "position") : <span className="muted">none</span>}</td>
+                  {monies.map((m) => cell(m, r))}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 export function ResultsView({ page }: { page: Page }) {
   const s = page.s;
   const R = s.results.real;
@@ -170,11 +247,13 @@ export function ResultsView({ page }: { page: Page }) {
   );
   const chart = <ChartPanel page={page} C={C} range={range} setRange={setRange} />;
   // nothing closed in any book yet: the chart's own sentence says so
+  const monies: Money[] = hasPaper ? ["real", "practice", "paper_account"] : ["real", "practice"];
   if (!days.length && !R.unmeasured && !P.unmeasured && !hasPaper)
     return (
       <div className="view">
         {head}
         {chart}
+        {s.positions.length > 0 && <SignalPanel page={page} monies={monies} />}
       </div>
     );
   const showN = allDays ? days.length : Math.min(days.length, 10);
@@ -199,6 +278,7 @@ export function ResultsView({ page }: { page: Page }) {
         <BookPanel k="practice" B={P} cap="Pretend trades. Never counted as money." page={page} />
         {hasPaper && <BookPanel k="paper" B={A} cap={PAPER_BOOK_CAPTION} page={page} />}
       </div>
+      <SignalPanel page={page} monies={monies} />
       {days.length > 0 && (
         <section className={`panel ${page.stale ? "stale" : ""}`}>
           <div className="ph">

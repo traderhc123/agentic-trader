@@ -250,6 +250,7 @@ export interface WizardState {
   policy_blocks_entries?: boolean; // policy saved but no AI: every entry would be skipped
   sizing: boolean;
   include_other_trades?: boolean;
+  include_swing_trades?: boolean;
   sizing_detail: { main: { mode: string; value: unknown } | null; other: { mode: string; value: unknown } | null };
   safety: boolean;
   notes: Record<string, string>;

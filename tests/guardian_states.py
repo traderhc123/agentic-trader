@@ -85,7 +85,7 @@ def _row(action, c, ts, mode, book="main", **over):
         if k in over:
             ui[k] = over.pop(k)
     if action in ("entry", "exit"):
-        ui["book"] = "main" if book == "main" else "other"
+        ui["book"] = book if book in ("main", "swing") else "other"
         r.pop("book")
     r.update(over)
     r["ui"] = ui
@@ -526,6 +526,31 @@ def _stress():
 
 
 STATES["stress"] = _stress()
+
+# Swing trades on: a swing call bought on Thu 11-05 (its 3rd session today),
+# held for days next to today's day trades, and an earlier swing trade that
+# closed after four sessions.
+SPY_SWING = ("SPY", "2026-11-20", 680, "C")
+QQQ_SWING = ("QQQ", "2026-10-30", 600, "C")
+
+
+def _swing():
+    cfg = {**LIVE, "include_swing_trades": True}
+    st = _state(True)
+    st["positions"][_key(SPY_SWING)] = {
+        **_pos(SPY_SWING, 1, 9.80, True, at(9, 35, "2026-11-05")),
+        "book": "swing", "track": "swing"}
+    rows = _history(True) + [
+        entry(QQQ_SWING, at(9, 36, "2026-10-14"), 1, 8.10, True, book="swing"),
+        exit_(QQQ_SWING, at(15, 40, "2026-10-17"), 1, 212.0, True,
+              book="swing"),
+        entry(SPY_SWING, at(9, 35, "2026-11-05"), 1, 9.80, True, book="swing"),
+    ]
+    rows.sort(key=lambda r: r["ts"])
+    return cfg, st, rows, runtime()
+
+
+STATES["swing-held"] = _swing()
 
 
 def status(name, now=NOW):

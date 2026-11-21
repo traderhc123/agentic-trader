@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Activity, Iso, Position, Status } from "../lib/viewModel";
 import { Band, type BandAction } from "./Band";
 import { ActionDialog, LiveDialog, UpdateDialog, type Cmd, type DialogKind } from "./Dialogs";
-import { UPDATE, describe, expiryWill } from "./lib/copy";
+import { SWING_LINE, UPDATE, bookLabel, describe, expiryWill } from "./lib/copy";
 import { asOf, brokerLabel, isStale, linkOf, nextFor, type Link } from "./lib/derive";
 import { badgeFor, updateLine } from "./lib/update";
 import { useUpdate, type UpdateFeed } from "./useUpdate";
@@ -161,7 +161,10 @@ function PositionDrawer({ p, page, onClose }: { p: Position; page: Page; onClose
           <dt>Where</dt>
           <dd>{p.real ? brokerLabel(s) : "Agent's practice records only"}</dd>
           <dt>Signal type</dt>
-          <dd>{p.book === "other" ? "Other trades" : p.book === "main" ? "Main pick" : "not recorded"}</dd>
+          <dd>
+            {bookLabel(p.book)}
+            {p.book === "swing" && <small>{SWING_LINE} Sold on its own exit signal, usually days after it was bought.</small>}
+          </dd>
           <dt>Value now</dt>
           <dd>
             <small>{p.real ? `Not tracked yet. ${b} shows the live price.` : "Not tracked for practice positions."}</small>

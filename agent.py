@@ -52,7 +52,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -811,7 +811,7 @@ def _clock_skew(ev):
     return min(float(skew), _CLOCK_SKEW_MAX_S)
 
 
-# When this run started receiving each track ("main" / "other"). A stale
+# When this run started receiving each track ("main" / "other" / "swing"). A stale
 # signal that happened BEFORE then was never catchable — the agent wasn't
 # running yet, or "other trades" was just switched on and the feed handed
 # back the day's earlier entries. That's backlog, not a delay worth an alert.
@@ -828,24 +828,79 @@ def note_watching(cfg, now=None, access=True):
         return
     now = now or datetime.now(timezone.utc)
     _WATCH_SINCE.setdefault("main", now)
-    if cfg.get("include_other_trades") or cfg.get("source", "agenthc") != "agenthc":
-        _WATCH_SINCE.setdefault("other", now)
-    else:
-        _WATCH_SINCE.pop("other", None)  # switched off: restart the clock if back on
+    for cat in ("other", SWING_TRACK):
+        if not _track_off(cfg, cat):
+            _WATCH_SINCE.setdefault(cat, now)
+        else:
+            _WATCH_SINCE.pop(cat, None)  # switched off: restart the clock if back on
+
+
+# ── which signal categories the owner takes ────────────────────────────────
+# The AgentHC feed has three categories of trades: the main pick (track
+# "main", always taken), "other trades" (the wider shadow journal: any
+# other track; include_other_trades) and swing trades (track "swing":
+# rare multi-day calls after a VIX spike; include_swing_trades, OFF by
+# default and only the owner turns it on). A category that is off takes no
+# entries; its exits still reach a position opened from it (the source
+# keeps reading every track while one is held).
+SWING_TRACK = "swing"
+SWING_HOLD_SESSIONS = 5   # trading sessions a swing trade is held at most
+SWING_WORDS = ("rare multi-day calls after a VIX spike; holds up to "
+               f"{SWING_HOLD_SESSIONS} trading days")
+SWING_ON_TEXT = ("Swing trades on — " + SWING_WORDS + ". Sized like the main "
+                 "pick; each one holds a position slot until its exit "
+                 "signal. Included in your signal days at no extra cost.")
+
+
+def _track_category(track):
+    """"main", "swing" or "other" for a raw track (None: the main pick)."""
+    t = str(track or "main")
+    return t if t in ("main", SWING_TRACK) else "other"
+
+
+def _track_off(cfg, track):
+    """AgentHC source, and this track's category is switched off (the main
+    pick never is). Other sources send what the owner pointed them at."""
+    if (cfg or {}).get("source", "agenthc") != "agenthc":
+        return False
+    cat = _track_category(track)
+    if cat == "main":
+        return False
+    if cat == SWING_TRACK:
+        return not cfg.get("include_swing_trades")
+    return not cfg.get("include_other_trades")
+
+
+def signal_scope_words(cfg):
+    """Which AgentHC signal categories are taken, in words."""
+    cats = ["main pick"]
+    if not _track_off(cfg, "other"):
+        cats.append("other trades")
+    if not _track_off(cfg, SWING_TRACK):
+        cats.append("swing trades")
+    return " + ".join(cats)
 
 
 def _other_trades_off(cfg):
-    """AgentHC source, "other trades" off: only main-pick entries are taken."""
-    return (cfg.get("source", "agenthc") == "agenthc"
-            and not cfg.get("include_other_trades"))
+    """AgentHC source, "other trades" off: no other-trades entries."""
+    return _track_off(cfg, "other")
 
 
-def _not_for_this_book(ev, state):
-    """With other trades off: an other-trades ENTERED, or an other-trades
-    EXITED for a contract the ledger doesn't hold as an other-trades
-    position (held from the main pick, by a row that doesn't say, or not
-    at all)."""
-    if str(ev.get("track", "main")) == "main":
+def _some_track_off(cfg):
+    """AgentHC source with "other trades" or swing trades off."""
+    return _track_off(cfg, "other") or _track_off(cfg, SWING_TRACK)
+
+
+def _not_for_this_book(ev, state, cfg=None):
+    """An ENTERED of a category that is switched off (_track_off), or its
+    EXITED for a contract the ledger doesn't hold from that same category
+    (held from the main pick or the other category, by a row that doesn't
+    say, or not at all). cfg None: as before swing trades existed (only
+    "other trades" off)."""
+    track = str(ev.get("track", "main"))
+    if cfg is None:
+        cfg = {"source": "agenthc", "include_swing_trades": True}
+    if not _track_off(cfg, track):
         return False
     if ev.get("event") == "ENTERED":
         return True
@@ -854,9 +909,14 @@ def _not_for_this_book(ev, state):
     key = (f"{ev['ticker']}|{ev['expiry']}|{ev['strike']}|{ev['type']}"
            if _valid_event(ev) else None)
     row = (state.get("positions") or {}).get(key) if key else None
-    fn = getattr(SOURCES.get("agenthc"), "held_as_other", None)
+    src = SOURCES.get("agenthc")
+    fn = getattr(src, "held_as_other", None)
+    held = getattr(src, "held_track", None)
     try:
-        return not (fn is not None and fn(row))
+        if fn is None or not fn(row):
+            return True   # held from the main pick, or not at all
+        return (held is not None
+                and _track_category(held(row)) != _track_category(track))
     except Exception:
         return True
 
@@ -865,7 +925,7 @@ def _backlog(ev):
     """True when the signal happened before this run was watching its track."""
     if ev.get("age_unknown") and not ev.get("occurred_at"):
         return True  # already listed the first time the feed was read
-    track = "main" if str(ev.get("track", "main")) == "main" else "other"
+    track = _track_category(ev.get("track"))
     since = _WATCH_SINCE.get(track)
     try:
         occurred = datetime.fromisoformat(
@@ -1741,7 +1801,7 @@ def _expired_exit_row(cfg, key, row):
         facts["paper"] = acct.endswith(":paper")  # as _trade_facts
     # labelled with the book whose contracts expired (as _trade_facts does
     # for a sale); a row that doesn't say has no label, as before
-    book = {"main": "main", "shadow": "other"}.get(_row_book(row))
+    book = _UI_BOOK.get(_row_book(row))
     if book:
         facts["book"] = book
     return _row_facts(rec, cfg, **facts)
@@ -1819,7 +1879,10 @@ def _maybe_daily_digest(cfg, state, save_state):
                 and not t.get("corrects"))
     vetoes = sum(1 for t in todays if t.get("action") == "policy_veto")
     skipped = sum(1 for t in todays if str(t.get("action", "")).startswith("skip"))
-    open_pos = list(state.get("positions", {})) or ["none"]
+    rows = state.get("positions") if isinstance(state.get("positions"), dict) else {}
+    # a swing trade stays open for days by design: say which ones are
+    open_pos = [k + (" (swing trade)" if _row_book_is_swing(r) else "")
+                for k, r in rows.items()] or ["none"]
     notify(cfg, (f"agentic-trader daily digest {day}: {entries} entries, "
                  f"{exits} exits, {vetoes} policy vetoes, {skipped} skipped. "
                  f"Open positions: {', '.join(open_pos)}"))
@@ -1928,10 +1991,11 @@ _TRACK_SIZING_KEYS = ("sizing_mode", "budget_per_trade_usd",
 
 def _sizing_cfg(cfg, event):
     """Effective config for one event. Feed events carry track="main" (the
-    daily pick) or track="other" (the wider journal); other-track events use
-    the other_* sizing overrides when set, so the two can be allocated
-    differently (e.g. $500 main / $100 other). No overrides = same sizing."""
-    if str(event.get("track", "main")) == "main":
+    daily pick), track="swing" (swing trades) or track="other" (the wider
+    journal); other-track events use the other_* sizing overrides when set,
+    so the two can be allocated differently (e.g. $500 main / $100 other).
+    No overrides = same sizing. Swing trades are sized like the main pick."""
+    if _track_category(event.get("track")) != "other":
         return cfg
     overrides = {k: cfg[f"other_{k}"] for k in _TRACK_SIZING_KEYS
                  if cfg.get(f"other_{k}") not in (None, "")}
@@ -2787,7 +2851,9 @@ def _budget_hints(cfg, trades=None, today=None):
             continue
         m = _COST_RE.search(str(t.get("reason", "")))
         if m:
-            costs.setdefault(t.get("book") or "main", []).append(
+            # swing trades are sized like the main pick: one hint
+            book = t.get("book") or "main"
+            costs.setdefault("main" if book == SWING_TRACK else book, []).append(
                 float(m.group(1).replace(",", "")))
     out = []
     for book, vals in sorted(costs.items()):
@@ -3783,7 +3849,12 @@ def _note_stale_exit(state, event_id):
 # other trades off — so that row's own exit still arrives, and a main-pick
 # exit for the same contract never sells it. A row with a track but no
 # (valid) book takes the track's book; a row with neither is legacy.
-_BOOK_WORDS = {"main": "main pick", "shadow": '"other trades"'}
+# Swing trades (track "swing") are a third book, "swing": their exits come
+# days later, and only a swing exit sells a swing row.
+_BOOK_WORDS = {"main": "main pick", "shadow": '"other trades"',
+               "swing": "swing trade"}
+# the dashboard's name for each book (trade-log facts, view model)
+_UI_BOOK = {"main": "main", "shadow": "other", "swing": "swing"}
 _ENTRY_BOOKS_KEPT = 50
 
 
@@ -3797,12 +3868,19 @@ def _event_track(ev):
 
 
 def _book_of_track(track):
-    return None if track is None else ("main" if track == "main" else "shadow")
+    if track is None:
+        return None
+    return track if track in ("main", SWING_TRACK) else "shadow"
+
+
+def _signal_book(ev):
+    """The book of a signal by its track ("main" when it names none)."""
+    return _book_of_track(str((ev or {}).get("track", "main")))
 
 
 def _event_book(ev):
-    """The book a feed signal names ("main" | "shadow"), or None when its
-    source sends no track or it is one of the agent's own exits."""
+    """The book a feed signal names ("main" | "shadow" | "swing"), or None
+    when its source sends no track or it is one of the agent's own exits."""
     return _book_of_track(_event_track(ev))
 
 
@@ -3846,7 +3924,8 @@ def _other_books_row(row, ev, cfg=None):
 
 
 def _book_words(book, track=None):
-    """'main pick', '"other trades"', or '"other trades" (track "swing")'."""
+    """'main pick', '"other trades"', 'swing trade', or '"other trades"
+    (track "x")' for another non-main track."""
     words = _BOOK_WORDS.get(book, "other book")
     if book == "shadow" and track and track != "other":
         words += f' (track "{track}")'
@@ -3961,7 +4040,7 @@ def _row_facts(rec, cfg, check=None, **facts):
       mode    "live" | "practice": what NEW trades used when it was written
       check   the ENTRY_CHECKS id an entry signal stopped at
       params  the numbers behind the reason (the cap, the loss so far…)
-      book    "main" | "other" (entry and exit rows carry no "book")
+      book    "main" | "other" | "swing" (entry and exit rows carry no "book")
       qty, mark, sent, filled   see _trade_facts
     Never raises: the row is logged with or without them."""
     try:
@@ -3989,8 +4068,7 @@ def _trade_facts(record, cfg, book, dry, row, prior_pos, mark, sold):
     broker and whether it has filled. `row`: the ledger row after the
     order, `prior_pos`: before it. Never raises."""
     try:
-        facts = {"book": "main" if book == "main" else "other",
-                 "sent": not dry}
+        facts = {"book": _UI_BOOK.get(book, "other"), "sent": not dry}
         if record.get("action") == "entry":
             qty = _int0((row or {}).get("qty"))
             # a real buy that is still working at the broker isn't filled yet
@@ -4048,7 +4126,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # missing key read as live here while doctor said DRY-RUN.
         cfg = {**cfg, "dry_run": _is_dry(cfg, state)}
     contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
-    book = "main" if str(ev.get("track", "main")) == "main" else "shadow"
+    book = _signal_book(ev)
 
     if not _valid_event(ev):
         print(f"skipped invalid event from source: {str(ev)[:120]}")
@@ -4704,7 +4782,7 @@ def _skip_exited_entry(ev, cfg, state, save_state):
                     "the exit for this trade had already arrived when the "
                     "agent first saw the entry, so it was not bought",
                     event_id=ev["event_id"],
-                    book="main" if str(ev.get("track", "main")) == "main" else "shadow",
+                    book=_signal_book(ev),
                     check="signal_fresh", code="exit_already_arrived")
     return msg
 
@@ -4748,21 +4826,21 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
     # only the agent's own exits may cap or reprice a sell
     new = [_from_feed(ev) for ev in events
            if ev.get("event_id") not in seen and ev.get("event_id") not in owed_ids]
-    off = _other_trades_off(cfg)
+    off = _some_track_off(cfg)
     if off:
         # The AgentHC source reads every track while the agent still holds
-        # an "other trades" position (its exit must reach it), but the
-        # owner turned other trades off: their entries are not taken, and
-        # their exits reach only a position opened from other trades — the
-        # shadow book often trades the main pick's contract and exits at
-        # another time, and must never sell the main position (positions
-        # are keyed by contract alone). Remembered, so they aren't looked
-        # at again.
-        # An exit still owed from before other trades were turned off (kept
+        # an "other trades" or swing position (its exit must reach it), or
+        # while one of those two categories is on, but the owner has the
+        # other one off: that category's entries are not taken, and its
+        # exits reach only a position opened from it — the shadow book
+        # often trades the main pick's contract and exits at another time,
+        # and must never sell the main position (positions are keyed by
+        # contract alone). Remembered, so they aren't looked at again.
+        # An exit still owed from before a category was turned off (kept
         # after a failed sell) obeys the same rule as a fresh one: it never
         # sells a position it wouldn't sell if it arrived now. Settled.
         dropped_owed = [ev for ev in owed if ev.get("event_id")
-                        and _not_for_this_book(ev, state)]
+                        and _not_for_this_book(ev, state, cfg)]
         for ev in dropped_owed:
             seen.add(ev["event_id"])
             _mark_seen(state, ev["event_id"], listed)
@@ -4770,14 +4848,20 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
         if dropped_owed:
             owed = [ev for ev in owed if ev.get("event_id") not in seen]
         dropped = [ev for ev in new if ev.get("event_id")
-                   and _not_for_this_book(ev, state)]
+                   and _not_for_this_book(ev, state, cfg)]
         for ev in dropped:
             seen.add(ev["event_id"])
             _mark_seen(state, ev["event_id"], listed)
         dropped += dropped_owed
         if dropped:
-            print(f"ignored {len(dropped)} \"other trades\" signal(s): "
-                  "other trades are off")
+            swings = sum(1 for ev in dropped
+                         if _track_category(ev.get("track")) == SWING_TRACK)
+            if len(dropped) > swings:
+                print(f"ignored {len(dropped) - swings} \"other trades\" "
+                      "signal(s): other trades are off")
+            if swings:
+                print(f"ignored {swings} swing trade signal(s): swing trades "
+                      "are off")
             new = [ev for ev in new if ev.get("event_id") not in seen]
             save_state(state)
     released = [ev for ev in new if _practice_release(ev)]
@@ -4791,10 +4875,10 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
         new = [ev for ev in new if not _practice_release(ev)]
         new += _practice_release_events(released, cfg, state, broker, client,
                                         save_state, listed, seen)
-    # with other trades off, a shadow-book exit doesn't end a main entry
+    # an exit of a category that is off doesn't end an entry of another
     known = [ev for ev in events
              if not _practice_release(ev)
-             and (not off or str(ev.get("track", "main")) == "main")] + owed
+             and not _track_off(cfg, ev.get("track"))] + owed
     batch = (owed + [ev for ev in new if ev.get("event") == "EXITED"]
              + [ev for ev in new if ev.get("event") != "EXITED"])
     for ev in batch:
@@ -5001,13 +5085,13 @@ def _practice_routed(fresh, state, cfg):
 
 
 def _practice_track(ev):
-    return "main" if str(ev.get("track", "main")) == "main" else "other"
+    return _track_category(ev.get("track"))
 
 
 def _practice_since(state):
     since = state.get("practice_since")
     return ({k: float(v) for k, v in since.items()
-             if k in ("main", "other") and isinstance(v, (int, float))
+             if k in ("main", "other", SWING_TRACK) and isinstance(v, (int, float))
              and not isinstance(v, bool) and math.isfinite(v)}
             if isinstance(since, dict) else {})
 
@@ -5016,8 +5100,9 @@ def _note_practice_since(cfg, state, save_state):
     """After a read of the AgentHC feed with entry access: when practice
     began getting released trades, per track (state["practice_since"]). A
     LIVE read ends it (practice starts afresh the next time), and a practice
-    read with other trades off ends "other" (turned on again later, it
-    starts then). A paused (off) read changes nothing."""
+    read with other trades (or swing trades) off ends "other" ("swing"):
+    turned on again later, it starts then. A paused (off) read changes
+    nothing."""
     mode = _feed_mode(cfg, state)
     old = _practice_since(state)
     since = dict(old)
@@ -5026,10 +5111,11 @@ def _note_practice_since(cfg, state, save_state):
     elif mode == "dry_run":
         now = datetime.now(timezone.utc).timestamp()
         since.setdefault("main", now)
-        if cfg.get("include_other_trades"):
-            since.setdefault("other", now)
-        else:
-            since.pop("other", None)
+        for cat in ("other", SWING_TRACK):
+            if not _track_off(cfg, cat):
+                since.setdefault(cat, now)
+            else:
+                since.pop(cat, None)
     if since == old and bool(since) == ("practice_since" in state):
         return
     if since:
@@ -5265,7 +5351,7 @@ def _book_practice_trade(entry, x, cfg, state, save_state, broker, client, rows)
         return None   # booked before a restart that lost state.json's note
     contract = (f"{entry['ticker']} {entry['expiry']} ${entry['strike']} "
                 f"{entry['type']}")
-    book = "main" if str(entry.get("track", "main")) == "main" else "shadow"
+    book = _signal_book(entry)
     t_in, t_out = _occurred_at(entry), _occurred_at(x)
     when = _practice_when(t_in, t_out)
     common = {"contract": contract, "dry": True, "practice_release": True,
@@ -5304,7 +5390,7 @@ def _book_practice_trade(entry, x, cfg, state, save_state, broker, client, rows)
         exit_row["est_pnl_usd"] = pnl
     if no_price:
         exit_row["no_price"] = True
-    facts = {"book": "main" if book == "main" else "other", "sent": False,
+    facts = {"book": _UI_BOOK.get(book, "other"), "sent": False,
              "filled": False}
     _log_trade(_row_facts(entry_row, cfg, **facts), ts=_iso_utc(t_in))
     _log_trade(_row_facts(exit_row, cfg, **facts), ts=_iso_utc(t_out))
@@ -5808,15 +5894,79 @@ def _signal_loss_acct(cfg, broker=None, client=None):
         return None
 
 
-def _signal_loss_rows(state):
+def _row_book_is_swing(row):
+    """True for a ledger row opened from a swing-trade signal."""
+    return _row_book(row) == SWING_TRACK
+
+
+def _swing_keys(state):
+    """Ledger keys of the swing positions held now."""
+    rows = (state or {}).get("positions")
+    return [k for k, r in (rows.items() if isinstance(rows, dict) else ())
+            if _row_book_is_swing(r)]
+
+
+def _swing_fields(cfg, state):
+    """The classic dashboard's swing lines: "swing trades" (on/off) for the
+    AgentHC source, and "swing positions" (their ledger keys) while any is
+    held. {} otherwise."""
+    held = _swing_keys(state)
+    out = {}
+    if _agenthc_source(cfg) or held:
+        out["swing trades"] = ("on" if not _track_off(cfg, SWING_TRACK)
+                               else "off")
+    if held:
+        out["swing positions"] = ", ".join(held)
+    return out
+
+
+def _sessions_held(cfg, row, day):
+    """Trading sessions from the ET day `row` was opened to `day` (a date),
+    both counted: 1 on the day it was bought. None when the row doesn't say
+    when it was opened."""
+    opened = _num_or_none(row.get("opened_at")) if isinstance(row, dict) else None
+    if opened is None:
+        return None
+    start = datetime.fromtimestamp(opened, MARKET_TZ).date()
+    if start > day:
+        return 0
+    n, d = 0, start
+    while d <= day and n <= 60:   # bounded: a swing row lives days, not months
+        n += bool(is_trading_day(cfg, d))
+        d += timedelta(days=1)
+    return n
+
+
+def _swing_hold_over(cfg, row, day):
+    """A swing row on `day` (a date) is in or past the last session of its
+    hold (SWING_HOLD_SESSIONS: AgentHC's own time exit comes that day), or
+    doesn't say when it was opened. Before that, a missing exit signal is
+    nothing to act on: a swing trade's exit is days away by design."""
+    held = _sessions_held(cfg, row, day)
+    return held is None or held >= SWING_HOLD_SESSIONS
+
+
+def _num_or_none(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v) if math.isfinite(v) and v > 0 else None
+
+
+def _signal_loss_rows(state, cfg=None, now_et=None):
     """[(key, row)] ledger rows that hold contracts or have an order
     working, of every expiry. While the loss is a feed_gap (an exit may
     have scrolled out of the feed while the agent was away), only the rows
     held then that are still held (state["feed_gap"]["keys"], kept by the
-    AgentHC source): positions bought since get their exits normally."""
+    AgentHC source): positions bought since get their exits normally.
+    A swing trade is held for days by design: its row counts only from the
+    last session of its hold (_swing_hold_over) — before that the agent
+    keeps it and keeps reading for its exit, and the no-signal sell never
+    sells it the day it was bought."""
     rows = state.get("positions")
+    day = (now_et or _et_now()).date()
     out = [(k, r) for k, r in (list(rows.items()) if isinstance(rows, dict) else ())
-           if isinstance(r, dict) and (_int0(r.get("qty")) >= 1 or r.get("pending"))]
+           if isinstance(r, dict) and (_int0(r.get("qty")) >= 1 or r.get("pending"))
+           and (not _row_book_is_swing(r) or _swing_hold_over(cfg or {}, r, day))]
     rec = state.get("signal_loss")
     if isinstance(rec, dict) and rec.get("cause") == "feed_gap":
         gap = state.get("feed_gap")
@@ -6034,7 +6184,7 @@ def _signal_loss_tick(cfg, state, save_state, broker, client, paused, now_et,
         return []
     if not _in_session(cfg, now_et):
         return []
-    rows = _signal_loss_rows(state)
+    rows = _signal_loss_rows(state, cfg, now_et)
     if not rows:
         return []
     day = now_et.date().isoformat()
@@ -6118,7 +6268,7 @@ def signal_loss_sell_at(cfg, state, now_et=None, acct=None):
         if not isinstance(rec, dict) or not isinstance(rec.get("since"), (int, float)):
             return None
         acct = acct or _signal_loss_acct(cfg)
-        rows = [(k, r) for k, r in _signal_loss_rows(state)
+        rows = [(k, r) for k, r in _signal_loss_rows(state, cfg, now_et)
                 if not _signal_loss_elsewhere(r, acct)]
         if not rows or not is_trading_day(cfg, now_et.date()):
             return None
@@ -6170,7 +6320,8 @@ def signal_loss_banner(cfg, state, now_et=None, paused=False, acct=None):
                 or not _in_session(cfg, now_et)):
             return []
         acct = acct or _signal_loss_acct(cfg)
-        every = [(k, r) for k, r in _signal_loss_rows(state) if _opened_live(r)]
+        every = [(k, r) for k, r in _signal_loss_rows(state, cfg, now_et)
+                 if _opened_live(r)]
         if not every:
             return []
         real = [k for k, r in every if not _signal_loss_elsewhere(r, acct)]
@@ -6225,7 +6376,7 @@ def signal_loss_busy(cfg, state, now_et=None):
     try:
         now_et = now_et or _et_now()
         rec = state.get("signal_loss")
-        if not isinstance(rec, dict) or not _signal_loss_rows(state):
+        if not isinstance(rec, dict) or not _signal_loss_rows(state, cfg, now_et):
             return False
         if not is_trading_day(cfg, now_et.date()):
             return False
@@ -8303,6 +8454,14 @@ def _command(t, cfg, text):
                       "Now getting the main pick only — no new \"other trades\" "
                       "entries. Other trades it already holds still get their "
                       "exit signals.")
+    if t in ("swing trades on", "swing trades off", "swing on", "swing off"):
+        if cfg.get("source", "agenthc") != "agenthc":
+            return True, "That setting is for the AgentHC signal source only."
+        cfg["include_swing_trades"] = t.endswith("on")
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, (SWING_ON_TEXT if cfg["include_swing_trades"] else
+                      "Swing trades off — no new swing trades. Swing trades "
+                      "it already holds still get their exit signals.")
     if t in ("other sizing same", "clear other sizing"):
         set_book_sizing(cfg, "other", "same", None)
         _save(CONFIG_PATH, cfg, private=True)
@@ -8650,6 +8809,7 @@ def cmd_run(app_window=False):
                    if feed_note else {}),
                 "expiry guard": _expiry_guard_desc(c),
                 "open positions": ", ".join(st.get("positions", {})) or "none",
+                **_swing_fields(c, st),
                 "start at login": ("on" if keep_running.autostart_enabled()
                                    else "off"),
                 "keep awake": awake.describe(c),
@@ -9290,7 +9450,9 @@ def doctor_checks():
     state = _load(STATE_PATH, {}) or {}
     src = cfg.get("source", "")
     check("source", bool(src and src in SOURCES), "Signal source configured",
-          src or "unset", "python agent.py setup --from plan.json  (or the wizard)")
+          (f"{src} · {signal_scope_words(cfg)}" if src == "agenthc"
+           else src or "unset"),
+          "python agent.py setup --from plan.json  (or the wizard)")
 
     if src == "agenthc":
         try:

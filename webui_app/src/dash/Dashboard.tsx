@@ -352,7 +352,7 @@ export function Dashboard() {
             {proposal?.pending && <ProposalPanel p={proposal} onDone={refresh} />}
             <PnlPanel pnl={pnl} failed={pnlFailed} />
             {conn === "ok" && !live && status?.would_have && <WouldHavePanel p={status.would_have} />}
-            <PositionsPanel positions={parsePositions(f["open positions"])} />
+            <PositionsPanel positions={parsePositions(f["open positions"])} swing={parsePositions(f["swing positions"]).map((p) => p.raw)} />
             <Blotter
               trades={trades}
               total={tradeTotal}
@@ -880,7 +880,10 @@ function Stat({ k, v }: { k: string; v: string }) {
 }
 
 // ── positions ───────────────────────────────────────────────────────────────
-function PositionsPanel({ positions }: { positions: Contract[] }) {
+function PositionsPanel({ positions, swing = [] }: { positions: Contract[]; swing?: string[] }) {
+  // swing trades are held for days: listed after the day trades, each tagged
+  const isSwing = (p: Contract) => swing.includes(p.raw);
+  positions = [...positions.filter((p) => !isSwing(p)), ...positions.filter(isSwing)];
   return (
     <Panel title="Open positions" right={<Count n={positions.length} />}>
       <div className="overflow-x-auto">
@@ -905,7 +908,17 @@ function PositionsPanel({ positions }: { positions: Contract[] }) {
                 <tr key={i} className="border-t border-line hover:bg-panel2">
                   {p.right ? (
                     <>
-                      <Td className="font-semibold">{p.sym}</Td>
+                      <Td className="font-semibold">
+                        {p.sym}
+                        {isSwing(p) && (
+                          <span
+                            className="ml-2 rounded border border-line2 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-fg2"
+                            title="Swing Trade: a multi-day call after a VIX spike, held up to 5 trading days until its exit signal"
+                          >
+                            Swing Trade
+                          </span>
+                        )}
+                      </Td>
                       <Td>
                         <RightTag right={p.right} />
                       </Td>

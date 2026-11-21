@@ -384,6 +384,13 @@ main:focus{outline:none}
 .hhead .r{text-align:right}
 .hgroup-h{display:flex;align-items:center;gap:6px 8px;flex-wrap:wrap;padding:12px 16px;background:var(--well);border-bottom:1px solid var(--line);font-size:13px;color:var(--ink2)}
 .hgroup + .hgroup .hgroup-h{border-top:1px solid var(--line)}
+/* a signal category inside a money group (main pick / other trades / swing) */
+.hsub{display:flex;align-items:baseline;gap:4px 8px;flex-wrap:wrap;padding:8px 16px 6px;font-size:13px;color:var(--ink2);border-bottom:1px solid var(--line)}
+.hsub b{color:var(--ink);font-weight:650}
+.hcat + .hcat .hsub{border-top:1px solid var(--line)}
+.hcat-swing .hsub{border-left:3px solid var(--ink)}
+.flag-swing{font-weight:600}
+.sig-off{color:var(--ink2);font-weight:600}
 .hrow{border-bottom:1px solid var(--line);border-left:3px solid var(--real)}
 .hrow.prac{border-left:3px dashed var(--prac)}
 .hrow:last-child{border-bottom:0}
@@ -685,6 +692,7 @@ main:focus{outline:none}
   /* holdings become sentence cards */
   .hhead{display:none}
   .hgroup-h{padding:12px 12px}
+  .hsub{padding:8px 12px 6px}
   .hrow button,.hlist.wide .hrow button{grid-template-columns:minmax(0,1fr) auto;padding:12px;gap:6px 12px}
   .h-bought{display:none}
   .h-next{grid-column:1 / -1}

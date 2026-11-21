@@ -169,7 +169,16 @@ entry or an exit — that day**; quiet days (no picks, or your agent was off)
 are free, and several signals in one day count once. With "main pick only"
 only main-pick signals use days; adding "other trades" uses days on those
 too. When your days run out, exit signals keep coming for 3 more market days
-so open positions can close. You're notified when 2 days are left; buying
+so open positions can close.
+
+**Swing trades** (off by default; the owner turns them on in the dashboard's
+Signals page, or says `swing trades on`) are a third category next to the
+main pick and "other trades": rare multi-day calls after a VIX spike, held up
+to 5 trading days. They are included in your signal days at no extra cost, and
+a swing trade's exit signal reaches your agent even after your pass ends: the
+agent keeps reading for it (without buying anything) until every swing
+position it holds is closed. The no-signal sell leaves a swing position alone
+until the last day of its hold. You're notified when 2 days are left; buying
 more carries unused days over. A pass is valid for at most about twice its
 length in market days.
 

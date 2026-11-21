@@ -27,6 +27,9 @@ import {
   UNMANAGED_WHY,
   answerLook,
   answerWhy,
+  BOOK_LABEL,
+  SWING_LINE,
+  bookLabel,
   checkLabel,
   describe,
   expiryWill,
@@ -43,6 +46,7 @@ import {
   dayBooks,
   dayTally,
   dayWhole,
+  holdSplit,
   paidMark,
   problemGroups,
   isStale,
@@ -52,6 +56,7 @@ import {
   paidFor,
   realBookCaption,
   showPaperBook,
+  signalRows,
   statement,
   unwatched,
   vitals,
@@ -2031,4 +2036,63 @@ test("a contract that expired unsold is never described as a sale or an order", 
     assert.equal(d.tag, tag);
     assert.equal(d.cat, "trade");
   }
+});
+
+// ── swing trades: the third signal category ─────────────────────────────────
+
+const posOf = (id, book, real = true) => ({ id, book, real, qty: 1, label: id, contract: null, account: null });
+
+test("each signal category has its dashboard name, swing is 'Swing Trade'", () => {
+  assert.deepEqual(BOOK_LABEL, { main: "Main pick", other: "Other trades", swing: "Swing Trade" });
+  assert.equal(bookLabel("swing"), "Swing Trade");
+  assert.equal(bookLabel(null), "not recorded");
+  clean(SWING_LINE, "swing line");
+  assert.match(SWING_LINE, /VIX spike/);
+  assert.match(SWING_LINE, /5 trading days/);
+  // an activity row of a swing trade names it
+  const d = describe(row({ action: "entry", reason_code: "entered", book: "swing", real: true, mode_at_time: "live" }), "Robinhood");
+  assert.match(d.sub, /swing trade/);
+});
+
+test("holdings: a swing trade is never mixed in with the day trades", () => {
+  // one category, no swing: one list as before
+  assert.deepEqual(holdSplit([posOf("a", "main"), posOf("b", "main")]).map((g) => g.book), ["all"]);
+  assert.deepEqual(holdSplit([]), []);
+  // a lone swing trade still gets its own heading
+  assert.deepEqual(holdSplit([posOf("s", "swing")]).map((g) => g.book), ["swing"]);
+  const g = holdSplit([posOf("s", "swing"), posOf("a", "main"), posOf("o", "other"), posOf("x", null)]);
+  assert.deepEqual(g.map((x) => x.book), ["main", "other", "swing", null]);
+  assert.deepEqual(g.map((x) => x.list.map((p) => p.id)), [["a"], ["o"], ["s"], ["x"]]);
+});
+
+test("the swing switch has one home, on Signals, and goes through the two-step signals route", () => {
+  assert.equal(ACTION_HOME.swing, "signals");
+  const sig = fs.readFileSync(path.join(SRC, "v2", "views", "Signals.tsx"), "utf8");
+  assert.equal((sig.match(/data-act="swing"/g) || []).length, 1);
+  const dlg = fs.readFileSync(path.join(SRC, "v2", "views", "SignalsDialogs.tsx"), "utf8");
+  assert.match(dlg, /export function SwingDialog[\s\S]*?const payload = \{ swing: next \};[\s\S]*?usePreview\(API\.signals, payload\)/);
+  assert.match(dlg, /<ReviewDialog\s+path=\{API\.signals\}[\s\S]*?Take swing trades\?/);
+});
+
+test("swing trades: positions and results by signal type, real money and practice apart", { skip }, () => {
+  const s = states.find(([n]) => n === "swing-held")[1];
+  const swing = s.positions.filter((p) => p.book === "swing");
+  assert.equal(swing.length, 1);
+  const g = holdSplit(s.positions.filter((p) => p.real));
+  assert.deepEqual(g.map((x) => x.book), ["main", "swing"]);
+  const real = signalRows(s, "real");
+  assert.deepEqual(real.map((r) => r.book), ["main", "swing"]); // other trades off and empty: left out
+  const sw = real.find((r) => r.book === "swing");
+  assert.equal(sw.label, "Swing Trade");
+  assert.equal(sw.on, true);
+  assert.equal(sw.multiDay, true);
+  assert.equal(sw.open, 1);
+  assert.equal(sw.closed, 1);
+  assert.equal(sw.total, 212);
+  assert.equal(signalRows(s, "practice").find((r) => r.book === "swing").total, 0);
+  // swing off and nothing in it: still listed, so the owner sees it exists
+  const live = states.find(([n]) => n === "live")[1];
+  const off = signalRows(live, "real").find((r) => r.book === "swing");
+  assert.equal(off.on, false);
+  assert.equal(off.open + off.closed, 0);
 });

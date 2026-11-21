@@ -262,6 +262,13 @@ docker run -d --name agentic-trader --restart on-failure -v agentic-trader-data:
   several entries a day) during setup — or later via
   `"include_other_trades": true` in `~/.agentic-trader/config.json`. The daily
   cap and per-trade budget apply either way.
+- **Swing trades (off by default)**: a third category — rare multi-day calls
+  after a VIX spike, held up to 5 trading days and closed on their own exit
+  signal. Only you turn them on (dashboard → Signals → Swing trades, or chat
+  `swing trades on`); an assistant's setup plan cannot. They are sized like
+  the main pick, count toward the daily entry cap, and hold a position slot
+  until they close. Included in your signal days; their exits arrive even
+  after your pass ends.
 - **Three ways to size, per book**: a fixed dollar amount, a fixed number
   of contracts, or a percent of your account value per trade. The main book
   (the daily pick) and the shadow book ("other trades") each pick their own —

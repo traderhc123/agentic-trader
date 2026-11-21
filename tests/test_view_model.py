@@ -858,7 +858,11 @@ def test_logs_written_by_older_versions_still_load(home):
     again = vm.build_status({"dry_run": False}, {}, agent._read_trade_log(),
                             {"running": True})
     assert again["limits"] == status["limits"]
-    assert again["results"] == status["results"]
+    # by_signal splits only rows that say their category (old rows: none)
+    assert ({k: v for k, v in again["results"].items() if k != "by_signal"}
+            == {k: v for k, v in status["results"].items() if k != "by_signal"})
+    assert all(b["closed"] == {"real": 0, "practice": 0, "paper_account": 0}
+               for b in status["results"]["by_signal"].values())
     assert again["activity"]["rows"][-1]["qty"] == 1  # ...and more is known
 
 

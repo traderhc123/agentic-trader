@@ -800,7 +800,10 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
      <option value="all">Main pick + "other trades" — wider journal, several entries a day</option>
     </select>
     <p class="help">"Other trades" follows AgentHC's broader shadow journal; your
-    daily entry cap and per-trade budget still apply to every signal.</p></div>
+    daily entry cap and per-trade budget still apply to every signal.</p>
+    <label class="check" for="hc-swing"><input type="checkbox" id="hc-swing">
+    Swing trades — rare multi-day calls after a VIX spike; holds up to 5 trading
+    days (off by default; included in your signal days)</label></div>
   </div></div>
   <div class="sec-b"><div class="fs-grid">
    <div class="fs-lbl">Access — prepay signal days<p>Prepaid in sats over Lightning.</p></div>
@@ -1464,7 +1467,8 @@ async function boot(){
     document.getElementById('llm-key').placeholder='saved key on file — leave blank and press Find models to change model';}
   if(st.source){done('s-source');restoredNote('s-source',notes.source||('Source saved: '+st.source));
     const sel=document.getElementById('src');sel.value=st.source;srcChanged();
-    document.getElementById('hc-scope').value=st.include_other_trades?'all':'main';}
+    document.getElementById('hc-scope').value=st.include_other_trades?'all':'main';
+    document.getElementById('hc-swing').checked=!!st.include_swing_trades;}
   if(st.wallet&&st.wallet.connected){showWallet(st.wallet.page,'wallet connected ✓');
     document.getElementById('adv-wallet').open=true;}
   if(st.pass)checkPass();
@@ -1665,6 +1669,7 @@ async function doSource(){
   const v=document.getElementById('src').value;
   const r=await api('/api/source',{source:v,
     scope:document.getElementById('hc-scope').value,
+    swing:document.getElementById('hc-swing').checked,
     lnbits_url:document.getElementById('ln-url').value,
     lnbits_key:document.getElementById('ln-key').value,
     agenthc_key:document.getElementById('hc-key').value,
@@ -2360,14 +2365,17 @@ async function refresh(){
     const mt=$('m-entries');mt.firstChild.style.width=(cap?Math.min(100,n*100/cap):0)+'%';
     mt.className='meter'+(cap&&n>=cap?' hot':'');
     const pos=(f['open positions']||'none');
-    const list=pos==='none'?[]:pos.split(', ');
+    const swing=(f['swing positions']||'').split(', ').filter(Boolean);
+    // swing trades (held for days) after the day trades, each tagged
+    const list0=pos==='none'?[]:pos.split(', ');
+    const list=list0.filter(p=>!swing.includes(p)).concat(list0.filter(p=>swing.includes(p)));
     $('t-pos').textContent=list.length;
     const pc=$('pos-count');pc.textContent=list.length;pc.style.display=list.length?'':'none';
     $('positions').innerHTML=list.length?list.map(p=>{
       const a=p.split('|');
       if(a.length<4)return '<tr><td class=sym colspan=4>'+esc(p)+'</td></tr>';
       const d=new Date(a[1]+'T12:00:00');const k=Number(a[2]);
-      return '<tr><td class=sym>'+esc(a[0])+'</td><td><span class="tag '+(a[3]==='C'?'call':'put')+'">'+
+      return '<tr><td class=sym>'+esc(a[0])+(swing.includes(p)?' <span class="tag" title="Swing Trade: a multi-day call after a VIX spike, held up to 5 trading days">SWING TRADE</span>':'')+'</td><td><span class="tag '+(a[3]==='C'?'call':'put')+'">'+
         (a[3]==='C'?'CALL':'PUT')+'</span></td><td class=num>'+esc(isNaN(d)?a[1]:shortDate(d))+
         '</td><td class="r num">'+(isNaN(k)?esc(a[2]):fmtStrike(k))+'</td></tr>';
     }).join(''):'<tr><td colspan=4 class=empty>No open positions</td></tr>';
@@ -3350,6 +3358,8 @@ def _restore_notes(cfg, acceptance=None):
                 detail = " · Lightning wallet connected"
             if cfg.get("include_other_trades"):
                 detail += " · main + other trades"
+            if cfg.get("include_swing_trades"):
+                detail += " · swing trades on"
         elif src == "url" and cfg.get("source_url"):
             detail = f" · {cfg['source_url']}"
         notes["source"] = f"Source saved: {src}{detail}"
@@ -4056,6 +4066,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "sizing": bool(cfg.get("sizing_mode")),
             "sizing_detail": _sizing_detail(cfg),
             "include_other_trades": bool(cfg.get("include_other_trades")),
+            "include_swing_trades": bool(cfg.get("include_swing_trades")),
             "safety": cfg.get("max_entries_per_day") is not None,
             "notes": _restore_notes(cfg, A._load(A.ACCEPTANCE_PATH, {})),
             "wallet": {
@@ -4124,6 +4135,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             cfg["source_url"] = url
         if src == "agenthc":
             cfg["include_other_trades"] = data.get("scope") == "all"
+            if isinstance(data.get("swing"), bool):
+                # the owner's own switch (a form that doesn't send it keeps it)
+                cfg["include_swing_trades"] = data["swing"]
             if data.get("agenthc_key"):
                 cfg["agenthc_api_key"] = str(data["agenthc_key"]).strip()
                 note = "API key saved ✓"
@@ -4696,13 +4710,21 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     if k not in cfg or cfg[k] != v})  # only what sizing changed
 
     def source_scope(_h, data):
-        """Just the "which signals" choice (main / main + other trades), so the
-        Sizing step can fix a mismatch without re-saving the whole source."""
+        """Just the "which signals" choice (main / main + other trades, and
+        swing trades on/off when "swing" is sent), so the Sizing step can fix
+        a mismatch without re-saving the whole source."""
         if cfg.get("source", "agenthc") != "agenthc":
             return {"ok": False, "error": "only the AgentHC source has this setting"}
-        if data.get("scope") not in ("main", "all"):
+        if "scope" in data and data.get("scope") not in ("main", "all"):
             return {"ok": False, "error": "scope must be main or all"}
-        cfg["include_other_trades"] = data["scope"] == "all"
+        if "swing" in data and not isinstance(data.get("swing"), bool):
+            return {"ok": False, "error": "swing must be true or false"}
+        if "scope" not in data and "swing" not in data:
+            return {"ok": False, "error": "scope must be main or all"}
+        if "scope" in data:
+            cfg["include_other_trades"] = data["scope"] == "all"
+        if "swing" in data:
+            cfg["include_swing_trades"] = data["swing"]
         save()
         return {"ok": True}
 
@@ -5441,6 +5463,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                        "warning": "options_off" if pending["rh_warning"] else None},
             "signals": {"source": cfg.get("source"),
                         "include_other_trades": bool(cfg.get("include_other_trades")),
+                        "include_swing_trades": bool(cfg.get("include_swing_trades")),
                         "dry_run_preview": cfg.get("dry_run_preview", True) is not False,
                         "recurring": bool(cfg.get("day_pass_recurring")),
                         "wallet_connected": bool(cfg.get("lnbits_url")
@@ -6457,35 +6480,49 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     @_v2
     def v2_signals(data):
         """POST /api/v2/settings/signals: which AgentHC signals (scope "main"
-        or "all": the classic /api/source/scope, two steps) and the practice
-        preview on/off (the key the chat's "preview on|off" writes; straight
-        away when sent alone)."""
-        p = _v2_payload(data, ("scope", "dry_run_preview"))
+        or "all", and swing trades on/off: the classic /api/source/scope, two
+        steps) and the practice preview on/off (the key the chat's "preview
+        on|off" writes; straight away when sent alone)."""
+        p = _v2_payload(data, ("scope", "swing", "dry_run_preview"))
         if not p:
-            raise _Invalid("Send scope and/or dry_run_preview. Nothing was "
-                           "changed.")
+            raise _Invalid("Send scope, swing and/or dry_run_preview. Nothing "
+                           "was changed.")
         if "scope" in p and p["scope"] not in ("main", "all"):
             raise _Invalid('scope must be "main" or "all". Nothing was changed.')
+        if "swing" in p and not isinstance(p["swing"], bool):
+            raise _Invalid("swing must be true or false. Nothing was changed.")
         if "dry_run_preview" in p and not isinstance(p["dry_run_preview"], bool):
             raise _Invalid("dry_run_preview must be true or false. Nothing was "
                            "changed.")
         with A.CONFIG_LOCK:
             _sync()
             changes = []
-            if "scope" in p:
-                if cfg.get("source", "agenthc") != "agenthc":
-                    raise _Invalid("Which signals is a choice of the AgentHC "
-                                   "source only. Nothing was changed.")
-                if p["scope"] != _scope_now():
-                    changes.append(_change(
-                        "scope", "Which signals", _scope_now(), p["scope"],
-                        "raises_risk" if p["scope"] == "all" else "lowers_risk"))
+            if ("scope" in p or "swing" in p) \
+                    and cfg.get("source", "agenthc") != "agenthc":
+                raise _Invalid("Which signals is a choice of the AgentHC "
+                               "source only. Nothing was changed.")
+            if "scope" in p and p["scope"] != _scope_now():
+                changes.append(_change(
+                    "scope", "Which signals", _scope_now(), p["scope"],
+                    "raises_risk" if p["scope"] == "all" else "lowers_risk"))
+            swing_now = bool(cfg.get("include_swing_trades"))
+            if "swing" in p and p["swing"] != swing_now:
+                changes.append(_change(
+                    "swing", "Swing trades", swing_now, p["swing"],
+                    "raises_risk" if p["swing"] else "lowers_risk"))
             if changes:
-                wait = _two_step("signals", p, data, changes, [
-                    "It does not switch between Practice and LIVE.",
-                    does_not_trade,
-                    "It does not change your trade sizes: other trades are "
-                    "sized as Rules & limits says."])
+                notes = ["It does not switch between Practice and LIVE.",
+                         does_not_trade,
+                         "It does not change your trade sizes: other trades are "
+                         "sized as Rules & limits says."]
+                if "swing" in p and p["swing"] != swing_now:
+                    notes.append(
+                        "It does not cost extra: swing trades (" + A.SWING_WORDS
+                        + ") are included in your signal days and sized like "
+                        "the main pick." if p["swing"] else
+                        "It does not sell swing trades the agent already holds: "
+                        "they are still sold on their exit signals.")
+                wait = _two_step("signals", p, data, changes, notes)
                 if wait:
                     return wait
             elif "dry_run_preview" not in p:
@@ -6494,7 +6531,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             if "dry_run_preview" in p:
                 cfg["dry_run_preview"] = p["dry_run_preview"]
             if changes:
-                res = source_scope(None, {"scope": p["scope"]})  # saves
+                res = source_scope(None, {k: p[k] for k in ("scope", "swing")
+                                          if k in p})  # saves
                 if not res.get("ok"):
                     return res
             else:
@@ -7649,6 +7687,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "exact command (pause, resume, dry on/off, set budget N, "
                 "set contracts N, set percent N, set other budget|contracts|"
                 "percent N, other sizing same, other trades on|off, "
+                "swing trades on|off, "
                 "set positions N (most positions open at once), "
                 "set max contracts N (most contracts one trade buys), "
                 "set cap N (new trades per day), stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, auto update on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N, set autopay cap N|auto). Never give investment advice; you may "

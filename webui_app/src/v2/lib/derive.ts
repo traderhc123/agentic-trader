@@ -12,7 +12,7 @@
 //     presented as current: the mode is "unknown" and every panel is stamped
 //     "as of" the last report.
 import type { Activity, Book, Condition, Iso, Notice, Position, Status } from "../../lib/viewModel";
-import { GUARD_STILL, UNMANAGED_FALLBACK, UNMANAGED_SHORT, UNMANAGED_WHY, answerWhy, describe, exitLossWhy, leftToday, nextSay, own, sellsFor, sizeEach, type Go, type IconName, type NextSay } from "./copy.ts";
+import { BOOK_LABEL, GUARD_STILL, UNMANAGED_FALLBACK, UNMANAGED_SHORT, UNMANAGED_WHY, answerWhy, describe, exitLossWhy, leftToday, nextSay, own, sellsFor, sizeEach, type Go, type IconName, type NextSay, type SignalBook } from "./copy.ts";
 import { hintWords, v2Words } from "./settings.ts";
 import { contractName, etDayKey, etTime, etWhen, dayLong, plural, span, secondsBetween, usd } from "./format.ts";
 import { PRACTICE_BANNER_TEXT } from "../../lib/modeText.ts";
@@ -48,6 +48,57 @@ const their = (n: number, one: string, many: string) => (n === 1 ? one : many);
 
 export const realPositions = (s: Status) => s.positions.filter((p) => p.real);
 export const practicePositions = (s: Status) => s.positions.filter((p) => !p.real);
+
+const BOOK_ORDER: (SignalBook | null)[] = ["main", "other", "swing", null];
+
+/** One holdings group's positions by signal category: main pick, other
+ *  trades, swing trades, then the ones that don't say. A group that holds
+ *  no swing trade and only one category stays one list (book "all"): the
+ *  split is there so a multi-day swing position is never mixed in with the
+ *  day trades. */
+export function holdSplit(ps: Position[]): { book: SignalBook | null | "all"; list: Position[] }[] {
+  const books = new Set(ps.map((p) => p.book ?? null));
+  if (!books.has("swing") && books.size <= 1) return ps.length ? [{ book: "all", list: ps }] : [];
+  return BOOK_ORDER.filter((b) => books.has(b)).map((b) => ({ book: b, list: ps.filter((p) => (p.book ?? null) === b) }));
+}
+
+export interface SignalRow {
+  book: SignalBook;
+  label: string;
+  /** the agent takes this category's new entries now */
+  on: boolean;
+  multiDay: boolean;
+  open: number;
+  today: number;
+  total: number;
+  closed: number;
+  unmeasured: number;
+}
+
+/** Results by signal category for one money book (real money, practice or a
+ *  broker's paper-trading account): each category apart. A category that is
+ *  off and never had anything is left out, except swing trades, which are
+ *  always listed so the owner sees they exist (and are off). */
+export function signalRows(s: Status, money: "real" | "practice" | "paper_account"): SignalRow[] {
+  const by = s.results.by_signal;
+  if (!by) return [];
+  return (["main", "other", "swing"] as SignalBook[])
+    .map((b) => {
+      const x = by[b];
+      return {
+        book: b,
+        label: BOOK_LABEL[b],
+        on: x.on,
+        multiDay: x.multi_day,
+        open: x.open[money],
+        today: x.today[money],
+        total: x.total[money],
+        closed: x.closed[money],
+        unmeasured: x.unmeasured[money],
+      };
+    })
+    .filter((r) => r.on || r.book === "swing" || r.open || r.closed || r.unmeasured || r.total);
+}
 
 /** The real positions the agent is NOT selling right now. When the status
  *  says "not managed" but names none, every real position counts. */
