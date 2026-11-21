@@ -9461,7 +9461,7 @@ def _credit_check(cfg, hc, token, check, have_pass=False):
 def _autotopup_check(cfg, hc, check):
     """Auto top-up on or off, with its cap (an information line)."""
     if cfg.get("credit_autotopup"):
-        caps = hc.autopay_caps(cfg)
+        caps = hc.autopay_caps(cfg, "topup")
         usd = hc._whole(cfg.get("credit_topup_usd", hc.CREDIT_TOPUP_DEFAULT_USD)) \
             or hc.CREDIT_TOPUP_DEFAULT_USD
         detail = (f"on — buys {hc.usd_words(usd)} when the balance can't cover "

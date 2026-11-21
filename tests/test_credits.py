@@ -327,7 +327,13 @@ def test_credit_notices_come_once_a_day(clock, feed, alerts):
     ("exits_only", "exits_only", PASS),
     (None, "exits_only", TOKEN),
 ])
-def test_an_active_pass_comes_before_credits(clock, pass_status, credit_status, want):
+def test_an_active_pass_comes_before_credits(clock, monkeypatch, pass_status,
+                                             credit_status, want):
+    # used-up credits behind a used-up pass are asked again: still used up
+    monkeypatch.setattr(hc, "pass_status", lambda tok: {
+        "kind": "credits", "status": "exits_only", "balance_cents": 0,
+        "entry_tracks": [], "entry_prices_usd": {"main": 10.0, "other": 2.0},
+        "access_until": "2036-01-01T00:00:00+00:00"})
     cfg = cfg_(feed_pass={"token": PASS})
     st = state_(status=credit_status)
     if pass_status:
@@ -640,6 +646,89 @@ def test_an_owners_fixed_caps_are_used_exactly_in_credits_mode(monkeypatch):
     assert hc.autopay_cap_words(cfg_(max_autopay_sats=45_000)) == "Fixed: 45,000 sats"
 
 
+def _day_price(monkeypatch, sats=50_000):
+    monkeypatch.setattr(hc, "_price_cache",
+                        {"at": float("inf"), "usd": {1: 50.0}, "sats": {1: sats}})
+
+
+def test_a_credits_account_never_shrinks_the_day_pass_cap(monkeypatch):
+    _offer_on(monkeypatch)
+    _day_price(monkeypatch)                         # 50,000 × 1.10 = 55,000
+    cfg = cfg_(credit_topup_usd=20)                 # a $20 top-up: 22,000
+    day = hc.autopay_caps(cfg, "daypass")
+    assert day["per_invoice"] == day["per_day"] == 55_000
+    assert day["auto_basis"] == "server_sats" and "auto_usd" not in day
+    top = hc.autopay_caps({**cfg, "day_pass_recurring": True}, "topup")
+    assert top["per_invoice"] == 22_000 and top["auto_basis"] == "credits_topup"
+    # what the owner is shown: the top-up price, unless recurring day-pass is ON
+    assert hc.autopay_caps(cfg)["auto_basis"] == "credits_topup"
+    assert hc.autopay_caps({**cfg, "day_pass_recurring": True})["per_invoice"] == 55_000
+    # a credits account is not a prepaid pass: the owner's re-buy choice stands
+    assert not hc._one_pass_a_day(cfg_(max_autopay_sats_per_day=120_000))
+    assert hc._one_pass_a_day(cfg_(max_autopay_sats_per_day=120_000,
+                                   feed_pass={"token": PASS}))
+
+
+def test_an_unpaid_top_up_never_blocks_the_recurring_day_pass(monkeypatch, clock, alerts):
+    from test_daypass_payments import Feed, Wallet
+    _offer_on(monkeypatch)
+    _day_price(monkeypatch)
+    feed, wallet = Feed(sats=50_000), Wallet()
+    monkeypatch.setattr(hc.requests, "get", feed.get)
+    monkeypatch.setattr(hc, "wallet_from_cfg", lambda cfg: wallet)
+    cfg = cfg_(day_pass_recurring=True, credit_topup_usd=20,
+               lnbits_url="https://wallet.example", lnbits_admin_key="k")
+    now = clock.time()
+    # the owner asked for a $20 top-up in the dashboard and hasn't paid it
+    st = state_(status="pending", balance=0, tracks=())
+    st["pass_status"][hc._token_id(TOKEN)].update(checked=now, first_seen=now)
+    hc.poll(cfg, st)
+    assert len(wallet.paid) == 1 and st["autopay_spent"]["sats"] == 50_000
+
+
+def test_used_up_credits_behind_a_used_up_pass_are_asked_again(clock, monkeypatch):
+    now = clock.time()
+    cfg = cfg_(feed_pass={"token": PASS})
+    st = state_(balance=0, status="exits_only", tracks=())
+    st["pass_status"][hc._token_id(TOKEN)]["checked"] = now
+    st["pass_status"][hc._token_id(PASS)] = {
+        "status": "exits_only", "until_ts": now + 3 * 86400, "checked": now,
+        "first_seen": now - 9e5}
+    asked = []
+
+    def status(tok):
+        asked.append(tok)
+        assert tok == TOKEN
+        return {"kind": "credits", "status": "active", "balance_cents": 5000,
+                "entry_tracks": ["main", "other"],
+                "entry_prices_usd": {"main": 10.0, "other": 2.0},
+                "access_until": "2036-11-21T00:00:00+00:00"}
+
+    monkeypatch.setattr(hc, "pass_status", status)
+    assert hc._refresh_pass(cfg, st, lambda s: None) == PASS
+    assert asked == []                              # just checked: not yet
+    clock.tick(minutes=2)                           # the owner topped up meanwhile
+    assert hc._refresh_pass(cfg, st, lambda s: None) == TOKEN
+    assert asked == [TOKEN]
+    # while a pass still has days left, used-up credits cost no request
+    st["pass_status"][hc._token_id(TOKEN)].update(status="exits_only", checked=0)
+    st["pass_status"][hc._token_id(PASS)]["status"] = "active"
+    assert hc._refresh_pass(cfg, st, lambda s: None) == PASS
+    assert asked == [TOKEN]
+
+
+def test_reading_with_used_up_credits_needs_no_extra_status_check(clock, feed, alerts,
+                                                                  monkeypatch):
+    monkeypatch.setattr(hc, "pass_status",
+                        lambda tok: pytest.fail("asked again while reading"))
+    feed.reply = body([ev("EXITED")], balance=0, tracks=(), exits_only=True)
+    st = state_(balance=0, status="exits_only", tracks=())
+    for _ in range(3):
+        clock.tick(minutes=2)
+        hc.poll(cfg_(), st)
+    assert len(feed.reads) == 3
+
+
 # ── 9. what the owner reads ──────────────────────────────────────────────────
 
 def test_pass_summary_says_the_servers_balance():
@@ -830,6 +919,17 @@ def test_auto_top_up_switch_is_two_steps_and_never_a_phone_route(home, app):
     saved = read_cfg(home)
     assert saved["credit_autotopup"] is True and saved["credit_topup_usd"] == 50
     assert saved["credit_autotopup_on_at"]
+    # changing only the size while it is on does not restart a stopped
+    # auto top-up: only switching it off and on again does
+    on_at = saved["credit_autotopup_on_at"] = "2026-01-01T00:00:00Z"
+    write_cfg(home, saved)
+    c.post("/api/credits/autotopup", {"on": True, "usd": 100})
+    assert read_cfg(home)["credit_topup_usd"] == 100
+    assert read_cfg(home)["credit_autotopup_on_at"] == on_at
+    c.post("/api/credits/autotopup", {"on": False})
+    assert read_cfg(home)["credit_autotopup_on_at"] == on_at
+    c.post("/api/credits/autotopup", {"on": True})
+    assert read_cfg(home)["credit_autotopup_on_at"] != on_at
     # bad sizes and values change nothing
     for bad in ({"on": "yes"}, {"on": True, "usd": 30}, {"on": True, "usd": True}):
         assert c.post("/api/v2/credits/autotopup", bad)["ok"] is False

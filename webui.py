@@ -3621,8 +3621,9 @@ CREDIT_TOPUP_SIZES = (20, 50, 100)
 def _set_autotopup(cfg, save, on, usd=None):
     """Switch trade-credits auto top-up on or off (owner only: never from a
     setup plan or the phone), and the size it buys. Notes when it was last
-    switched ON: that restarts an auto top-up the agent stopped (a paid
-    top-up AgentHC didn't credit)."""
+    switched from off to ON: only that restarts an auto top-up the agent
+    stopped (a paid top-up AgentHC didn't credit) — changing the size while
+    it is on does not."""
     if not isinstance(on, bool):
         return {"ok": False, "error": "on must be true or false"}
     if usd is not None and (isinstance(usd, bool) or usd not in CREDIT_TOPUP_SIZES):
@@ -3630,10 +3631,11 @@ def _set_autotopup(cfg, save, on, usd=None):
     if on and not (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")):
         return {"ok": False, "error": "Connect a wallet first: without one "
                 "there is nothing to pay a top-up from."}
+    was_on = bool(cfg.get("credit_autotopup"))
     cfg["credit_autotopup"] = on
     if usd is not None:
         cfg["credit_topup_usd"] = usd
-    if on:
+    if on and not was_on:
         import time
         cfg["credit_autotopup_on_at"] = time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -6381,7 +6383,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 return {"ok": True, "saved": False,
                         "note": "Nothing to change: that is your setting already."}
             from sources import agenthc_day_trade_ideas as hc
-            caps = hc.autopay_caps({**cfg, "credit_topup_usd": usd})
+            caps = hc.autopay_caps({**cfg, "credit_topup_usd": usd}, "topup")
             changes = []
             if was != p["on"]:
                 changes.append(_change(
@@ -6424,7 +6426,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 return {"ok": True, "saved": False,
                         "note": "Nothing to change: that is your setting already."}
             from sources import agenthc_day_trade_ideas as hc
-            caps = hc.autopay_caps(cfg)
+            caps = hc.autopay_caps(cfg, "daypass")
             wait = _two_step("recurring", p, data, [_change(
                 "day_pass_recurring", "Buy a day-pass automatically", was,
                 p["on"], "raises_risk" if p["on"] else "lowers_risk")], [

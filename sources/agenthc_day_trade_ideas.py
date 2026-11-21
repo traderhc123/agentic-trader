@@ -114,6 +114,7 @@ _USABLE = ("active", "exits_only")
 _PENDING_RECHECK_S = 60         # status poll cadence while an invoice is unpaid
 _INVOICE_LIFETIME_S = 3600      # server invoices expire after 1h
 _UNPAID_RECHECK_S = 3600        # an invoice AgentHC called unpaid: asked again this often
+_CREDIT_EXITS_RECHECK_S = 60    # used-up credits outranked by a used-up pass: asked again this often
 
 # Wallet day-pass (the agent pays ~$50 from its own wallet).
 _DAYPASS_S = 23 * 3600          # how long the agent uses a paid day-pass token
@@ -363,17 +364,24 @@ def auto_autopay_cap():
     return {"sats": min(sats, AUTOPAY_AUTO_CEILING_SATS), "basis": basis}
 
 
-def autopay_caps(cfg):
+def autopay_caps(cfg, purpose=None):
     """The auto-pay caps in force: {"per_invoice": n, "per_day": n,
     "per_invoice_auto": bool, "per_day_auto": bool, "auto_basis": str |
     None}. per_day defaults to the per-invoice cap (one pass a day). In
     credits mode the auto basis is "credits_topup" (the chosen top-up's
-    sats + 10%, "auto_usd" = its size) and per_day defaults to two of them."""
+    sats + 10%, "auto_usd" = its size) and per_day defaults to two of them.
+
+    purpose says what is being paid: "daypass" always uses the day price
+    (a credits account never shrinks the cap a wallet day-pass is paid
+    under), "topup" always the top-up price; None (what to show the owner)
+    uses the top-up price in credits mode unless recurring day-pass is ON."""
     inv = owner_autopay_cap(cfg.get("max_autopay_sats"))
     day = owner_autopay_cap(cfg.get("max_autopay_sats_per_day"))
     # credits mode (a credits account, and AgentHC sells credits): "auto"
     # follows the chosen top-up's price, and a day may hold two top-ups
-    credit = _credit_auto_cap(cfg) if inv is None else None
+    use_credit = (purpose == "topup"
+                  or (purpose is None and not cfg.get("day_pass_recurring")))
+    credit = _credit_auto_cap(cfg) if inv is None and use_credit else None
     auto = (credit or auto_autopay_cap()) if inv is None else None
     per_invoice = inv if inv is not None else auto["sats"]
     per_day = day if day is not None else (
@@ -1097,7 +1105,14 @@ def _refresh_pass(cfg, state, save_state, force=False):
                  or _pass_status_unknown(cfg, rec, token, now)
                  or (st == "pending" and now - rec.get("checked", 0) > _PENDING_RECHECK_S)
                  or (st == "unpaid" and now - rec.get("checked", 0) > _UNPAID_RECHECK_S)
-                 or (st in _USABLE and now > rec.get("until_ts", 0)))
+                 or (st in _USABLE and now > rec.get("until_ts", 0))
+                 # used-up credits behind a used-up pass's exits are never
+                 # read, so a top-up the owner paid since would go unseen:
+                 # ask AgentHC again (no request while a pass has days left,
+                 # nor when the credits are read anyway)
+                 or (token == credit and st == "exits_only"
+                     and best_rank is not None and not best_rank[0]
+                     and now - rec.get("checked", 0) > _CREDIT_EXITS_RECHECK_S))
         if stale:
             try:
                 fresh = pass_status(token)
@@ -1748,7 +1763,7 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
         if time.time() < float(state.get("daypass_retry_at") or 0):
             return False  # the last try failed (already reported): wait a bit
         spent = _autopay_spent_today(state, now)
-        cap = autopay_caps(cfg)["per_day"]
+        cap = autopay_caps(cfg, "daypass")["per_day"]
         if spent["sats"] >= cap:
             day = now.strftime("%Y-%m-%d")
             if state.get("autopay_cap_notified") != day:
@@ -1854,8 +1869,10 @@ def _no_receipt_stop(cfg, state, save_state):
 
 def _one_pass_a_day(cfg):
     """True unless the owner chose to allow more than one wallet day-pass a
-    day by setting max_autopay_sats_per_day (never with a prepaid pass)."""
-    return (bool(_pass_tokens(cfg))
+    day by setting max_autopay_sats_per_day (never with a prepaid pass; a
+    trade-credits account is not one and leaves the owner's choice as it is)."""
+    credit = _credit_token(cfg)
+    return (any(t != credit for t in _pass_tokens(cfg))
             or owner_autopay_cap(cfg.get("max_autopay_sats_per_day")) is None)
 
 
@@ -1888,13 +1905,13 @@ def _daily_autopay_cap(cfg):
     without this cap the agent would re-buy on every poll and drain the
     wallet. Counted from the amounts in the invoices themselves; only
     payments that went through, or whose outcome is still unknown, count."""
-    return autopay_caps(cfg)["per_day"]
+    return autopay_caps(cfg, "daypass")["per_day"]
 
 
 def autopay_refusal_text(amount, cfg, caps=None):
     """Why a day-pass invoice above the per-invoice cap was not paid: the
     cap in force now and how to raise it."""
-    caps = caps or autopay_caps(cfg)
+    caps = caps or autopay_caps(cfg, "daypass")
     need = _plus_margin_k(amount)
     return (f"The day-pass costs {amount:,} sats, which is more than your "
             f"auto-pay cap for one pass ({caps['per_invoice']:,} sats), so "
@@ -2189,7 +2206,7 @@ def _pay_day_pass(cfg, state, body, save_state, running_until=None):
         raise InvoiceRefused(
             "The feed sent a Lightning invoice that is not the one its "
             "day-pass belongs to, so the agent did not pay it. Nothing was paid.")
-    caps = autopay_caps(cfg)
+    caps = autopay_caps(cfg, "daypass")
     cap = caps["per_invoice"]
     if amount > cap:
         raise InvoiceRefused(autopay_refusal_text(amount, cfg, caps))
@@ -2751,9 +2768,11 @@ def _poll_with_credits(cfg, state, save_state, token, body, params):
     new = {"kind": "credits", "status": "active" if covered else "exits_only",
            "balance_cents": bal, "entry_tracks": sorted(tracks),
            "entry_prices_cents": prices or rec.get("entry_prices_cents") or {}}
+    # AgentHC just answered for this account: no separate status check is
+    # due (saved with the next change)
+    rec["checked"] = time.time()
     if any(rec.get(k) != v for k, v in new.items()):
         rec.update(new)
-        rec.setdefault("checked", time.time())
         save_state(state)
     _note_credit_offer(cr.get("top_up"), cr.get("entry_prices_usd"))
     need = max((new["entry_prices_cents"].get(t) or 0) for t in wanted)
@@ -2894,7 +2913,7 @@ def _pay_topup(cfg, state, save_state, wallet, token, usd):
                      "AgentHC said it made, so the agent did not pay it. "
                      "Nothing was paid.")
         return "failed"
-    caps = autopay_caps(cfg)
+    caps = autopay_caps(cfg, "topup")
     spent = _autopay_spent_today(state)
     if sats > caps["per_invoice"] or spent["sats"] + sats > caps["per_day"]:
         over = ("one payment" if sats > caps["per_invoice"] else "one day")
