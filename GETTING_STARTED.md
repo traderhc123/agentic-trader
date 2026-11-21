@@ -261,7 +261,8 @@ docker run -d --name agentic-trader --restart on-failure -v agentic-trader-data:
   high-conviction pick unless you opt into "other trades" (the wider journal,
   several entries a day) during setup — or later via
   `"include_other_trades": true` in `~/.agentic-trader/config.json`. The daily
-  cap and per-trade budget apply either way.
+  cap and per-trade budget apply either way. "Swing Trade":
+  `"include_swing_trades": true` (default off; chat `swing trades on|off`).
 - **Three ways to size, per book**: a fixed dollar amount, a fixed number
   of contracts, or a percent of your account value per trade. The main book
   (the daily pick) and the shadow book ("other trades") each pick their own —

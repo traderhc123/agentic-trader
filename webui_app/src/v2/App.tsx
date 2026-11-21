@@ -161,7 +161,7 @@ function PositionDrawer({ p, page, onClose }: { p: Position; page: Page; onClose
           <dt>Where</dt>
           <dd>{p.real ? brokerLabel(s) : "Agent's practice records only"}</dd>
           <dt>Signal type</dt>
-          <dd>{p.book === "other" ? "Other trades" : p.book === "main" ? "Main pick" : "not recorded"}</dd>
+          <dd>{p.book === "other" ? "Other trades" : p.book === "swing" ? "Swing Trade" : p.book === "main" ? "Main pick" : "not recorded"}</dd>
           <dt>Value now</dt>
           <dd>
             <small>{p.real ? `Not tracked yet. ${b} shows the live price.` : "Not tracked for practice positions."}</small>

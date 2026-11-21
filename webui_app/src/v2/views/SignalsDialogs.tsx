@@ -168,6 +168,32 @@ export function ScopeDialog({ page, onClose }: { page: Page; onClose: () => void
   );
 }
 
+/** "Swing Trade" signals on or off: the server's preview of the switch, then confirm. */
+export function SwingDialog({ page, onClose }: { page: Page; onClose: () => void }) {
+  const v = page.settings.view as SettingsView;
+  const next = !v.signals.include_swing_trades;
+  const payload = { include_swing_trades: next };
+  const ask = usePreview(API.signals, payload);
+  if (ask.kind !== "review") return <Asking title="Swing Trade" ask={ask} onClose={onClose} />;
+  return (
+    <ReviewDialog
+      path={API.signals}
+      payload={payload}
+      first={ask.preview}
+      title={next ? "Take Swing Trade signals?" : "Stop taking Swing Trade signals?"}
+      lead={next ? undefined : "Swing trades it already holds are still sold on their exit signals."}
+      cancel="Keep it as it is"
+      confirm={next ? "Turn on" : "Turn off"}
+      live={page.s.mode === "live"}
+      onClose={onClose}
+      onDone={async () => {
+        await saved(page, (nv) => `Saved. Swing Trade: ${nv.signals.include_swing_trades ? "on" : "off"}.`);
+        onClose();
+      }}
+    />
+  );
+}
+
 /** The AgentHC subscription key: write-only, saved straight away. */
 export function KeyDialog({ page, onClose }: { page: Page; onClose: () => void }) {
   const v = page.settings.view as SettingsView;

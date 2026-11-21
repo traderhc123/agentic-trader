@@ -87,7 +87,7 @@ interface Entry {
 const skipped = (c: Ctx) => `A signal to buy ${c.name} arrived and the agent did not act on it. No order was sent.`;
 const nothing = () => "Nothing needed.";
 const ownLimit = "Nothing needed. This is your own limit doing its job.";
-const bookWord = (e: Activity) => (e.book === "other" ? "other trades" : e.book === "main" ? "main pick" : "");
+const bookWord = (e: Activity) => (e.book === "other" ? "other trades" : e.book === "swing" ? "Swing Trade" : e.book === "main" ? "main pick" : "");
 const withNote = (c: Ctx, lead: string) => (c.note ? `${lead} ${c.note}` : lead);
 /** "paper-account" for an order the row records as sent to a broker's
  *  paper-trading account, else "real" */

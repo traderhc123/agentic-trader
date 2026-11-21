@@ -39,6 +39,7 @@ export type ActionId =
   | "buy-days"
   | "source"
   | "scope"
+  | "swing"
   | "api-key"
   | "preview"
   | "wallet-create"
@@ -87,6 +88,7 @@ export const ACTION_HOME: Record<ActionId, Home> = {
   "buy-days": "signals",
   source: "signals",
   scope: "signals",
+  swing: "signals",
   "api-key": "signals",
   preview: "signals",
   "wallet-create": "signals",
@@ -196,7 +198,7 @@ export function screenOf(view: View, s: Status, l: Link): Screen {
     if (statement(s, l).empty || todayLimitsLink(s, l)) links.push("rules");
   } else if (view === "rules") controls.push("limits", "size", "filters", "policy");
   else if (view === "signals") {
-    controls.push("buy-days", "source", "scope", "api-key", "wallet-create", "wallet-fund", "wallet-connect", "wallet-page", "recurring");
+    controls.push("buy-days", "source", "scope", "swing", "api-key", "wallet-create", "wallet-fund", "wallet-connect", "wallet-page", "recurring");
     if (s.mode === "practice") controls.push("preview");
   }
   else if (view === "settings") {

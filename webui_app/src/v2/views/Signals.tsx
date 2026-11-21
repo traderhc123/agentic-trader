@@ -15,7 +15,7 @@ import { UNKNOWN, count, etDayKey, etWhen, plural, tone, usd } from "../lib/form
 import { Dialog, Icon, Stamp } from "../ui";
 import { PayCode } from "./Pay";
 import { Row } from "./Pages";
-import { ConnectWalletDialog, CreateWalletDialog, FundDialog, KeyDialog, RecurringDialog, ScopeDialog, SourceDialog } from "./SignalsDialogs";
+import { ConnectWalletDialog, CreateWalletDialog, FundDialog, KeyDialog, RecurringDialog, ScopeDialog, SourceDialog, SwingDialog } from "./SignalsDialogs";
 import type { Page } from "../App";
 
 
@@ -258,7 +258,7 @@ function BuyDays({ page, onClose }: { page: Page; onClose: () => void }) {
   );
 }
 
-type Open = "source" | "scope" | "key" | "wallet-create" | "wallet-connect" | "wallet-fund" | "recurring" | null;
+type Open = "source" | "scope" | "swing" | "key" | "wallet-create" | "wallet-connect" | "wallet-fund" | "recurring" | null;
 
 /** Where the signals come from: the source, which AgentHC signals, and the
  *  subscription key. One control each. */
@@ -287,6 +287,17 @@ function SourcePanel({ page, open }: { page: Page; open: (o: Open) => void }) {
           act={
             <button className="btn btn-sm" data-act="scope" aria-haspopup="dialog" disabled={!!why} onClick={() => open("scope")}>
               {v.signals.include_other_trades ? "Main pick only…" : "Take other trades too…"}
+            </button>
+          }
+        />
+      )}
+      {hc && v && (
+        <Row
+          label="Swing Trade"
+          exp={v.signals.include_swing_trades ? "On." : "Off."}
+          act={
+            <button className="btn btn-sm" data-act="swing" aria-haspopup="dialog" disabled={!!why} onClick={() => open("swing")}>
+              {v.signals.include_swing_trades ? "Turn off…" : "Turn on…"}
             </button>
           }
         />
@@ -640,6 +651,7 @@ export function SignalsView({ page }: { page: Page }) {
       {buying && <BuyDays page={page} onClose={() => setBuying(false)} />}
       {open === "source" && page.settings.view && <SourceDialog page={page} onClose={() => setOpen(null)} />}
       {open === "scope" && page.settings.view && <ScopeDialog page={page} onClose={() => setOpen(null)} />}
+      {open === "swing" && page.settings.view && <SwingDialog page={page} onClose={() => setOpen(null)} />}
       {open === "key" && page.settings.view && <KeyDialog page={page} onClose={() => setOpen(null)} />}
       {open === "wallet-create" && page.settings.view && <CreateWalletDialog page={page} onClose={() => setOpen(null)} />}
       {open === "wallet-connect" && page.settings.view && <ConnectWalletDialog page={page} onClose={() => setOpen(null)} />}

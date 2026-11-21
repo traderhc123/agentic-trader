@@ -931,20 +931,27 @@ def _row_track(row):
     one in the id of the event that opened it (only a non-main AgentHC id
     ends in "|<track>": ENTERED|T|expiry|strike|type|occurred_at[|track]),
     else None (a row that doesn't say: a practice row of an older version).
-    Its "book" (agent per-book exits: "main" | "shadow") wins over a track
-    that contradicts it, as in the agent (agent._row_book / _row_track)."""
+    Its "book" (agent per-book exits: "main" | "shadow" | "swing") wins
+    over a track that contradicts it, as in the agent (agent._row_book /
+    _row_track); a "shadow" row of any non-main track is consistent."""
     track, book = row.get("track"), row.get("book")
-    book = book if book in ("main", "shadow") else None
+    book = book if book in ("main", "shadow", "swing") else None
     if (isinstance(track, str) and track
-            and (book is None or (track == "main") == (book == "main"))):
+            and (book is None or _book_of(track) == book
+                 or (book == "shadow" and track != "main"))):
         return track
     if book is not None:
-        return "main" if book == "main" else "other"
+        return "other" if book == "shadow" else book
     opened = row.get("opened_event")
     if isinstance(opened, str) and opened:
         parts = opened.split("|")
         return parts[6] if len(parts) >= 7 and parts[6] else "main"
     return None
+
+
+def _book_of(track):
+    """The agent's book for a track (agent._book_of_track)."""
+    return {"main": "main", "swing": "swing"}.get(track, "shadow")
 
 
 def held_as_other(row):
@@ -978,7 +985,8 @@ def _last_read(state):
 
 def _feed_params(cfg, state):
     """{"limit", "track"} for the next read of the feed."""
-    track = ("all" if cfg.get("include_other_trades") or _holds_other_track(state)
+    track = ("all" if cfg.get("include_other_trades")
+             or cfg.get("include_swing_trades") or _holds_other_track(state)
              else "main")
     last = _last_read(state).get("local")
     gap = (not isinstance(last, (int, float)) or isinstance(last, bool)
@@ -2144,7 +2152,8 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     Signal scope (config `include_other_trades`, default False): the main
     daily pick only, or main + AgentHC's "other trades" journal (its wider
     shadow book — several entries a day; your daily entry cap and budget
-    still apply per trade).
+    still apply per trade). Config `include_swing_trades` (default False):
+    "Swing Trade" signals too.
     """
     # until the feed is actually read (below)
     _LAST_POLL.update(access=False, exits=False, why="")
@@ -2466,6 +2475,10 @@ def setup(cfg):
     saved = "2" if cfg.get("include_other_trades") else "1"
     scope = input(f"Choose [1/2, default {saved}]: ").strip() or saved
     cfg["include_other_trades"] = scope == "2"
+    saved = "y" if cfg.get("include_swing_trades") else "n"
+    swing = input(f"Also take \"Swing Trade\" signals? [y/n, default {saved}]: "
+                  ).strip().lower() or saved
+    cfg["include_swing_trades"] = swing.startswith("y")
     print(f"  1) Lightning day-pass — the agent pays "
           f"~{usd_words(day_pass_price()['usd'])}/day in sats from its")
     print("     own wallet, no account needed (recommended for agents)")

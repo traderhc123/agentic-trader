@@ -163,6 +163,7 @@ def _settings(tab):
                    "warning": None},
         "signals": {"source": cfg.get("source"),
                     "include_other_trades": bool(cfg.get("include_other_trades")),
+                    "include_swing_trades": bool(cfg.get("include_swing_trades")),
                     "dry_run_preview": cfg.get("dry_run_preview", True) is not False,
                     "recurring": bool(cfg.get("day_pass_recurring")),
                     "wallet_connected": bool(cfg.get("lnbits_url")),
@@ -403,6 +404,8 @@ def _v2_post(tab, path, data):
         if path.endswith("signals"):
             if "scope" in data:
                 cfg["include_other_trades"] = data["scope"] == "all"
+            if "include_swing_trades" in data:
+                cfg["include_swing_trades"] = data["include_swing_trades"]
             if "dry_run_preview" in data:
                 cfg["dry_run_preview"] = data["dry_run_preview"]
         elif path.endswith("source") and "source" in data:

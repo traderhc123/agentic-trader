@@ -75,8 +75,8 @@ and apply them in one step. Order:
    **LIVE**, a plan may only leave trading as it is or make it smaller or
    stricter: it is refused if it would change the broker account, raise the
    per-trade size, raise a safety cap, change the signal source (its type
-   or web address), turn on `include_other_trades`, remove or widen a rule,
-   or replace an existing policy. For those, the human first says `dry on`
+   or web address), turn on `include_other_trades` or `include_swing_trades`,
+   remove or widen a rule, or replace an existing policy. For those, the human first says `dry on`
    in the dashboard, you apply the plan, and they say `dry off` once they
    have checked the new settings. **Tell them what `dry on` does:** it
    stops new trades only — a position the agent already bought with a real
