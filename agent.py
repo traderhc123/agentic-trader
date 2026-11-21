@@ -2320,16 +2320,32 @@ def _pause_note(cfg, state):
         return MOVE_EXITS_NOTE
     if not _paused(cfg) or not _feed_paid_per_day(cfg):
         return ""
+    credits = _credit_access(cfg)
     if _real_positions(state):
         wallet = _no_pass_exits_note(cfg, state, "paused")
         if wallet:
             return wallet
+        if credits:
+            return ("While a real position is open the agent still reads the "
+                    "signal feed to get its exit signal. A read while paused "
+                    "uses no trade credits: entries aren't requested, and "
+                    "exits are free.")
         return ("While a real position is open the agent still reads the "
                 "signal feed to get its exit signal. A paused agent tells "
                 "AgentHC it is off, so this uses no signal day, and it does "
                 "not buy a day-pass.")
     return ("No real position is open, so the agent is not reading the signal "
-            "feed: the pause uses no signal day.")
+            "feed: the pause uses no "
+            + ("trade credits." if credits else "signal day."))
+
+
+def _credit_access(cfg):
+    """The agent has a trade-credits account with AgentHC (no request)."""
+    try:
+        from sources import agenthc_day_trade_ideas as hc
+        return bool(hc._credit_token(cfg)) and not cfg.get("agenthc_api_key")
+    except Exception:
+        return False
 
 
 def _dry_size(cfg, event, broker, client):
@@ -8967,6 +8983,10 @@ def cmd_run(app_window=False):
                     try:
                         # the mode this read says to the feed (only LIVE
                         # uses a signal day or buys a day-pass)
+                        if hasattr(source, "set_entry_wish"):
+                            # paused / a move's exits-only: a trade-credits
+                            # read asks for no entries (none is charged)
+                            source.set_entry_wish("none" if _paused(cfg) else None)
                         events = source.poll(
                             {**cfg, "feed_mode": _feed_mode(cfg, state)},
                             state, save_state)
@@ -9164,6 +9184,9 @@ def cmd_status():
     if tok.get("expires_at", 0) > time.time():
         mins = int((tok["expires_at"] - time.time()) / 60)
         print(f"day-pass         : active, ~{mins} min remaining")
+    elif _credit_access(cfg):
+        from sources import agenthc_day_trade_ideas as hc
+        print(f"feed access      : {hc.pass_summary(cfg, state)}")
     else:
         print("day-pass         : none (bought automatically on next 402)")
     broker_name = cfg.get("broker", "robinhood")
@@ -9398,13 +9421,89 @@ def doctor_checks():
     return checks, cfg
 
 
+def _credit_check(cfg, hc, token, check, have_pass=False):
+    """The doctor's trade-credits line. True when it said something (the
+    pass lines are then skipped)."""
+    try:
+        st = hc.credit_status(token)
+    except Exception:
+        return False
+    status = st.get("status")
+    rec = {"status": status}
+    hc._credit_fields(cfg, rec, st)   # active / exits_only for this agent's tracks
+    left = st.get("entries_left") if isinstance(st.get("entries_left"), dict) else {}
+    bal = rec.get("balance_cents") or 0
+    if rec["status"] == "active":
+        counts = f"{left.get('main', 0)} main"
+        if cfg.get("include_other_trades"):
+            counts += f" / {left.get('other', 0)} other"
+        check("feed_access", True, "Feed access",
+              f"AgentHC trade credits: ${bal / 100:,.2f} ({counts} entries)")
+        return True
+    if have_pass:
+        return False   # a used-up pass says its own line
+    if rec["status"] == "exits_only":
+        check("feed_access", False, "Feed access",
+              f"trade credits used up (${bal / 100:,.2f} left) — top up "
+              "(exits still free)",
+              "the OWNER tops up on the Signals page, or turns on auto top-up",
+              who="owner")
+        return True
+    if status == "pending":
+        check("feed_access", False, "Feed access",
+              "trade credits: the first top-up isn't paid yet",
+              "the OWNER pays the top-up invoice shown on the Signals page",
+              who="owner")
+        return True
+    return False
+
+
+def _autotopup_check(cfg, hc, check):
+    """Auto top-up on or off, with its cap (an information line)."""
+    if cfg.get("credit_autotopup"):
+        caps = hc.autopay_caps(cfg)
+        usd = hc._whole(cfg.get("credit_topup_usd", hc.CREDIT_TOPUP_DEFAULT_USD)) \
+            or hc.CREDIT_TOPUP_DEFAULT_USD
+        detail = (f"on — buys {hc.usd_words(usd)} when the balance can't cover "
+                  f"the next entry; cap per payment "
+                  f"{hc.autopay_cap_words(cfg, caps)}, per day "
+                  f"{caps['per_day']:,} sats")
+    else:
+        detail = "off — the owner tops up on the Signals page"
+    check("credit_autotopup", True, "Auto top-up (trade credits)", detail)
+    if not cfg.get("credit_autotopup"):
+        return
+    # the wallet must hold one top-up plus LNbits' routing-fee reserve
+    wallet = wallet_from_cfg(cfg)
+    auto = hc._credit_auto_cap(cfg)
+    offer = hc.credit_prices() or {}
+    sats = (offer.get("topup_prices_sats") or {}).get((auto or {}).get("usd"))
+    if not wallet or not sats:
+        return
+    try:
+        from lightning_wallet import fee_reserve_sats
+        bal = wallet.balance_sats()
+        need = int(sats) + fee_reserve_sats(int(sats))
+        check("feed_access_wallet", bal >= need, "Wallet funded",
+              f"{bal:,} sats (one {hc.usd_words(auto['usd'])} top-up needs "
+              f"~{need:,} sats with the LNbits fee reserve)",
+              "python agent.py fund 100000   (the OWNER pays the invoice)",
+              who="owner")
+    except WalletError as exc:
+        check("feed_access_wallet", False, "Lightning wallet", str(exc)[:80],
+              "python agent.py setup   (source step → recreate wallet)")
+
+
 def _feed_access_check(cfg, state, check):
     if cfg.get("agenthc_api_key"):
         check("feed_access", True, "Feed access", "Premium API key set")
         return
     from sources import agenthc_day_trade_ideas as hc
-    tokens = hc._pass_tokens(cfg)
-    if tokens:
+    credit = hc._credit_token(cfg)
+    tokens = [t for t in hc._pass_tokens(cfg) if t != credit]
+    if credit:
+        _autotopup_check(cfg, hc, check)
+    if tokens or credit:
         best, pending = None, False
         for token in tokens:
             try:
@@ -9416,6 +9515,9 @@ def _feed_access_check(cfg, state, check):
                 best = st
             elif st.get("status") == "pending":
                 pending = True
+        if credit and not (best and best.get("status") == "active"):
+            if _credit_check(cfg, hc, credit, check, have_pass=bool(best)):
+                return
         if best:
             if best.get("status") == "exits_only":
                 check("feed_access", False, "Feed access",

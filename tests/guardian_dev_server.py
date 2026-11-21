@@ -175,7 +175,17 @@ def _settings(tab):
                                "new_site": "demo.lnbits.com", "new_warning": None},
                     "api_key": {"set": False, "last4": None}, "pass_on_file": True,
                     # the fixture's invoice is never paid: it stays waiting
-                    "purchases": {"paid": [], "waiting": ["fixture-purchase"]}},
+                    "purchases": {"paid": [], "waiting": ["fixture-purchase"]},
+                    # trade credits: offered by the fixture AgentHC; an
+                    # account only in the credits-* states
+                    "credits": {"offered": True, "account": bool(cfg.get("feed_credits")),
+                                "status": "active" if cfg.get("feed_credits") else None,
+                                "balance_usd": 24.0 if cfg.get("feed_credits") else None,
+                                "entry_prices_usd": {"main": 10.0, "other": 2.0},
+                                "options_usd": [20, 50, 100],
+                                "autotopup": bool(cfg.get("credit_autotopup")),
+                                "topup_usd": cfg.get("credit_topup_usd", 20),
+                                "pending": []}},
     }
 
 
@@ -390,7 +400,8 @@ def _v2_post(tab, path, data):
         tab["proposal"] = False
         return {"ok": True, "reply": "(fixture server) Applied 1 file(s). Restarting."}
     if path in ("/api/v2/settings/source", "/api/v2/settings/signals", "/api/v2/wallet/create",
-                "/api/v2/wallet/fund", "/api/v2/wallet/connect", "/api/v2/wallet/recurring"):
+                "/api/v2/wallet/fund", "/api/v2/wallet/connect", "/api/v2/wallet/recurring",
+                "/api/v2/credits/autotopup"):
         direct = (path.endswith("source") and "agenthc_key" in data) or (
             path.endswith("signals") and set(data) - {"confirm"} == {"dry_run_preview"})
         if token is None and not direct:
@@ -409,6 +420,9 @@ def _v2_post(tab, path, data):
             cfg["source"] = data["source"]
         elif path.endswith("recurring"):
             cfg["day_pass_recurring"] = bool(data.get("on"))
+        elif path.endswith("autotopup"):
+            cfg["credit_autotopup"] = bool(data.get("on"))
+            cfg["credit_topup_usd"] = data.get("usd", 20)
         elif path.endswith("create") or path.endswith("connect"):
             cfg["lnbits_url"] = "https://demo.lnbits.com"
         elif path.endswith("fund"):
@@ -501,7 +515,14 @@ class Handler(BaseHTTPRequestHandler):
                      "keys_url": "console.anthropic.com"}}},
                  "/api/pass/options": lambda: {"options": [1, 5],
                                                "prices_usd": {"1": 50.0, "5": 225.0},
-                                               "prices_sats": {"1": 51600, "5": 232000}},
+                                               "prices_sats": {"1": 51600, "5": 232000},
+                                               "credits": {"pricing": "credits",
+                                                           "options_usd": [20, 50, 100],
+                                                           "paused": False,
+                                                           "topup_prices_sats": {"20": 20600, "50": 51600, "100": 103100},
+                                                           "entry_prices_usd": {"main": 10.0, "other": 2.0},
+                                                           "max_topup_usd": 225,
+                                                           "max_entry_age_s": 600}},
                  "/api/pass/status": lambda: {"status": "pending"},
                  "/api/wallet/balance": lambda: (
                      {"ok": True, "sats": 41200} if tab["cfg"].get("lnbits_url")

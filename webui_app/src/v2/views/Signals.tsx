@@ -5,8 +5,8 @@
 // page says "paid" only when the agent's own pass check says so. The wallet
 // is shown here, read-only.
 import { useEffect, useRef, useState } from "react";
-import type { Invoice, PassCheck, PassOptions, Preview, WalletBalance, WalletPage } from "../../lib/settingsApi";
-import { passPriceUsd, passSavingUsd } from "../../lib/settingsApi";
+import type { CreditOffer, Invoice, PassCheck, PassOptions, Preview, WalletBalance, WalletPage } from "../../lib/settingsApi";
+import { buyTopup, creditPriceWords, passPriceUsd, passSavingUsd, passUsdWords } from "../../lib/settingsApi";
 import type { Status } from "../../lib/viewModel";
 import { FieldError, ReviewDialog, SettingsDoubt, Switch, askPreview } from "../Forms";
 import { API, getJson, send } from "../lib/http";
@@ -15,7 +15,7 @@ import { UNKNOWN, count, etDayKey, etWhen, plural, tone, usd } from "../lib/form
 import { Dialog, Icon, Stamp } from "../ui";
 import { PayCode } from "./Pay";
 import { Row } from "./Pages";
-import { ConnectWalletDialog, CreateWalletDialog, FundDialog, KeyDialog, RecurringDialog, ScopeDialog, SourceDialog } from "./SignalsDialogs";
+import { AutoTopupDialog, ConnectWalletDialog, CreateWalletDialog, FundDialog, KeyDialog, RecurringDialog, ScopeDialog, SourceDialog } from "./SignalsDialogs";
 import type { Page } from "../App";
 
 
@@ -25,6 +25,7 @@ const PASS_KIND: Record<Status["signals"]["pass"]["kind"], string> = {
   subscription: "Subscription key",
   not_needed: "This signal source needs no pass",
   none: "No pass",
+  credits: "Trade credits",
 };
 const PASS_STATUS: Record<Status["signals"]["pass"]["status"], string> = {
   active: "Active",
@@ -255,6 +256,263 @@ function BuyDays({ page, onClose }: { page: Page; onClose: () => void }) {
       <FieldError id="buy-e" text={err} />
       <p className="small muted">This does not change Practice or LIVE, and does not buy or sell anything.</p>
     </Dialog>
+  );
+}
+
+type TopupStep =
+  | { kind: "pick" }
+  | { kind: "review"; usd: number; preview: Preview }
+  | { kind: "pay"; usd: number; inv: Invoice }
+  | { kind: "paid"; usd: number; balance: number | null };
+
+/** Top up trade credits: pick a size AgentHC sells now → the server's
+ *  preview → a Lightning invoice the owner pays from their own wallet app.
+ *  "Paid" only when AgentHC says it credited this top-up; the balance shown
+ *  is AgentHC's, never counted here. */
+function BuyTopup({ page, onClose }: { page: Page; onClose: () => void }) {
+  const [step, setStep] = useState<TopupStep>({ kind: "pick" });
+  const [offer, setOffer] = useState<CreditOffer | null | undefined>(undefined); // undefined: asking
+  const [size, setSize] = useState<number | null>(null);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [payWords, setPayWords] = useState("Waiting for your payment…");
+  const timer = useRef<ReturnType<typeof setInterval>>();
+  const polling = useRef(false);
+  useEffect(() => {
+    getJson<PassOptions>(API.passOptions).then((r) => setOffer(r.ok && r.body.credits ? r.body.credits : null));
+    return () => clearInterval(timer.current);
+  }, []);
+  const sizes = offer?.options_usd ?? [];
+  const review = async () => {
+    if (size == null) return setErr("Pick a top-up size.");
+    setBusy(true);
+    setErr("");
+    const a = await askPreview(API.passBuy, buyTopup(size));
+    setBusy(false);
+    if (a.kind === "review") setStep({ kind: "review", usd: size, preview: a.preview });
+    else setErr(a.kind === "error" ? a.error : a.note);
+  };
+  // every 3 s while the invoice is open: where AgentHC says this top-up stands
+  const watch = (usdAmount: number, hash: string | undefined) => {
+    clearInterval(timer.current);
+    timer.current = setInterval(async () => {
+      if (polling.current) return;
+      polling.current = true;
+      try {
+        const r = await getJson<PassCheck>(API.passStatus);
+        const t = r.ok ? r.body.credits?.topup : null;
+        if (t && (!hash || t.payment_hash === hash) && t.status === "credited") {
+          clearInterval(timer.current);
+          setStep({ kind: "paid", usd: usdAmount, balance: r.ok ? (r.body.credits?.balance_usd ?? null) : null });
+          page.settings.reload();
+          page.refresh();
+        } else if (t && (!hash || t.payment_hash === hash) && t.status === "expired") {
+          clearInterval(timer.current);
+          setPayWords("That payment code expired unpaid. Nothing was paid. Close this and top up again to get a new one.");
+        } else if (!r.ok) setPayWords(`Waiting for your payment… (${r.error})`);
+        else if (r.body.credits?.error) setPayWords(`Waiting for your payment… The last check said: ${r.body.credits.error}`);
+        else setPayWords("Waiting for your payment…");
+      } finally {
+        polling.current = false;
+      }
+    }, 3000);
+  };
+
+  if (step.kind === "review")
+    return (
+      <ReviewDialog<Invoice>
+        path={API.passBuy}
+        payload={buyTopup(step.usd)}
+        first={step.preview}
+        title={`Top up ${passUsdWords(step.usd)} of trade credits?`}
+        lead="Next you get a payment code to pay from your own Lightning wallet app. The price in sats is on it; nothing is paid until you approve it there."
+        cancel="Not now"
+        confirm="Show the payment code"
+        onClose={onClose}
+        onDone={(r) => {
+          const inv = r as unknown as Invoice;
+          if (!inv.bolt11) {
+            setStep({ kind: "pick" });
+            setErr("The agent did not hand back a payment code. Nothing was paid. Try again.");
+            return;
+          }
+          setStep({ kind: "pay", usd: step.usd, inv });
+          watch(step.usd, inv.payment_hash);
+        }}
+      >
+        {() => (
+          <dl className="facts">
+            <dt>Balance now</dt>
+            <dd>{page.s.signals.pass.balance_usd != null ? usd(page.s.signals.pass.balance_usd) : UNKNOWN}</dd>
+            <dt>Price</dt>
+            <dd>
+              {offer?.topup_prices_sats?.[String(step.usd)] ? `About ${count(offer.topup_prices_sats[String(step.usd)])} sats. ` : ""}
+              Exact sats on the payment code <small>AgentHC sets it when the code is made.</small>
+            </dd>
+          </dl>
+        )}
+      </ReviewDialog>
+    );
+
+  if (step.kind === "pay") {
+    const i = step.inv;
+    return (
+      <Dialog
+        title={`Pay for ${passUsdWords(step.usd)} of trade credits`}
+        lead="Scan this with a Bitcoin Lightning wallet app, or copy the code into it, and approve the payment there."
+        onClose={onClose}
+        foot={
+          <button className="btn" onClick={onClose} data-autofocus>
+            Close
+          </button>
+        }
+      >
+        <PayCode bolt11={i.bolt11} qr={i.qr}>
+          <dl className="facts">
+            <dt>Price</dt>
+            <dd>{i.amount_sats != null ? `${count(i.amount_sats)} sats` : UNKNOWN}</dd>
+          </dl>
+        </PayCode>
+        {i.note && <p className="small">{i.note}</p>}
+        <p className="wait" role="status" aria-live="polite">
+          <span className="spin" aria-hidden="true" />
+          {payWords}
+        </p>
+        <p className="small muted">Closing this does not cancel the code: if you pay it later, AgentHC still credits it.</p>
+      </Dialog>
+    );
+  }
+
+  if (step.kind === "paid")
+    return (
+      <Dialog
+        title="Paid"
+        lead={`AgentHC credited ${passUsdWords(step.usd)}${step.balance != null ? `: the balance is now ${usd(step.balance)}` : ""}.`}
+        onClose={onClose}
+        foot={
+          <button className="btn btn-primary" onClick={onClose} data-autofocus>
+            Done
+          </button>
+        }
+      />
+    );
+
+  return (
+    <Dialog
+      title="Top up trade credits"
+      lead={`Entries are charged per trade (${creditPriceWords(offer?.entry_prices_usd)}); exits are always free and keep coming at any balance. AgentHC holds the balance.`}
+      onClose={() => !busy && onClose()}
+      foot={
+        <>
+          <button className="btn" onClick={onClose} disabled={busy} data-autofocus>
+            Not now
+          </button>
+          <button className="btn btn-primary" id="dlg-ok" onClick={review} disabled={busy || size == null || sizes.length === 0}>
+            {busy ? "Asking the agent…" : "Review"}
+          </button>
+        </>
+      }
+    >
+      {offer === undefined ? (
+        <p className="small muted" role="status">
+          Asking AgentHC which top-ups are on sale…
+        </p>
+      ) : offer === null ? (
+        <p className="callout" role="status">
+          AgentHC isn't selling trade credits right now.
+        </p>
+      ) : sizes.length === 0 ? (
+        <p className="callout" role="status">
+          No top-up is on sale right now (AgentHC's payment node is refilling). Try again in a few minutes.
+        </p>
+      ) : (
+        <div className="pass-opts" role="radiogroup" aria-label="Top-up size">
+          {sizes.map((n) => (
+            <label key={n} className="pass-opt">
+              <input type="radio" name="topup" value={n} checked={size === n} onChange={() => (setSize(n), setErr(""))} />
+              <b>{passUsdWords(n)}</b>
+              <span>of trade credits</span>
+              {offer.topup_prices_sats?.[String(n)] ? <em>about {count(offer.topup_prices_sats[String(n)])} sats</em> : null}
+            </label>
+          ))}
+        </div>
+      )}
+      <FieldError id="topup-e" text={err} />
+      <p className="small muted">This does not change Practice or LIVE, and does not buy or sell anything.</p>
+    </Dialog>
+  );
+}
+
+/** Trade credits: AgentHC's balance, the per-entry prices, top-up, and the
+ *  auto top-up switch (one home each). Shown when AgentHC sells credits or
+ *  an account is on file. */
+function CreditsPanel({ page, onTopup, onAuto }: { page: Page; onTopup: () => void; onAuto: (on: boolean, usd: number) => void }) {
+  const v = page.settings.view;
+  const c = v?.signals.credits;
+  if (!c || !(c.offered || c.account)) return null;
+  const p = page.s.signals.pass;
+  const lost = page.link === "lost" || !v;
+  const bal = p.kind === "credits" ? p.balance_usd : c.balance_usd;
+  const wallet = !!v?.signals.wallet_connected;
+  return (
+    <section className="panel">
+      <div className="ph">
+        <h2>Trade credits</h2>
+        <span className="meta">Prepaid with AgentHC: entries are charged per trade, exits are free</span>
+      </div>
+      <Row
+        label="Balance"
+        exp={
+          !c.account
+            ? "No credits yet. Top up to open your account with AgentHC."
+            : p.kind === "credits" && p.status === "exits_only"
+              ? "Credits used up — exits still come in free. Top up to get new entries."
+              : c.status === "pending" || (p.kind === "credits" && p.status === "waiting")
+                ? "Waiting for the first top-up to be paid."
+                : `AgentHC's balance, as it last told your agent: ${creditPriceWords(c.entry_prices_usd)}.`
+        }
+        val={bal != null ? <span className="tag tag-plain">{usd(bal)}</span> : undefined}
+        act={
+          <button className="btn btn-sm btn-primary" data-act="buy-credits" aria-haspopup="dialog" disabled={lost || !c.offered} onClick={onTopup}>
+            Top up…
+          </button>
+        }
+      />
+      {c.account && (
+        <Row
+          label="Auto top-up"
+          exp={
+            c.autotopup
+              ? `On: when the balance can't cover the next entry, the agent buys ${passUsdWords(c.topup_usd)} from its wallet (market days, LIVE only, within the auto-pay cap${v?.signals.wallet.autopay_cap_words ? `: ${v.signals.wallet.autopay_cap_words}` : ""}).`
+              : wallet
+                ? "Off: the agent never tops up by itself."
+                : "Off. Auto top-up pays from the agent's own wallet (Payment wallet, below)."
+          }
+          val={
+            <select
+              className="input"
+              style={{ width: "auto", minHeight: 36 }}
+              aria-label="Top-up size"
+              value={c.topup_usd}
+              disabled={lost}
+              data-act="credit-size"
+              onChange={(e) => onAuto(c.autotopup, Number(e.target.value))}
+            >
+              {[20, 50, 100].map((n) => (
+                <option key={n} value={n}>
+                  {passUsdWords(n)}
+                </option>
+              ))}
+            </select>
+          }
+          act={
+            <button className="btn btn-sm" data-act="credit-autotopup" aria-haspopup="dialog" disabled={lost || (!wallet && !c.autotopup)} onClick={() => onAuto(!c.autotopup, c.topup_usd)}>
+              {c.autotopup ? "Turn off…" : "Turn on…"}
+            </button>
+          }
+        />
+      )}
+    </section>
   );
 }
 
@@ -528,6 +786,8 @@ export function SignalsView({ page }: { page: Page }) {
   const p = sig.pass;
   const c = s.results.signal_cost;
   const [buying, setBuying] = useState(false);
+  const [toppingUp, setToppingUp] = useState(false);
+  const [auto, setAuto] = useState<{ on: boolean; usd: number } | null>(null);
   const [open, setOpen] = useState<Open>(null);
   const reload = page.settings.reload;
   useEffect(() => {
@@ -560,6 +820,10 @@ export function SignalsView({ page }: { page: Page }) {
               <div className="bignum">
                 {p.days_left != null ? count(p.days_left) : "?"} <small>{p.days_left != null ? "signal days left" : "signal days left: not known yet"}</small>
               </div>
+            ) : p.kind === "credits" ? (
+              <div className="bignum">
+                {p.balance_usd != null ? usd(p.balance_usd) : "?"} <small>{p.balance_usd != null ? "credits left" : "credits left: not known yet"}</small>
+              </div>
             ) : (
               <div className="bignum" style={{ fontSize: 24 }}>
                 {PASS_KIND[p.kind] ?? "Unknown pass"}
@@ -587,7 +851,11 @@ export function SignalsView({ page }: { page: Page }) {
               )}
             </ul>
             <p className="small muted" style={{ marginTop: 10 }}>
-              {p.status === "exits_only"
+              {p.kind === "credits" && p.status === "exits_only"
+                ? "Credits used up — exits still come in free. Top up to get new entries; the agent still sells what it holds on its exit signals."
+                : p.kind === "credits" && p.status === "active"
+                  ? `Covers ${p.entries_left_main != null ? plural(p.entries_left_main, "main-pick entry", "main-pick entries") : "? main-pick entries"}${p.entries_left_other != null ? ` or ${plural(p.entries_left_other, "other-trades entry", "other-trades entries")}` : ""} at AgentHC's prices. Exits are free.`
+                  : p.status === "exits_only"
                 ? "No days are left for new trades. The agent still receives exit signals for anything it holds, so open positions are still sold."
                 : p.status === "waiting"
                   ? "The agent is waiting for a pass to become usable (a payment that has not arrived, or a day pass it will buy on the next market day)."
@@ -634,10 +902,13 @@ export function SignalsView({ page }: { page: Page }) {
           </div>
         </section>
       </div>
+      <CreditsPanel page={page} onTopup={() => setToppingUp(true)} onAuto={(on, n) => setAuto({ on, usd: n })} />
       <SourcePanel page={page} open={setOpen} />
       {s.mode === "practice" && <PreviewPanel page={page} />}
       <WalletPanel page={page} open={setOpen} />
       {buying && <BuyDays page={page} onClose={() => setBuying(false)} />}
+      {toppingUp && <BuyTopup page={page} onClose={() => setToppingUp(false)} />}
+      {auto && page.settings.view && <AutoTopupDialog page={page} on={auto.on} usd={auto.usd} onClose={() => setAuto(null)} />}
       {open === "source" && page.settings.view && <SourceDialog page={page} onClose={() => setOpen(null)} />}
       {open === "scope" && page.settings.view && <ScopeDialog page={page} onClose={() => setOpen(null)} />}
       {open === "key" && page.settings.view && <KeyDialog page={page} onClose={() => setOpen(null)} />}

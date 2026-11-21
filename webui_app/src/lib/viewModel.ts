@@ -231,7 +231,7 @@ export interface WouldHaveRow {
 }
 
 export interface Pass {
-  kind: "prepaid" | "day_pass" | "subscription" | "not_needed" | "none";
+  kind: "prepaid" | "day_pass" | "subscription" | "not_needed" | "none" | "credits";
   /** unknown: a prepaid pass the agent could not check with AgentHC yet (it reads no signals until it can); a wallet day-pass that is running counts as active */
   status: "active" | "exits_only" | "waiting" | "none" | "unknown";
   days_left: number | null;
@@ -240,6 +240,14 @@ export interface Pass {
   last_day: boolean;
   /** when a used-up pass stops getting exit signals, if AgentHC said */
   exits_until: Iso | null;
+  /** kind credits: the trade-credits balance AgentHC last reported (the agent never counts it); null otherwise or not known yet */
+  balance_usd: number | null;
+  /** kind credits: main-pick entries the balance covers at AgentHC's price; null otherwise */
+  entries_left_main: number | null;
+  /** kind credits: other-trades entries the balance covers at AgentHC's price; null otherwise */
+  entries_left_other: number | null;
+  /** kind credits: the owner's auto top-up switch; null otherwise */
+  auto_topup: boolean | null;
 }
 
 export interface ExitLoss {

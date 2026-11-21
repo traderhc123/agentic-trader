@@ -237,7 +237,16 @@ docker run -d --name agentic-trader --restart on-failure -v agentic-trader-data:
 - **Max daily loss** (optional): set it in the wizard's Safety step or say
   `set max loss 300` in the dashboard — after an estimated $300 realized loss
   in a day, no new entries until tomorrow (exits still run).
-- **Prepaid feed access**: for the AgentHC feed, buy 1 signal day (~$50) or 5
+- **Trade credits** (where AgentHC offers them): a prepaid balance AgentHC
+  holds — $10 per main-pick entry, $2 per other-trades entry, exits always
+  free. Top up $20, $50 or $100 in the wizard or on the Signals page with one
+  Lightning payment. The agent shows AgentHC's balance and never counts it;
+  when it can't cover the next entry, new entries are held back and exits
+  keep coming. Practice and paused reads are never charged. Auto top-up is
+  off until you turn it on (Signals page): it pays from the agent's own
+  wallet, only the size you picked, within the auto-pay caps, on market days
+  when the balance can't cover the next entry.
+- **Prepaid feed access** (signal days, while still on sale): for the AgentHC feed, buy 1 signal day (~$50) or 5
   signal days (~$225) in the wizard with one Lightning payment from the wallet you
   already use —
   the agent holds no money. A day is only used when your agent is LIVE and

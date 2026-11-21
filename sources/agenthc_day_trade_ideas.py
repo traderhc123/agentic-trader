@@ -12,6 +12,12 @@ Access is sats-based: the agent auto-buys a ~$50/day Lightning day-pass
 Premium AgentHC API key. Free aggregate track record (hypothetical, labeled):
 GET https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record
 
+Trade credits (when AgentHC sells them): a prepaid balance AgentHC holds,
+paid down per ENTRY it serves (main pick and other trades each have their
+own price); exits are always free. The agent shows AgentHC's balance and
+never counts it; auto top-up (owner's choice, off by default) refills it
+from the wallet within the autopay caps.
+
 Only LIVE uses signal days. Every read of the feed says the agent's mode
 (feed_mode: query param `mode` and header X-Agent-Mode, the same value):
 "live", "dry_run" (practice) or "off" (paused). AgentHC charges a prepaid
@@ -360,15 +366,24 @@ def auto_autopay_cap():
 def autopay_caps(cfg):
     """The auto-pay caps in force: {"per_invoice": n, "per_day": n,
     "per_invoice_auto": bool, "per_day_auto": bool, "auto_basis": str |
-    None}. per_day defaults to the per-invoice cap (one pass a day)."""
+    None}. per_day defaults to the per-invoice cap (one pass a day). In
+    credits mode the auto basis is "credits_topup" (the chosen top-up's
+    sats + 10%, "auto_usd" = its size) and per_day defaults to two of them."""
     inv = owner_autopay_cap(cfg.get("max_autopay_sats"))
     day = owner_autopay_cap(cfg.get("max_autopay_sats_per_day"))
-    auto = auto_autopay_cap() if inv is None else None
+    # credits mode (a credits account, and AgentHC sells credits): "auto"
+    # follows the chosen top-up's price, and a day may hold two top-ups
+    credit = _credit_auto_cap(cfg) if inv is None else None
+    auto = (credit or auto_autopay_cap()) if inv is None else None
     per_invoice = inv if inv is not None else auto["sats"]
-    return {"per_invoice": per_invoice,
-            "per_day": day if day is not None else per_invoice,
-            "per_invoice_auto": inv is None, "per_day_auto": day is None,
-            "auto_basis": auto["basis"] if auto else None}
+    per_day = day if day is not None else (
+        2 * per_invoice if credit else per_invoice)
+    out = {"per_invoice": per_invoice, "per_day": per_day,
+           "per_invoice_auto": inv is None, "per_day_auto": day is None,
+           "auto_basis": auto["basis"] if auto else None}
+    if credit:
+        out["auto_usd"] = credit["usd"]
+    return out
 
 
 def autopay_cap_words(cfg, caps=None):
@@ -378,6 +393,9 @@ def autopay_cap_words(cfg, caps=None):
     n = caps["per_invoice"]
     if not caps["per_invoice_auto"]:
         return f"Fixed: {n:,} sats"
+    if caps["auto_basis"] == "credits_topup":
+        return (f"Auto: follows the {usd_words(caps.get('auto_usd') or 0)} "
+                f"top-up price (now ≈ {n:,} sats)")
     if caps["auto_basis"] == "fallback":
         return (f"Auto: follows AgentHC's day price (now {n:,} sats: "
                 "AgentHC's price isn't known yet)")
@@ -405,6 +423,292 @@ def pass_status(token):
         return {"status": "invalid"}
     resp.raise_for_status()
     return resp.json()
+
+
+# ── prepaid trade credits ───────────────────────────────────────────────────
+# AgentHC may sell prepaid trade credits instead of (or next to) signal days:
+# a balance held by AgentHC, paid down per ENTRY it serves (a main-pick entry
+# and an other-trades entry each have their own price) — exits are always
+# free and keep coming at any balance. Top-ups ($20/$50/$100 by default) are
+# paid in sats. The balance the agent shows is ALWAYS AgentHC's last answer:
+# nothing here counts credits locally. An AgentHC that doesn't sell credits
+# (404, or an older server) leaves every signal-day path as it was.
+#
+# One account per agent: config["feed_credits"] = {"token", "opened_at",
+# "first_payment_hash"}. The token is replaced only by a credit_token
+# AgentHC returns (the dashboard does that, never the agent loop).
+CREDITS_PATH = FEED_PATH + "/credits"
+CREDIT_TOPUP_DEFAULT_USD = 20
+CREDIT_AUTO_CEILING_SATS = 300_000
+CREDIT_TOPUP_LIFETIME_S = 3600          # a top-up invoice can be paid for 1h
+_TOPUP_RETRY_S = 900                    # after a top-up that failed: wait this long
+_TOPUP_CAP_RETRY_S = 3600               # over a cap: ask again this much later
+# The server's last credit offer (credit_offer), or None (none on sale).
+_credit_cache = {"at": 0.0, "offer": None}
+# What the agent's loop wants from the next read (set_entry_wish): None =
+# entries as the settings say, "none" = exits only (paused, a move's
+# exits-only). A read that asks for no entries is never charged.
+_ENTRY_WISH = {"entries": None}
+
+CREDIT_EMPTY_TEXT = (
+    "Trade credits used up: exits still come in free, new entries are held "
+    f"back. Top up on the Signals page ({_SETTINGS}), or turn on auto top-up.")
+CREDIT_LOW_TEXT = ("Trade credits low: {bal} left (main pick {m}, other trades "
+                   "{o} per entry). Top up on the Signals page.")
+
+
+class CreditAccountInvalid(RuntimeError):
+    """AgentHC doesn't know the credits token that was sent (400
+    invalid_account): forget it and open a new account."""
+
+
+class CreditAccountPending(RuntimeError):
+    """The account's opening invoice is still unpaid and payable (409
+    account_pending). `invoice` = {payment_request, payment_hash,
+    amount_sats, topup_usd}: show that one again."""
+
+    def __init__(self, message, invoice=None):
+        super().__init__(message)
+        self.invoice = invoice if isinstance(invoice, dict) else {}
+
+
+def _usd_cents(v):
+    """A positive USD amount from the wire as whole cents, else None."""
+    if isinstance(v, bool):
+        return None
+    try:
+        c = int(round(float(v) * 100))
+    except (TypeError, ValueError):
+        return None
+    return c if c > 0 else None
+
+
+def _whole(v, low=1):
+    if isinstance(v, bool):
+        return None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= low and n == float(v) else None
+
+
+def _parse_credit_offer(detail):
+    """The probe's detail as {"pricing": "credits", "options_usd": [..],
+    "paused", "topup_prices_sats": {usd: sats}, "entry_prices_usd":
+    {"main": 10.0, "other": 2.0}, "entry_prices_cents": {...},
+    "max_topup_usd", "max_entry_age_s"}, or None when it isn't one."""
+    if not isinstance(detail, dict) or detail.get("pricing") != "credits":
+        return None
+    prices = detail.get("entry_prices_usd")
+    cents = {}
+    for track in ("main", "other"):
+        c = _usd_cents((prices or {}).get(track)) if isinstance(prices, dict) else None
+        if c is not None:
+            cents[track] = c
+    if "main" not in cents:
+        return None
+    opts = detail.get("options_usd")
+    options = sorted({n for n in (_whole(v) for v in (opts if isinstance(opts, list) else []))
+                      if n is not None})
+    return {"pricing": "credits",
+            "options_usd": options,
+            "paused": bool(detail.get("paused")) or not options,
+            "topup_prices_sats": _price_map(detail.get("topup_prices_sats"), int) or {},
+            "entry_prices_usd": {t: c / 100 for t, c in cents.items()},
+            "entry_prices_cents": cents,
+            "max_topup_usd": _whole(detail.get("max_topup_usd")),
+            "max_entry_age_s": _whole(detail.get("max_entry_age_s"))}
+
+
+def credit_offer():
+    """What AgentHC sells as trade credits right now (a POST with usd 0: no
+    invoice is made), or None: credits aren't on sale (404, an older server,
+    an answer that isn't a credits offer) or AgentHC can't be reached. The
+    answer (None included) is what credit_prices() shows next."""
+    try:
+        resp = _http.post(f"{AGENTHC_API}{CREDITS_PATH}", json={"usd": 0}, timeout=10)
+    except Exception:
+        return None
+    offer = None
+    if resp.status_code != 404:
+        try:
+            body = resp.json()
+        except Exception:
+            return None   # not an answer: keep what was known
+        offer = _parse_credit_offer(body.get("detail") if isinstance(body, dict) else None)
+    _credit_cache.update(at=time.time(), offer=offer)
+    return offer
+
+
+def credit_prices(max_age=_PRICE_TTL_S):
+    """The credit offer to show (credit_offer's shape), or None when AgentHC
+    doesn't sell credits. The ONE place the client reads credit prices: asks
+    AgentHC at most every max_age seconds (any credit_offer() call refreshes
+    it too)."""
+    c = _credit_cache
+    if time.time() - float(c.get("at") or 0) >= max_age:
+        credit_offer()
+        if time.time() - float(c.get("at") or 0) >= max_age:   # not reached
+            c["at"] = time.time() - max_age + _PRICE_RETRY_S
+    offer = c.get("offer")
+    return dict(offer) if isinstance(offer, dict) else None
+
+
+def _note_credit_offer(top_up, entry_prices):
+    """A feed reply's top_up block (and its entry prices) is AgentHC's offer
+    too: keep it, so the caps follow it without another request."""
+    if not isinstance(top_up, dict):
+        return
+    offer = _parse_credit_offer({"pricing": "credits",
+                                 "options_usd": top_up.get("options_usd"),
+                                 "topup_prices_sats": top_up.get("prices_sats"),
+                                 "entry_prices_usd": entry_prices})
+    if offer is None:
+        return
+    old = _credit_cache.get("offer") if isinstance(_credit_cache.get("offer"), dict) else {}
+    offer["max_topup_usd"] = old.get("max_topup_usd")
+    offer["max_entry_age_s"] = old.get("max_entry_age_s")
+    _credit_cache.update(at=time.time(), offer=offer)
+
+
+def buy_topup(usd, account_token=None):
+    """Ask AgentHC for a top-up invoice of `usd` dollars of trade credits.
+    Without `account_token` it opens a new account; with it, that account
+    is topped up (the same credit_token comes back). Returns the server body
+    (payment_request, payment_hash, amount_sats, credit_token, ...)."""
+    payload = {"usd": int(usd)}
+    if account_token:
+        payload["account"] = account_token
+    resp = _http.post(f"{AGENTHC_API}{CREDITS_PATH}", json=payload, timeout=20)
+    code = _error_code(resp)
+    try:
+        detail = resp.json().get("detail")
+    except Exception:
+        detail = None
+    detail = detail if isinstance(detail, dict) else {}
+    if resp.status_code == 404:
+        raise PassUnavailable("Trade credits aren't on sale right now — signal "
+                              "days still work where they are offered.")
+    if resp.status_code == 400 and code == "invalid_topup":
+        sizes = ", ".join(usd_words(n) for n in detail.get("options_usd") or [])
+        raise PassSizeUnavailable(f"{usd_words(usd)} top-ups aren't on sale right now"
+                                  + (f" — pick {sizes}." if sizes else "."))
+    if resp.status_code == 400 and code == "invalid_account":
+        raise CreditAccountInvalid("AgentHC doesn't know this trade-credits "
+                                   "account any more.")
+    if resp.status_code == 409 and code == "account_pending":
+        raise CreditAccountPending(
+            "The first top-up of this account isn't paid yet: pay that invoice "
+            "first.", {k: detail.get(k) for k in ("payment_request", "payment_hash",
+                                                  "amount_sats", "topup_usd")})
+    if resp.status_code == 503 and code == "pass_size_temporarily_unavailable":
+        raise PassSizeRefilling("That top-up size is briefly unavailable while "
+                                "our node refills — try a smaller one or again "
+                                "in about an hour.")
+    if resp.status_code != 200:
+        msg = detail.get("message") or detail.get("error") or code or resp.status_code
+        raise RuntimeError(f"top-up failed ({resp.status_code}): {str(msg)[:160]}")
+    body = resp.json()
+    if (not isinstance(body, dict) or not isinstance(body.get("payment_request"), str)
+            or not isinstance(body.get("credit_token"), str)):
+        raise RuntimeError("top-up failed: AgentHC's answer had no invoice")
+    return body
+
+
+def credit_status(token, entries="all"):
+    """AgentHC's view of a credits account: {"kind": "credits", "status":
+    pending|active|exits_only|expired, "balance_cents", "entry_tracks",
+    "topups": [...], ...}; {"status": "invalid"} for a token it refuses."""
+    resp = _http.get(f"{AGENTHC_API}{CREDITS_PATH}", params={"entries": entries},
+                     headers={"Authorization": token}, timeout=15)
+    if resp.status_code == 401:
+        return {"status": "invalid"}
+    resp.raise_for_status()
+    return resp.json()
+
+
+def set_entry_wish(value):
+    """The agent's loop says before every poll whether this read wants
+    entries: "none" (paused, a move's exits-only) or None (as the settings
+    say). A credits read then asks AgentHC for no entries, so none is
+    charged."""
+    _ENTRY_WISH["entries"] = "none" if value == "none" else None
+
+
+def _credit_token(cfg):
+    """The trade-credits account token from config, or None."""
+    fc = (cfg or {}).get("feed_credits")
+    tok = fc.get("token") if isinstance(fc, dict) else None
+    return tok if isinstance(tok, str) and tok else None
+
+
+def _wanted_tracks(cfg):
+    """The tracks whose entries the agent takes: the main pick, and other
+    trades when switched on."""
+    return {"main"} | ({"other"} if (cfg or {}).get("include_other_trades") else set())
+
+
+def _track_kind(track):
+    """"main" for the main pick (a feed without tracks), else "other"."""
+    return "main" if str(track or "main") == "main" else "other"
+
+
+def _credit_rec(cfg, state):
+    """The saved status of the credits account ({} without one)."""
+    tok = _credit_token(cfg)
+    if not tok:
+        return {}
+    rec = ((state or {}).get("pass_status") or {}).get(_token_id(tok))
+    return rec if isinstance(rec, dict) else {}
+
+
+def _chosen_topup_usd(cfg, options):
+    """The owner's top-up size (credit_topup_usd) when AgentHC offers it,
+    else the smallest it offers; None when it offers none."""
+    options = sorted(o for o in (options or []) if isinstance(o, int))
+    if not options:
+        return None
+    want = _whole((cfg or {}).get("credit_topup_usd", CREDIT_TOPUP_DEFAULT_USD))
+    return want if want in options else options[0]
+
+
+def credits_mode(cfg):
+    """True when the agent has a credits account and AgentHC sells credits:
+    the auto cap then follows the top-up price."""
+    return bool(_credit_token(cfg)) and credit_prices() is not None
+
+
+def _credit_auto_cap(cfg):
+    """{"sats", "basis": "credits_topup", "usd"} in credits mode: the chosen
+    top-up's server sats + 10%, at most CREDIT_AUTO_CEILING_SATS; else None."""
+    if not _credit_token(cfg):
+        return None
+    offer = credit_prices()
+    if not offer:
+        return None
+    sats_by_usd = offer.get("topup_prices_sats") or {}
+    usd = _chosen_topup_usd(cfg, offer.get("options_usd")) or (
+        _chosen_topup_usd(cfg, sorted(sats_by_usd)))
+    sats = sats_by_usd.get(usd) if usd else None
+    if not sats:
+        return None
+    return {"sats": min(_plus_margin_k(sats), CREDIT_AUTO_CEILING_SATS),
+            "basis": "credits_topup", "usd": usd}
+
+
+def credit_summary_words(rec):
+    """"$24.00 left (main $10 / other $2 per entry)" from a saved status."""
+    bal = rec.get("balance_cents")
+    prices = rec.get("entry_prices_cents") or {}
+    left = (f"${int(bal) / 100:,.2f} left" if isinstance(bal, int)
+            and not isinstance(bal, bool) else "balance not known yet")
+    if prices.get("main"):
+        per = f"main {usd_words(prices['main'] / 100)}"
+        if prices.get("other"):
+            per += f" / other {usd_words(prices['other'] / 100)}"
+        left += f" ({per} per entry)"
+    return left
 
 
 # ── tips ─────────────────────────────────────────────────────────────────────
@@ -702,7 +1006,8 @@ def tip_status(payment_hash):
 
 
 def _pass_tokens(cfg):
-    """Prepaid pass tokens from config, newest purchase first."""
+    """Prepaid pass tokens from config, newest purchase first; the
+    trade-credits account (if any) comes last."""
     out = []
     # feed_pass_extra: earlier invoices the owner may still pay, and paid
     # passes that aren't the main one (the dashboard files them there)
@@ -714,6 +1019,9 @@ def _pass_tokens(cfg):
         tok = entry.get("token") if isinstance(entry, dict) else None
         if tok and tok not in out:
             out.append(tok)
+    credit = _credit_token(cfg)
+    if credit and credit not in out:
+        out.append(credit)
     return out
 
 
@@ -773,11 +1081,14 @@ def _refresh_pass(cfg, state, save_state, force=False):
     lifetime until AgentHC answers for it (only AgentHC's answer makes it
     "unpaid", never the time alone), "unpaid" ones once an hour and as soon
     as one becomes the main pass, active passes only after their end time
-    or when the feed refused them."""
+    or when the feed refused them. Ranking: an active pass, then active
+    trade credits, then a used-up pass's exits, then used-up credits' exits
+    — an active pass (signal days already paid for) is always used first."""
     cache = state.setdefault("pass_status", {})
     now = time.time()
     main = _main_pass_token(cfg)
-    best, best_until = None, 0.0
+    credit = _credit_token(cfg)
+    best, best_rank = None, None
     for token in _pass_tokens(cfg):
         tid = _token_id(token)
         rec = cache.get(tid) or {}
@@ -805,14 +1116,38 @@ def _refresh_pass(cfg, state, save_state, force=False):
                        "main": token == main}
                 if fresh.get("exits_until"):
                     rec["exits_until"] = _iso_ts(fresh["exits_until"]) or None
+                if fresh.get("kind") == "credits" or token == credit:
+                    _credit_fields(cfg, rec, fresh)
                 cache[tid] = rec
                 save_state(state)
         if rec.get("status") in _USABLE:
-            # prefer a pass with days left over one in its exits-only grace
-            rank = rec.get("until_ts", 0) + (1e12 if rec.get("status") == "active" else 0)
-            if rank > best_until:
-                best, best_until = token, rank
+            # prefer a pass with days left over one in its exits-only grace,
+            # and a pass over trade credits in the same state
+            rank = (rec.get("status") == "active", token != credit,
+                    rec.get("until_ts", 0))
+            if best_rank is None or rank > best_rank:
+                best, best_rank = token, rank
     return best
+
+
+def _credit_fields(cfg, rec, fresh):
+    """AgentHC's credits status into a saved pass_status record: the
+    balance, and active / exits_only judged against the tracks this agent
+    takes entries from (AgentHC's own status counts every track)."""
+    rec["kind"] = "credits"
+    bal = fresh.get("balance_cents")
+    rec["balance_cents"] = (bal if isinstance(bal, int) and not isinstance(bal, bool)
+                            else _usd_cents(fresh.get("balance_usd")) or 0)
+    tracks = fresh.get("entry_tracks")
+    rec["entry_tracks"] = sorted(str(t) for t in tracks) if isinstance(tracks, list) else []
+    prices = fresh.get("entry_prices_usd")
+    rec["entry_prices_cents"] = {t: c for t, c in (
+        (t, _usd_cents(v)) for t, v in (prices.items() if isinstance(prices, dict) else ()))
+        if c is not None}
+    rec["days_left"] = None
+    if rec.get("status") in _USABLE:
+        rec["status"] = ("active" if set(rec["entry_tracks"]) & _wanted_tracks(cfg)
+                         else "exits_only")
 
 
 def _iso_ts(value):
@@ -976,15 +1311,34 @@ def _last_read(state):
     return rec if isinstance(rec, dict) else {}
 
 
-def _feed_params(cfg, state):
-    """{"limit", "track"} for the next read of the feed."""
+def _feed_params(cfg, state, credits=False):
+    """{"limit", "track"} for the next read of the feed. A read with trade
+    credits (`credits`) also says which entries it wants ("entries": none
+    while the agent takes no new trades; main when other trades are off,
+    even while track=all is read for an other-trades exit) and how old an
+    entry may be (a little under the agent's own max_event_age_s), so
+    AgentHC never charges for an entry the agent would drop."""
     track = ("all" if cfg.get("include_other_trades") or _holds_other_track(state)
              else "main")
     last = _last_read(state).get("local")
     gap = (not isinstance(last, (int, float)) or isinstance(last, bool)
            or not 0 <= time.time() - last <= FEED_GAP_S)
-    return {"limit": FEED_LIMIT_MAX if track == "all" or gap else FEED_LIMIT,
-            "track": track}
+    params = {"limit": FEED_LIMIT_MAX if track == "all" or gap else FEED_LIMIT,
+              "track": track}
+    if credits:
+        if _ENTRY_WISH["entries"] == "none":
+            entries = "none"
+        elif not cfg.get("include_other_trades") or track == "main":
+            entries = "main"
+        else:
+            entries = "all"
+        try:
+            age = int(float(cfg.get("max_event_age_s", 300)))
+        except (TypeError, ValueError):
+            age = 300
+        params["entries"] = entries
+        params["entry_max_age"] = max(30, age - 30)
+    return params
 
 
 def _epoch(value):
@@ -1571,7 +1925,7 @@ def _autopay_spent_today(state, now=None):
     return spent
 
 
-def _invoice_sats(invoice, claimed):
+def _invoice_sats(invoice, claimed, what="the day-pass"):
     """Whole sats the invoice ITSELF asks for (rounded up) — the only amount
     the caps are checked against, because it is what the wallet would pay.
     Raises when the invoice names no amount, or when the server's amount_sats
@@ -1590,7 +1944,7 @@ def _invoice_sats(invoice, claimed):
             said = None
         if isinstance(claimed, bool) or said is None or abs(said * 1000 - msat) >= 1000:
             raise InvoiceRefused(
-                f"The feed said the day-pass costs {str(claimed)[:20]} sats but "
+                f"The feed said {what} costs {str(claimed)[:20]} sats but "
                 f"its Lightning invoice asks for {sats:,} sats, so the agent "
                 "did not pay it. Nothing was paid.")
     return sats
@@ -2121,6 +2475,8 @@ def payment_pending(cfg, state):
         return False
     if isinstance(state.get("daypass_pending"), dict):
         return True
+    if isinstance(state.get("topup_pending"), dict) and _credit_token(cfg):
+        return True   # an auto top-up AgentHC hasn't credited yet
     cache = state.get("pass_status")
     cache = cache if isinstance(cache, dict) else {}
     for token in _pass_tokens(cfg):
@@ -2166,7 +2522,9 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
             # day-pass ON, today's day-pass brings the entries back (exits
             # come with it); if it can't be bought now, the exits are still
             # read with the used-up pass in this same poll.
+            # (Trade credits: auto top-up brings entries back instead.)
             if (not _retried and not undecided
+                    and token != _credit_token(cfg)
                     and _token_status(state, token) == "exits_only"
                     and cfg.get("lnbits_url") and cfg.get("day_pass_recurring")
                     and _pass_purchase_allowed(cfg, state, save_state)):
@@ -2299,7 +2657,8 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
 
 
 def _poll_with_pass(cfg, state, save_state, token, _retried):
-    params = _feed_params(cfg, state)
+    credits = token == _credit_token(cfg)
+    params = _feed_params(cfg, state, credits=credits)
     resp = _feed_get(cfg, params, {"Authorization": token})
     _note_feed_answer(resp)
     if resp.status_code in (401, 402) and not _retried:
@@ -2312,6 +2671,8 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
         raise RuntimeError(f"403 from feed: {str(detail)[:200]}")
     resp.raise_for_status()
     body = resp.json()
+    if body.get("access") == "credits" or (credits and isinstance(body.get("credits"), dict)):
+        return _poll_with_credits(cfg, state, save_state, token, body, params)
     if body.get("pass_charged_today"):
         # The pass paid for today: the wallet must not buy a day-pass today.
         today = _now_et().strftime("%Y-%m-%d")
@@ -2359,25 +2720,332 @@ def _poll_with_pass(cfg, state, save_state, token, _retried):
     return events
 
 
+def _poll_with_credits(cfg, state, save_state, token, body, params):
+    """A feed reply read with the trade-credits account. AgentHC serves only
+    entries this account has paid for (charged on this read or earlier) and
+    every exit, free, at any balance. The balance shown is AgentHC's: the
+    saved status takes the reply's numbers, nothing is counted here."""
+    cr = body.get("credits") if isinstance(body.get("credits"), dict) else {}
+    wanted = _wanted_tracks(cfg)
+    tracks = {str(t) for t in cr.get("entry_tracks") or [] if isinstance(t, str)}
+    covered = bool(tracks & wanted)
+    events = _parse_events(body)
+    events = _finish_read(cfg, state, save_state, body, params, events,
+                          {"Authorization": token})
+    # A paid entry served in the same reply that says the balance is now
+    # used up is KEPT (it was bought with the last credits). Only an entry
+    # on a track the agent doesn't take is dropped (AgentHC was asked for
+    # none: defensive).
+    events = [e for e in events if e["event"] != "ENTERED"
+              or e.get("practice_release") or _track_kind(e.get("track")) in wanted]
+    served_entry = any(e["event"] == "ENTERED" for e in events)
+    can_enter = covered and _ENTRY_WISH["entries"] != "none"
+    _LAST_POLL.update(access=can_enter or served_entry, exits=True)
+    rec = state.setdefault("pass_status", {}).setdefault(_token_id(token), {})
+    bal = cr.get("balance_cents")
+    bal = (bal if isinstance(bal, int) and not isinstance(bal, bool)
+           else _usd_cents(cr.get("balance_usd")) or 0)
+    prices = {t: c for t, c in ((t, _usd_cents(v)) for t, v in (
+        (cr.get("entry_prices_usd") or {}).items()
+        if isinstance(cr.get("entry_prices_usd"), dict) else ())) if c is not None}
+    new = {"kind": "credits", "status": "active" if covered else "exits_only",
+           "balance_cents": bal, "entry_tracks": sorted(tracks),
+           "entry_prices_cents": prices or rec.get("entry_prices_cents") or {}}
+    if any(rec.get(k) != v for k, v in new.items()):
+        rec.update(new)
+        rec.setdefault("checked", time.time())
+        save_state(state)
+    _note_credit_offer(cr.get("top_up"), cr.get("entry_prices_usd"))
+    need = max((new["entry_prices_cents"].get(t) or 0) for t in wanted)
+    if not covered:
+        note = str(cr.get("note") or "")[:300]
+        _pass_notice(cfg, state, save_state, "credit_empty_notified",
+                     CREDIT_EMPTY_TEXT + (f" ({note})" if note else ""))
+    elif need and bal < 2 * need:
+        p = new["entry_prices_cents"]
+        _pass_notice(cfg, state, save_state, "credit_low_notified",
+                     CREDIT_LOW_TEXT.format(
+                         bal=f"${bal / 100:,.2f}",
+                         m=usd_words((p.get("main") or 0) / 100),
+                         o=usd_words((p.get("other") or 0) / 100)))
+    else:
+        _entry_read(state, save_state)
+    if (covered and bal >= need and not state.get("topup_pending")
+            and state.get("daypass_alert") == "credit_topup_failed_notified"):
+        _daypass_alert_clear(state)   # topped up since: the alert is over
+        state.pop("topup_retry_at", None)
+        save_state(state)
+    try:
+        _maybe_autotopup(cfg, state, save_state, cr)
+    except Exception as exc:   # never lose the events read over a top-up
+        print(f"Auto top-up skipped ({str(exc)[:160]}).")
+    return events
+
+
+# ── auto top-up ──────────────────────────────────────────────────────────────
+# Owner-only consent config["credit_autotopup"] (default OFF; never set by a
+# setup plan, the phone or a self-edit). When ON the agent's wallet buys
+# config["credit_topup_usd"] of trade credits (one of the sizes AgentHC
+# offers, else its smallest) — only on a market day between 08:30 ET and the
+# close, while LIVE, when the balance can't cover the next entry on the most
+# expensive track the agent takes, never while a top-up is unpaid or the
+# account's status is unknown, never with a Premium key, and never above the
+# autopay caps (autopay_caps, shared with the day-pass: one daily budget).
+# The top-up is saved BEFORE paying (state["topup_pending"]) and settled by
+# AgentHC's own list of the account's top-ups (credit_status: credited /
+# expired / pending) — no receipt is needed, AgentHC's word is the proof.
+
+def _topup_alert(cfg, state, save_state, text, retry_s=_TOPUP_RETRY_S):
+    """A top-up that didn't happen: hold the next try off, tell the owner
+    once a day."""
+    state["topup_retry_at"] = time.time() + retry_s
+    _daypass_alert(cfg, state, save_state, "credit_topup_failed_notified", text)
+
+
+def _topup_stopped(cfg, state):
+    """True while auto top-up is stopped because a paid top-up wasn't
+    credited: until the owner switches auto top-up off and on again."""
+    stop = state.get("topup_stop")
+    if not isinstance(stop, dict):
+        return False
+    try:
+        on_at = float(_iso_ts(cfg.get("credit_autotopup_on_at"))
+                      or cfg.get("credit_autotopup_on_at") or 0)
+    except (TypeError, ValueError):
+        on_at = 0.0
+    if on_at > float(stop.get("at") or 0):
+        state.pop("topup_stop", None)
+        return False
+    return True
+
+
+def _maybe_autotopup(cfg, state, save_state, cr, now=None):
+    """Settle a top-up that is under way, then buy one when every rule in
+    the block above holds. Returns "pending" / "credited" / "failed" /
+    "bought" / None (nothing to do)."""
+    if isinstance(state.get("topup_pending"), dict):
+        outcome = _settle_topup(cfg, state, save_state)
+        if outcome != "credited":
+            return outcome
+    token = _credit_token(cfg)
+    if (not cfg.get("credit_autotopup") or not token
+            or cfg.get("agenthc_api_key") or not cfg.get("lnbits_url")
+            or _ENTRY_WISH["entries"] == "none" or feed_mode(cfg) != "live"):
+        return None
+    rec = _credit_rec(cfg, state)
+    if _known_status(cfg, rec, token) not in _USABLE:
+        return None
+    now = now or _now_et()
+    if _next_buy_time(cfg, now) is not None:
+        return None   # not a market day, before 08:30 ET, or after the close
+    prices = rec.get("entry_prices_cents") or {}
+    need = max((prices.get(t) or 0) for t in _wanted_tracks(cfg))
+    bal = rec.get("balance_cents")
+    if not need or not isinstance(bal, int) or bal >= need:
+        return None
+    if time.time() < float(state.get("topup_retry_at") or 0) or _topup_stopped(cfg, state):
+        return None
+    top = cr.get("top_up") if isinstance(cr.get("top_up"), dict) else None
+    offer = credit_prices() or {}
+    options = (top or {}).get("options_usd") if top else offer.get("options_usd")
+    options = [n for n in (_whole(v) for v in (options or [])) if n is not None]
+    usd = _chosen_topup_usd(cfg, options)
+    if usd is None:
+        _topup_alert(cfg, state, save_state,
+                     "Auto top-up waits: AgentHC isn't selling trade-credit "
+                     "top-ups right now (its node is refilling). Exits keep "
+                     "coming free; the agent tries again later.",
+                     retry_s=_TOPUP_CAP_RETRY_S)
+        return None
+    wallet = wallet_from_cfg(cfg)
+    if wallet is None:
+        return None
+    return _pay_topup(cfg, state, save_state, wallet, token, usd)
+
+
+def _pay_topup(cfg, state, save_state, wallet, token, usd):
+    words = usd_words(usd)
+    try:
+        inv = buy_topup(usd, token)
+    except Exception as exc:
+        _topup_alert(cfg, state, save_state,
+                     f"Auto top-up of {words} didn't start: {str(exc)[:200]} "
+                     "Nothing was paid.")
+        return "failed"
+    if inv.get("credit_token") != token:
+        # a top-up always names this account; an answer for another one
+        # would credit an account this agent can't use
+        _topup_alert(cfg, state, save_state,
+                     f"Auto top-up of {words}: AgentHC answered for a different "
+                     "trade-credits account, so the agent did not pay. Nothing "
+                     "was paid. Top up from the Signals page instead.")
+        return "failed"
+    bolt11 = inv["payment_request"]
+    try:
+        sats = _invoice_sats(bolt11, inv.get("amount_sats"), what="the top-up")
+    except InvoiceRefused as exc:
+        _topup_alert(cfg, state, save_state, f"Auto top-up of {words}: {exc}")
+        return "failed"
+    payment_hash = bolt11_payment_hash(bolt11)
+    said = inv.get("payment_hash")
+    if not payment_hash or (said and str(said).lower() != payment_hash):
+        _topup_alert(cfg, state, save_state,
+                     f"Auto top-up of {words}: the invoice is not the one "
+                     "AgentHC said it made, so the agent did not pay it. "
+                     "Nothing was paid.")
+        return "failed"
+    caps = autopay_caps(cfg)
+    spent = _autopay_spent_today(state)
+    if sats > caps["per_invoice"] or spent["sats"] + sats > caps["per_day"]:
+        over = ("one payment" if sats > caps["per_invoice"] else "one day")
+        _topup_alert(cfg, state, save_state,
+                     f"Auto top-up of {words} ({sats:,} sats) is over your "
+                     f"autopay cap for {over} (per payment "
+                     f"{caps['per_invoice']:,} sats, per day "
+                     f"{caps['per_day']:,} sats, {spent['sats']:,} already "
+                     f"spent today), so the agent did not pay. Nothing was "
+                     f"paid. {AUTOPAY_HOW_TO_SET[0].upper()}{AUTOPAY_HOW_TO_SET[1:]}.",
+                     retry_s=_TOPUP_CAP_RETRY_S)
+        return "failed"
+    pending = {"payment_hash": payment_hash, "bolt11": bolt11, "usd": usd,
+               "amount_sats": sats, "created_at": time.time(),
+               "day": _now_et().strftime("%Y-%m-%d"),
+               "wallet": wallet_fingerprint(cfg)}
+    state["topup_pending"] = pending     # saved BEFORE the wallet is asked
+    save_state(state)
+    print(f"Auto top-up: paying {sats:,} sats for {words} of trade credits …")
+    try:
+        wallet.pay_invoice(bolt11)
+    except (PaymentNotSent, PaymentRefused) as exc:
+        # never left this computer (PaymentNotSent, WalletKeyRejected) or
+        # the wallet turned it down and filed nothing: nothing was paid
+        state.pop("topup_pending", None)
+        if isinstance(exc, WalletKeyRejected):
+            why = ("the wallet's server did not accept the agent's wallet key "
+                   "— check the wallet in the dashboard")
+        elif isinstance(exc, PaymentNotSent):
+            why = "the wallet could not be reached"
+        elif re.search(r"insufficient|not enough|balance|reserve|routing fee",
+                       str(exc), re.I):
+            why = "the wallet does not hold enough sats — add sats in the dashboard"
+        else:
+            why = "the wallet did not make the payment"
+        _topup_alert(cfg, state, save_state,
+                     f"Auto top-up of {words} ({sats:,} sats) failed: {why}. "
+                     "Nothing was paid. Exits keep coming free.")
+        return "failed"
+    except Exception as exc:
+        # sent, outcome not known yet: AgentHC's top-up list decides
+        _count_autopay(state, pending)
+        save_state(state)
+        print(f"Auto top-up of {sats:,} sats: the wallet hasn't said yet "
+              f"whether it went through ({str(exc)[:120]}). The agent asks "
+              "AgentHC about it on every read and pays nothing else meanwhile.")
+        return "pending"
+    _count_autopay(state, pending)
+    save_state(state)
+    return "bought"
+
+
+def _settle_topup(cfg, state, save_state):
+    """What became of state["topup_pending"], by AgentHC's list of this
+    account's top-ups: credited → done (the balance is refreshed); pending
+    → wait; expired (or gone and past its lifetime) → ask the wallet that
+    paid: not paid → the day's budget is given back; paid (or not known)
+    → auto top-up stops and the owner is told to contact AgentHC."""
+    pending = state.get("topup_pending")
+    token = _credit_token(cfg)
+    if not isinstance(pending, dict) or not pending.get("payment_hash") or not token:
+        state.pop("topup_pending", None)
+        save_state(state)
+        return "failed"
+    try:
+        st = credit_status(token)
+    except Exception:
+        return "pending"
+    row = next((t for t in (st.get("topups") or []) if isinstance(t, dict)
+                and t.get("payment_hash") == pending["payment_hash"]), None)
+    age = time.time() - float(pending.get("created_at") or 0)
+    status = (row or {}).get("status")
+    if status == "credited":
+        state.pop("topup_pending", None)
+        state.pop("topup_retry_at", None)
+        if state.get("daypass_alert") == "credit_topup_failed_notified":
+            _daypass_alert_clear(state)
+        rec = state.setdefault("pass_status", {}).setdefault(_token_id(token), {})
+        if st.get("status") in _USABLE + ("pending",):
+            rec["status"] = st.get("status")
+        _credit_fields(cfg, rec, st)
+        save_state(state)
+        print(f"Auto top-up of {usd_words(pending.get('usd') or 0)} credited: "
+              f"{credit_summary_words(rec)}.")
+        return "credited"
+    lifetime = CREDIT_TOPUP_LIFETIME_S + _INVOICE_SLACK_S
+    if status == "pending" and age <= _PENDING_MAX_AGE_S:
+        return "pending"
+    if status is None and age <= lifetime:
+        return "pending"
+    # expired, unknown to AgentHC past its lifetime, or undecided for a day
+    wstatus = "unknown"
+    if pending.get("wallet") == wallet_fingerprint(cfg):
+        check = getattr(wallet_from_cfg(cfg), "payment_status", None)
+        if check is not None:
+            try:
+                wstatus, _pre = check(pending["payment_hash"])
+            except Exception:
+                wstatus = "unknown"
+    state.pop("topup_pending", None)
+    if wstatus in ("failed", "not_found"):
+        _uncount_autopay(state, pending)
+        save_state(state)
+        print("Auto top-up invoice expired unpaid: nothing was paid.")
+        return "failed"
+    state["topup_stop"] = {"at": time.time(),
+                           "payment_hash": pending["payment_hash"]}
+    save_state(state)
+    _daypass_alert(
+        cfg, state, save_state, "credit_topup_failed_notified",
+        f"Your agent's wallet may have paid {int(pending.get('amount_sats') or 0):,} "
+        f"sats for a {usd_words(pending.get('usd') or 0)} trade-credits top-up, "
+        "but AgentHC has not credited it. Auto top-up is stopped so this "
+        "can't repeat. Contact AgentHC with the time of the payment from your "
+        "wallet's payment list; switch auto top-up off and on again to restart "
+        "it.")
+    return "failed"
+
+
 def pass_summary(cfg, state):
     """One line for the dashboard: what feed access the agent has right now."""
     if cfg.get("agenthc_api_key"):
         return "Premium API key"
     best = None
+    credit = _credit_token(cfg)
     for token in _pass_tokens(cfg):
+        if token == credit:
+            continue
         rec = (state.get("pass_status") or {}).get(_token_id(token)) or {}
         if rec.get("status") in _USABLE and (
                 best is None or (rec.get("status") == "active"
                                  and best.get("status") != "active")):
             best = rec
+    crec = _credit_rec(cfg, state)
+    if credit and not (best and best.get("status") == "active"):
+        if crec.get("status") == "active":
+            return f"trade credits · {credit_summary_words(crec)}"
+        if crec.get("status") == "exits_only" and not best:
+            return "trade credits used up — exit signals only; top up"
+        if crec.get("status") in (None, "pending") and not best:
+            return "trade credits · waiting for the first payment"
     if best and best.get("status") == "exits_only":
         return "prepaid pass used up — exit signals only; buy more"
     if best:
         left = best.get("days_left")
         return (f"prepaid pass · {left} signal day(s) left" if left is not None
                 else "prepaid pass · active")
-    if _pass_tokens(cfg):
+    if [t for t in _pass_tokens(cfg) if t != credit]:
         return "prepaid pass · waiting for payment or expired"
+    if credit:
+        return "trade credits · first payment not made or expired"
     if cfg.get("lnbits_url"):
         return ("wallet auto-pay (recurring ON)" if cfg.get("day_pass_recurring")
                 else "wallet — recurring day-pass OFF")

@@ -32,6 +32,10 @@ def _no_pass_price_ask(monkeypatch):
     from sources import agenthc_day_trade_ideas as hc
     monkeypatch.setattr(hc, "_price_cache",
                         {"at": float("inf"), "usd": None, "sats": None})
+    # trade credits: none on sale unless a test says so (tests of the
+    # credits path set hc._credit_cache themselves)
+    monkeypatch.setattr(hc, "_credit_cache", {"at": float("inf"), "offer": None})
+    monkeypatch.setattr(hc, "_ENTRY_WISH", {"entries": None})
     monkeypatch.setattr(hc, "_live_btc_usd", lambda: 0.0)   # the auto cap's BTC price
 
 

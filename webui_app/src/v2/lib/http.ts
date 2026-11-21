@@ -168,6 +168,7 @@ export const API = {
   source: "/api/v2/settings/source",
   signals: "/api/v2/settings/signals",
   recurring: "/api/v2/wallet/recurring",
+  creditsAutotopup: "/api/v2/credits/autotopup",
   walletCreate: "/api/v2/wallet/create",
   walletFund: "/api/v2/wallet/fund",
   walletConnect: "/api/v2/wallet/connect",

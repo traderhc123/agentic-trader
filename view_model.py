@@ -92,7 +92,8 @@ NEXT_ACTIONS = ("sell_on_exit", "sell_at_expiry_guard", "selling_now",
 NEXT_REASONS = UNMANAGED_REASONS + (
     "exit_signal", "expiry_guard", "sell_working", "exit_remainder",
     "pause_feed_not_read")
-PASS_KINDS = ("prepaid", "day_pass", "subscription", "not_needed", "none")
+PASS_KINDS = ("prepaid", "day_pass", "subscription", "not_needed", "none",
+              "credits")
 # unknown: a prepaid pass the agent could not check with AgentHC (the check
 # failed, or it has not run yet); it reads no signals until it can
 PASS_STATES = ("active", "exits_only", "waiting", "none", "unknown")
@@ -292,6 +293,10 @@ def _types():
             "auto_pay": "bool",
             "last_day": "bool",
             "exits_until": Opt("iso"),
+            "balance_usd": Opt("num"),
+            "entries_left_main": Opt("int"),
+            "entries_left_other": Opt("int"),
+            "auto_topup": Opt("bool"),
         },
         "ExitLoss": {
             "since": "iso",
@@ -500,6 +505,15 @@ _DOC = {
                      "trades (its last signal day was charged today)",
     "Pass.exits_until": "when a used-up pass stops getting exit signals, if "
                         "AgentHC said",
+    "Pass.balance_usd": "kind credits: the trade-credits balance AgentHC last "
+                        "reported (the agent never counts it); null otherwise "
+                        "or not known yet",
+    "Pass.entries_left_main": "kind credits: main-pick entries the balance "
+                              "covers at AgentHC's price; null otherwise",
+    "Pass.entries_left_other": "kind credits: other-trades entries the balance "
+                               "covers at AgentHC's price; null otherwise",
+    "Pass.auto_topup": "kind credits: the owner's auto top-up switch; null "
+                       "otherwise",
     "Signals.exit_loss": "null while exit signals can reach the agent; else "
                          "since when they can't and why",
     "ExitLoss.sell_at": "when the agent sells what it holds today because of "
@@ -1623,7 +1637,9 @@ def _pass(cfg, state, now):
     """What signal access the agent has, as data — the cases of
     sources.agenthc_day_trade_ideas.pass_summary."""
     none = {"kind": "none", "status": "none", "days_left": None,
-            "auto_pay": False, "last_day": False, "exits_until": None}
+            "auto_pay": False, "last_day": False, "exits_until": None,
+            "balance_usd": None, "entries_left_main": None,
+            "entries_left_other": None, "auto_topup": None}
     if cfg.get("source", "agenthc") != "agenthc":
         return {**none, "kind": "not_needed", "status": "active"}
     if cfg.get("agenthc_api_key"):
@@ -1631,15 +1647,21 @@ def _pass(cfg, state, now):
     try:
         from sources import agenthc_day_trade_ideas as hc
         tokens = hc._pass_tokens(cfg)
+        credit = hc._credit_token(cfg)
         cache = state.get("pass_status")
         cache = cache if isinstance(cache, dict) else {}
         best = None
         statuses = set()
+        crec, cstatus = {}, None
         for token in tokens:
             rec = cache.get(hc._token_id(token))
             rec = rec if isinstance(rec, dict) else {}
             # None while hc.poll can't rely on it either (hc._known_status)
-            statuses.add(hc._known_status(cfg, rec, token, now.timestamp()))
+            known = hc._known_status(cfg, rec, token, now.timestamp())
+            if token == credit:
+                crec, cstatus = rec, known
+                continue
+            statuses.add(known)
             if rec.get("status") in hc._USABLE and (
                     best is None or (rec.get("status") == "active"
                                      and best.get("status") != "active")):
@@ -1654,8 +1676,14 @@ def _pass(cfg, state, now):
     until = _num(l402.get("expires_at"))
     live = bool(l402.get("token")) and until is not None \
         and until > now.timestamp()
-    if live and not (best and best.get("status") == "active"):
+    if live and not (best and best.get("status") == "active") \
+            and crec.get("status") != "active":
         return {**none, "kind": "day_pass", "status": "active", "auto_pay": auto}
+    if credit and not (best and best.get("status") == "active") and (
+            crec.get("status") == "active"
+            or (crec.get("status") == "exits_only" and not best)
+            or (not best and not [t for t in tokens if t != credit])):
+        return _credit_pass(cfg, crec, cstatus, none, auto)
     if best:
         left = _int(best.get("days_left"))
         import agent as A
@@ -1669,6 +1697,7 @@ def _pass(cfg, state, now):
                              and state.get("pass_charged_day") == today),
                 "exits_until": (_iso(exits_until) if exits_until
                                 and best["status"] == "exits_only" else None)}
+    tokens = [t for t in tokens if t != credit]
     if tokens:
         # no record for a pass: its check with AgentHC failed (or has not
         # run yet), and hc.poll reads nothing until it knows — never "used
@@ -1682,6 +1711,27 @@ def _pass(cfg, state, now):
         return {**none, "kind": "day_pass",
                 "status": "waiting" if auto else "none", "auto_pay": auto}
     return none
+
+
+def _credit_pass(cfg, rec, known, none, auto):
+    """The trade-credits account as a Pass (kind credits): AgentHC's last
+    balance (sources.agenthc_day_trade_ideas never counts it locally)."""
+    status = rec.get("status")
+    if status not in ("active", "exits_only"):
+        status = "unknown" if known is None else "waiting"
+    bal = _int(rec.get("balance_cents"))
+    prices = rec.get("entry_prices_cents")
+    prices = prices if isinstance(prices, dict) else {}
+
+    def left(track):
+        p = _int(prices.get(track))
+        return bal // p if bal is not None and bal >= 0 and p and p > 0 else None
+    return {**none, "kind": "credits", "status": status, "auto_pay": auto,
+            "balance_usd": (round(bal / 100, 2) if bal is not None and bal >= 0
+                            else None),
+            "entries_left_main": left("main"),
+            "entries_left_other": left("other"),
+            "auto_topup": bool(cfg.get("credit_autotopup"))}
 
 
 def _exit_loss(cfg, state, now, blocked=False, acct=None):

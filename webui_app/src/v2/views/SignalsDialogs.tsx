@@ -11,10 +11,11 @@
 //                  (GET /api/wallet/quote, reused, says what it is worth)
 //   Own wallet     POST /api/v2/wallet/connect {url, admin_key}: two steps
 //   Buys a day-pass by itself   POST /api/v2/wallet/recurring {on}: two steps
+//   Auto top-up    POST /api/v2/credits/autotopup {on, usd}: two steps
 // After each, the page reads the settings again and shows those.
 import { useEffect, useId, useState } from "react";
 import type { FundInvoice, Preview, SettingsView, WalletBalance, WalletQuote } from "../../lib/settingsApi";
-import { passPriceUsd, passUsdWords } from "../../lib/settingsApi";
+import { creditPriceWords, passPriceUsd, passUsdWords, setAutoTopup } from "../../lib/settingsApi";
 import { FieldError, ReviewDialog, askPreview } from "../Forms";
 import { API, getJson, send } from "../lib/http";
 import { readAddress, readSats, scopeWords, sourceWords } from "../lib/settings";
@@ -404,7 +405,9 @@ export function FundDialog({ page, onClose }: { page: Page; onClose: () => void 
         {() =>
           quote && quote.ok ? (
             <p className="small">
-              About {usd(quote.usd)} at {usd(quote.btc_usd, 0)} a bitcoin: {plural(quote.day_passes, "day-pass", "day-passes")} at about {passUsdWords(dayUsd(quote))} each.
+              {quote.topups != null && quote.topup_usd != null
+                ? `About ${usd(quote.usd)} at ${usd(quote.btc_usd, 0)} a bitcoin: ${plural(quote.topups, `${passUsdWords(quote.topup_usd)} top-up`)} of trade credits.`
+                : `About ${usd(quote.usd)} at ${usd(quote.btc_usd, 0)} a bitcoin: ${plural(quote.day_passes, "day-pass", "day-passes")} at about ${passUsdWords(dayUsd(quote))} each.`}
             </p>
           ) : null
         }
@@ -511,6 +514,38 @@ export function RecurringDialog({ page, onClose }: { page: Page; onClose: () => 
       onClose={onClose}
       onDone={async () => {
         await saved(page, (nv) => `Saved. Buys a day-pass by itself: ${nv.signals.recurring ? "on" : "off"}.`);
+        onClose();
+      }}
+    />
+  );
+}
+
+/** Trade credits: let the agent top up by itself (and which size), two steps.
+ *  `on`/`usd`: what the owner asked for. */
+export function AutoTopupDialog({ page, on, usd: size, onClose }: { page: Page; on: boolean; usd: number; onClose: () => void }) {
+  const v = page.settings.view as SettingsView;
+  const c = v.signals.credits;
+  const payload = setAutoTopup(on, size);
+  const ask = usePreview(API.creditsAutotopup, payload);
+  const turning = on !== !!c?.autotopup;
+  const title = !turning ? `Top up ${passUsdWords(size)} at a time?` : on ? "Let the agent top up trade credits by itself?" : "Stop topping up automatically?";
+  if (ask.kind !== "review") return <Asking title={title} ask={ask} onClose={onClose} />;
+  return (
+    <ReviewDialog
+      path={API.creditsAutotopup}
+      payload={payload}
+      first={ask.preview}
+      title={title}
+      lead={
+        on
+          ? `When the balance can't cover the next entry (${creditPriceWords(c?.entry_prices_usd)}), the agent buys ${passUsdWords(size)} of trade credits from its wallet, only on market days while LIVE, never while a top-up is unpaid, and never above your auto-pay caps. Exits are always free.`
+          : "The agent never tops up by itself. You top up on this page; exits keep coming free at any balance."
+      }
+      cancel="Keep it as it is"
+      confirm={!turning ? "Save" : on ? "Turn it on" : "Turn it off"}
+      onClose={onClose}
+      onDone={async () => {
+        await saved(page, (nv) => `Saved. Auto top-up: ${nv.signals.credits?.autotopup ? `on, ${passUsdWords(nv.signals.credits.topup_usd)} at a time` : "off"}.`);
         onClose();
       }}
     />

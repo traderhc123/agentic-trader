@@ -115,7 +115,27 @@ export interface SettingsView {
     /** signal-day purchases on file by id: paid, or an invoice that can still be paid
      *  (an invoice that expired unpaid is in neither) */
     purchases: Purchases;
+    /** trade credits (older agents leave it out) */
+    credits?: CreditsView;
   };
+}
+
+/** Trade credits in GET /api/v2/settings (never the account's token). */
+export interface CreditsView {
+  /** AgentHC sells trade credits (its last answer) */
+  offered: boolean;
+  /** a credits account is on file */
+  account: boolean;
+  status: string | null;
+  /** AgentHC's balance as last reported to the agent; null: not known */
+  balance_usd: number | null;
+  entry_prices_usd: Record<string, number> | null;
+  options_usd: number[];
+  /** the owner's auto top-up switch and its size */
+  autotopup: boolean;
+  topup_usd: number;
+  /** top-up invoices still on file */
+  pending: { usd: number | null; amount_sats: number | null; created_at: number | null }[];
 }
 
 export type Dashboard = "classic" | "v2";
@@ -229,8 +249,13 @@ export interface Purchases {
   waiting: string[];
 }
 
-/** POST /api/v2/pass/buy, confirmed: the Lightning invoice to pay. */
+/** POST /api/v2/pass/buy, confirmed: the Lightning invoice to pay (signal
+ *  days, or with kind "credits" a trade-credits top-up). */
 export interface Invoice {
+  kind?: "credits";
+  topup_usd?: number;
+  payment_hash?: string;
+  note?: string;
   /** this purchase's id in SettingsView.signals.purchases */
   purchase?: string;
   bolt11: string;
@@ -324,7 +349,31 @@ export interface PassOptions {
   options: number[] | null;
   prices_usd?: Record<string, number> | null;
   prices_sats?: Record<string, number> | null;
+  /** trade credits when AgentHC sells them; null (or missing) otherwise */
+  credits?: CreditOffer | null;
 }
+/** AgentHC's trade-credits offer: entries are charged per trade (main pick
+ *  and other trades each at their own price), exits are free. */
+export interface CreditOffer {
+  pricing: "credits";
+  /** top-up sizes on sale now (USD); [] = paused */
+  options_usd: number[];
+  paused: boolean;
+  /** sats per top-up size (keys "20", "50", "100") */
+  topup_prices_sats: Record<string, number>;
+  entry_prices_usd: Record<string, number>;
+  max_topup_usd: number | null;
+  max_entry_age_s: number | null;
+}
+/** "main pick $10 / other trades $2 per entry" */
+export function creditPriceWords(p: Record<string, number> | null | undefined): string {
+  if (!p || !(Number(p.main) > 0)) return "priced per entry";
+  const w = (v: number) => passUsdWords(Math.round(v * 100) / 100);
+  return `main pick ${w(Number(p.main))}${Number(p.other) > 0 ? ` / other trades ${w(Number(p.other))}` : ""} per entry`;
+}
+/** The two-step payloads for buying a top-up and the auto top-up switch. */
+export const buyTopup = (usd: number) => ({ topup_usd: usd });
+export const setAutoTopup = (on: boolean, usd: number) => ({ on, usd });
 /** Prepaid pass prices in USD (paid in sats) shown when the server sends none.
  *  AgentHC sets the real price on each invoice. */
 export const PASS_PRICES_USD: Record<number, number> = { 1: 50, 5: 225 };
@@ -351,6 +400,14 @@ export interface PassCheck {
   status?: string;
   days_left?: number | null;
   error?: string;
+  /** the trade-credits account, when there is one */
+  credits?: {
+    status?: string | null;
+    balance_usd?: number;
+    error?: string;
+    /** the newest top-up invoice on file and where AgentHC says it stands */
+    topup?: { payment_hash?: string; usd?: number; status?: string } | null;
+  };
 }
 /** GET /api/wallet/balance */
 export type WalletBalance = { ok: true; sats: number } | { ok: false; error: string };
@@ -437,7 +494,7 @@ export interface WalletView {
 /** day_pass_usd: AgentHC's price for one day-pass (the built-in one when it can't say);
  *  older agents leave it out. */
 export type WalletQuote =
-  | ({ ok: true; btc_usd: number; usd: number; day_pass_usd?: number; day_passes: number; day_pass_sats: number; suggested_sats: number; invoice_cap: number | null } & AutopayCap)
+  | ({ ok: true; btc_usd: number; usd: number; day_pass_usd?: number; day_passes: number; day_pass_sats: number; suggested_sats: number; invoice_cap: number | null; topups?: number; topup_usd?: number; topup_sats?: number } & AutopayCap)
   | ({ ok: false; error: string; day_pass_usd?: number } & AutopayCap);
 /** The wallet's auto-pay cap, as /api/wallet/quote reports it (older agents leave it out). */
 export interface AutopayCap {

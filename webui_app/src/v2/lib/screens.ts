@@ -46,6 +46,9 @@ export type ActionId =
   | "wallet-connect"
   | "wallet-page"
   | "recurring"
+  | "buy-credits"
+  | "credit-autotopup"
+  | "credit-size"
   // Settings
   | "broker"
   | "ai"
@@ -94,6 +97,9 @@ export const ACTION_HOME: Record<ActionId, Home> = {
   "wallet-connect": "signals",
   "wallet-page": "signals",
   recurring: "signals",
+  "buy-credits": "signals",
+  "credit-autotopup": "signals",
+  "credit-size": "signals",
   broker: "settings",
   ai: "settings",
   alerts: "settings",
@@ -197,6 +203,9 @@ export function screenOf(view: View, s: Status, l: Link): Screen {
   } else if (view === "rules") controls.push("limits", "size", "filters", "policy");
   else if (view === "signals") {
     controls.push("buy-days", "source", "scope", "api-key", "wallet-create", "wallet-fund", "wallet-connect", "wallet-page", "recurring");
+    // trade credits: AgentHC's balance, top-up and auto top-up (shown when
+    // AgentHC sells credits or an account is on file)
+    controls.push("buy-credits", "credit-autotopup", "credit-size");
     if (s.mode === "practice") controls.push("preview");
   }
   else if (view === "settings") {

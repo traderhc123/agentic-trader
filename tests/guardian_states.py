@@ -67,6 +67,20 @@ def _pass_state(days_left=13, status="active"):
                       "2026-11-06", TODAY]}
 
 
+def _credit_state(balance_cents, status):
+    """A trade-credits account (no prepaid pass) as the agent saved
+    AgentHC's last answer."""
+    from sources import agenthc_day_trade_ideas as hc
+    tracks = [t for t, p in (("main", 1000), ("other", 200)) if balance_cents >= p]
+    return {"pass_status": {hc._token_id("fixture-credits"): {
+        "status": status, "kind": "credits", "balance_cents": balance_cents,
+        "entry_tracks": tracks, "entry_prices_cents": {"main": 1000, "other": 200},
+        "days_left": None, "until_ts": NOW.timestamp() + 10 * 365 * 86400}}}
+
+
+_CREDITS = {"feed_pass": None, "feed_credits": {"token": "fixture-credits"}}
+
+
 def _text(c):
     sym, expiry, strike, side = c
     return f"{sym} {expiry} ${float(strike)} {side}"
@@ -475,6 +489,13 @@ STATES.update({
                       _history(True), runtime()),
     # the 08:30 renewal of the wallet day-pass failed; the running one still
     # reads entries until 3:00 PM ET (review F5: the alert is on /v2 too)
+    # trade credits instead of signal days: AgentHC's balance, then used up
+    # (exits keep coming free)
+    "credits-active": ({**LIVE, **_CREDITS}, {**_state(True), **_credit_state(2400, "active")},
+                       _history(True), runtime()),
+    "credits-used-up": ({**LIVE, **_CREDITS},
+                        {**_state(True), **_credit_state(400, "exits_only")},
+                        _history(True), runtime(feed_access=False)),
     "daypass-renewal-failed": (
         {**LIVE, "feed_pass": None, "lnbits_url": "https://wallet.example",
          "day_pass_recurring": True},

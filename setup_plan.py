@@ -20,7 +20,8 @@ dashboard):
     applied, and the owner goes live again (`dry off`) after checking it
   - turning on self-edit
   - logging in to Robinhood (OAuth in the owner's browser)
-  - paying for the feed (the owner pays the invoice from their own wallet)
+  - paying for the feed (the owner pays the invoice from their own wallet),
+    including trade-credit top-ups and turning on auto top-up
 
 Sizing is accepted only because the owner chose it; assistants must not
 suggest amounts (BOOT.md).
@@ -57,6 +58,11 @@ _FORBIDDEN = {
                          "(`self-edit on` in the dashboard)",
     "consent": "the owner accepts DISCLAIMER.md themselves in the wizard",
     "accepted": "the owner accepts DISCLAIMER.md themselves in the wizard",
+    "credit_autotopup": "auto top-up of trade credits spends from the "
+                        "agent's wallet: only the owner turns it on, on the "
+                        "Signals page",
+    "credit_topup_usd": "the auto top-up size is the owner's choice, on the "
+                        "Signals page",
 }
 
 
@@ -286,7 +292,8 @@ def apply(plan, cfg, consent_ok, home):
     extra = set(fa) - {"agenthc_api_key"}
     if extra:
         errors.append("feed_access accepts only agenthc_api_key — prepaid days "
-                      "are bought and paid by the owner in the wizard")
+                      "and trade credits are bought and paid by the owner in "
+                      "the wizard")
 
     # ── AI model ──
     ai = plan.get("ai")

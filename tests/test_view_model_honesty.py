@@ -20,6 +20,10 @@ IWM_TODAY = f"IWM|{TODAY}|245.0|C"
 LIVE = {"source": "agenthc", "broker": "robinhood", "dry_run": False,
         "agenthc_api_key": ""}
 
+# the trade-credits fields of a Pass that is not kind credits
+NO_CREDITS = {"balance_usd": None, "entries_left_main": None,
+              "entries_left_other": None, "auto_topup": None}
+
 
 def at(hh, mm=0, day=TODAY):
     d = datetime.strptime(day, "%Y-%m-%d").replace(
@@ -168,7 +172,8 @@ def test_a_running_wallet_day_pass_is_the_pass_the_agent_reads_with():
     s = build({**WALLET, "feed_pass": {"token": "tok"}}, st)
     assert s["signals"]["pass"] == {"kind": "day_pass", "status": "active",
                                     "days_left": None, "auto_pay": True,
-                                    "last_day": False, "exits_until": None}
+                                    "last_day": False, "exits_until": None,
+        **NO_CREDITS}
     assert s["positions"][0]["next"]["action"] == "sell_on_exit"
     assert s["real_positions_managed"] is True
     caps = s["capabilities"]

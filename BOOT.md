@@ -127,7 +127,14 @@ This walks through, in order:
    apply only when they pick `agenthc`.
 2. **AgentHC feed access (sats-based)** — in the wizard's Signal source
    step:
-   - **Prepaid signal days (recommended)**: the human picks 1 or 5
+   - **Trade credits (where AgentHC offers them)**: the human tops up
+     $20, $50 or $100 with ONE Lightning invoice from their own wallet. A
+     balance AgentHC holds: $10 per main-pick entry, $2 per other-trades
+     entry, exits always free. The agent shows AgentHC's balance and never
+     counts it. You never pay it for them. Auto top-up is the owner's own
+     switch on the Signals page: a setup plan can never turn it on (nor set
+     its size).
+   - **Prepaid signal days (while still on sale)**: the human picks 1 or 5
      signal days and pays ONE Lightning invoice (QR code) from the wallet
      they already use (Cash App, Strike, Phoenix…). ~$50 per signal day
      (5 days for ~$225), priced in sats; a day is only used when the agent
@@ -210,6 +217,7 @@ watched several days of activity and explicitly ask to go live.
 | `403 feed_not_live` | Feed isn't publishing yet — agent idles and keeps polling; normal |
 | `402` loops / "more than your auto-pay cap" | Day-pass price above the cap in force (the refusal names it; `autopay cap` shows it) — if the price is legitimate the owner raises it with `set autopay cap N` (or `max_autopay_sats` in config.json) |
 | `WalletError: payment failed` | Wallet balance too low — `python agent.py fund <sats>` and pay the invoice |
+| "Trade credits used up" | The balance can't cover the next entry: exits still arrive free; the owner tops up on the Signals page (or turns on auto top-up) |
 | `403 terms_acceptance_required` | Agent auto-accepts and retries; if it loops, run setup again |
 | `403 tier_required` | AgentHC key is FREE tier — upgrade to Premium (`/docs`) or switch to the day-pass |
 | `401 Invalid API key` | Key revoked/typo — re-run setup with a valid key |

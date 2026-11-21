@@ -231,6 +231,7 @@ Input for the 4a.5 test (`tests/test_v2_parity.py::test_every_route_has_a_v2_cal
 | `/api/deploy` | POST | create cloud server | classic: wrapped by NEW /api/v2/move/deploy two-step (P-69) | classic |
 | `/api/update/pull` | POST | install update | /v2 lib/update.ts:37 (P-72) | v2 |
 | `/api/wallet/recurring` | POST | recurring day-pass | classic: wrapped by PR 2 /api/v2/wallet/recurring (P-53) | classic |
+| `/api/credits/autotopup` | POST | trade-credits auto top-up | classic: wrapped by /api/v2/credits/autotopup (two-step) | classic |
 | `/api/broker/connect` | POST | connect key broker | classic: wrapped by PR 2 /api/v2/broker/connect (P-56) | classic |
 | `/api/proposal/apply` | POST | apply code change + restart | classic: wrapped by NEW /api/v2/proposal/apply two-step (P-75) | classic |
 | `/api/proposal/reject` | POST | reject code change | /v2 Settings → Code changes (P-76) | v2 |
@@ -242,8 +243,9 @@ Input for the 4a.5 test (`tests/test_v2_parity.py::test_every_route_has_a_v2_cal
 | `/api/v2/settings/ai` | POST | AI helper | /v2 Settings → Connections | v2 |
 | `/api/v2/broker/connect` | POST | key-based broker (two-step) | /v2 Settings → Connections | v2 |
 | `/api/v2/broker/robinhood` | POST | Robinhood sign-in (two-step) | /v2 Settings → Connections | v2 |
-| `/api/v2/pass/buy` | POST | signal days invoice (two-step) | /v2 Signals & pass | v2 |
+| `/api/v2/pass/buy` | POST | signal days or trade-credits top-up invoice (two-step) | /v2 Signals & pass | v2 |
 | `/api/v2/wallet/recurring` | POST | recurring day-pass (two-step) | /v2 Signals & pass → Payment wallet (P-53) | v2 |
+| `/api/v2/credits/autotopup` | POST | trade-credits auto top-up and its size (two-step; not a phone route) | /v2 Signals & pass → Trade credits | v2 |
 | `/api/v2/command` | POST | pause, resume, practice, LIVE (two-step), stop (two-step, P-07) | /v2 band; Settings → The agent on this computer | v2 |
 | `/api/v2/agent/start` | POST | start the agent (start_local; two-step when the saved mode is LIVE, P-08) | /v2 Settings → The agent on this computer | v2 |
 | `/api/v2/move/finish` | POST | retire this computer after the move file is saved (two-step, P-68) | /v2 Settings → This computer → Move | v2 |
@@ -525,7 +527,7 @@ Routes /v2 does not call directly (the *classic* rows of the Server routes table
 - `/api/source`, `/api/source/scope`, `/api/sizing`, `/api/safety`
 - `/api/policy`, `/api/policy/disable`, `/api/llm`
 - `/api/start-local`, `/api/move/finish`, `/api/deploy`, `/api/rh/start`
-- `/api/wallet/create`, `/api/wallet/fund`, `/api/wallet/recurring`
+- `/api/wallet/create`, `/api/wallet/fund`, `/api/wallet/recurring`, `/api/credits/autotopup`
 - `/api/pass/buy`, `/api/broker/connect`, `/api/proposal/apply`
 
 ## One action, one home: choices where the two inventories differed

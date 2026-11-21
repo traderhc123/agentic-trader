@@ -256,6 +256,8 @@ export interface WizardState {
   wallet: { connected: boolean; page: string };
   recurring: boolean;
   pass: boolean;
+  /** trade credits (older agents leave it out; never the account's token) */
+  credits?: { account: boolean; autotopup: boolean; topup_usd: number };
   autostart?: boolean;
   rules?: {
     rule_tickers?: string[] | null;

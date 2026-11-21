@@ -7,7 +7,8 @@ import { Field, Input, Select } from "../components/ui/field";
 import { QR } from "../components/ui/qr";
 import { Msg, err, info, ok, type MsgT } from "../components/ui/tag";
 import { api } from "../lib/api";
-import { passPriceUsd, passSavingUsd, passUsdWords } from "../lib/settingsApi";
+import type { CreditOffer } from "../lib/settingsApi";
+import { creditPriceWords, passPriceUsd, passSavingUsd, passUsdWords } from "../lib/settingsApi";
 import { cn } from "../lib/cn";
 import { copyToClipboard, usePolling } from "../lib/hooks";
 import { PASS_SIZES_MS, balanceEvery, passStatusEvery } from "./polls";
@@ -39,6 +40,11 @@ export function SourceStep() {
   // pass purchase
   const [sizes, setSizes] = useState<number[] | null>(null); // null = server not asked / unknown → show all
   const [prices, setPrices] = useState<Record<string, number> | null>(null); // the server's USD prices, if it sent them
+  // trade credits, when AgentHC sells them (null: not offered / not known)
+  const [credits, setCredits] = useState<CreditOffer | null>(null);
+  const [selTopup, setSelTopup] = useState<number | null>(null);
+  // the top-up invoice being waited for (its payment hash; "" = not known)
+  const topupHash = useRef<string | null>(null);
   const [selDays, setSelDays] = useState<number | null>(null);
   const [passMsg, setPassMsg] = useState<MsgT>(null);
   const [inv, setInv] = useState<Invoice | null>(null);
@@ -56,10 +62,11 @@ export function SourceStep() {
   // every 15 minutes while it is visible (each ask goes on to AgentHC).
   usePolling(
     () =>
-      api<{ options?: number[]; prices_usd?: Record<string, number> | null }>("/api/pass/options")
+      api<{ options?: number[]; prices_usd?: Record<string, number> | null; credits?: CreditOffer | null }>("/api/pass/options")
         .then((r) => {
           if (r.prices_usd && typeof r.prices_usd === "object") setPrices(r.prices_usd);
           if (Array.isArray(r.options)) setSizes(r.options);
+          setCredits(r.credits && typeof r.credits === "object" ? r.credits : null);
         })
         .catch(() => {}),
     PASS_SIZES_MS,
@@ -72,7 +79,7 @@ export function SourceStep() {
   usePolling(checkPass, waitingFor ? passStatusEvery : null, { immediate: false }, waitingFor);
 
   useEffect(() => {
-    if (st?.pass) checkPass();
+    if (st?.pass || st?.credits?.account) checkPass();
     return () => {
       if (helpTimer.current) clearTimeout(helpTimer.current);
     };
@@ -86,6 +93,22 @@ export function SourceStep() {
 
   async function checkPass() {
     const r = await api("/api/pass/status");
+    const t = r.credits?.topup;
+    if (topupHash.current !== null && t && (!topupHash.current || t.payment_hash === topupHash.current)) {
+      if (t.status === "credited") {
+        stopPoll();
+        topupHash.current = null;
+        setInv(null);
+        const b = Number(r.credits.balance_usd);
+        setPassMsg(ok(`Credits added${Number.isFinite(b) ? `: balance $${b.toFixed(2)}` : ""}`));
+      } else if (t.status === "expired") {
+        stopPoll();
+        topupHash.current = null;
+        setInv(null);
+        setPassMsg(err("That invoice expired unpaid. Pick a top-up again."));
+      } else setPassMsg(info("Waiting for payment…"));
+      return;
+    }
     if (r.status === "active") {
       stopPoll();
       setInv(null);
@@ -121,7 +144,42 @@ export function SourceStep() {
     }
   };
 
+  const buyTopup = async (usd: number) => {
+    if (buying.current) return;
+    buying.current = true;
+    setBuyBusy(true);
+    try {
+      setSelTopup(usd);
+      setSelDays(null);
+      setPassMsg(info("Creating invoice…"));
+      const r = await api("/api/pass/buy", { topup_usd: usd });
+      if (!r.ok) {
+        setPassMsg(err(r.error));
+        return;
+      }
+      topupHash.current = typeof r.payment_hash === "string" ? r.payment_hash : "";
+      setInv({
+        bolt11: r.bolt11,
+        qr: r.qr,
+        quote: `$${usd} of trade credits: ${Number(r.amount_sats).toLocaleString()} sats${r.note ? ` · ${r.note}` : ""}`,
+        need: Math.ceil((r.amount_sats || 0) * 1.01) + 50,
+      });
+      setCopied("");
+      setShowHelp(false);
+      setPassMsg(info("Waiting for payment…"));
+      waiting.current = true;
+      setWaitingFor(r.bolt11 || String(Date.now()));
+    } catch {
+      setPassMsg(err("Could not reach the agent on this computer. Check that it is still running, then pick a top-up again."));
+    } finally {
+      buying.current = false;
+      setBuyBusy(false);
+    }
+  };
+
   const requestPass = async (days: number) => {
+    topupHash.current = null;
+    setSelTopup(null);
     setSelDays(days);
     setPassMsg(info("Creating invoice…"));
     const r = await api("/api/pass/buy", { days });
@@ -210,7 +268,47 @@ export function SourceStep() {
             </Field>
           </Block>
 
-          <Block label="Access" desc="Prepay signal days in sats over Lightning.">
+          {credits && (
+            <Block label="Trade credits" desc="Prepaid with AgentHC: entries are charged per trade, exits are free.">
+              <p className="m-0 max-w-[72ch] text-sm leading-relaxed text-fg2">
+                One balance that AgentHC holds for your agent: <b className="text-fg">{creditPriceWords(credits.entry_prices_usd)}</b>. Exits are always
+                free and keep coming at any balance. Top up in sats from the wallet you already use; the balance your agent shows is AgentHC's own.
+              </p>
+              <div role="group" aria-label="Trade-credit top-ups" className="grid grid-cols-[repeat(auto-fit,minmax(130px,1fr))] gap-2">
+                {credits.options_usd.map((n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    data-topup-usd={n}
+                    onClick={() => buyTopup(n)}
+                    disabled={buyBusy}
+                    aria-busy={buyBusy && selTopup === n}
+                    aria-pressed={selTopup === n}
+                    className={cn(
+                      "flex min-w-0 flex-col items-start rounded-md border px-3 pb-2.5 pt-3 text-left transition-colors disabled:cursor-wait disabled:opacity-60",
+                      selTopup === n
+                        ? "border-accent bg-accent/[0.08] shadow-[inset_0_0_0_1px_rgb(var(--accent))]"
+                        : "border-line2 bg-panel2 hover:border-accent/50 hover:bg-raise",
+                    )}
+                  >
+                    <span className="h-4 text-2xs font-medium text-accent">Top up</span>
+                    <span className="mt-1 font-mono text-2xl font-medium leading-none tracking-[-0.02em] text-fg">{passUsdWords(n)}</span>
+                    <span className="mt-1 text-xs text-muted">of trade credits</span>
+                    <span className="mt-3 w-full border-t border-line pt-2 font-mono text-xs text-fg2">
+                      {credits.topup_prices_sats?.[String(n)] ? `≈ ${Number(credits.topup_prices_sats[String(n)]).toLocaleString()} sats` : "priced in sats"}
+                    </span>
+                  </button>
+                ))}
+              </div>
+              {credits.options_usd.length === 0 && (
+                <p role="status" className="m-0 text-sm text-muted">
+                  Top-ups are paused for a little while: our node is refilling so it can receive the payment.
+                </p>
+              )}
+            </Block>
+          )}
+
+          <Block label="Access" desc={credits ? "Signal days, while still on sale." : "Prepay signal days in sats over Lightning."}>
             <p className="m-0 max-w-[72ch] text-sm leading-relaxed text-fg2">
               One Lightning payment from the wallet you already use (Cash App, Strike, Phoenix, Alby…).{" "}
               <b className="text-fg">About {passUsdWords(passPriceUsd(1, prices) ?? 50)} per signal day</b>, or 5 signal days for about{" "}

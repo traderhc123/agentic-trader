@@ -20,6 +20,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NOW = datetime(2026, 11, 9, 19, 41, 7, tzinfo=timezone.utc)
 TODAY = "2026-11-09"
 
+# the trade-credits fields of a Pass that is not kind credits
+NO_CREDITS = {"balance_usd": None, "entries_left_main": None,
+              "entries_left_other": None, "auto_topup": None}
+
 
 def at(hh, mm=0, day=TODAY):
     """An ISO UTC stamp for hh:mm ET on `day` (EST, UTC-5)."""
@@ -385,7 +389,8 @@ def test_empty_first_run():
     assert s["signals"]["last_signal"] is None
     assert s["signals"]["pass"] == {"kind": "none", "status": "none",
                                     "days_left": None, "auto_pay": False,
-                                    "last_day": False, "exits_until": None}
+                                    "last_day": False, "exits_until": None,
+        **NO_CREDITS}
     assert s["signals"]["exit_loss"] is None
     assert s["broker"]["connected"] is None
     assert s["limits"]["cap"] == 5 and s["limits"]["max_positions"] == 10
@@ -949,7 +954,8 @@ def test_signal_pass_states():
     s = p(prepaid, {"pass_status": {tid: {"status": "active", "days_left": 13}}})
     assert s["signals"]["pass"] == {"kind": "prepaid", "status": "active",
                                     "days_left": 13, "auto_pay": False,
-                                    "last_day": False, "exits_until": None}
+                                    "last_day": False, "exits_until": None,
+        **NO_CREDITS}
     used = p(prepaid, {"pass_status": {tid: {"status": "exits_only"}}},
              feed_access=False)
     assert used["signals"]["pass"]["status"] == "exits_only"
@@ -970,7 +976,8 @@ def test_signal_pass_states():
     wallet = {**base, "lnbits_url": "https://wallet.example", "day_pass_recurring": True}
     assert p(wallet, feed_access=None)["signals"]["pass"] == {
         "kind": "day_pass", "status": "waiting", "days_left": None,
-        "auto_pay": True, "last_day": False, "exits_until": None}
+        "auto_pay": True, "last_day": False, "exits_until": None,
+        **NO_CREDITS}
     # not read yet, auto-pay on: nothing says it can't
     assert p(wallet, feed_access=None)["capabilities"]["opening"]["state"] \
         == "practice_only"
@@ -979,7 +986,8 @@ def test_signal_pass_states():
     assert p(base, feed_access=None)["signals"]["pass"]["kind"] == "none"
     assert p({**CFG, "source": "manual"})["signals"]["pass"] == {
         "kind": "not_needed", "status": "active", "days_left": None,
-        "auto_pay": False, "last_day": False, "exits_until": None}
+        "auto_pay": False, "last_day": False, "exits_until": None,
+        **NO_CREDITS}
     assert p(base, poll_ok=False, feed_access=True)["capabilities"][
         "listening"] == {"state": "cant", "reason_code": "feed_unreachable"}
 

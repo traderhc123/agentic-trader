@@ -14,7 +14,7 @@ heartbeat — entirely under your configuration and responsibility.
 |---|---|
 | `manual` | Your own commands, appended to a local `commands.jsonl` — fully self-directed |
 | `url` | Any JSON feed URL you supply — bring your own signals |
-| `agenthc` *(optional, featured)* | [Agentic Day Trade Ideas](https://api.traderhc.com/docs) — AgentHC's published **hypothetical paper-trade journal** as declarative ENTERED/EXITED events. Sats-priced (~$50/day Lightning day-pass or 5 signal days for ~$225, price floats with Bitcoin). Free aggregate [track record](https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record) (hypothetical, labeled) |
+| `agenthc` *(optional, featured)* | [Agentic Day Trade Ideas](https://api.traderhc.com/docs) — AgentHC's published **hypothetical paper-trade journal** as declarative ENTERED/EXITED events. Sats-priced: prepaid trade credits where AgentHC offers them ($10 per main-pick entry, $2 per other-trades entry, exits free), or signal days while still on sale (~$50/day Lightning day-pass or 5 signal days for ~$225, price floats with Bitcoin). Free aggregate [track record](https://api.traderhc.com/api/v1/trading/day-trade-ideas/track-record) (hypothetical, labeled) |
 
 > ## ⚠️ Read this first
 > **Nothing here is investment advice.** Signal sources report facts; every
@@ -152,7 +152,30 @@ additionally needs prepaid signal days (below) or a Premium API key.
 
 ## 💰 Paying for the AgentHC feed
 
-The AgentHC feed costs **~$50 per signal day, or ~$225 for 5 signal days,
+**Trade credits (where AgentHC offers them).** A prepaid balance that
+AgentHC holds for your agent, paid down per **entry** it sends you: **$10
+per main-pick entry, $2 per other-trades entry. Exits are always free** and
+keep coming at any balance, so open positions can always close. Top up
+**$20, $50 or $100** at a time (paid in sats at the price of the moment)
+from the *Trade credits* card on the Signals page or in the wizard — one
+Lightning invoice from the wallet you already use. The balance the agent
+shows is **AgentHC's own** — the agent never counts credits itself. When the
+balance can't cover the next entry, new entries are held back (exits keep
+coming) until you top up. Only entries the agent would take are charged: a
+paused agent asks for none, "main pick only" asks for main-pick entries
+only, and an entry older than the agent would act on isn't sold. Practice
+(`dry_run`) and paused (`off`) reads are never charged. An active pass with
+signal days left is used before credits, and signal days you already bought
+keep working.
+
+*Auto top-up* (off until you turn it on, on the Signals page) lets the
+agent's own wallet (Advanced, below) buy the top-up size you picked when the
+balance can't cover the next entry — only on market days from 8:30 AM ET to
+the close, only while LIVE, never while a top-up is unpaid, and never above
+your auto-pay caps (in credits mode the auto cap follows the chosen top-up's
+price + 10%, at most 300,000 sats, and two top-ups a day).
+
+**Signal days (while still on sale).** The AgentHC feed costs **~$50 per signal day, or ~$225 for 5 signal days,
 paid in bitcoin sats** (the sats amount floats with Bitcoin's price). Two ways to pay:
 
 **Prepaid signal days (recommended).** In the setup wizard's *Signal source*

@@ -820,6 +820,29 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     <p class="muted" style="font-size:var(--fs-sm)">"Main pick only" uses a day only
     for main-pick signals; adding "other trades" (above) uses days on those
     too.</p>
+    <div id="credits-card" style="display:none">
+     <h4>Trade credits</h4>
+     <p class="copy">Prepaid credits that AgentHC holds for your agent:
+     <b><span id="cr-main">$10</span> per main-pick entry</b>, <b><span id="cr-other">$2</span>
+     per other-trades entry</b>. Exits are always free and keep coming at any
+     balance. Top up in sats from any Lightning wallet; the balance shown is
+     AgentHC's own.</p>
+     <p id="cr-balance" class="status-line" role="status"></p>
+     <div class="passes">
+      <button class="pass" data-topup-usd="20" onclick="buyTopup(20)"><span class="tagline">Top up</span><span class="q">$20</span><span class="u">of credits</span><span class="p" data-topup-sats="20"></span></button>
+      <button class="pass" data-topup-usd="50" onclick="buyTopup(50)"><span class="tagline">Top up</span><span class="q">$50</span><span class="u">of credits</span><span class="p" data-topup-sats="50"></span></button>
+      <button class="pass" data-topup-usd="100" onclick="buyTopup(100)"><span class="tagline">Top up</span><span class="q">$100</span><span class="u">of credits</span><span class="p" data-topup-sats="100"></span></button>
+     </div>
+     <div class="navrow inline"><button id="autotopup-btn" onclick="toggleAutoTopup()">Auto top-up: OFF</button>
+      <label for="autotopup-usd">size</label>
+      <select id="autotopup-usd"><option value="20">$20</option><option value="50">$50</option><option value="100">$100</option></select>
+      <span id="autotopup-msg" role="status" aria-live="polite"></span></div>
+     <p class="muted" style="font-size:var(--fs-sm)">Auto top-up is off until you
+     turn it on. It pays from the agent's own wallet (Advanced, below), buys only
+     the size you picked, never above your auto-pay caps, and only on market days
+     when the balance can't cover the next entry.</p>
+     <p id="passes-label" class="muted" style="display:none">Signal days, while still on sale:</p>
+    </div>
     <div class="passes">
      <button class="pass" data-days="1" onclick="buyPass(1)"><span class="tagline">Try it</span><span class="q">1</span><span class="u">signal day</span><span class="p">≈ <span data-pass-usd="1">$50</span></span></button>
      <button class="pass" data-days="5" onclick="buyPass(5)"><span class="tagline">Save $25</span><span class="q">5</span><span class="u">signal days</span><span class="p">≈ <span data-pass-usd="5">$225</span></span></button>
@@ -1394,8 +1417,73 @@ async function buyPassNow(days){
   // every 3 s for 2 minutes, then every 15 s; paused while the page is hidden
   passTimer=poll(checkPass,ms=>ms<120000?3000:15000,{immediate:false});
 }
+// Trade credits: a top-up invoice uses the same invoice box as a pass.
+let topupWait=null;
+async function buyTopup(usd){
+  if(passBusy)return;passBusy=true;
+  try{await buyTopupNow(usd);}finally{passBusy=false;}
+}
+async function buyTopupNow(usd){
+  document.querySelectorAll('button.pass').forEach(b=>b.classList.toggle('sel',b.dataset.topupUsd===String(usd)));
+  const st=document.getElementById('pass-status');st.textContent='creating invoice…';
+  const r=await api('/api/pass/buy',{topup_usd:usd});
+  if(!r.ok){st.innerHTML='<span class="err">'+esc(r.error)+'</span>';
+    if(r.refresh_sizes){document.querySelectorAll('button.pass').forEach(b=>b.classList.remove('sel'));passSizes();}
+    return;}
+  topupWait=r.payment_hash||'';
+  document.getElementById('pass-box').style.display='';
+  document.getElementById('pass-quote').textContent='$'+usd+' of trade credits — '+
+    Number(r.amount_sats||0).toLocaleString()+' sats'+(r.note?' · '+String(r.note):'');
+  renderQr(r.qr,'pass-qr');
+  const need=Math.ceil((r.amount_sats||0)*1.01)+50;
+  document.getElementById('pass-need').textContent=need.toLocaleString()+' sats';
+  document.getElementById('pass-help').style.display='none';
+  document.getElementById('pass-bolt11').textContent=r.bolt11;
+  document.getElementById('pass-link').href='lightning:'+r.bolt11;
+  document.getElementById('pass-copy-msg').textContent='';
+  st.textContent='waiting for payment…';
+  if(passTimer)passTimer();
+  passTimer=poll(checkPass,ms=>ms<120000?3000:15000,{immediate:false});
+}
+function showCredits(c){
+  const el=document.getElementById('cr-balance');
+  if(!el||!c)return;
+  if(c.status==='error'){el.innerHTML='<span class="err">'+esc(c.error||'')+'</span>';return;}
+  if(typeof c.balance_usd==='number'){
+    el.innerHTML=(c.status==='exits_only'?'<span class="err">Credits used up — exits still come in free. Top up to get new entries.</span> ':'')+
+      'Balance: <b>$'+c.balance_usd.toFixed(2)+'</b>';
+  }else if(c.status==='pending'){el.textContent='Waiting for the first top-up to be paid.';}
+}
+function setAutoTopupBtn(on,usd){
+  const b=document.getElementById('autotopup-btn');if(!b)return;
+  b.textContent='Auto top-up: '+(on?'ON':'OFF');b.dataset.on=on?'1':'';
+  if(usd)document.getElementById('autotopup-usd').value=String(usd);
+}
+async function toggleAutoTopup(){
+  const on=!document.getElementById('autotopup-btn').dataset.on;
+  const usd=+document.getElementById('autotopup-usd').value;
+  const r=await api('/api/credits/autotopup',{on:on,usd:usd});
+  const m=document.getElementById('autotopup-msg');
+  if(r.ok){setAutoTopupBtn(r.on,r.usd);m.textContent='';}else{m.innerHTML='<span class="err">'+esc(r.error||'')+'</span>';}
+}
 async function checkPass(){
   const r=await api('/api/pass/status');
+  if(r.credits){showCredits(r.credits);
+    const t=r.credits.topup;
+    if(topupWait!==null&&t&&(!topupWait||t.payment_hash===topupWait)){
+      const st=document.getElementById('pass-status');
+      if(t.status==='credited'){
+        if(passTimer){passTimer();passTimer=null;}topupWait=null;
+        document.getElementById('pass-box').style.display='none';
+        st.innerHTML='<span class="ok">✓ Credits added</span>';
+      }else if(t.status==='expired'){
+        if(passTimer){passTimer();passTimer=null;}topupWait=null;
+        document.getElementById('pass-box').style.display='none';
+        st.innerHTML='<span class="err">That invoice expired unpaid — pick a top-up again.</span>';
+      }
+      return;
+    }
+  }
   const st=document.getElementById('pass-status');
   if(r.status==='active'){
     if(passTimer){passTimer();passTimer=null;}
@@ -1447,8 +1535,21 @@ async function passSizes(){
     document.querySelectorAll('.pass[data-days]').forEach(b=>{
       b.style.display=r.options.indexOf(+b.dataset.days)>=0?'':'none';});
     passPrices(r.prices_usd);
+    const c=r.credits;
+    document.getElementById('credits-card').style.display=c?'':'none';
+    if(c){
+      const usd=v=>'$'+(v%1?v.toFixed(2):String(v));
+      const ep=c.entry_prices_usd||{};
+      if(ep.main)document.getElementById('cr-main').textContent=usd(ep.main);
+      if(ep.other)document.getElementById('cr-other').textContent=usd(ep.other);
+      document.querySelectorAll('.pass[data-topup-usd]').forEach(b=>{
+        const n=+b.dataset.topupUsd,s=(c.topup_prices_sats||{})[String(n)];
+        b.style.display=(c.options_usd||[]).indexOf(n)>=0?'':'none';
+        b.querySelector('.p').textContent=s?'≈ '+Number(s).toLocaleString()+' sats':'';});
+      document.getElementById('passes-label').style.display=r.options.length?'':'none';
+    }
     const n=document.getElementById('pass-sizes-note');
-    if(n)n.textContent=r.options.length?'':'Passes are paused for a little while — '+
+    if(n)n.textContent=(r.options.length||(c&&c.options_usd&&c.options_usd.length))?'':(c?'Top-ups are':'Passes are')+' paused for a little while — '+
       'our node is refilling so it can receive the payment. This page checks again every 15 minutes while it is open.';
   }catch(e){}
 }
@@ -1467,8 +1568,9 @@ async function boot(){
     document.getElementById('hc-scope').value=st.include_other_trades?'all':'main';}
   if(st.wallet&&st.wallet.connected){showWallet(st.wallet.page,'wallet connected ✓');
     document.getElementById('adv-wallet').open=true;}
-  if(st.pass)checkPass();
+  if(st.pass||(st.credits&&st.credits.account))checkPass();
   setRecurBtn(!!st.recurring);
+  if(st.credits)setAutoTopupBtn(!!st.credits.autotopup,st.credits.topup_usd);
   if(st.broker){done('s-broker');
     // numeric = Robinhood account last4; otherwise a key-based broker id
     // (status goes in the step's own line, not beside the Robinhood button)
@@ -2858,7 +2960,7 @@ def _btc_usd():
     return 0.0
 
 
-def _fund_quote(sats, invoice_cap=0):
+def _fund_quote(sats, invoice_cap=0, credits_cfg=None):
     """USD context for a sats amount: value, ~day-passes covered, and the
     price of ONE day pass (the funding default — this is a day-pass
     product). The day pass's USD price is AgentHC's own (hc.day_pass_price,
@@ -2867,7 +2969,10 @@ def _fund_quote(sats, invoice_cap=0):
     suggested_sats is the day pass plus LNbits' routing-fee reserve (it
     refuses a payment without it), clamped to the instance's per-invoice cap
     when one is known. {ok: False} when no live price is available (the
-    funding box just omits the hint)."""
+    funding box just omits the hint). credits_cfg (the agent's config, with
+    a trade-credits account): also how many top-ups of the chosen size the
+    amount covers (topups, topup_usd, topup_sats), and the suggestion is one
+    top-up plus the reserve."""
     from sources import agenthc_day_trade_ideas as hc
     day = hc.day_pass_price()
     usd_per_btc = _btc_usd()
@@ -2879,13 +2984,24 @@ def _fund_quote(sats, invoice_cap=0):
     from lightning_wallet import fee_reserve_sats
     need = day_sats + fee_reserve_sats(day_sats)
     suggested = min(need, invoice_cap) if invoice_cap else need
-    return {"ok": True, "btc_usd": round(usd_per_btc, 2),
-            "usd": round(usd, 2),
-            "day_pass_usd": day["usd"],
-            "day_passes": int(usd // day["usd"]),
-            "day_pass_sats": day_sats,
-            "suggested_sats": suggested,
-            "invoice_cap": invoice_cap or None}
+    out = {"ok": True, "btc_usd": round(usd_per_btc, 2),
+           "usd": round(usd, 2),
+           "day_pass_usd": day["usd"],
+           "day_passes": int(usd // day["usd"]),
+           "day_pass_sats": day_sats,
+           "suggested_sats": suggested,
+           "invoice_cap": invoice_cap or None}
+    if credits_cfg is not None:
+        # trade credits: the quote counts top-ups of the chosen size
+        auto = hc._credit_auto_cap(credits_cfg)
+        offer = hc.credit_prices() or {}
+        t_sats = (offer.get("topup_prices_sats") or {}).get((auto or {}).get("usd"))
+        if auto and t_sats:
+            need = t_sats + fee_reserve_sats(t_sats)
+            out.update(topup_usd=auto["usd"], topup_sats=t_sats,
+                       topups=int(sats // t_sats),
+                       suggested_sats=min(need, invoice_cap) if invoice_cap else need)
+    return out
 
 
 # One-shot guard: attempt the missing-dependency bootstrap at most once per
@@ -3088,6 +3204,7 @@ def _one_at_a_time(fn):
         with _MONEY_LOCK:
             return fn(*args, **kwargs)
     run.__name__, run.__doc__ = fn.__name__, fn.__doc__
+    run.__wrapped__ = fn
     return run
 
 
@@ -3102,6 +3219,8 @@ def _pass_buy(cfg, save, data):
     so whichever one the owner pays, the agent finds the pass."""
     from sources import agenthc_day_trade_ideas as hc
     import time as _t
+    if isinstance(data, dict) and data.get("topup_usd") is not None:
+        return _topup_buy(cfg, save, data)
     try:
         days = int(data.get("days") or 0)
     except (TypeError, ValueError):
@@ -3147,8 +3266,176 @@ def _pass_buy(cfg, save, data):
     return {**reply, "qr": _qr_matrix(bolt11.upper())}
 
 
+def _credit_offer_json(offer):
+    """A credit offer (hc.credit_offer) for JSON: string keys, or None."""
+    if not isinstance(offer, dict):
+        return None
+    return {**offer, "topup_prices_sats": {
+        str(k): v for k, v in (offer.get("topup_prices_sats") or {}).items()}}
+
+
+def _topup_record(body, usd, now):
+    """A top-up invoice as feed_credits_pending keeps it."""
+    return {"payment_hash": str(body.get("payment_hash") or "")[:64],
+            "bolt11": body["payment_request"].strip(), "usd": usd,
+            "amount_sats": body.get("amount_sats"), "created_at": now}
+
+
+def _topup_reply(rec, note=""):
+    reply = {"ok": True, "bolt11": rec["bolt11"],
+             "amount_sats": rec.get("amount_sats"),
+             "amount_usd": rec.get("usd"), "kind": "credits",
+             "topup_usd": rec.get("usd"),
+             "payment_hash": rec.get("payment_hash"),
+             "qr": _qr_matrix(rec["bolt11"].upper())}
+    if note:
+        reply["note"] = note
+    return reply
+
+
+def _retire_credits(cfg):
+    """Put the credits account aside (AgentHC said it is not one, or its
+    first top-up expired unpaid). Its token is kept in feed_credits_retired
+    — never thrown away — in case AgentHC was wrong."""
+    old = cfg.pop("feed_credits", None)
+    cfg.pop("feed_credits_pending", None)
+    if isinstance(old, dict) and old.get("token"):
+        keep = [o for o in (cfg.get("feed_credits_retired") or []) if isinstance(o, dict)]
+        cfg["feed_credits_retired"] = ([old] + keep)[:5]
+
+
+@_one_at_a_time
+def _topup_buy(cfg, save, data, _again=False):
+    """Invoice for a trade-credits top-up of `topup_usd` dollars; the owner
+    pays it from any wallet (or 'pay from wallet'). The first top-up opens
+    the account (config feed_credits, the token AgentHC returns); later ones
+    name it and get the same token back. The same size asked again within
+    _PASS_REUSE_S gets the invoice already made. Nothing is counted here:
+    the balance is AgentHC's."""
+    from sources import agenthc_day_trade_ideas as hc
+    import time as _t
+    raw = data.get("topup_usd")
+    try:
+        usd = int(raw)
+    except (TypeError, ValueError):
+        usd = 0
+    if isinstance(raw, bool) or usd <= 0 or usd != raw:
+        return {"ok": False, "error": "pick a top-up size"}
+    fc = cfg.get("feed_credits") if isinstance(cfg.get("feed_credits"), dict) else None
+    token = (fc or {}).get("token") or None
+    pend = [p for p in (cfg.get("feed_credits_pending") or [])
+            if isinstance(p, dict) and isinstance(p.get("bolt11"), str)]
+    now = _t.time()
+    for p in pend:
+        if p.get("usd") == usd and now - float(p.get("created_at") or 0) < _PASS_REUSE_S:
+            return _topup_reply(p)
+    try:
+        body = hc.buy_topup(usd, token)
+    except hc.CreditAccountPending as exc:
+        inv = exc.invoice
+        if not isinstance(inv.get("payment_request"), str):
+            return {"ok": False, "error": str(exc)}
+        rec = _topup_record(inv, inv.get("topup_usd") or usd, now)
+        cfg["feed_credits_pending"] = [rec] + [
+            p for p in pend if p.get("payment_hash") != rec["payment_hash"]][:4]
+        save()
+        return _topup_reply(rec, "The first top-up of your trade-credits "
+                                 "account isn't paid yet — here it is again. "
+                                 "Pay it to open the account.")
+    except hc.CreditAccountInvalid as exc:
+        if token and not _again:
+            _retire_credits(cfg)
+            save()
+            return _topup_buy.__wrapped__(cfg, save, data, _again=True)
+        return {"ok": False, "error": str(exc)}
+    except hc.PassSizeUnavailable as exc:   # PassSizeRefilling included
+        return {"ok": False, "error": str(exc), "refresh_sizes": True}
+    except hc.PassUnavailable as exc:
+        return {"ok": False, "error": str(exc), "unavailable": True}
+    except Exception as exc:
+        return {"ok": False, "error": _net_error_text(exc)}
+    import time
+    new = body["credit_token"]
+    if new != token:
+        # a new account (the first top-up, or AgentHC opened a new one
+        # because the old one's first top-up expired unpaid)
+        if token:
+            _retire_credits(cfg)
+        pend = []
+        cfg["feed_credits"] = {
+            "token": new,
+            "opened_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "first_payment_hash": str(body.get("payment_hash") or "")[:64]}
+    rec = _topup_record(body, usd, now)
+    cfg["feed_credits_pending"] = [rec] + pend[:4]
+    cfg["source"] = "agenthc"
+    save()
+    return _topup_reply(rec)
+
+
+def _credits_status(cfg, save):
+    """The credits account as AgentHC sees it, for the dashboards: {status,
+    balance_usd, balance_cents, entry_tracks, entries_left, entry_prices_usd,
+    topup: {payment_hash, status} | None}, or None without an account. Top-up
+    invoices AgentHC has credited or let expire leave feed_credits_pending;
+    an account whose first top-up expired unpaid is put aside."""
+    from sources import agenthc_day_trade_ideas as hc
+    fc = cfg.get("feed_credits") if isinstance(cfg.get("feed_credits"), dict) else None
+    token = (fc or {}).get("token")
+    if not token:
+        return None
+    try:
+        st = hc.credit_status(token)
+    except Exception as exc:
+        return {"status": "error", "error": _net_error_text(exc, cache_s=60)}
+    pend = [p for p in (cfg.get("feed_credits_pending") or []) if isinstance(p, dict)]
+    rows = {t.get("payment_hash"): t for t in (st.get("topups") or [])
+            if isinstance(t, dict)}
+    newest = None
+    if pend:
+        row = rows.get(pend[0].get("payment_hash")) or {}
+        newest = {"payment_hash": pend[0].get("payment_hash"),
+                  "usd": pend[0].get("usd"),
+                  "status": row.get("status") or "pending"}
+    import time as _t
+    keep = [p for p in pend
+            if (rows.get(p.get("payment_hash")) or {}).get("status")
+            not in ("credited", "expired")
+            and _t.time() - float(p.get("created_at") or 0) < _PASS_INVOICE_S]
+    first = (rows.get(fc.get("first_payment_hash")) or {}).get("status")
+    if st.get("status") == "pending" and first == "expired" and not keep:
+        _retire_credits(cfg)     # nothing was ever paid into it
+        save()
+        return {"status": "none", "topup": newest}
+    if keep != pend:
+        if keep:
+            cfg["feed_credits_pending"] = keep
+        else:
+            cfg.pop("feed_credits_pending", None)
+        save()
+    bal = st.get("balance_cents")
+    bal = bal if isinstance(bal, int) and not isinstance(bal, bool) else 0
+    return {"status": st.get("status"), "balance_cents": bal,
+            "balance_usd": round(bal / 100, 2),
+            "entry_tracks": st.get("entry_tracks") or [],
+            "entries_left": st.get("entries_left") or {},
+            "entry_prices_usd": st.get("entry_prices_usd") or {},
+            "topup": newest}
+
+
 @_one_at_a_time
 def _pass_status(cfg, save):
+    """The pass check (_pass_status_passes), plus the trade-credits account
+    under "credits" when there is one."""
+    reply = _pass_status_passes.__wrapped__(cfg, save)
+    credits = _credits_status(cfg, save)
+    if credits is not None:
+        reply = {**reply, "credits": {"kind": "credits", **credits}}
+    return reply
+
+
+@_one_at_a_time
+def _pass_status_passes(cfg, save):
     """Every purchase on file is checked with AgentHC. A paid one becomes
     the pass (newest first); an unpaid one stays while its invoice can still
     be paid; a paid pass that isn't the main one stays until AgentHC says it
@@ -3326,6 +3613,33 @@ def _set_recurring(cfg, save, on):
         cfg["day_pass_recurring_on_at"] = time.time()
     save()
     return {"ok": True, "on": cfg["day_pass_recurring"]}
+
+
+CREDIT_TOPUP_SIZES = (20, 50, 100)
+
+
+def _set_autotopup(cfg, save, on, usd=None):
+    """Switch trade-credits auto top-up on or off (owner only: never from a
+    setup plan or the phone), and the size it buys. Notes when it was last
+    switched ON: that restarts an auto top-up the agent stopped (a paid
+    top-up AgentHC didn't credit)."""
+    if not isinstance(on, bool):
+        return {"ok": False, "error": "on must be true or false"}
+    if usd is not None and (isinstance(usd, bool) or usd not in CREDIT_TOPUP_SIZES):
+        return {"ok": False, "error": "pick a $20, $50 or $100 top-up"}
+    if on and not (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")):
+        return {"ok": False, "error": "Connect a wallet first: without one "
+                "there is nothing to pay a top-up from."}
+    cfg["credit_autotopup"] = on
+    if usd is not None:
+        cfg["credit_topup_usd"] = usd
+    if on:
+        import time
+        cfg["credit_autotopup_on_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    save()
+    return {"ok": True, "on": on,
+            "usd": cfg.get("credit_topup_usd", CREDIT_TOPUP_SIZES[0])}
 
 
 def _restore_notes(cfg, acceptance=None):
@@ -3709,7 +4023,8 @@ _FP_KEYS = (
     "llm_model", "llm_base_url", "anthropic_api_key", "llm_fallback",
     "broker", "robinhood_account", "source", "include_other_trades",
     "day_pass_recurring", "lnbits_url", "lnbits_admin_key",
-    "agenthc_api_key", "max_autopay_sats")
+    "agenthc_api_key", "max_autopay_sats", "credit_autotopup",
+    "credit_topup_usd")
 
 
 def _broker_field_keys():
@@ -4065,6 +4380,13 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             },
             "recurring": bool(cfg.get("day_pass_recurring")),
             "pass": bool(cfg.get("feed_pass") or cfg.get("feed_pass_pending")),
+            # trade credits (never the token): an account on file, and the
+            # owner's auto top-up choice
+            "credits": {"account": bool((cfg.get("feed_credits") or {}).get("token")
+                                        if isinstance(cfg.get("feed_credits"), dict)
+                                        else False),
+                        "autotopup": bool(cfg.get("credit_autotopup")),
+                        "topup_usd": cfg.get("credit_topup_usd", CREDIT_TOPUP_SIZES[0])},
             "autostart": __import__("keep_running").autostart_enabled(),
             "rules": {k: cfg.get(k) for k in (
                 "rule_tickers", "rule_skip_tickers", "rule_sides",
@@ -4542,7 +4864,16 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         def keyed(m):
             return {str(k): v for k, v in m.items()} if m else None
         return {"options": o["options"], "prices_usd": keyed(o["prices_usd"]),
-                "prices_sats": keyed(o["prices_sats"])}
+                "prices_sats": keyed(o["prices_sats"]),
+                # trade credits, when AgentHC sells them (else null)
+                "credits": _credit_offer_json(hc.credit_offer())}
+
+    def credits_autotopup(_h, data):
+        """POST /api/credits/autotopup {on, usd?}: the owner's auto top-up
+        switch. On this computer only (not a phone route)."""
+        if not A.consent_ok():
+            return {"ok": False, "error": "accept the agreement first"}
+        return _set_autotopup(cfg, save, data.get("on"), data.get("usd"))
 
     def pass_status_route(_h):
         return _pass_status(cfg, save)
@@ -4605,7 +4936,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         from sources import agenthc_day_trade_ideas as hc
         caps = hc.autopay_caps(cfg)
         return {**_fund_quote(max(0, sats),
-                              int(cfg.get("lnbits_max_invoice_sats") or 0)),
+                              int(cfg.get("lnbits_max_invoice_sats") or 0),
+                              credits_cfg=cfg if hc.credits_mode(cfg) else None),
                 "autopay_cap_sats": caps["per_invoice"],
                 "autopay_cap_auto": caps["per_invoice_auto"],
                 "autopay_cap_words": hc.autopay_cap_words(cfg, caps)}
@@ -5453,8 +5785,42 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                         "api_key": _secret(cfg.get("agenthc_api_key")),
                         "pass_on_file": bool(cfg.get("feed_pass")
                                              or cfg.get("feed_pass_pending")),
-                        "purchases": _pass_purchases()},
+                        "purchases": _pass_purchases(),
+                        "credits": _credits_view()},
         }
+
+    def _credits_view():
+        """Trade credits, secret-free (never the token): whether AgentHC
+        sells them (its last answer — no request here), the balance AgentHC
+        last reported to the agent, the owner's auto top-up choice, and the
+        top-up invoices still on file."""
+        from sources import agenthc_day_trade_ideas as hc
+        offer = hc._credit_cache.get("offer")
+        offer = offer if isinstance(offer, dict) else None
+        has = bool(hc._credit_token(cfg))
+        rec = {}
+        if has:
+            try:
+                st, _how = A._read_state_file(A.STATE_PATH)
+                rec = hc._credit_rec(cfg, st if isinstance(st, dict) else {})
+            except Exception:
+                rec = {}
+        bal = rec.get("balance_cents")
+        pend = [{"usd": p.get("usd"), "amount_sats": p.get("amount_sats"),
+                 "created_at": p.get("created_at")}
+                for p in (cfg.get("feed_credits_pending") or []) if isinstance(p, dict)]
+        return {"offered": offer is not None,
+                "account": has,
+                "status": rec.get("status") if has else None,
+                "balance_usd": (round(bal / 100, 2) if isinstance(bal, int)
+                                and not isinstance(bal, bool) else None),
+                "entry_prices_usd": (offer or {}).get("entry_prices_usd")
+                or {t: c / 100 for t, c in (rec.get("entry_prices_cents") or {}).items()}
+                or None,
+                "options_usd": (offer or {}).get("options_usd") or [],
+                "autotopup": bool(cfg.get("credit_autotopup")),
+                "topup_usd": cfg.get("credit_topup_usd", CREDIT_TOPUP_SIZES[0]),
+                "pending": pend}
 
     def _wallet_view():
         """The payment wallet, secret-free: its site, the test-server
@@ -5948,13 +6314,23 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     def v2_pass_buy(data):
         """POST /api/v2/pass/buy: the classic /api/pass/buy (an invoice for
         N signal days), made by the second (confirmed) POST only."""
-        p = _v2_payload(data, ("days",))
-        days = _v2_number(p.get("days"), "days", 1, 366, whole=True)
-        p = {"days": days}
+        p = _v2_payload(data, ("days", "topup_usd"))
+        if "topup_usd" in p:
+            if "days" in p:
+                raise _Invalid("Send days or topup_usd, not both. Nothing was "
+                               "changed.")
+            usd = _v2_number(p.get("topup_usd"), "topup_usd", 1, 1000, whole=True)
+            p = {"topup_usd": usd}
+            change = _change("credit_topup", "Trade credits to buy", None,
+                             f"${usd}", "neutral")
+        else:
+            days = _v2_number(p.get("days"), "days", 1, 366, whole=True)
+            p = {"days": days}
+            change = _change("signal_days", "Signal days to buy", None, days,
+                             "neutral")
         with A.CONFIG_LOCK:
             _sync()
-            wait = _two_step("pass_buy", p, data, [_change(
-                "signal_days", "Signal days to buy", None, days, "neutral")], [
+            wait = _two_step("pass_buy", p, data, [change], [
                 "Nothing is paid yet: the next step shows a Lightning invoice "
                 "with its price, and nothing is paid until you pay it from "
                 "your wallet.",
@@ -5979,6 +6355,56 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     res = {**res, "purchase": hc._token_id(e["token"])}
                     break
         return res
+
+    @_v2
+    def v2_credits_autotopup(data):
+        """POST /api/v2/credits/autotopup {on, usd?}: the trade-credits auto
+        top-up switch, by the second (confirmed) POST only. Not a phone
+        route: like the recurring day-pass, only the owner on this
+        computer turns spending on."""
+        p = _v2_payload(data, ("on", "usd"))
+        if not isinstance(p.get("on"), bool):
+            raise _Invalid("on must be true or false. Nothing was changed.")
+        if "usd" in p and (isinstance(p["usd"], bool)
+                           or p["usd"] not in CREDIT_TOPUP_SIZES):
+            raise _Invalid("usd must be 20, 50 or 100. Nothing was changed.")
+        with A.CONFIG_LOCK:
+            _sync()
+            if p["on"] and not (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")):
+                raise _Invalid("Connect a wallet first: without one there is "
+                               "nothing to pay a top-up from. Nothing was "
+                               "changed.")
+            was = bool(cfg.get("credit_autotopup"))
+            was_usd = cfg.get("credit_topup_usd", CREDIT_TOPUP_SIZES[0])
+            usd = p.get("usd", was_usd)
+            if was == p["on"] and usd == was_usd:
+                return {"ok": True, "saved": False,
+                        "note": "Nothing to change: that is your setting already."}
+            from sources import agenthc_day_trade_ideas as hc
+            caps = hc.autopay_caps({**cfg, "credit_topup_usd": usd})
+            changes = []
+            if was != p["on"]:
+                changes.append(_change(
+                    "credit_autotopup", "Top up trade credits automatically",
+                    was, p["on"], "raises_risk" if p["on"] else "lowers_risk"))
+            if usd != was_usd:
+                changes.append(_change("credit_topup_usd", "Top-up size",
+                                       f"${was_usd}", f"${usd}",
+                                       "raises_risk" if usd > was_usd
+                                       else "lowers_risk"))
+            wait = _two_step("credits_autotopup", p, data, changes, [
+                (f"It buys ${usd} only on market days when the balance can't "
+                 "cover the next entry, never while a top-up is unpaid, and "
+                 f"each payment is capped at {caps['per_invoice']:,} sats "
+                 f"({hc.autopay_cap_words({**cfg, 'credit_topup_usd': usd}, caps)}).")
+                if p["on"] else "Credits you already have are kept.",
+                "It does not switch between Practice and LIVE.",
+                does_not_trade])
+            if wait:
+                return wait
+            res = _set_autotopup(cfg, save, p["on"], usd)
+            return {**res, "saved": res.get("ok", False),
+                    "settings": _settings_view()}
 
     @_v2
     def v2_recurring(data):
@@ -6740,6 +7166,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/autostart": autostart_set,
                      "/api/wallet/create": wallet_create,
                      "/api/pass/buy": pass_buy,
+                     "/api/credits/autotopup": credits_autotopup,
                      "/api/tip/create": _tip_create,
                      "/api/tip/status": _tip_status_route,
                      "/api/wallet/fund": wallet_fund,
@@ -6760,6 +7187,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                      "/api/v2/broker/robinhood": v2_robinhood,
                      "/api/v2/pass/buy": v2_pass_buy,
                      "/api/v2/wallet/recurring": v2_recurring,
+                     "/api/v2/credits/autotopup": v2_credits_autotopup,
                      "/api/v2/command": v2_command,
                      "/api/v2/agent/start": v2_agent_start,
                      "/api/v2/move/finish": v2_move_finish,
