@@ -4585,6 +4585,11 @@ def handle_event(ev, cfg, state, broker, client, save_state):
                 row.setdefault("opened_at", _now())
                 row["last_order_at"] = max(_float0(row.get("last_order_at")), _now())
                 row.setdefault("acct", _account_tag(cfg, broker, client))
+            else:
+                # when the practice position opened (a swing row's hold is
+                # counted from it: _sessions_held): the signal's time, not
+                # later than now (a released practice entry is older)
+                row.setdefault("opened_at", _dry_opened_at(ev))
         elif action == "exit" and sold is None:  # dry run
             mark = _mark(broker, client, ecfg, ev, "sell")
             est = _est_exit_pnl(prior_pos, mark, ev)
@@ -5760,6 +5765,8 @@ _SIGNAL_LOSS_WHY = {
     "feed_refused": "the signal feed is refusing the agent",
     "feed_gap": ("the agent was away long enough that an exit signal may "
                  "have scrolled out of the signal feed"),
+    "swing_overdue": ("a swing trade's exit signal did not arrive by the last "
+                      "day of its hold"),
 }
 # what the owner can do about it (none: the agent keeps trying)
 _BUY_DAYS = "buy signal days (dashboard → Settings → Signal source)"
@@ -5923,8 +5930,12 @@ def _swing_fields(cfg, state):
 def _sessions_held(cfg, row, day):
     """Trading sessions from the ET day `row` was opened to `day` (a date),
     both counted: 1 on the day it was bought. None when the row doesn't say
-    when it was opened."""
+    when it was opened (no opened_at, and no entry signal time in its
+    opened_event)."""
     opened = _num_or_none(row.get("opened_at")) if isinstance(row, dict) else None
+    if opened is None and isinstance(row, dict):
+        sig = _row_opened_signal(row)
+        opened = sig.timestamp() if sig is not None else None
     if opened is None:
         return None
     start = datetime.fromtimestamp(opened, MARKET_TZ).date()
@@ -5935,6 +5946,15 @@ def _sessions_held(cfg, row, day):
         n += bool(is_trading_day(cfg, d))
         d += timedelta(days=1)
     return n
+
+
+def _dry_opened_at(ev):
+    """A practice row's opened_at (epoch): its entry signal's time when it
+    has a sane one, else now."""
+    now = _now()
+    t = _occurred_at(ev or {})
+    t = t.timestamp() if t is not None else 0.0
+    return t if 0 < t <= now else now
 
 
 def _swing_hold_over(cfg, row, day):
@@ -5955,7 +5975,8 @@ def _num_or_none(v):
 def _signal_loss_rows(state, cfg=None, now_et=None):
     """[(key, row)] ledger rows that hold contracts or have an order
     working, of every expiry. While the loss is a feed_gap (an exit may
-    have scrolled out of the feed while the agent was away), only the rows
+    have scrolled out of the feed while the agent was away) or a
+    swing_overdue (a swing row held past its last session), only the rows
     held then that are still held (state["feed_gap"]["keys"], kept by the
     AgentHC source): positions bought since get their exits normally.
     A swing trade is held for days by design: its row counts only from the
@@ -5968,7 +5989,7 @@ def _signal_loss_rows(state, cfg=None, now_et=None):
            if isinstance(r, dict) and (_int0(r.get("qty")) >= 1 or r.get("pending"))
            and (not _row_book_is_swing(r) or _swing_hold_over(cfg or {}, r, day))]
     rec = state.get("signal_loss")
-    if isinstance(rec, dict) and rec.get("cause") == "feed_gap":
+    if isinstance(rec, dict) and rec.get("cause") in ("feed_gap", "swing_overdue"):
         gap = state.get("feed_gap")
         keys = set(k for k in ((gap.get("keys") or ()) if isinstance(gap, dict)
                                else ()) if isinstance(k, str))

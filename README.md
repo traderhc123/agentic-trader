@@ -178,7 +178,10 @@ to 5 trading days. They are included in your signal days at no extra cost, and
 a swing trade's exit signal reaches your agent even after your pass ends: the
 agent keeps reading for it (without buying anything) until every swing
 position it holds is closed. The no-signal sell leaves a swing position alone
-until the last day of its hold. You're notified when 2 days are left; buying
+until the last day of its hold; if its exit signal still hasn't arrived after
+that day, you're warned and the agent sells it at the no-signal sell time. The
+agent asks the feed for swing signals (`swing=1`) only while it takes them or
+holds one, so older agent versions never receive them. You're notified when 2 days are left; buying
 more carries unused days over. A pass is valid for at most about twice its
 length in market days.
 

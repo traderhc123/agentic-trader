@@ -71,6 +71,11 @@ class Server:
             for e in reversed(self.lines):
                 if track != "all" and e.get("track", "main") != track:
                     continue
+                # swing events are in track=all only for a read that asks
+                # (an agent from before swing trades never does)
+                if (track == "all" and e.get("track") == "swing"
+                        and params.get(hc.SWING_PARAM) != "1"):
+                    continue
                 out.append(e)
                 if len(out) >= limit:
                     break
@@ -296,6 +301,133 @@ def test_a_swing_row_is_never_sold_by_the_no_signal_sell_on_day_one(home, told):
     sold = agent.signal_loss_tick({}, state, lambda s: None, StubBroker(), None,
                                   now_et=_et(date(2026, 11, 23), 15, 45))
     assert sold == [] and key("SPY", 680) in state["positions"]
+
+
+def test_a_practice_swing_row_knows_when_it_opened(home, monkeypatch, no_policy, told):
+    # review: practice rows had no opened_at, so a practice swing row counted
+    # as "hold over" and the no-signal sell could sell it on day 1
+    cfg = {"source": "agenthc", "dry_run": True, "include_swing_trades": True,
+           "max_entries_per_day": 50, "max_open_positions": 50}
+    state = {"seen": [], "positions": {}}
+    t0 = (datetime.now(timezone.utc) - timedelta(minutes=3)).replace(microsecond=0)
+    events = hc._parse_events({"events": [ev("ENTERED", "SPY", 680, "swing", t0)]})
+    agent._handle_feed_events(events, cfg, state, StubBroker(), None, lambda s: None)
+    row = state["positions"][key("SPY", 680)]
+    assert row["dry"] is True and row["book"] == "swing"
+    assert row["opened_at"] == t0.timestamp()
+    # a signal time in the future (a skewed clock): now instead
+    assert agent._dry_opened_at({"occurred_at": _iso(t0 + timedelta(days=1))}) <= time.time()
+
+
+def test_a_practice_swing_row_is_not_sold_by_the_no_signal_sell_on_day_one(home, told):
+    opened = _et(date(2026, 11, 23), 9, 35).timestamp()
+    state = {"positions": {key("SPY", 680): {
+        "option_id": "dry", "qty": 1, "dry": True, "book": "swing",
+        "track": "swing", "opened_at": opened}},
+        "signal_loss": {"since": opened + 600}}
+    sold = agent.signal_loss_tick({}, state, lambda s: None, StubBroker(), None,
+                                  now_et=_et(date(2026, 11, 23), 15, 45))
+    assert sold == [] and key("SPY", 680) in state["positions"]
+    # the last session of its hold: sold like any practice row
+    sold = agent.signal_loss_tick({}, state, lambda s: None, StubBroker(), None,
+                                  now_et=_et(date(2026, 11, 30), 15, 45))
+    assert key("SPY", 680) not in state["positions"]
+
+
+def test_a_row_without_opened_at_counts_from_its_entry_signal():
+    row = {"book": "swing",
+           "opened_event": "ENTERED|SPY|2099-12-18|680.0|C|2026-11-23T14:35:00+00:00|swing"}
+    assert agent._sessions_held({}, row, date(2026, 11, 23)) == 1
+    assert not agent._swing_hold_over({}, row, date(2026, 11, 27))
+    assert hc._swing_opened(row) == datetime(2026, 11, 23, 14, 35,
+                                             tzinfo=timezone.utc).timestamp()
+
+
+def test_the_swing_switch_is_part_of_the_confirmation_fingerprint():
+    # review: switching swing (the chat command) after a /v2 preview left
+    # its confirmation valid for settings the owner never reviewed
+    import webui
+    assert "include_swing_trades" in webui._FP_KEYS
+    off = webui._settings_fingerprint({"include_swing_trades": False}, b"k" * 32)
+    on = webui._settings_fingerprint({"include_swing_trades": True}, b"k" * 32)
+    assert off != on
+
+
+# ── a swing exit that never arrives ─────────────────────────────────────────
+
+def _overdue_state():
+    opened = _et(date(2026, 11, 23), 9, 35).timestamp()
+    state = {"positions": {}, "seen": []}
+    _hold(state, key("SPY", 680), "swing", "swing", opened)
+    _hold(state, key("QQQ", 640), "main", None, opened)        # not swing
+    _hold(state, key("IWM", 230), "swing", "swing",
+          _et(date(2026, 11, 30), 9, 35).timestamp())           # day 2 of 5
+    return state
+
+
+def test_a_swing_row_held_past_its_last_session_is_overdue():
+    rows = _overdue_state()["positions"]
+    # 11-23 .. 11-30 = 5 sessions (Thanksgiving skipped): AgentHC's time exit
+    assert hc._swing_overdue({}, rows, now_et=_et(date(2026, 11, 30))) == []
+    assert hc._swing_overdue({}, rows, now_et=_et(date(2026, 12, 1), 9, 40)) == [
+        key("SPY", 680)]
+    # a row that doesn't say when it was opened: left to the usual rules
+    assert hc._swing_overdue({}, {"x": {"book": "swing"}},
+                             now_et=_et(date(2026, 12, 1))) == []
+
+
+def test_an_overdue_swing_row_arms_the_no_signal_sell_for_it_alone(monkeypatch, told):
+    # review: with swing on, the agent reads track=all at 100 events; a swing
+    # exit that scrolled out (or never came) left the row held until the
+    # expiry guard, ~17 days later, with no warning
+    monkeypatch.setattr(hc, "_now_et", lambda: _et(date(2026, 12, 1), 9, 40))
+    monkeypatch.setattr(hc, "_LAST_POLL", {"access": True, "exits": True, "why": ""})
+    state = _overdue_state()
+    hc._check_window({}, state, lambda s: None, {"events": []}, {"limit": 100}, [])
+    assert state["feed_gap"]["keys"] == [key("SPY", 680)]
+    assert state["feed_gap"]["swing_overdue"] == [key("SPY", 680)]
+    assert hc.had_exit_access() is False
+    assert hc.exit_loss_reason() == "swing_overdue"
+    assert len(told) == 1 and "swing trade" in told[0] and key("SPY", 680) in told[0]
+    hc._check_window({}, state, lambda s: None, {"events": []}, {"limit": 100}, [])
+    assert len(told) == 1                                   # told once
+    # the agent sells only that row (the main pick and the young swing stay)
+    state["signal_loss"] = {"since": _et(date(2026, 12, 1), 9, 40).timestamp(),
+                            "cause": "swing_overdue"}
+    assert [k for k, _r in agent._signal_loss_rows(
+        state, {}, _et(date(2026, 12, 1), 15, 0))] == [key("SPY", 680)]
+    assert "swing trade" in agent._signal_loss_why("swing_overdue")
+    # its exit arrives after all: the row goes, and so does the gap
+    state["positions"].pop(key("SPY", 680))
+    hc._LAST_POLL.update(exits=True, why="")
+    hc._check_window({}, state, lambda s: None, {"events": []}, {"limit": 100}, [])
+    assert "feed_gap" not in state and hc.had_exit_access() is True
+
+
+def test_an_overdue_swing_row_beside_a_real_gap_reads_as_a_gap(monkeypatch, told):
+    monkeypatch.setattr(hc, "_now_et", lambda: _et(date(2026, 12, 1), 9, 40))
+    monkeypatch.setattr(hc, "_LAST_POLL", {"access": True, "exits": True, "why": ""})
+    state = _overdue_state()
+    state["feed_gap"] = {"since": time.time(), "keys": [key("QQQ", 640)],
+                         "opened": {key("QQQ", 640): state["positions"][key("QQQ", 640)]["opened_at"]}}
+    hc._check_window({}, state, lambda s: None, {"events": []}, {"limit": 100}, [])
+    assert state["feed_gap"]["keys"] == sorted([key("QQQ", 640), key("SPY", 680)])
+    assert hc.exit_loss_reason() == "feed_gap"
+
+
+def test_an_agent_that_never_asks_for_swing_gets_no_swing_event(home, monkeypatch, no_policy, told):
+    # review: an agent from before swing trades reads track=all with other
+    # trades on and maps every non-main track to "other trades"; AgentHC
+    # lists swing events in track=all only for a read that asks (SWING_PARAM)
+    cfg, state = _setup(monkeypatch, swing=False, other=True)
+    b, srv = StubBroker(), Server()
+    t0 = datetime.now(timezone.utc) - timedelta(seconds=30)
+    srv.lines += [ev("ENTERED", "SPY", 680, "swing", t0),
+                  ev("ENTERED", "QQQ", 600, "other", t0)]
+    _loop(cfg, state, b, srv, monkeypatch)
+    params = srv.asked[-1][0]
+    assert params["track"] == "all" and hc.SWING_PARAM not in params
+    assert [c["ticker"] for c in b.calls] == ["QQQ"]
 
 
 # ── after the pass ends: the swing exit is still owed ───────────────────────
@@ -575,9 +707,16 @@ def test_the_feed_params_follow_the_switch_and_the_ledger(monkeypatch):
     state = {"feed_read": {"local": 990.0}, "positions": {}}
     assert hc._feed_params({}, state)["track"] == "main"
     assert hc._feed_params({"include_swing_trades": True}, state) == {
+        "limit": hc.FEED_LIMIT_MAX, "track": "all", hc.SWING_PARAM: "1"}
+    # "other trades" alone: every track, but swing events are not asked for
+    assert hc._feed_params({"include_other_trades": True}, state) == {
         "limit": hc.FEED_LIMIT_MAX, "track": "all"}
     state["positions"]["x"] = {"book": "swing"}
     assert hc._feed_params({}, state)["track"] == "all"
+    assert hc._feed_params({}, state)[hc.SWING_PARAM] == "1"   # its exit
+    state["positions"] = {}
+    state["exits_to_retry"] = [{"event": "EXITED", "track": "swing"}]
+    assert hc._feed_params({}, state)[hc.SWING_PARAM] == "1"
     assert hc._row_track({"book": "swing"}) == "swing"
     assert hc._row_track({"book": "swing", "track": "other"}) == "swing"
 

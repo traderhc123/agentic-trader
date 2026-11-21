@@ -3718,7 +3718,7 @@ _FP_KEYS = (
     "telegram_chat_id", "keep_awake", "llm_provider", "llm_api_key",
     "llm_model", "llm_base_url", "anthropic_api_key", "llm_fallback",
     "broker", "robinhood_account", "source", "include_other_trades",
-    "day_pass_recurring", "lnbits_url", "lnbits_admin_key",
+    "include_swing_trades", "day_pass_recurring", "lnbits_url", "lnbits_admin_key",
     "agenthc_api_key", "max_autopay_sats")
 
 

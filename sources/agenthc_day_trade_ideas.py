@@ -931,8 +931,20 @@ def _token_status(state, token):
 # while a real swing position is held, a pass that has ended is still
 # offered for exits only, saying mode=off (never charged, nothing bought:
 # _ended_pass_exits).
+# Agents from before swing trades map every non-main track to "other
+# trades": a track=all that listed swing events would have them buy swing
+# calls as other trades, never opted in. So the agent asks for swing events
+# explicitly (SWING_PARAM=1 on the read, _feed_params) only while it takes
+# them or holds or is owed one; AgentHC lists swing events in track=all only
+# for a read that asks (an older agent never does).
+# A swing row still held after its last session (AgentHC's time exit that
+# day never reached the agent: it scrolled out of the window, or was never
+# published) is treated like a feed gap (_check_window: cause
+# "swing_overdue"): the owner is warned and it is sold at the no-signal
+# sell time.
 SWING_TRACK = "swing"
 SWING_HOLD_SESSIONS = 5
+SWING_PARAM = "swing"
 
 
 def _track_book(track):
@@ -1020,20 +1032,40 @@ def _last_read(state):
     return rec if isinstance(rec, dict) else {}
 
 
+def _wants_swing(cfg, state):
+    """Swing trades are on, or a swing position is held or its exit owed:
+    the read asks AgentHC for swing events (SWING_PARAM)."""
+    if cfg.get("include_swing_trades"):
+        return True
+    rows = (state or {}).get("positions")
+    for row in (rows.values() if isinstance(rows, dict) else ()):
+        if isinstance(row, dict) and held_as_swing(row):
+            return True
+    owed = (state or {}).get("exits_to_retry")
+    return any(isinstance(ev, dict) and str(ev.get("track", "main")) == SWING_TRACK
+               for ev in (owed if isinstance(owed, list) else ()))
+
+
 def _feed_params(cfg, state):
-    """{"limit", "track"} for the next read of the feed: every track while
-    "other trades" or swing trades are on (AgentHC has no "main + swing"
-    read: the agent drops the tracks it doesn't take) or a non-main position
-    or owed exit is held, else the main pick only."""
-    track = ("all" if (cfg.get("include_other_trades")
-                       or cfg.get("include_swing_trades")
+    """{"limit", "track"[, SWING_PARAM]} for the next read of the feed:
+    every track while "other trades" or swing trades are on (AgentHC has no
+    "main + swing" read: the agent drops the tracks it doesn't take) or a
+    non-main position or owed exit is held, else the main pick only. Swing
+    events are asked for (SWING_PARAM=1) only while the agent wants them
+    (_wants_swing): AgentHC leaves them out of track=all otherwise, so an
+    agent from before swing trades never gets one."""
+    swing = _wants_swing(cfg, state)
+    track = ("all" if (cfg.get("include_other_trades") or swing
                        or _holds_other_track(state))
              else "main")
     last = _last_read(state).get("local")
     gap = (not isinstance(last, (int, float)) or isinstance(last, bool)
            or not 0 <= time.time() - last <= FEED_GAP_S)
-    return {"limit": FEED_LIMIT_MAX if track == "all" or gap else FEED_LIMIT,
-            "track": track}
+    out = {"limit": FEED_LIMIT_MAX if track == "all" or gap else FEED_LIMIT,
+           "track": track}
+    if swing:
+        out[SWING_PARAM] = "1"
+    return out
 
 
 def _epoch(value):
@@ -1062,6 +1094,71 @@ def _opened_mark(row):
     contract: the event that opened it, else when (None: a practice row,
     which says neither)."""
     return row.get("opened_event") or row.get("opened_at") or None
+
+
+def _swing_opened(row):
+    """When a ledger row was opened (epoch): its opened_at, else the time
+    of the entry signal in its opened_event. None when it says neither."""
+    t = _epoch(row.get("opened_at"))
+    if t is None:
+        parts = str(row.get("opened_event") or "").split("|")
+        if len(parts) >= 6 and parts[0] == "ENTERED":
+            t = _epoch(parts[5])
+    return t
+
+
+def _swing_overdue(cfg, rows, now_et=None):
+    """Ledger keys of the swing rows held after the last session of their
+    hold (more than SWING_HOLD_SESSIONS trading sessions, the day bought
+    counted): AgentHC's time exit came on that last session, so its exit
+    signal never reached the agent. A row that doesn't say when it was
+    opened is left out (the no-signal sell's own rules still cover it)."""
+    from brokers import market_hours   # holiday aware
+    day = (now_et or _now_et()).date()
+    out = []
+    for k, r in (rows.items() if isinstance(rows, dict) else ()):
+        if not (isinstance(r, dict) and held_as_swing(r)):
+            continue
+        opened = _swing_opened(r)
+        if opened is None:
+            continue
+        d, n = datetime.fromtimestamp(opened, MARKET_TZ).date(), 0
+        while d <= day and n <= SWING_HOLD_SESSIONS:
+            n += bool(market_hours.is_trading_day(cfg, d))
+            d += timedelta(days=1)
+        if n > SWING_HOLD_SESSIONS:
+            out.append(k)
+    return sorted(out)
+
+
+def _note_swing_overdue(cfg, state, save_state, rows):
+    """Swing rows past their hold (_swing_overdue) join state["feed_gap"]
+    (listed in its "swing_overdue" too): the no-signal sell is armed for
+    them, as for a feed gap. The owner is told once per row here; the
+    no-signal sell's own warning says when it sells."""
+    late = _swing_overdue(cfg, rows)
+    gap = state.get("feed_gap")
+    known = set(gap.get("keys") or ()) if isinstance(gap, dict) else set()
+    new = [k for k in late if k not in known]
+    if not new:
+        return
+    if not isinstance(gap, dict):
+        gap = {"since": time.time(), "keys": [], "opened": {}}
+    gap["keys"] = sorted(known | set(new))
+    gap.setdefault("opened", {}).update({k: _opened_mark(rows[k]) for k in new})
+    gap["swing_overdue"] = sorted(set(gap.get("swing_overdue") or ()) | set(new))
+    state["feed_gap"] = gap
+    save_state(state)
+    text = ("agentic-trader: the exit signal for your swing trade "
+            + ", ".join(new) + f" has not arrived, and its {SWING_HOLD_SESSIONS}"
+            "-day hold is over (AgentHC closes it on its last day). If no exit "
+            "arrives, the agent sells it at the no-signal sell time.")
+    print(text)
+    try:
+        from notifications import notify
+        notify(cfg, text)
+    except Exception:
+        pass
 
 
 def _check_window(cfg, state, save_state, body, params, events):
@@ -1128,6 +1225,7 @@ def _check_window(cfg, state, save_state, body, params, events):
                 except Exception:
                     pass
         state["feed_read"] = {"local": time.time(), "server": server_now}
+        _note_swing_overdue(cfg, state, save_state, rows)
         gap = state.get("feed_gap")
         if isinstance(gap, dict):
             marks = gap.get("opened") if isinstance(gap.get("opened"), dict) else {}
@@ -1136,9 +1234,13 @@ def _check_window(cfg, state, save_state, body, params, events):
                      if isinstance((rows or {}).get(k), dict)
                      and _opened_mark(rows[k]) == marks.get(k)]
             if still:
-                _LAST_POLL.update(exits=False, why="feed_gap")
+                late = set(gap.get("swing_overdue") or ())
+                _LAST_POLL.update(exits=False, why=(
+                    "swing_overdue" if late.issuperset(still) else "feed_gap"))
                 if still != gap.get("keys"):
                     gap["keys"] = still
+                    if late:
+                        gap["swing_overdue"] = [k for k in still if k in late]
                     save_state(state)
             else:
                 state.pop("feed_gap", None)
@@ -2147,7 +2249,7 @@ def had_exit_access():
 def exit_loss_reason():
     """Why the last poll() read no exit signals ("" when it did):
     pass_unchecked, pass_unpaid, pass_ended, day_pass_refused,
-    feed_not_live, feed_gap, or a _day_pass_loss_code (no_day_pass, day_pass_off,
+    feed_not_live, feed_gap, swing_overdue, or a _day_pass_loss_code (no_day_pass, day_pass_off,
     day_pass_short, day_pass_failed, day_pass_undecided). Also set when
     poll() raised because the wallet could not pay for the day-pass."""
     return "" if _LAST_POLL["exits"] else str(_LAST_POLL.get("why") or "")
