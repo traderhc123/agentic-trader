@@ -102,6 +102,7 @@ export interface SettingsView {
   signals: {
     source: string | null;
     include_other_trades: boolean;
+    include_swing_trades: boolean;
     /** practice mode's "what it would have taken" preview is on */
     dry_run_preview: boolean;
     recurring: boolean;

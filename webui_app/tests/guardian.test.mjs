@@ -1459,7 +1459,7 @@ test("signals & pass: source, scope, key, preview and the wallet, each one contr
     [API.source, API.signals, API.recurring, API.walletCreate, API.walletFund, API.walletConnect, API.walletPage, API.walletQuote, API.walletBalance],
     ["/api/v2/settings/source", "/api/v2/settings/signals", "/api/v2/wallet/recurring", "/api/v2/wallet/create", "/api/v2/wallet/fund", "/api/v2/wallet/connect", "/api/v2/wallet/page", "/api/wallet/quote", "/api/wallet/balance"],
   );
-  const acts = ["source", "scope", "api-key", "preview", "wallet-create", "wallet-fund", "wallet-connect", "wallet-page", "recurring"];
+  const acts = ["source", "scope", "swing", "api-key", "preview", "wallet-create", "wallet-fund", "wallet-connect", "wallet-page", "recurring"];
   const sig = fs.readFileSync(path.join(SRC, "v2", "views", "Signals.tsx"), "utf8");
   for (const a of acts) {
     assert.equal(ACTION_HOME[a], "signals", a);

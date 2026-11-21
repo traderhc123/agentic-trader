@@ -33,7 +33,8 @@ ALLOWED_TOP = {"source", "feed_access", "ai", "broker", "sizing", "safety",
                "notifications", "policy", "rules"}
 
 EXAMPLE_PLAN = {
-    "source": {"type": "agenthc", "include_other_trades": False},
+    "source": {"type": "agenthc", "include_other_trades": False,
+               "include_swing_trades": False},
     "ai": {"provider": "anthropic", "api_key": "sk-ant-…", "model": "claude-opus-4-8"},
     "broker": {"type": "alpaca", "alpaca_key_id": "…", "alpaca_secret": "…",
                "alpaca_paper": True},
@@ -200,6 +201,8 @@ def _live_increases(cfg, new, broker_changed, home=None, policy=None):
     if new.get("include_other_trades") and not cfg.get("include_other_trades"):
         out.append("take every trade on the feed instead of only the main "
                    "pick")
+    if new.get("include_swing_trades") and not cfg.get("include_swing_trades"):
+        out.append("take \"Swing Trade\" signals")
     out.extend(_looser_rules(cfg, new))
     if isinstance(policy, str) and policy.strip() and home:
         # A policy only ever skips entries, so a first policy is never
@@ -277,6 +280,7 @@ def apply(plan, cfg, consent_ok, home):
                 new["source_url"] = str(src.get("url", "")).strip()
             if kind == "agenthc":
                 new["include_other_trades"] = bool(src.get("include_other_trades", False))
+                new["include_swing_trades"] = bool(src.get("include_swing_trades", False))
             applied.append(f"signal source: {kind}")
 
     fa = plan.get("feed_access") or {}

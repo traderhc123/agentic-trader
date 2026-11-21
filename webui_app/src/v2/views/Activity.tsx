@@ -311,7 +311,7 @@ export function EventDrawer({ e, page, onClose }: { e: Row; page: Page; onClose:
       "Contract",
       `${contractName(e.contract, e.contract_text)}${e.contract ? `, expires ${dayLong(e.contract.expiry)}` : ""}`,
     ],
-    ["Signal type", e.book === "other" ? "Other trades" : e.book === "main" ? "Main pick" : "not recorded"],
+    ["Signal type", e.book === "other" ? "Other trades" : e.book === "swing" ? "Swing Trade" : e.book === "main" ? "Main pick" : "not recorded"],
     ["Agent mode then", e.mode_at_time === "live" ? "LIVE" : e.mode_at_time === "practice" ? "Practice" : "not recorded"],
     ["Money", d.money],
   ];

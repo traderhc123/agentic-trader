@@ -811,10 +811,25 @@ def _clock_skew(ev):
     return min(float(skew), _CLOCK_SKEW_MAX_S)
 
 
-# When this run started receiving each track ("main" / "other"). A stale
-# signal that happened BEFORE then was never catchable — the agent wasn't
-# running yet, or "other trades" was just switched on and the feed handed
-# back the day's earlier entries. That's backlog, not a delay worth an alert.
+# The setting each non-main feed track is taken under: "swing" with
+# include_swing_trades, any other track with include_other_trades.
+_TRACK_OPT_IN = {"other": "include_other_trades", "swing": "include_swing_trades"}
+# how a log line names signals of a track switched off
+_TRACK_OFF_WORDS = {"other": ('"other trades"', "other trades are off"),
+                    "swing": ('"Swing Trade"', "Swing Trade is off")}
+
+
+def _track_group(track):
+    """"main", "swing" or "other": the group a feed track belongs to."""
+    t = "main" if track is None else str(track)
+    return t if t in ("main", "swing") else "other"
+
+
+# When this run started receiving each track ("main" / "other" / "swing"). A
+# stale signal that happened BEFORE then was never catchable — the agent
+# wasn't running yet, or "other trades" was just switched on and the feed
+# handed back the day's earlier entries. That's backlog, not a delay worth an
+# alert.
 _WATCH_SINCE = {}
 
 
@@ -828,24 +843,26 @@ def note_watching(cfg, now=None, access=True):
         return
     now = now or datetime.now(timezone.utc)
     _WATCH_SINCE.setdefault("main", now)
-    if cfg.get("include_other_trades") or cfg.get("source", "agenthc") != "agenthc":
-        _WATCH_SINCE.setdefault("other", now)
-    else:
-        _WATCH_SINCE.pop("other", None)  # switched off: restart the clock if back on
+    for group, key in _TRACK_OPT_IN.items():
+        if cfg.get(key) or cfg.get("source", "agenthc") != "agenthc":
+            _WATCH_SINCE.setdefault(group, now)
+        else:
+            _WATCH_SINCE.pop(group, None)  # switched off: restart the clock if back on
 
 
-def _other_trades_off(cfg):
-    """AgentHC source, "other trades" off: only main-pick entries are taken."""
-    return (cfg.get("source", "agenthc") == "agenthc"
-            and not cfg.get("include_other_trades"))
+def _track_off(cfg, track):
+    """AgentHC source: True for a track whose setting is off ("other
+    trades" / "Swing Trade"); the main pick never is."""
+    group = _track_group(track)
+    return (cfg.get("source", "agenthc") == "agenthc" and group != "main"
+            and not cfg.get(_TRACK_OPT_IN[group]))
 
 
-def _not_for_this_book(ev, state):
-    """With other trades off: an other-trades ENTERED, or an other-trades
-    EXITED for a contract the ledger doesn't hold as an other-trades
-    position (held from the main pick, by a row that doesn't say, or not
-    at all)."""
-    if str(ev.get("track", "main")) == "main":
+def _not_for_this_book(ev, state, cfg):
+    """With its track switched off: an ENTERED, or an EXITED for a contract
+    the ledger doesn't hold as a non-main position (held from the main
+    pick, by a row that doesn't say, or not at all)."""
+    if not _track_off(cfg, ev.get("track", "main")):
         return False
     if ev.get("event") == "ENTERED":
         return True
@@ -865,8 +882,7 @@ def _backlog(ev):
     """True when the signal happened before this run was watching its track."""
     if ev.get("age_unknown") and not ev.get("occurred_at"):
         return True  # already listed the first time the feed was read
-    track = "main" if str(ev.get("track", "main")) == "main" else "other"
-    since = _WATCH_SINCE.get(track)
+    since = _WATCH_SINCE.get(_track_group(ev.get("track", "main")))
     try:
         occurred = datetime.fromisoformat(
             str(ev.get("occurred_at")).replace("Z", "+00:00"))
@@ -1741,7 +1757,7 @@ def _expired_exit_row(cfg, key, row):
         facts["paper"] = acct.endswith(":paper")  # as _trade_facts
     # labelled with the book whose contracts expired (as _trade_facts does
     # for a sale); a row that doesn't say has no label, as before
-    book = {"main": "main", "shadow": "other"}.get(_row_book(row))
+    book = _UI_BOOK.get(_row_book(row))
     if book:
         facts["book"] = book
     return _row_facts(rec, cfg, **facts)
@@ -2787,7 +2803,9 @@ def _budget_hints(cfg, trades=None, today=None):
             continue
         m = _COST_RE.search(str(t.get("reason", "")))
         if m:
-            costs.setdefault(t.get("book") or "main", []).append(
+            # any non-main book is sized as "other trades" (_sizing_cfg)
+            costs.setdefault("main" if (t.get("book") or "main") == "main"
+                             else "shadow", []).append(
                 float(m.group(1).replace(",", "")))
     out = []
     for book, vals in sorted(costs.items()):
@@ -3766,7 +3784,8 @@ def _note_stale_exit(state, event_id):
 # ── per-book exits ──────────────────────────────────────────────────────────
 # With "other trades" on, the AgentHC feed signals two books: the main pick
 # (track "main") and the wider journal (any other track; the "shadow" book
-# here). Both can name the same contract, and the ledger holds one row per
+# here). Track "swing" is a book of its own ("Swing Trade"), kept apart the
+# same way. Both can name the same contract, and the ledger holds one row per
 # contract. An entry for a contract the ledger already holds buys nothing,
 # so a row's contracts are the ones ONE book's entry bought: its "book".
 # A feed exit sells a row only when it is that book's exit. A row without a
@@ -3775,15 +3794,18 @@ def _note_stale_exit(state, event_id):
 # agent's own exits (expiry guard, no-signal sell, exit remainder) carry
 # exit_cause and no track: they sell a row whatever its book.
 # The row also keeps the signal's raw track ("main", "other", ...): two
-# non-main tracks are both the "shadow" book, and an exit of one must not
-# sell the other's row either. "book" is what sizing and the dashboard use.
+# tracks of the "other trades" book are both the "shadow" book, and an exit
+# of one must not sell the other's row either. "book" is what sizing and the dashboard use.
 # One model with the AgentHC source's reads (audit PR2): row["track"] is the
 # same raw track the source looks at (held_as_other) to keep reading every
 # track while an "other trades" row is held, even after the owner turns
 # other trades off — so that row's own exit still arrives, and a main-pick
 # exit for the same contract never sells it. A row with a track but no
 # (valid) book takes the track's book; a row with neither is legacy.
-_BOOK_WORDS = {"main": "main pick", "shadow": '"other trades"'}
+_BOOK_WORDS = {"main": "main pick", "shadow": '"other trades"',
+               "swing": '"Swing Trade"'}
+# a book as the dashboard names it
+_UI_BOOK = {"main": "main", "shadow": "other", "swing": "swing"}
 _ENTRY_BOOKS_KEPT = 50
 
 
@@ -3797,11 +3819,12 @@ def _event_track(ev):
 
 
 def _book_of_track(track):
-    return None if track is None else ("main" if track == "main" else "shadow")
+    return None if track is None else {"main": "main", "swing": "swing"}.get(
+        track, "shadow")
 
 
 def _event_book(ev):
-    """The book a feed signal names ("main" | "shadow"), or None when its
+    """The book a feed signal names ("main" | "shadow" | "swing"), or None when its
     source sends no track or it is one of the agent's own exits."""
     return _book_of_track(_event_track(ev))
 
@@ -3821,9 +3844,13 @@ def _row_book(row):
 
 def _row_track(row):
     """The raw track of the entry that opened this row, when recorded and
-    consistent with its book; else None."""
+    consistent with its book; else None. A "shadow" row of any non-main
+    track is consistent: older versions stamped every non-main track so."""
     t = row.get("track") if isinstance(row, dict) else None
-    if not isinstance(t, str) or not t or _book_of_track(t) != _row_book(row):
+    if not isinstance(t, str) or not t:
+        return None
+    book = _row_book(row)
+    if _book_of_track(t) != book and not (book == "shadow" and t != "main"):
         return None
     return t
 
@@ -3846,7 +3873,8 @@ def _other_books_row(row, ev, cfg=None):
 
 
 def _book_words(book, track=None):
-    """'main pick', '"other trades"', or '"other trades" (track "swing")'."""
+    """'main pick', '"other trades"', '"Swing Trade"', or
+    '"other trades" (track "<name>")'."""
     words = _BOOK_WORDS.get(book, "other book")
     if book == "shadow" and track and track != "other":
         words += f' (track "{track}")'
@@ -3961,7 +3989,7 @@ def _row_facts(rec, cfg, check=None, **facts):
       mode    "live" | "practice": what NEW trades used when it was written
       check   the ENTRY_CHECKS id an entry signal stopped at
       params  the numbers behind the reason (the cap, the loss so far…)
-      book    "main" | "other" (entry and exit rows carry no "book")
+      book    "main" | "other" | "swing" (entry and exit rows carry no "book")
       qty, mark, sent, filled   see _trade_facts
     Never raises: the row is logged with or without them."""
     try:
@@ -3989,7 +4017,7 @@ def _trade_facts(record, cfg, book, dry, row, prior_pos, mark, sold):
     broker and whether it has filled. `row`: the ledger row after the
     order, `prior_pos`: before it. Never raises."""
     try:
-        facts = {"book": "main" if book == "main" else "other",
+        facts = {"book": _UI_BOOK.get(book, "other"),
                  "sent": not dry}
         if record.get("action") == "entry":
             qty = _int0((row or {}).get("qty"))
@@ -4048,7 +4076,7 @@ def handle_event(ev, cfg, state, broker, client, save_state):
         # missing key read as live here while doctor said DRY-RUN.
         cfg = {**cfg, "dry_run": _is_dry(cfg, state)}
     contract = f"{ev.get('ticker')} {ev.get('expiry')} ${ev.get('strike')} {ev.get('type')}"
-    book = "main" if str(ev.get("track", "main")) == "main" else "shadow"
+    book = _book_of_track(str(ev.get("track", "main")))
 
     if not _valid_event(ev):
         print(f"skipped invalid event from source: {str(ev)[:120]}")
@@ -4704,7 +4732,7 @@ def _skip_exited_entry(ev, cfg, state, save_state):
                     "the exit for this trade had already arrived when the "
                     "agent first saw the entry, so it was not bought",
                     event_id=ev["event_id"],
-                    book="main" if str(ev.get("track", "main")) == "main" else "shadow",
+                    book=_book_of_track(str(ev.get("track", "main"))),
                     check="signal_fresh", code="exit_already_arrived")
     return msg
 
@@ -4748,7 +4776,7 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
     # only the agent's own exits may cap or reprice a sell
     new = [_from_feed(ev) for ev in events
            if ev.get("event_id") not in seen and ev.get("event_id") not in owed_ids]
-    off = _other_trades_off(cfg)
+    off = any(_track_off(cfg, t) for t in _TRACK_OPT_IN)
     if off:
         # The AgentHC source reads every track while the agent still holds
         # an "other trades" position (its exit must reach it), but the
@@ -4762,7 +4790,7 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
         # after a failed sell) obeys the same rule as a fresh one: it never
         # sells a position it wouldn't sell if it arrived now. Settled.
         dropped_owed = [ev for ev in owed if ev.get("event_id")
-                        and _not_for_this_book(ev, state)]
+                        and _not_for_this_book(ev, state, cfg)]
         for ev in dropped_owed:
             seen.add(ev["event_id"])
             _mark_seen(state, ev["event_id"], listed)
@@ -4770,14 +4798,17 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
         if dropped_owed:
             owed = [ev for ev in owed if ev.get("event_id") not in seen]
         dropped = [ev for ev in new if ev.get("event_id")
-                   and _not_for_this_book(ev, state)]
+                   and _not_for_this_book(ev, state, cfg)]
         for ev in dropped:
             seen.add(ev["event_id"])
             _mark_seen(state, ev["event_id"], listed)
         dropped += dropped_owed
         if dropped:
-            print(f"ignored {len(dropped)} \"other trades\" signal(s): "
-                  "other trades are off")
+            for group, (words, why) in _TRACK_OFF_WORDS.items():
+                n = sum(1 for ev in dropped
+                        if _track_group(ev.get("track", "main")) == group)
+                if n:
+                    print(f"ignored {n} {words} signal(s): {why}")
             new = [ev for ev in new if ev.get("event_id") not in seen]
             save_state(state)
     released = [ev for ev in new if _practice_release(ev)]
@@ -4794,7 +4825,7 @@ def _handle_feed_events(events, cfg, state, broker, client, save_state,
     # with other trades off, a shadow-book exit doesn't end a main entry
     known = [ev for ev in events
              if not _practice_release(ev)
-             and (not off or str(ev.get("track", "main")) == "main")] + owed
+             and not _track_off(cfg, ev.get("track", "main"))] + owed
     batch = (owed + [ev for ev in new if ev.get("event") == "EXITED"]
              + [ev for ev in new if ev.get("event") != "EXITED"])
     for ev in batch:
@@ -5001,13 +5032,13 @@ def _practice_routed(fresh, state, cfg):
 
 
 def _practice_track(ev):
-    return "main" if str(ev.get("track", "main")) == "main" else "other"
+    return _track_group(ev.get("track", "main"))
 
 
 def _practice_since(state):
     since = state.get("practice_since")
     return ({k: float(v) for k, v in since.items()
-             if k in ("main", "other") and isinstance(v, (int, float))
+             if k in ("main", "other", "swing") and isinstance(v, (int, float))
              and not isinstance(v, bool) and math.isfinite(v)}
             if isinstance(since, dict) else {})
 
@@ -5016,8 +5047,8 @@ def _note_practice_since(cfg, state, save_state):
     """After a read of the AgentHC feed with entry access: when practice
     began getting released trades, per track (state["practice_since"]). A
     LIVE read ends it (practice starts afresh the next time), and a practice
-    read with other trades off ends "other" (turned on again later, it
-    starts then). A paused (off) read changes nothing."""
+    read with other trades off ends "other" ("Swing Trade" off: "swing";
+    turned on again later, it starts then). A paused (off) read changes nothing."""
     mode = _feed_mode(cfg, state)
     old = _practice_since(state)
     since = dict(old)
@@ -5026,10 +5057,11 @@ def _note_practice_since(cfg, state, save_state):
     elif mode == "dry_run":
         now = datetime.now(timezone.utc).timestamp()
         since.setdefault("main", now)
-        if cfg.get("include_other_trades"):
-            since.setdefault("other", now)
-        else:
-            since.pop("other", None)
+        for group, key in _TRACK_OPT_IN.items():
+            if cfg.get(key):
+                since.setdefault(group, now)
+            else:
+                since.pop(group, None)
     if since == old and bool(since) == ("practice_since" in state):
         return
     if since:
@@ -5265,7 +5297,7 @@ def _book_practice_trade(entry, x, cfg, state, save_state, broker, client, rows)
         return None   # booked before a restart that lost state.json's note
     contract = (f"{entry['ticker']} {entry['expiry']} ${entry['strike']} "
                 f"{entry['type']}")
-    book = "main" if str(entry.get("track", "main")) == "main" else "shadow"
+    book = _book_of_track(str(entry.get("track", "main")))
     t_in, t_out = _occurred_at(entry), _occurred_at(x)
     when = _practice_when(t_in, t_out)
     common = {"contract": contract, "dry": True, "practice_release": True,
@@ -5304,7 +5336,7 @@ def _book_practice_trade(entry, x, cfg, state, save_state, broker, client, rows)
         exit_row["est_pnl_usd"] = pnl
     if no_price:
         exit_row["no_price"] = True
-    facts = {"book": "main" if book == "main" else "other", "sent": False,
+    facts = {"book": _UI_BOOK.get(book, "other"), "sent": False,
              "filled": False}
     _log_trade(_row_facts(entry_row, cfg, **facts), ts=_iso_utc(t_in))
     _log_trade(_row_facts(exit_row, cfg, **facts), ts=_iso_utc(t_out))
@@ -8303,6 +8335,15 @@ def _command(t, cfg, text):
                       "Now getting the main pick only — no new \"other trades\" "
                       "entries. Other trades it already holds still get their "
                       "exit signals.")
+    if t in ("swing trades on", "swing trades off"):
+        if cfg.get("source", "agenthc") != "agenthc":
+            return True, "That setting is for the AgentHC signal source only."
+        cfg["include_swing_trades"] = t.endswith("on")
+        _save(CONFIG_PATH, cfg, private=True)
+        return True, ("Now also getting \"Swing Trade\" signals."
+                      if cfg["include_swing_trades"] else
+                      "No new \"Swing Trade\" entries. Swing trades it already "
+                      "holds still get their exit signals.")
     if t in ("other sizing same", "clear other sizing"):
         set_book_sizing(cfg, "other", "same", None)
         _save(CONFIG_PATH, cfg, private=True)

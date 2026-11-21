@@ -366,7 +366,7 @@ export interface Position {
   /** the agent's own tag for the broker account; never an account number */
   account: string | null;
   /** null for a position opened before this was recorded */
-  book: "main" | "other" | null;
+  book: "main" | "other" | "swing" | null;
   expires_today: boolean;
   pending: "buy" | "sell" | null;
   next: NextAction;
@@ -406,7 +406,7 @@ export interface Activity {
   known: boolean;
   contract: Contract | null;
   contract_text: string | null;
-  book: "main" | "other" | null;
+  book: "main" | "other" | "swing" | null;
   /** which book the row belongs to; null = not recorded */
   real: boolean | null;
   /** true: the order went to a broker's paper-trading account (not real money); null = not recorded */

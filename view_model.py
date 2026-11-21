@@ -191,7 +191,7 @@ def aliases():
 
 def _types():
     checks = Ref("CheckId")
-    book = Enum("main", "other")
+    book = Enum("main", "other", "swing")
     per_book = lambda t: {"real": t, "practice": t}  # noqa: E731
     return {
         "Status": {
@@ -325,7 +325,7 @@ def _types():
             "budget_hints": List(Ref("BudgetHint")),
         },
         "BudgetHint": {
-            "book": book,
+            "book": Enum("main", "other"),  # the books with a size of their own
             "budget": "num",
             "skipped": "int",
             "min_cost": "num",
@@ -903,8 +903,8 @@ def _known_kinds():
 
 def _book_of(row, ui):
     b = ui.get("book") or row.get("book")
-    if b == "main":
-        return "main"
+    if b in ("main", "swing"):
+        return b
     return "other" if b in ("other", "shadow") else None
 
 
@@ -1574,8 +1574,8 @@ def _position(key, row, opened, c):
         "account": _text(row.get("acct"), _NAME) if real else None,
         # the ledger row's own book (what its exits follow) first, then
         # the book its newest entry row was logged under
-        "book": ({"main": "main", "shadow": "other"}.get(A._row_book(row))
-                 or (ui.get("book") if ui.get("book") in ("main", "other")
+        "book": (A._UI_BOOK.get(A._row_book(row))
+                 or (ui.get("book") if ui.get("book") in ("main", "other", "swing")
                      else None)),
         "expires_today": (contract is not None and contract["expiry"]
                           == c["now_et"].date().isoformat()),

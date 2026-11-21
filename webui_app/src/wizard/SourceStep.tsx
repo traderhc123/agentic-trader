@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { Button, LinkButton } from "../components/ui/button";
 import { ConfirmDialog } from "../components/ui/dialog";
 import { Disclosure } from "../components/ui/disclosure";
-import { Field, Input, Select } from "../components/ui/field";
+import { ChoiceRow, Field, Input, Select } from "../components/ui/field";
 import { QR } from "../components/ui/qr";
 import { Msg, err, info, ok, type MsgT } from "../components/ui/tag";
 import { api } from "../lib/api";
@@ -29,6 +29,7 @@ export function SourceStep() {
   // Start from the saved choice: re-saving this step (e.g. to buy a pass)
   // must never silently switch "other trades" off.
   const [scope, setScope] = useState(st?.include_other_trades ? "all" : "main");
+  const [swing, setSwing] = useState(!!st?.include_swing_trades);
   const [srcUrl, setSrcUrl] = useState("");
   const [lnUrl, setLnUrl] = useState("");
   const [lnKey, setLnKey] = useState("");
@@ -156,6 +157,7 @@ export function SourceStep() {
     const r = await api("/api/source", {
       source: src,
       scope,
+      swing,
       lnbits_url: lnUrl,
       lnbits_key: lnKey,
       agenthc_key: hcKey,
@@ -208,6 +210,9 @@ export function SourceStep() {
                 <option value="all">Main pick + "other trades": wider journal, several entries a day</option>
               </Select>
             </Field>
+            <ChoiceRow type="checkbox" id="hc-swing" checked={swing} onChange={setSwing}>
+              Swing Trade
+            </ChoiceRow>
           </Block>
 
           <Block label="Access" desc="Prepay signal days in sats over Lightning.">

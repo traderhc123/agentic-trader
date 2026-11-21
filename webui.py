@@ -800,7 +800,8 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
      <option value="all">Main pick + "other trades" — wider journal, several entries a day</option>
     </select>
     <p class="help">"Other trades" follows AgentHC's broader shadow journal; your
-    daily entry cap and per-trade budget still apply to every signal.</p></div>
+    daily entry cap and per-trade budget still apply to every signal.</p>
+    <label class="check"><input type="checkbox" id="hc-swing"><span>Swing Trade</span></label></div>
   </div></div>
   <div class="sec-b"><div class="fs-grid">
    <div class="fs-lbl">Access — prepay signal days<p>Prepaid in sats over Lightning.</p></div>
@@ -1464,7 +1465,8 @@ async function boot(){
     document.getElementById('llm-key').placeholder='saved key on file — leave blank and press Find models to change model';}
   if(st.source){done('s-source');restoredNote('s-source',notes.source||('Source saved: '+st.source));
     const sel=document.getElementById('src');sel.value=st.source;srcChanged();
-    document.getElementById('hc-scope').value=st.include_other_trades?'all':'main';}
+    document.getElementById('hc-scope').value=st.include_other_trades?'all':'main';
+    document.getElementById('hc-swing').checked=!!st.include_swing_trades;}
   if(st.wallet&&st.wallet.connected){showWallet(st.wallet.page,'wallet connected ✓');
     document.getElementById('adv-wallet').open=true;}
   if(st.pass)checkPass();
@@ -1665,6 +1667,7 @@ async function doSource(){
   const v=document.getElementById('src').value;
   const r=await api('/api/source',{source:v,
     scope:document.getElementById('hc-scope').value,
+    swing:document.getElementById('hc-swing').checked,
     lnbits_url:document.getElementById('ln-url').value,
     lnbits_key:document.getElementById('ln-key').value,
     agenthc_key:document.getElementById('hc-key').value,
@@ -3350,6 +3353,8 @@ def _restore_notes(cfg, acceptance=None):
                 detail = " · Lightning wallet connected"
             if cfg.get("include_other_trades"):
                 detail += " · main + other trades"
+            if cfg.get("include_swing_trades"):
+                detail += " · Swing Trade"
         elif src == "url" and cfg.get("source_url"):
             detail = f" · {cfg['source_url']}"
         notes["source"] = f"Source saved: {src}{detail}"
@@ -3708,7 +3713,7 @@ _FP_KEYS = (
     "telegram_chat_id", "keep_awake", "llm_provider", "llm_api_key",
     "llm_model", "llm_base_url", "anthropic_api_key", "llm_fallback",
     "broker", "robinhood_account", "source", "include_other_trades",
-    "day_pass_recurring", "lnbits_url", "lnbits_admin_key",
+    "include_swing_trades", "day_pass_recurring", "lnbits_url", "lnbits_admin_key",
     "agenthc_api_key", "max_autopay_sats")
 
 
@@ -4056,6 +4061,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             "sizing": bool(cfg.get("sizing_mode")),
             "sizing_detail": _sizing_detail(cfg),
             "include_other_trades": bool(cfg.get("include_other_trades")),
+            "include_swing_trades": bool(cfg.get("include_swing_trades")),
             "safety": cfg.get("max_entries_per_day") is not None,
             "notes": _restore_notes(cfg, A._load(A.ACCEPTANCE_PATH, {})),
             "wallet": {
@@ -4124,6 +4130,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             cfg["source_url"] = url
         if src == "agenthc":
             cfg["include_other_trades"] = data.get("scope") == "all"
+            if "swing" in data:
+                cfg["include_swing_trades"] = data.get("swing") is True
             if data.get("agenthc_key"):
                 cfg["agenthc_api_key"] = str(data["agenthc_key"]).strip()
                 note = "API key saved ✓"
@@ -5441,6 +5449,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                        "warning": "options_off" if pending["rh_warning"] else None},
             "signals": {"source": cfg.get("source"),
                         "include_other_trades": bool(cfg.get("include_other_trades")),
+                        "include_swing_trades": bool(cfg.get("include_swing_trades")),
                         "dry_run_preview": cfg.get("dry_run_preview", True) is not False,
                         "recurring": bool(cfg.get("day_pass_recurring")),
                         "wallet_connected": bool(cfg.get("lnbits_url")
@@ -6457,15 +6466,20 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
     @_v2
     def v2_signals(data):
         """POST /api/v2/settings/signals: which AgentHC signals (scope "main"
-        or "all": the classic /api/source/scope, two steps) and the practice
-        preview on/off (the key the chat's "preview on|off" writes; straight
-        away when sent alone)."""
-        p = _v2_payload(data, ("scope", "dry_run_preview"))
+        or "all": the classic /api/source/scope, two steps; and
+        include_swing_trades, two steps) and the practice preview on/off
+        (the key the chat's "preview on|off" writes; straight away when sent
+        alone)."""
+        p = _v2_payload(data, ("scope", "include_swing_trades", "dry_run_preview"))
         if not p:
-            raise _Invalid("Send scope and/or dry_run_preview. Nothing was "
-                           "changed.")
+            raise _Invalid("Send scope, include_swing_trades and/or "
+                           "dry_run_preview. Nothing was changed.")
         if "scope" in p and p["scope"] not in ("main", "all"):
             raise _Invalid('scope must be "main" or "all". Nothing was changed.')
+        if ("include_swing_trades" in p
+                and not isinstance(p["include_swing_trades"], bool)):
+            raise _Invalid("include_swing_trades must be true or false. "
+                           "Nothing was changed.")
         if "dry_run_preview" in p and not isinstance(p["dry_run_preview"], bool):
             raise _Invalid("dry_run_preview must be true or false. Nothing was "
                            "changed.")
@@ -6480,10 +6494,26 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                     changes.append(_change(
                         "scope", "Which signals", _scope_now(), p["scope"],
                         "raises_risk" if p["scope"] == "all" else "lowers_risk"))
+            swing_now = bool(cfg.get("include_swing_trades"))
+            if "include_swing_trades" in p:
+                if cfg.get("source", "agenthc") != "agenthc":
+                    raise _Invalid("Swing Trade is a choice of the AgentHC "
+                                   "source only. Nothing was changed.")
+                if p["include_swing_trades"] != swing_now:
+                    changes.append(_change(
+                        "include_swing_trades", "Swing Trade", swing_now,
+                        p["include_swing_trades"],
+                        "raises_risk" if p["include_swing_trades"]
+                        else "lowers_risk"))
             if changes:
                 wait = _two_step("signals", p, data, changes, [
                     "It does not switch between Practice and LIVE.",
                     does_not_trade,
+                    "It does not change your trade sizes: other trades "
+                    "and Swing Trade signals are sized as Rules & limits "
+                    "says for other trades."
+                    if any(c.get("key") == "include_swing_trades"
+                           for c in changes) else
                     "It does not change your trade sizes: other trades are "
                     "sized as Rules & limits says."])
                 if wait:
@@ -6493,7 +6523,9 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                         "note": "Nothing to change: that is your setting already."}
             if "dry_run_preview" in p:
                 cfg["dry_run_preview"] = p["dry_run_preview"]
-            if changes:
+            if "include_swing_trades" in p:
+                cfg["include_swing_trades"] = p["include_swing_trades"]
+            if "scope" in p and p["scope"] != _scope_now():
                 res = source_scope(None, {"scope": p["scope"]})  # saves
                 if not res.get("ok"):
                     return res
@@ -7649,6 +7681,7 @@ def _ask_llm(cfg, question, status_fields, trades, system=None):
                 "exact command (pause, resume, dry on/off, set budget N, "
                 "set contracts N, set percent N, set other budget|contracts|"
                 "percent N, other sizing same, other trades on|off, "
+                "swing trades on|off, "
                 "set positions N (most positions open at once), "
                 "set max contracts N (most contracts one trade buys), "
                 "set cap N (new trades per day), stop, autostart on|off, open at login on|off, keep awake on|off, preview on|off, auto update on|off, rules, tickers SPY QQQ, calls only|puts only|calls and puts, min strike N, no 0dte on|off, loss stop N, set autopay cap N|auto). Never give investment advice; you may "
