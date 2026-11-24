@@ -38,6 +38,8 @@ import { UNKNOWN, count, etDayKey, etTime, etWhen, plural, signed, tone, usd } f
 import { Icon, Stamp } from "../ui";
 import type { Page } from "../App";
 import { Row } from "./Pages";
+import { GUIDE_TRADES, GUIDE_WINDOW, type GuideRow } from "../lib/budgetGuide.data";
+import { CAPITAL_SHARE, RISK_LEVELS, TIERS, pickBudgets, type RiskKey } from "../lib/budgetGuide";
 
 /** The size the agent runs on (status), when the saved one is not read yet. */
 function statusSize(t: TradeSize): string {
@@ -892,6 +894,194 @@ function PolicyRow({ page }: { page: Page }) {
 
 // ── the page ────────────────────────────────────────────────────────────────
 
+// ── the budget guide (sizes by account, from the provider's paper trades) ──
+// What a per-trade budget for each book would have meant over the provider's
+// last three months, for an account size or a most-you'd-lose-in-a-day
+// figure (lib/budgetGuide.ts does the sums over the generated grid). Same
+// table for everyone; risk facts only, no P&L. "Use these sizes" is a size
+// change, confirmed in the same review dialog as the trade-size rows.
+
+const pct = (f: number) => `${Math.round(f * 100)}%`;
+const kUsd = (n: number) => (n >= 1000 ? `$${(n / 1000).toLocaleString("en-US", { maximumFractionDigits: 1 })}k` : usd(n, 0));
+const budgetWords = (r: GuideRow | null) => (r ? usd(r[0], 0) : "Skip");
+const fillWords = (r: GuideRow | null, n: number) => (r ? `took ${pct(r[1])} of ${n.toLocaleString("en-US")} trades` : "no budget fit");
+
+function BudgetGuide({ page, why }: { page: Page; why: string }) {
+  const id = useId();
+  const [by, setBy] = useState<"account" | "loss">("account");
+  const [text, setText] = useState("");
+  const [risk, setRisk] = useState<RiskKey>("mid");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const level = RISK_LEVELS.find((l) => l.key === risk) ?? RISK_LEVELS[1];
+
+  const parsed = text.trim() ? readNumber(text, { low: 100, high: 100_000_000 }) : null;
+  const amount = parsed && parsed.ok ? parsed.value : null;
+  const pick =
+    amount == null ? null : by === "account" ? pickBudgets((amount * level.pct) / 100, amount) : pickBudgets(amount);
+
+  const use = async () => {
+    if (!pick || !pick.main) return;
+    const trade_size: Record<string, unknown> = { main: { mode: "budget", value: pick.main[0] } };
+    if (pick.other) trade_size.other = { mode: "budget", value: pick.other[0] };
+    setBusy(true);
+    setErr("");
+    const payload = { trade_size };
+    const a = await askPreview(API.limits, payload);
+    setBusy(false);
+    if (a.kind === "review") setDraft({ payload, preview: a.preview });
+    else setErr(a.kind === "error" ? a.error : a.note);
+  };
+
+  return (
+    <section className={`panel ${page.stale ? "stale" : ""}`} data-panel="budget-guide">
+      <div className="ph">
+        <h2>Budget guide</h2>
+        <span className="meta">
+          Provider's paper trades, {GUIDE_WINDOW.start} to {GUIDE_WINDOW.end}
+        </span>
+      </div>
+      <div className="pb">
+        <p className="small">
+          What a dollar budget per trade would have meant over the last three months, for an account of your size. Each book gets half of the
+          day's loss allowance; the money in open positions at once stays under {pct(CAPITAL_SHARE)} of the account. Whole contracts only: a
+          trade whose one contract costs more than the budget is skipped.
+        </p>
+        <div className="editor-row">
+          <div className="field">
+            <label htmlFor={`${id}-by`}>Start from</label>
+            <select id={`${id}-by`} className="input" value={by} onChange={(e) => setBy(e.target.value as "account" | "loss")}>
+              <option value="account">My account size</option>
+              <option value="loss">The most I'd lose in one day</option>
+            </select>
+          </div>
+          <div className="field">
+            <label htmlFor={`${id}-n`}>{by === "account" ? "Account size" : "Most lost in one day"}</label>
+            <span className="input-money">
+              <span>$</span>
+              <input
+                id={`${id}-n`}
+                className="input input-num"
+                inputMode="decimal"
+                autoComplete="off"
+                placeholder={by === "account" ? "20,000" : "2,000"}
+                value={text}
+                onChange={(e) => {
+                  setText(e.target.value);
+                  setErr("");
+                }}
+              />
+            </span>
+          </div>
+          {by === "account" && (
+            <div className="field">
+              <label htmlFor={`${id}-r`}>Risk level</label>
+              <select id={`${id}-r`} className="input" value={risk} onChange={(e) => setRisk(e.target.value as RiskKey)}>
+                {RISK_LEVELS.map((l) => (
+                  <option key={l.key} value={l.key}>
+                    {l.label}: worst day under {l.pct}%
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+        {parsed && !parsed.ok && <p className="small err">Type a dollar amount of at least $100.</p>}
+        {pick && (
+          <div className="note note-info" data-guide-result>
+            <Icon name="info" />
+            <h3>
+              Main pick {budgetWords(pick.main)} a trade · Other trades {budgetWords(pick.other)} a trade
+            </h3>
+            <p className="small">
+              Main pick: {fillWords(pick.main, GUIDE_TRADES.main)}. Other trades: {fillWords(pick.other, GUIDE_TRADES.other)}. Over those three
+              months, the worst day lost {usd(pick.worstDay, 0)}, the biggest drawdown was {usd(pick.drawdown, 0)}, and at most{" "}
+              {usd(pick.capital, 0)} was in open positions at once.
+              {!pick.main && " Even the smallest main-pick budget lost more than half of this in one day."}
+            </p>
+            {pick.main && (
+              <p>
+                <button className="btn btn-sm" data-act="size" disabled={!!why || busy} title={why || undefined} onClick={use}>
+                  Use these sizes
+                </button>{" "}
+                <span className="small muted">Shown for review first. Nothing changes until you confirm.</span>
+              </p>
+            )}
+            {err && <p className="small err">{err}</p>}
+          </div>
+        )}
+      </div>
+      <div className="tbl-wrap">
+        <table className="tbl" data-guide-table>
+          <thead>
+            <tr>
+              <th>Account</th>
+              <th className="r">Main pick</th>
+              <th className="r">Other trades</th>
+              <th className="r">Worst day</th>
+              <th className="r">Biggest drawdown</th>
+              <th className="r">Most in positions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {TIERS.map((a) => {
+              const p = pickBudgets((a * level.pct) / 100, a);
+              return (
+                <tr key={a}>
+                  <th>{kUsd(a)}</th>
+                  <td className="r">
+                    {budgetWords(p.main)}
+                    <small>{p.main ? `${pct(p.main[1])} of trades` : ""}</small>
+                  </td>
+                  <td className="r">
+                    {budgetWords(p.other)}
+                    <small>{p.other ? `${pct(p.other[1])} of trades` : ""}</small>
+                  </td>
+                  <td className="r">{usd(p.worstDay, 0)}</td>
+                  <td className="r">{usd(p.drawdown, 0)}</td>
+                  <td className="r">{usd(p.capital, 0)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="pb">
+        <p className="small muted" data-disclaimer>
+          Table at the {level.label.toLowerCase()} level (worst day under {level.pct}% of the account). Hypothetical results from the provider's
+          paper-trade journal ({GUIDE_TRADES.main} main-pick and {GUIDE_TRADES.other.toLocaleString("en-US")} other trades), bought at the ask
+          and sold at the bid, fees not counted. Real fills can be worse, and past results do not predict future ones. The same table is
+          shown to everyone; it is not advice for your situation, and the sizes you use are your decision.
+        </p>
+      </div>
+      {draft && (
+        <ReviewDialog
+          path={API.limits}
+          payload={draft.payload}
+          first={draft.preview}
+          title="Use the budget guide's sizes?"
+          cancel="Keep my sizes"
+          live={page.s.mode === "live"}
+          onClose={() => setDraft(null)}
+          onDone={async () => {
+            setDraft(null);
+            await page.settings.reload();
+            page.refresh();
+            page.say(true, "Saved. The trade sizes above show the new budgets.");
+          }}
+        >
+          {() => (
+            <p className="small">
+              Sizes from the budget guide: hypothetical figures from the provider's paper trades. Whether to use them is your decision.
+            </p>
+          )}
+        </ReviewDialog>
+      )}
+    </section>
+  );
+}
+
 export function RulesView({ page }: { page: Page }) {
   const s = page.s;
   const L = s.limits;
@@ -979,6 +1169,7 @@ export function RulesView({ page }: { page: Page }) {
           now={cap != null && mc != null && mc > cap ? `Your main pick size is ${plural(mc, "contract")}: each trade buys ${count(cap)}` : ""}
         />
       </section>
+      <BudgetGuide page={page} why={why} />
       <section className={`panel ${page.stale ? "stale" : ""}`}>
         <div className="ph">
           <h2>On expiry day</h2>
