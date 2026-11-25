@@ -1533,7 +1533,9 @@ _WALLET_OK_S = 300              # enough sats: that answer is used this long
 _WALLET_WATCH_S = 900           # early warning (every poll): at most this often
 _WALLET_DOWN_ALERT_S = 900      # unreachable this long: the owner is told
 _WALLET_NEED_MAX_AGE_S = 24 * 3600
-_WALLET_TIMEOUT_S = 8           # one balance read waits at most this long
+# one balance read on the agent's loop: (connect, read) seconds — a wallet
+# server that hangs holds the poll (and its exit read) up ~8 s at most
+_WALLET_TIMEOUT_S = (3, 5)
 _WALLET_ALERTS = ("daypass_wallet_gone_notified", "daypass_wallet_down_notified",
                   "daypass_low_balance_notified")
 # the classic dashboard's words: /v2 shows them as "on Signals & pass"
@@ -1601,17 +1603,22 @@ def _wallet_check(cfg, state, save_state, max_age):
     return rec
 
 
-def _wallet_need(cfg, state):
+def _wallet_need(cfg, state, service=False):
     """Sats the wallet must hold before a day-pass is bought: AgentHC's own
-    day price plus what LNbits keeps back (fee_reserve_sats), or what LNbits
-    itself last said it needed for a day-pass ("You must reserve at least
-    ..."), whichever is more. None when the price is not known (then the
-    balance does not hold the purchase back)."""
+    day price plus LNbits' routing reserve (fee_reserve_sats, without a
+    server's service fee: this agent's note of that fee may be out of date,
+    and a stale one would refuse purchases a wallet could pay), or what
+    LNbits itself last said it needed for a day-pass ("You must reserve at
+    least ...", which counts the service fee), whichever is more. None when
+    the price is not known (then the balance does not hold the purchase
+    back). service=True: with the known service fee too — what the owner
+    is asked to add."""
     need = None
     try:
         day = day_pass_price().get("sats")
         if isinstance(day, int) and not isinstance(day, bool) and day > 0:
-            need = day + fee_reserve_sats(day, cfg.get("lnbits_url"))
+            need = day + fee_reserve_sats(day, cfg.get("lnbits_url"),
+                                          service=service)
     except Exception:
         need = None
     said = state.get("daypass_wallet_need")
@@ -1676,12 +1683,14 @@ def _wallet_can_pay(cfg, state, save_state):
         rec["short"], rec["need"] = short, need
         save_state(state)
     if short:
+        # the owner is asked for the fees this server is known to charge too
+        ask = max(need, _wallet_need(cfg, state, service=True) or 0)
         _daypass_alert(
             cfg, state, save_state, "daypass_low_balance_notified",
             f"Your agent's wallet holds {sats:,} sats, less than today's "
-            f"day-pass plus the wallet's fee reserve (about {need:,} sats), so "
+            f"day-pass plus the wallet's fees (about {ask:,} sats), so "
             "the agent did not buy one. Add at least "
-            f"{need - sats:,} sats in {WALLET_WHERE}. The agent checks the "
+            f"{ask - sats:,} sats in {WALLET_WHERE}. The agent checks the "
             "wallet every minute until today's market close and buys the "
             "pass as soon as it holds enough.")
         return False
@@ -2125,9 +2134,15 @@ def _pay_day_pass(cfg, state, body, save_state, running_until=None):
                 err.loss_code = "day_pass_wallet_gone"
                 raise err
             if isinstance(exc, PaymentNotSent):
+                # (a WalletKeyRejected that is not LNbits refusing the key —
+                # a proxy's or protection page's 401/403/404 — lands here:
+                # the wallet may be fine, so it is not called gone)
                 _wallet_mark(cfg, state, "unreachable")
                 save_state(state)
-                why = ("the wallet could not be reached — check this "
+                why = ("the wallet's server turned the payment away before "
+                       "reading it (it may be down, or behind a protection "
+                       "page)" if isinstance(exc, WalletKeyRejected) else
+                       "the wallet could not be reached — check this "
                        "computer's internet connection; the wallet's server "
                        "may also be down")
                 retry = (_retry_text() + " It asks AgentHC for a new pass "

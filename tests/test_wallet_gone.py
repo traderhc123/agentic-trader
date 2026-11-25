@@ -93,10 +93,54 @@ def test_a_key_the_server_does_not_know_is_wallet_gone_on_every_call(
     with pytest.raises(lightning_wallet.WalletKeyRejected) as exc:
         w.pay_invoice("lnbc1fake")
     # nothing was paid (PaymentNotSent), and it is the same "gone"
+    assert isinstance(exc.value, lightning_wallet.WalletGoneOnPay)
     assert isinstance(exc.value, lightning_wallet.PaymentNotSent)
     assert isinstance(exc.value, lightning_wallet.WalletGone)
     assert lightning_wallet.wallet_health(
         {"lnbits_url": DEMO, "lnbits_admin_key": KEY})["status"] == "gone"
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_a_pay_turned_away_by_a_web_page_is_not_sent_and_not_gone(monkeypatch, status):
+    """A protection / proxy page (not LNbits) turns the pay request away:
+    nothing was paid, but the wallet is NOT called gone — the owner must
+    not be told to abandon a funded wallet."""
+    page = "<!doctype html><html><body>Just a moment… (challenge)</body></html>"
+    _server(monkeypatch, post=lambda url, body: R(status, text=page))
+    w = lightning_wallet.LNbitsWallet(DEMO, KEY)
+    with pytest.raises(lightning_wallet.WalletKeyRejected) as exc:
+        w.pay_invoice("lnbc1fake")
+    assert isinstance(exc.value, lightning_wallet.PaymentNotSent)
+    assert not isinstance(exc.value, lightning_wallet.WalletGone)
+    assert "<" not in str(exc.value)
+    h = lightning_wallet.wallet_health({"lnbits_url": DEMO, "lnbits_admin_key": KEY})
+    assert (h or {}).get("status") != "gone"
+
+
+def test_which_server_errors_count_as_out_of_reach(monkeypatch):
+    """A gateway error or a protection page: out of reach. LNbits' own 5xx
+    answer ({"detail": ...}, e.g. 520 "Payment or Invoice error"): the
+    wallet's own error, not a server that is down."""
+    w = lightning_wallet.LNbitsWallet(DEMO, KEY)
+    page = "<!doctype html><html>Attention required</html>"
+    for answer in (R(403, text=page), R(429, text=page), R(500, text=page),
+                   R(503, {"detail": "Service Unavailable"})):
+        _server(monkeypatch, get=answer)
+        with pytest.raises(lightning_wallet.WalletUnreachable):
+            w.balance_sats()
+    _server(monkeypatch, post=lambda url, body: R(520, {"detail": "Payment or Invoice error"}))
+    with pytest.raises(lightning_wallet.WalletError) as exc:
+        w.create_invoice(1000)
+    assert not isinstance(exc.value, (lightning_wallet.WalletUnreachable,
+                                      lightning_wallet.WalletGone))
+    assert "Payment or Invoice error" in str(exc.value)
+
+
+def test_a_failed_new_wallet_never_shows_the_servers_page(monkeypatch):
+    _server(monkeypatch, post=lambda url, body: R(403, text="<html><body>blocked</body></html>"))
+    with pytest.raises(lightning_wallet.WalletError) as exc:
+        lightning_wallet.create_wallet(DEMO)
+    assert "<html" not in str(exc.value) and "web page" in str(exc.value)
 
 
 def test_a_404_that_is_not_lnbits_is_not_called_gone(monkeypatch):
@@ -162,6 +206,8 @@ def test_the_reserve_counts_the_demo_servers_service_fee():
     assert lightning_wallet.fee_reserve_sats(86_000, "https://my.node") == 860
     assert lightning_wallet.fee_reserve_sats(86_000) == 860
     assert lightning_wallet.fee_reserve_sats(10_000, DEMO) == 100 + 500
+    # what holds a purchase back counts LNbits' defaults only
+    assert lightning_wallet.fee_reserve_sats(86_000, DEMO, service=False) == 860
     assert lightning_wallet.reserve_from_refusal(
         "payment failed HTTP 520: You must reserve at least (1860  sat) to "
         "cover potential routing fees.") == 1_860
@@ -201,10 +247,11 @@ class LNbitsLike(Wallet):
 
     def __init__(self, balance=1_000_000, mode="ok"):
         super().__init__(mode)
-        self.balance, self.asked = balance, 0
+        self.balance, self.asked, self.timeouts = balance, 0, []
 
-    def balance_sats(self):
+    def balance_sats(self, timeout=None):
         self.asked += 1
+        self.timeouts.append(timeout)
         if isinstance(self.balance, Exception):
             raise self.balance
         return self.balance
@@ -228,6 +275,8 @@ def test_a_gone_wallet_asks_agenthc_for_no_invoice_and_says_how_to_fix_it(
     state = {}
     assert not _poll(dict(WCFG), state)
     assert feed.minted == 0 and wallet.paid == []          # no invoice made
+    # read on the agent's loop with a short wait (connect, read)
+    assert wallet.timeouts and set(wallet.timeouts) == {(3, 5)}
     assert agenthc.exit_loss_reason() == "day_pass_wallet_gone"
     (text,) = alerts
     assert "no longer exists on demo.lnbits.com" in text
@@ -264,7 +313,7 @@ def test_a_gone_wallet_found_by_the_payment_itself_stops_the_retries(
         monkeypatch, clock, alerts):
     class GoneAtPay(LNbitsLike):
         def pay_invoice(self, invoice):
-            raise lightning_wallet.WalletKeyRejected(
+            raise lightning_wallet.WalletGoneOnPay(
                 "the wallet's server did not accept the request, HTTP 404: "
                 "Wallet not found.", url=DEMO)
     wallet = GoneAtPay()
@@ -282,22 +331,59 @@ def test_a_gone_wallet_found_by_the_payment_itself_stops_the_retries(
     assert feed.minted == 1
 
 
+def test_a_pay_turned_away_by_a_protection_page_is_not_called_gone(
+        monkeypatch, clock, alerts):
+    """A 403 challenge page in front of the wallet at pay time: nothing was
+    paid, and the owner is NOT told his (funded) wallet is gone; while the
+    page stays up the balance read is out of reach too, so no more AgentHC
+    invoices are asked for; when the server answers again the pass is
+    bought."""
+    class Challenged(LNbitsLike):
+        def pay_invoice(self, invoice):
+            raise lightning_wallet.WalletKeyRejected(
+                "the wallet's server did not accept the request, HTTP 403: "
+                "the server answered with a web page", url=DEMO)
+    wallet = Challenged()
+    feed = _feed_and(monkeypatch, wallet)
+    state = {}
+    assert not _poll(dict(WCFG), state)
+    assert feed.minted == 1 and "daypass_pending" not in state   # nothing paid
+    assert len(alerts) == 1 and "no longer exists" not in alerts[0]
+    assert "Create a new wallet" not in alerts[0]
+    assert "protection page" in alerts[0] and "Nothing was paid" in alerts[0]
+    assert agenthc.exit_loss_reason() == "day_pass_failed"
+    assert state["daypass_wallet_check"]["status"] == "unreachable"
+    wallet.balance = lightning_wallet.WalletUnreachable("HTTP 403: a web page")
+    for _ in range(6):
+        clock.tick(minutes=5)
+        _poll(dict(WCFG), state)
+    assert feed.minted == 1                              # no invoice loop
+    assert not any("no longer exists" in a for a in alerts)
+    wallet.balance = 500_000
+    wallet.pay_invoice = lambda invoice: Wallet.pay_invoice(wallet, invoice)
+    clock.tick(minutes=5)
+    assert len(_poll(dict(WCFG), state)) == 1 and feed.minted == 2
+
+
 def test_a_short_wallet_is_not_offered_an_invoice_until_it_holds_enough(
         monkeypatch, clock, alerts):
-    """Price 10,000 sats on demo.lnbits.com: 10,000 + 100 reserve + 500
-    service fee = 10,600 needed. 10,300 is short: no invoice, the exact
-    top-up named; topped up, the pass is bought within a minute."""
+    """Price 10,000 sats on demo.lnbits.com. The purchase is held back below
+    10,000 + 100 (LNbits' routing reserve); the owner is asked for 10,600
+    (+ 500 service fee, this agent's note of demo's setting, which may go
+    out of date — so it never holds a purchase back by itself)."""
     monkeypatch.setattr(agenthc, "day_pass_price",
                         lambda: {"usd": 50.0, "sats": 10_000})
-    wallet = LNbitsLike(balance=10_300)
+    wallet = LNbitsLike(balance=10_050)
     feed = _feed_and(monkeypatch, wallet)
     state = {}
     assert not _poll(dict(WCFG), state)
     assert feed.minted == 0 and agenthc.exit_loss_reason() == "day_pass_short"
     (text,) = alerts
-    assert "10,300 sats" in text and "about 10,600 sats" in text
-    assert "Add at least 300 sats" in text
-    wallet.balance = 10_600
+    assert "10,050 sats" in text and "about 10,600 sats" in text
+    assert "Add at least 550 sats" in text
+    # 10,300: enough by LNbits' defaults, so it is tried (if the server's
+    # fee is still charged, LNbits' own refusal figure holds it back after)
+    wallet.balance = 10_300
     clock.tick(seconds=61)
     assert len(_poll(dict(WCFG), state)) == 1 and feed.minted == 1
 
@@ -451,6 +537,39 @@ def test_adding_sats_to_a_gone_wallet_says_so_and_shows_no_invoice(
     r = c.post("/api/wallet/fund", {"sats": 90_000})
     assert r["ok"] is True and r["bolt11"].startswith("lnbc")
     assert "Cash App" in r["hint"]
+
+
+def test_a_pasted_key_the_server_does_not_know_says_copy_it_again(
+        home, app, gone_lnbits):
+    """The owner pastes his own wallet's key and the server doesn't know
+    it: most often a mis-copied key — not "your agent's wallet is gone"."""
+    write_cfg(home, {**BASE, "lnbits_url": DEMO, "lnbits_admin_key": "fakeNEWmine"})
+    c = _running(app)
+    r = c.post("/api/source", {"source": "agenthc", "lnbits_url": DEMO,
+                               "lnbits_key": "fakeMIScopied"})
+    assert r["ok"] is False
+    assert "does not know that admin key" in r["error"]
+    assert "Copy the admin key again" in r["error"]
+    assert "no longer exists" not in r["error"]
+    assert read_cfg(home)["lnbits_admin_key"] == "fakeNEWmine"   # unchanged
+
+
+def test_adding_sats_while_the_server_is_slow_still_reviews(home, app, monkeypatch):
+    """Only a gone wallet stops the review step; a read that failed for
+    another reason (a slow or briefly down server) is a heads-up there."""
+    class Slow:
+        def __init__(self, url, key):
+            self.url = url
+
+        def balance_sats(self, timeout=None):
+            raise lightning_wallet.WalletUnreachable("timed out")
+    monkeypatch.setattr(lightning_wallet, "LNbitsWallet", Slow)
+    write_cfg(home, {**BASE, "lnbits_url": DEMO, "lnbits_admin_key": KEY})
+    c = _running(app)
+    r = c.post("/api/v2/wallet/fund", {"sats": 90_000})
+    assert r["ok"] is True and r["needs_confirm"] is True
+    note = r["preview"]["does_not"][0]
+    assert note.startswith("Heads-up:") and "can't reach its wallet's server" in note
 
 
 def test_the_funding_suggestion_counts_the_servers_fees(monkeypatch):

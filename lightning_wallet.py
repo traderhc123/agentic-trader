@@ -57,16 +57,20 @@ def host_of(url):
         return ""
 
 
-def fee_reserve_sats(sats, url=None):
+def fee_reserve_sats(sats, url=None, service=True):
     """Sats LNbits wants on top of `sats` before it pays them: the routing-fee
     reserve, the larger of 2 sats and 1% (its defaults,
     lnbits_reserve_fee_min and lnbits_reserve_fee_percent), plus the service
     fee of a server known to charge one (SERVICE_FEES; `url` is the wallet's
     address). LNbits refuses a payment unless the wallet holds the amount
-    plus this ("You must reserve at least ...")."""
+    plus this ("You must reserve at least ..."). service=False leaves the
+    service fee out: SERVICE_FEES is this agent's own note of a server's
+    setting, which its operators may change, so what holds a purchase BACK
+    counts only LNbits' defaults (and what LNbits itself last said); the
+    funding amounts and the owner's messages count the fee."""
     sats = int(sats)
     reserve = max(2, -(-sats // 100))
-    fee = SERVICE_FEES.get(host_of(url))
+    fee = SERVICE_FEES.get(host_of(url)) if service else None
     if fee:
         pct, most = fee
         reserve += min(int(sats * pct / 100), most)
@@ -127,6 +131,17 @@ def wallet_gone_text(url, how=NEW_WALLET_DASHBOARD, old_file=None):
             "new wallet from that page.)")
 
 
+def unknown_key_text(url, how="let the agent create a new wallet"):
+    """What the owner reads when a wallet key he PASTED is not known to the
+    server he named: most often a wrong or partly copied key, not a wallet
+    that was lost."""
+    host = host_of(url) or "that server"
+    return (f"{host} does not know that admin key (\"Wallet not found\"): the "
+            "key is not that wallet's ADMIN key, or the wallet was deleted "
+            "or reset. Copy the admin key again from the wallet's page (API "
+            f"info), or {how}.")
+
+
 def wallet_unreachable_text(url):
     host = host_of(url) or "its server"
     return (f"The agent can't reach its wallet's server ({host}) right now, "
@@ -167,10 +182,23 @@ class PaymentNotSent(WalletError):
     wallet could not be opened at all, so nothing can have been paid."""
 
 
-class WalletKeyRejected(PaymentNotSent, WalletGone):
-    """The wallet's server turned the pay request away before acting on it
-    (HTTP 401/403/404: it does not accept this wallet key — the wallet may
-    no longer exist). Nothing can have been paid."""
+class WalletKeyRejected(PaymentNotSent):
+    """The pay request was turned away before anything acted on it (HTTP
+    401/403/404). Nothing can have been paid. By itself this is NOT "the
+    wallet is gone": a proxy or a protection page in front of the wallet's
+    server (e.g. a 403 challenge page) answers like this too — only
+    WalletGoneOnPay, LNbits' own refusal of the key, is."""
+
+    def __init__(self, message="", url="", answer=""):
+        self.url = url
+        self.answer = answer
+        super().__init__(message)
+
+
+class WalletGoneOnPay(WalletKeyRejected, WalletGone):
+    """LNbits itself refused the pay request's wallet key ("Wallet not
+    found." / "Invalid adminkey." ...): nothing was paid (PaymentNotSent),
+    and the wallet is gone (WalletGone)."""
 
     def __init__(self, message="", url="", answer=""):
         WalletGone.__init__(self, message, url, answer)
@@ -212,12 +240,16 @@ def _answer_words(resp, limit=200):
     detail = _detail(resp)
     if detail:
         return detail[:limit]
-    text = str(getattr(resp, "text", "") or "")
-    head = text.lstrip()[:300].lower()
-    if head.startswith("<") or "<html" in head or "<!doctype" in head:
+    if _web_page(resp):
         return ("the server answered with a web page instead of the wallet's "
                 "answer (it may be down, or behind a protection page)")
-    return " ".join(text.split())[:limit]
+    return " ".join(str(getattr(resp, "text", "") or "").split())[:limit]
+
+
+def _web_page(resp):
+    """True when the answer is a web page (HTML), not the wallet's own."""
+    head = str(getattr(resp, "text", "") or "").lstrip()[:300].lower()
+    return head.startswith("<") or "<html" in head or "<!doctype" in head
 
 
 def _unreachable(url, exc):
@@ -227,8 +259,18 @@ def _unreachable(url, exc):
 
 
 def _server_trouble(resp):
-    """HTTP 5xx: the wallet's server (or one in front of it) is failing."""
-    return 500 <= int(getattr(resp, "status_code", 0) or 0) <= 599
+    """The wallet's server (or one in front of it) is failing, or something
+    in front of it turned the request away: HTTP 502-504 (a gateway), any
+    other 5xx that is not LNbits' own answer (LNbits' 520 "Payment or
+    Invoice error" or a 500 with its {"detail"} is the wallet answering,
+    not a server that is down), or a 403/429 web page (a protection or
+    rate-limit page). Not "gone": the wallet itself may be fine."""
+    status = int(getattr(resp, "status_code", 0) or 0)
+    if status in (502, 503, 504):
+        return True
+    if 500 <= status <= 599:
+        return not _detail(resp)
+    return status in (403, 429) and _web_page(resp)
 
 
 def _never_left(exc):
@@ -363,7 +405,8 @@ def create_wallet(instance_url=None, name="agentic-trader"):
         raise WalletError(
             f"wallet creation failed HTTP {resp.status_code} — this instance "
             "may not allow open registration; set AGENTIC_TRADER_LNBITS to "
-            f"one that does, or supply your own wallet. {resp.text[:150]}")
+            f"one that does, or supply your own wallet. "
+            f"{_answer_words(resp, 150)}")
 
     def _find_key(obj):
         if isinstance(obj, dict):
@@ -486,11 +529,8 @@ def wallet_setup(cfg):
     try:
         bal = wallet.balance_sats()
     except WalletGone:
-        print(f"Wallet check FAILED: {host_of(url) or url} does not know that "
-              "admin key (\"Wallet not found\"): the wallet was deleted or "
-              "reset, or the key is not the wallet's ADMIN key. Copy the admin "
-              "key again from the wallet's page (API info), or choose 1 to let "
-              "the agent create a new wallet.")
+        print("Wallet check FAILED: " + unknown_key_text(
+            url, "choose 1 to let the agent create a new wallet"))
         return cfg
     except WalletError as exc:
         print(f"Wallet check FAILED: {exc}")
@@ -702,8 +742,9 @@ class LNbitsWallet:
         Raises WalletError on failure or timeout. PaymentRefused means the
         wallet said no; PaymentNotSent that the request never reached it,
         or (WalletKeyRejected) that its server turned the request away
-        unread. Any other error leaves the outcome unknown (the payment may
-        still go through) — ask payment_status().
+        unread (WalletGoneOnPay when that was LNbits refusing the wallet's
+        key: the wallet is gone). Any other error leaves the outcome unknown
+        (the payment may still go through) — ask payment_status().
         """
         try:
             # payment_request is LNbits' name since 1.x; bolt11 (the same
@@ -724,12 +765,17 @@ class LNbitsWallet:
             # turned away at the door (key not accepted / no such wallet):
             # the request was never acted on, so no payment was started
             words = _answer_words(resp, 300)
-            if _key_refused(resp):
+            # only LNbits' own refusal of the key means the wallet is gone;
+            # a proxy's or protection page's 401/403/404 does not
+            gone = _key_refused(resp)
+            if gone:
                 self._note("gone", error=words)
-            raise WalletKeyRejected("the wallet's server did not accept the "
-                                    f"request, HTTP {resp.status_code}: "
-                                    f"{words}", url=self.url,
-                                    answer=f"HTTP {resp.status_code}: {words}")
+            elif _server_trouble(resp):
+                self._note("unreachable", error=words)
+            raise (WalletGoneOnPay if gone else WalletKeyRejected)(
+                "the wallet's server did not accept the request, HTTP "
+                f"{resp.status_code}: {words}", url=self.url,
+                answer=f"HTTP {resp.status_code}: {words}")
         if resp.status_code not in (200, 201):
             raise PaymentRefused(f"payment failed HTTP {resp.status_code}: "
                                  f"{_answer_words(resp, 300)}")

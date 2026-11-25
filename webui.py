@@ -4180,6 +4180,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 try:
                     bal = LNbitsWallet(url, str(data["lnbits_key"]).strip()).balance_sats()
                 except WalletError as exc:
+                    import lightning_wallet as lw
+                    if isinstance(exc, lw.WalletGone):
+                        # a key the owner pasted: most often mis-copied,
+                        # not the agent's wallet gone (nothing was saved)
+                        return {"ok": False, "error": "wallet check failed: "
+                                + lw.unknown_key_text(url)}
                     return {"ok": False, "error": f"wallet check failed: {exc}"}
                 # a different wallet replaces the agent's: the old one's
                 # keys are kept on file first (sats may be left in it)
@@ -6681,20 +6687,27 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             sats = _v2_number(p.get("sats"), "sats", 1000, cap or 100_000_000,
                               whole=True)
             p = {"sats": sats}
+        heads_up = []
         if "confirm" not in data:
             # the review step: ask the wallet first, so a wallet that is
-            # gone says so (with its fix) before the owner confirms
+            # gone says so (with its fix) before the owner confirms. Any
+            # other failed read (a slow or briefly down server) does not
+            # stop the review: the invoice itself may still be made, and
+            # if not, that step says why.
+            import lightning_wallet as lw
             try:
                 w.balance_sats()
-            except Exception as exc:
+            except lw.WalletGone as exc:
                 return _wallet_trouble(exc, w.url)
+            except Exception as exc:
+                heads_up = ["Heads-up: " + _wallet_trouble(exc, w.url)["error"]]
         with A.CONFIG_LOCK:
             _sync()
             from sources import agenthc_day_trade_ideas as hc
             auto = hc.autopay_caps(cfg)["per_invoice"]
             wait = _two_step("wallet_fund", p, data, [_change(
                 "wallet_fund", "Add to the agent's wallet", None, sats,
-                "neutral")], [
+                "neutral")], heads_up + [
                 "Nothing is paid yet: the next step shows a Lightning invoice, "
                 "and nothing is paid until you pay it from your own wallet app.",
                 ("The agent spends from this wallet only on day-passes, each "

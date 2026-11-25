@@ -741,7 +741,7 @@ def test_wallet_that_no_longer_exists_is_reported_and_not_waited_for(
     Nothing was paid — the agent must not sit "undecided" for a day."""
     class Gone(Wallet):
         def pay_invoice(self, invoice):
-            raise lightning_wallet.WalletKeyRejected(
+            raise lightning_wallet.WalletGoneOnPay(
                 "the wallet's server did not accept the request, HTTP 404: "
                 '{"detail":"Wallet not found."}')
 
@@ -911,6 +911,10 @@ def test_wallet_key_that_is_not_accepted_means_nothing_was_sent(monkeypatch, sta
     assert issubclass(lightning_wallet.WalletKeyRejected, lightning_wallet.PaymentNotSent)
     assert not issubclass(lightning_wallet.WalletKeyRejected,
                           lightning_wallet.PaymentRefused)
+    # only LNbits' own refusal of the key is "gone" (not any 401/403/404)
+    assert not issubclass(lightning_wallet.WalletKeyRejected,
+                          lightning_wallet.WalletGone)
+    assert issubclass(lightning_wallet.WalletGoneOnPay, lightning_wallet.WalletGone)
 
 
 def test_wallet_says_refused_only_when_it_answered_no(monkeypatch):
