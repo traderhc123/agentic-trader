@@ -104,6 +104,10 @@ def test_key_with_empty_balance_never_buys_a_wallet_day_pass(monkeypatch, clock,
 
 
 def test_purchase_gate_is_closed_while_a_key_is_set(monkeypatch, clock):
+    class Funded:   # the wallet answers before a purchase (_wallet_can_pay)
+        def balance_sats(self):
+            return 1_000_000
+    monkeypatch.setattr(agenthc, "wallet_from_cfg", lambda cfg: Funded())
     cfg = {"agenthc_api_key": "k", "lnbits_url": "https://w",
            "lnbits_admin_key": "x", "day_pass_recurring": True}
     assert agenthc._pass_purchase_allowed(cfg, {}, lambda s: None) is False

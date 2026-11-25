@@ -353,8 +353,10 @@ export interface PassCheck {
   days_left?: number | null;
   error?: string;
 }
-/** GET /api/wallet/balance */
-export type WalletBalance = { ok: true; sats: number } | { ok: false; error: string };
+/** GET /api/wallet/balance. wallet_gone: the wallet's server no longer knows
+ *  the wallet (error then says how to make a new one); unreachable: it could
+ *  not be asked. */
+export type WalletBalance = { ok: true; sats: number } | { ok: false; error: string; wallet_gone?: boolean; unreachable?: boolean };
 
 // ── Settings → Help and support (classic routes, reused as they are) ────────
 
@@ -419,6 +421,10 @@ export interface WalletView {
   site: string | null;
   /** a public test server's warning, or null */
   warning: string | null;
+  /** what the wallet's server last said about the wallet (re-asked in the
+   *  background every 10 minutes); null without a wallet; older agents
+   *  leave it out. message: the owner's words when it is gone / out of reach */
+  health?: { status: "ok" | "gone" | "unreachable" | "error" | "checking"; message: string | null; checked_at: number | null } | null;
   /** a wallet page link is on file (open it with POST /api/v2/wallet/page) */
   page_on_file: boolean;
   /** the most one day-pass payment may cost (the cap in force); null: not known */
@@ -438,7 +444,7 @@ export interface WalletView {
 /** day_pass_usd: AgentHC's price for one day-pass (the built-in one when it can't say);
  *  older agents leave it out. */
 export type WalletQuote =
-  | ({ ok: true; btc_usd: number; usd: number; day_pass_usd?: number; day_passes: number; day_pass_sats: number; suggested_sats: number; invoice_cap: number | null } & AutopayCap)
+  | ({ ok: true; btc_usd: number; usd: number; day_pass_usd?: number; day_passes: number; day_pass_sats: number; reserve_sats?: number; suggested_sats: number; invoice_cap: number | null } & AutopayCap)
   | ({ ok: false; error: string; day_pass_usd?: number } & AutopayCap);
 /** The wallet's auto-pay cap, as /api/wallet/quote reports it (older agents leave it out). */
 export interface AutopayCap {
@@ -454,6 +460,8 @@ export interface FundInvoice {
   /** said when the wallet made a smaller invoice than asked (its own cap) */
   note: string;
   qr: number[][] | null;
+  /** which wallet apps pay it (Cash App, …); older agents leave it out */
+  hint?: string;
 }
 
 /** POST /api/v2/wallet/page */

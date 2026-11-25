@@ -36,6 +36,18 @@ def _no_pass_price_ask(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_wallet_health_left_over(monkeypatch):
+    """The wallet health the dashboard shows is kept in memory for the run
+    and re-asked in a background thread: each test starts with none, and
+    no thread asks a wallet's server (tests of it switch it on with the
+    network stubbed)."""
+    import lightning_wallet
+    monkeypatch.setattr(lightning_wallet, "_HEALTH", {})
+    monkeypatch.setattr(lightning_wallet, "_HEALTH_ASKING", set())
+    monkeypatch.setattr(lightning_wallet, "HEALTH_BACKGROUND", False)
+
+
+@pytest.fixture(autouse=True)
 def _no_order_waits(monkeypatch):
     """moomoo's exit fill check polls with sleeps: none in tests."""
     from brokers import moomoo

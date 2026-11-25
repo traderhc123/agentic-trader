@@ -409,23 +409,35 @@ function WalletPanel({ page, open }: { page: Page; open: (o: Open) => void }) {
   const on = v?.signals.wallet_connected;
   const w = v?.signals.wallet;
   const [bal, setBal] = useState<string>("");
+  // the balance read said the wallet's server no longer knows the wallet:
+  // its words (how to make a new one), shown above everything else
+  const [goneNow, setGoneNow] = useState<string>("");
   // only ever why the page did not open: the link itself is never kept in
   // the page (a bearer link: whoever has it can spend from the wallet)
   const [link, setLink] = useState<{ err: string } | null>(null);
   const lost = page.link === "lost" || !v;
   useEffect(() => {
+    setGoneNow("");
     if (!on) return;
     let live = true;
     getJson<WalletBalance>(API.walletBalance).then((r) => {
       if (!live) return;
       if (!r.ok) setBal(`not read: ${r.error}`);
       else if (r.body.ok) setBal(`${count(r.body.sats)} sats`);
-      else setBal(`not read: ${r.body.error}`);
+      else if (r.body.wallet_gone) {
+        setBal("nothing: the wallet no longer exists");
+        setGoneNow(r.body.error);
+      } else setBal(`not read: ${r.body.error}`);
     });
     return () => {
       live = false;
     };
-  }, [on, w?.site]);
+    // read again whenever the agent's own check says something new (a
+    // replaced wallet starts as "checking")
+  }, [on, w?.site, w?.health?.status, w?.health?.checked_at]);
+  // the agent's own background check (every 10 minutes), or this page's read
+  const gone = on ? goneNow || (w?.health?.status === "gone" ? (w.health.message ?? "") : "") : "";
+  const down = on && !gone && w?.health?.status === "unreachable" ? (w.health.message ?? "") : "";
   // the page link opens the wallet: fetched by POST only on this click,
   // into a window opened by the click itself
   const openPage = async () => {
@@ -449,18 +461,39 @@ function WalletPanel({ page, open }: { page: Page; open: (o: Open) => void }) {
         <h2>Payment wallet</h2>
         <span className="meta">The agent's own Lightning wallet, for paying day-passes by itself</span>
       </div>
+      {gone && (
+        <div className="pb">
+          <div className="callout callout-bad" role="alert" data-wallet="gone">
+            <p>
+              <Icon name="alert" small />
+              {gone}
+            </p>
+          </div>
+        </div>
+      )}
+      {down && (
+        <div className="pb">
+          <div className="callout callout-warn" role="note">
+            <p>
+              <Icon name="alert" small />
+              {down}
+            </p>
+          </div>
+        </div>
+      )}
       <Row
         label="Wallet"
         exp={!v ? UNKNOWN : on ? `At ${w?.site ?? "an LNbits server"}.${on ? ` In it: ${bal || "reading…"}.` : ""}` : "None. Signal days bought on this page are paid from any wallet app you choose; this wallet is not needed for that."}
         act={
           <span className="row-acts">
-            {on && (
+            {on && !gone && (
               <button className="btn btn-sm btn-primary" data-act="wallet-fund" aria-haspopup="dialog" disabled={lost} onClick={() => open("wallet-fund")}>
                 Add sats…
               </button>
             )}
-            <button className="btn btn-sm" data-act="wallet-create" aria-haspopup="dialog" disabled={lost} onClick={() => open("wallet-create")}>
-              {on ? "Replace with a new wallet…" : "Make the agent's wallet…"}
+            {/* a wallet that no longer exists: this is the one step that fixes it */}
+            <button className={gone ? "btn btn-sm btn-primary" : "btn btn-sm"} data-act="wallet-create" aria-haspopup="dialog" disabled={lost} onClick={() => open("wallet-create")}>
+              {gone ? "Create a new wallet…" : on ? "Replace with a new wallet…" : "Make the agent's wallet…"}
             </button>
           </span>
         }
@@ -655,7 +688,7 @@ export function SignalsView({ page }: { page: Page }) {
       {open === "key" && page.settings.view && <KeyDialog page={page} onClose={() => setOpen(null)} />}
       {open === "wallet-create" && page.settings.view && <CreateWalletDialog page={page} onClose={() => setOpen(null)} />}
       {open === "wallet-connect" && page.settings.view && <ConnectWalletDialog page={page} onClose={() => setOpen(null)} />}
-      {open === "wallet-fund" && page.settings.view && <FundDialog page={page} onClose={() => setOpen(null)} />}
+      {open === "wallet-fund" && page.settings.view && <FundDialog page={page} onClose={() => setOpen(null)} onNewWallet={() => setOpen("wallet-create")} />}
       {open === "recurring" && page.settings.view && <RecurringDialog page={page} onClose={() => setOpen(null)} />}
     </div>
   );
