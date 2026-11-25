@@ -210,6 +210,7 @@ watched several days of activity and explicitly ask to go live.
 | `403 feed_not_live` | Feed isn't publishing yet — agent idles and keeps polling; normal |
 | `402` loops / "more than your auto-pay cap" | Day-pass price above the cap in force (the refusal names it; `autopay cap` shows it) — if the price is legitimate the owner raises it with `set autopay cap N` (or `max_autopay_sats` in config.json) |
 | `WalletError: payment failed` | Wallet balance too low — `python agent.py fund <sats>` and pay the invoice |
+| "Your agent's wallet no longer exists" / `Wallet not found` | The wallet's LNbits server was reset (or its keys changed). The owner makes a new wallet: dashboard → Signals & pass → Payment wallet → Create a new wallet, or `python agent.py wallet new`; then adds sats. The old wallet's details stay in `old-wallet-*.json`. The agent asks AgentHC for no day-pass until it has a working wallet |
 | `403 terms_acceptance_required` | Agent auto-accepts and retries; if it loops, run setup again |
 | `403 tier_required` | AgentHC key is FREE tier — upgrade to Premium (`/docs`) or switch to the day-pass |
 | `401 Invalid API key` | Key revoked/typo — re-run setup with a valid key |

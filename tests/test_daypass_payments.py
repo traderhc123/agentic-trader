@@ -741,7 +741,7 @@ def test_wallet_that_no_longer_exists_is_reported_and_not_waited_for(
     Nothing was paid — the agent must not sit "undecided" for a day."""
     class Gone(Wallet):
         def pay_invoice(self, invoice):
-            raise lightning_wallet.WalletKeyRejected(
+            raise lightning_wallet.WalletGoneOnPay(
                 "the wallet's server did not accept the request, HTTP 404: "
                 '{"detail":"Wallet not found."}')
 
@@ -754,9 +754,11 @@ def test_wallet_that_no_longer_exists_is_reported_and_not_waited_for(
     assert not _poll(CFG, state)
     assert "daypass_pending" not in state
     assert (state.get("autopay_spent") or {}).get("count", 0) == 0
-    assert len(alerts) == 1 and "did not accept the agent's wallet key" in alerts[0]
-    assert "may no longer exist" in alerts[0] and "Nothing was paid" in alerts[0]
+    # the owner's words: gone, the one step that fixes it, nothing paid
+    assert len(alerts) == 1 and "no longer exists" in alerts[0]
+    assert "Create a new wallet" in alerts[0] and "Nothing was paid" in alerts[0]
     assert "HTTP" not in alerts[0] and "{" not in alerts[0]
+    assert agenthc.exit_loss_reason() == "day_pass_wallet_gone"
 
 
 # ── P4: never buy a pass the market is closed for ───────────────────────────
@@ -909,6 +911,10 @@ def test_wallet_key_that_is_not_accepted_means_nothing_was_sent(monkeypatch, sta
     assert issubclass(lightning_wallet.WalletKeyRejected, lightning_wallet.PaymentNotSent)
     assert not issubclass(lightning_wallet.WalletKeyRejected,
                           lightning_wallet.PaymentRefused)
+    # only LNbits' own refusal of the key is "gone" (not any 401/403/404)
+    assert not issubclass(lightning_wallet.WalletKeyRejected,
+                          lightning_wallet.WalletGone)
+    assert issubclass(lightning_wallet.WalletGoneOnPay, lightning_wallet.WalletGone)
 
 
 def test_wallet_says_refused_only_when_it_answered_no(monkeypatch):
@@ -1214,7 +1220,7 @@ def test_low_balance_after_a_purchase_alerts_once(monkeypatch, clock, alerts):
     (text,) = alerts
     ends = datetime.fromtimestamp(state["l402"]["expires_at"], agenthc.MARKET_TZ)
     assert text == ("Your agent's wallet has 4,000 sats left, less than one "
-                    "day-pass plus the wallet's routing-fee reserve (about "
+                    "day-pass plus the wallet's fee reserve (about "
                     "10,100 sats). Add sats in the dashboard "
                     "(Settings → Signal source). If it cannot buy the next "
                     "pass, the agent takes no new trades from "

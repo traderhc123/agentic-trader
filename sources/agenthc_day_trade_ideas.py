@@ -28,9 +28,11 @@ from zoneinfo import ZoneInfo
 
 import requests  # noqa: F401  (tests stub requests.get/post; _http calls them)
 
-from lightning_wallet import (PaymentNotSent, PaymentRefused, WalletKeyRejected,
-                              fee_reserve_sats, wallet_fingerprint,
-                              wallet_from_cfg, wallet_setup)
+from lightning_wallet import (NEW_WALLET_DASHBOARD, PaymentNotSent,
+                              PaymentRefused, WalletGone, WalletKeyRejected,
+                              WalletUnreachable, fee_reserve_sats,
+                              reserve_from_refusal, wallet_fingerprint,
+                              wallet_from_cfg, wallet_gone_text, wallet_setup)
 from net_check import http as _http  # steps around a broken proxy setting
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -1344,7 +1346,10 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
     against an older server.
 
     Never buys while the wallet is known to pay without giving the receipt
-    the pass is made from (see _no_receipt_stop).
+    the pass is made from (see _no_receipt_stop), nor while the wallet
+    can't pay at all — gone, unreachable, or short of the day price plus
+    LNbits' reserve (_wallet_can_pay: asked of the wallet's own server, so
+    AgentHC makes no invoice that could only expire).
 
     One paid day-pass per day: never buys on a day the prepaid pass was
     already charged, and never buys a second day-pass the same day (the
@@ -1415,7 +1420,9 @@ def _pass_purchase_allowed(cfg, state, save_state, now=None):
                       "pass you paid for was rejected, contact the feed "
                       "operator before raising the cap. Resumes tomorrow.")
             return False
-        return True
+        # last: the wallet must be able to pay before AgentHC is asked for
+        # an invoice (a gone, unreachable or short wallet only lets it expire)
+        return _wallet_can_pay(cfg, state, save_state)
     day = time.strftime("%Y-%m-%d")
     if state.get("pass_needed_notified") != day:
         state["pass_needed_notified"] = day
@@ -1504,6 +1511,214 @@ def _no_receipt_stop(cfg, state, save_state):
     _daypass_alert(cfg, state, save_state, "daypass_noproof_notified",
                    _no_receipt_text(stop.get("sats")))
     return True
+
+
+# ── the wallet itself, before AgentHC is asked for a day-pass ───────────────
+# Every time the agent answers the feed's 402 with a purchase, AgentHC makes
+# a Lightning invoice. A wallet that is gone (its server no longer knows its
+# key: a public test server was reset), that can't be reached, or that holds
+# too little can't pay it, and the invoice just expires — one every
+# _PAY_RETRY_S, all day. So before a day-pass is bought the wallet is asked
+# for its balance (its own server only, never AgentHC). While it can't pay,
+# AgentHC is not asked at all; the wallet is asked again every
+# _WALLET_RECHECK_S (_WALLET_SHORT_RECHECK_S while it is only short of
+# sats, so a top-up is used quickly) and the purchase goes ahead as soon as
+# it answers with enough. state["daypass_wallet_check"] keeps the last
+# answer, for the wallet it was about only (wallet_fingerprint): a new wallet
+# is asked at once. Nothing here pays, and nothing here touches a payment
+# that was already started (daypass_pending) or the no-receipt stop.
+_WALLET_RECHECK_S = 300         # gone / unreachable: asked again this often
+_WALLET_SHORT_RECHECK_S = 60    # too few sats: asked again this often
+_WALLET_OK_S = 300              # enough sats: that answer is used this long
+_WALLET_WATCH_S = 900           # early warning (every poll): at most this often
+_WALLET_DOWN_ALERT_S = 900      # unreachable this long: the owner is told
+_WALLET_NEED_MAX_AGE_S = 24 * 3600
+# one balance read on the agent's loop: (connect, read) seconds — a wallet
+# server that hangs holds the poll (and its exit read) up ~8 s at most
+_WALLET_TIMEOUT_S = (3, 5)
+_WALLET_ALERTS = ("daypass_wallet_gone_notified", "daypass_wallet_down_notified",
+                  "daypass_low_balance_notified")
+# the classic dashboard's words: /v2 shows them as "on Signals & pass"
+# (webui_app/src/v2/lib/settings.ts v2Words)
+WALLET_WHERE = "the dashboard (Settings → Signal source)"
+
+
+def _wallet_rec(cfg, state):
+    """The last saved answer of the wallet set up now, or None (no answer
+    saved, or one about another wallet, or a day old)."""
+    rec = state.get("daypass_wallet_check")
+    fp = wallet_fingerprint(cfg)
+    if (not fp or not isinstance(rec, dict) or rec.get("wallet") != fp
+            or time.time() - float(rec.get("at") or 0) > _WALLET_NEED_MAX_AGE_S):
+        return None
+    return rec
+
+
+def _wallet_mark(cfg, state, status, **extra):
+    """Save what the wallet just showed (status gone / unreachable / ok).
+    Caller saves."""
+    now = time.time()
+    prev = _wallet_rec(cfg, state) or {}
+    rec = {"wallet": wallet_fingerprint(cfg), "at": now, "status": status}
+    if status == "unreachable":
+        rec["since"] = (prev.get("since") if prev.get("status") == "unreachable"
+                        else None) or now
+    rec.update(extra)
+    state["daypass_wallet_check"] = rec
+    return rec
+
+
+def _wallet_check(cfg, state, save_state, max_age):
+    """The wallet's answer to a balance read, at most `max_age` seconds old
+    (asked now when older). {status: ok|gone|unreachable|unknown, sats, at}
+    or None when there is no wallet to ask. Never raises."""
+    rec = _wallet_rec(cfg, state)
+    if rec and time.time() - float(rec.get("at") or 0) < max_age:
+        return rec
+    wallet = wallet_from_cfg(cfg)
+    read = getattr(wallet, "balance_sats", None)
+    if wallet is None or read is None or not wallet_fingerprint(cfg):
+        return None
+    try:
+        # a short wait: this runs on the agent's loop (an LNbitsWallet takes
+        # a timeout; a wallet that can't is asked as it is)
+        import inspect
+        try:
+            short = "timeout" in inspect.signature(read).parameters
+        except (TypeError, ValueError):
+            short = False
+        sats = read(timeout=_WALLET_TIMEOUT_S) if short else read()
+        if isinstance(sats, bool) or not isinstance(sats, int):
+            raise ValueError("no balance")
+        rec = _wallet_mark(cfg, state, "ok", sats=sats)
+    except WalletGone:
+        rec = _wallet_mark(cfg, state, "gone")
+    except (WalletUnreachable, PaymentNotSent):
+        rec = _wallet_mark(cfg, state, "unreachable")
+    except Exception:
+        # an answer this agent doesn't understand: no reason to hold back
+        # (the purchase itself says whether the wallet can pay)
+        rec = _wallet_mark(cfg, state, "unknown")
+    save_state(state)
+    return rec
+
+
+def _wallet_need(cfg, state, service=False):
+    """Sats the wallet must hold before a day-pass is bought: AgentHC's own
+    day price plus LNbits' routing reserve (fee_reserve_sats, without a
+    server's service fee: this agent's note of that fee may be out of date,
+    and a stale one would refuse purchases a wallet could pay), or what
+    LNbits itself last said it needed for a day-pass ("You must reserve at
+    least ...", which counts the service fee), whichever is more. None when
+    the price is not known (then the balance does not hold the purchase
+    back). service=True: with the known service fee too — what the owner
+    is asked to add."""
+    need = None
+    try:
+        day = day_pass_price().get("sats")
+        if isinstance(day, int) and not isinstance(day, bool) and day > 0:
+            need = day + fee_reserve_sats(day, cfg.get("lnbits_url"),
+                                          service=service)
+    except Exception:
+        need = None
+    said = state.get("daypass_wallet_need")
+    if (isinstance(said, dict) and said.get("wallet") == wallet_fingerprint(cfg)
+            and time.time() - float(said.get("at") or 0) < _WALLET_NEED_MAX_AGE_S):
+        try:
+            need = max(need or 0, int(said.get("sats") or 0)) or None
+        except (TypeError, ValueError):
+            pass
+    return need
+
+
+def _wallet_alert_clear(state, save_state):
+    """The wallet answers with enough sats: a wallet alert on the dashboard
+    (gone, unreachable, too few sats) is no longer true."""
+    if state.get("daypass_alert") in _WALLET_ALERTS:
+        _daypass_alert_clear(state)
+        save_state(state)
+
+
+def wallet_gone_alert_text(cfg):
+    return (wallet_gone_text(cfg.get("lnbits_url"), NEW_WALLET_DASHBOARD)
+            + " Until the agent has a working wallet it buys no day-passes "
+            "(and asks AgentHC for none); without a running pass or signal "
+            "days it takes no new trades.")
+
+
+def _wallet_gone_alert(cfg, state, save_state):
+    _daypass_alert(cfg, state, save_state, "daypass_wallet_gone_notified",
+                   wallet_gone_alert_text(cfg))
+
+
+def _wallet_can_pay(cfg, state, save_state):
+    """Before AgentHC is asked for a day-pass: True unless the wallet is
+    known not to be able to pay it (gone, unreachable, or fewer sats than
+    the day price plus LNbits' reserve). Tells the owner why (once a day,
+    and on the dashboard until it is fixed)."""
+    rec = _wallet_rec(cfg, state)
+    status = (rec or {}).get("status")
+    max_age = (_WALLET_SHORT_RECHECK_S if status == "ok" and rec.get("short")
+               else _WALLET_OK_S if status == "ok" else _WALLET_RECHECK_S)
+    rec = _wallet_check(cfg, state, save_state, max_age)
+    status = (rec or {}).get("status")
+    if status == "gone":
+        _wallet_gone_alert(cfg, state, save_state)
+        return False
+    if status == "unreachable":
+        if time.time() - float(rec.get("since") or rec.get("at") or 0) >= _WALLET_DOWN_ALERT_S:
+            from lightning_wallet import wallet_unreachable_text
+            _daypass_alert(
+                cfg, state, save_state, "daypass_wallet_down_notified",
+                wallet_unreachable_text(cfg.get("lnbits_url")) + " Until it "
+                "answers the agent does not buy today's day-pass; it asks the "
+                f"wallet again every {_WALLET_RECHECK_S // 60} minutes.")
+        return False
+    if status != "ok":
+        return True
+    need = _wallet_need(cfg, state)
+    sats = int(rec.get("sats") or 0)
+    short = bool(need) and sats < need
+    if short != bool(rec.get("short")) or rec.get("need") != need:
+        rec["short"], rec["need"] = short, need
+        save_state(state)
+    if short:
+        # the owner is asked for the fees this server is known to charge too
+        ask = max(need, _wallet_need(cfg, state, service=True) or 0)
+        _daypass_alert(
+            cfg, state, save_state, "daypass_low_balance_notified",
+            f"Your agent's wallet holds {sats:,} sats, less than today's "
+            f"day-pass plus the wallet's fees (about {ask:,} sats), so "
+            "the agent did not buy one. Add at least "
+            f"{ask - sats:,} sats in {WALLET_WHERE}. The agent checks the "
+            "wallet every minute until today's market close and buys the "
+            "pass as soon as it holds enough.")
+        return False
+    _wallet_alert_clear(state, save_state)
+    return True
+
+
+def _wallet_watch(cfg, state, save_state):
+    """Early warning, on every poll (at most every _WALLET_WATCH_S it asks
+    the wallet): a wallet the agent buys day-passes with ('Recurring
+    day-pass' ON) whose server no longer knows it is reported at once —
+    at agent start, and long before the next purchase or a funding try —
+    not on the morning it fails to pay. A wallet that answers again takes
+    that alert off. Never raises; never holds anything else back."""
+    try:
+        if (cfg.get("agenthc_api_key") or not cfg.get("day_pass_recurring")
+                or not (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"))):
+            return
+        rec = _wallet_check(cfg, state, save_state, _WALLET_WATCH_S)
+        status = (rec or {}).get("status")
+        if status == "gone":
+            _wallet_gone_alert(cfg, state, save_state)
+        elif (status == "ok"
+              and state.get("daypass_alert") == "daypass_wallet_gone_notified"):
+            _daypass_alert_clear(state)
+            save_state(state)
+    except Exception as exc:
+        print(f"Wallet check skipped ({str(exc)[:120]}).")
 
 
 def _one_pass_a_day(cfg):
@@ -1639,6 +1854,8 @@ def _daypass_paid(state, pending, preimage):
     state.pop("daypass_retry_at", None)
     state.pop("daypass_retry_why", None)
     state.pop("daypass_no_receipt", None)   # this wallet does give receipts
+    state.pop("daypass_wallet_need", None)  # it paid: what it held was enough
+    state.pop("daypass_wallet_check", None)  # read afresh before the next one
     _daypass_alert_clear(state)
     if isinstance(pending.get("day"), str):
         _record_paid_day(state, pending["day"])
@@ -1654,7 +1871,7 @@ def _check_balance(cfg, state, save_state, wallet, paid_sats):
         bal = wallet.balance_sats()
         ends = datetime.fromtimestamp(float(state["l402"]["expires_at"]), MARKET_TZ)
         need = int(paid_sats or 0)
-        need += fee_reserve_sats(need)
+        need += fee_reserve_sats(need, cfg.get("lnbits_url"))
     except Exception:
         return
     if isinstance(bal, bool) or not isinstance(bal, int) or bal >= need:
@@ -1662,9 +1879,8 @@ def _check_balance(cfg, state, save_state, wallet, paid_sats):
     _daypass_alert(
         cfg, state, save_state, "daypass_low_balance_notified",
         f"Your agent's wallet has {bal:,} sats left, less than one day-pass "
-        f"plus the wallet's routing-fee reserve (about {need:,} sats). Add "
-        "sats in the dashboard (Settings "
-        "→ Signal source). If it cannot buy the next pass, the agent takes no "
+        f"plus the wallet's fee reserve (about {need:,} sats). Add "
+        f"sats in {WALLET_WHERE}. If it cannot buy the next pass, the agent takes no "
         f"new trades from {ends.hour}:{ends.minute:02d} ET on "
         f"{ends:%A %b} {ends.day}.")
 
@@ -1707,6 +1923,15 @@ def _settle_daypass(cfg, state, save_state, wallet=None):
                 status, preimage = check(pending["payment_hash"])
             except Exception:
                 status, preimage = "unknown", ""
+    wallet_gone = status == "wallet_gone"
+    if wallet_gone:
+        # the wallet's server no longer knows the wallet: it can't say what
+        # became of the payment. Undecided (never "failed": that would let
+        # a second payment go out); the owner hears why below.
+        status = "unknown"
+        if (_wallet_rec(cfg, state) or {}).get("status") != "gone":
+            _wallet_mark(cfg, state, "gone")
+            save_state(state)
     age = time.time() - float(pending.get("created_at") or 0)
     amount = int(pending.get("amount_sats") or 0)
     if status == "paid" and preimage:
@@ -1760,6 +1985,15 @@ def _settle_daypass(cfg, state, save_state, wallet=None):
                 "and uses the pass if it was paid. (When a wallet is "
                 "replaced from the dashboard or setup, its details are saved "
                 "in an old-wallet file in the agent's folder.)")
+        elif wallet_gone:
+            text = (
+                f"Your agent asked its wallet to pay {amount:,} sats for "
+                "today's day-pass, and then the wallet's server stopped "
+                "accepting the wallet's key, so it can't say whether that "
+                "payment went through. The agent will not pay again for now "
+                "(it might pay twice for the same day); it buys again once a "
+                "day has passed since that payment. "
+                + wallet_gone_text(cfg.get("lnbits_url"), NEW_WALLET_DASHBOARD))
         else:
             text = (
                 f"Your agent asked its wallet to pay {amount:,} sats for "
@@ -1884,29 +2118,57 @@ def _pay_day_pass(cfg, state, body, save_state, running_until=None):
                 # LNbits' fee reserve: "You must reserve at least (N sat) to
                 # cover potential routing fees" is a short balance too
                 r"insufficient|not enough|balance|reserve|routing fee", reason, re.I))
-            if isinstance(exc, WalletKeyRejected):
-                why = ("the wallet's server did not accept the agent's "
-                       "wallet key — the wallet may no longer exist (public "
-                       "test servers can be reset). Check it, or set up "
-                       "another wallet, in the dashboard (Settings → Signal "
-                       "source)")
-            elif isinstance(exc, PaymentNotSent):
-                why = ("the wallet could not be reached — check this "
-                       "computer's internet connection; the wallet's server "
-                       "may also be down")
-            elif short:
-                why = ("the wallet does not hold enough sats — add sats in "
-                       "the dashboard (Settings → Signal source)")
-            else:
-                why = "the wallet did not make the payment"
             then = (_running_text(running_until) if running_until
                     else "Until a pass is paid the agent gets no new trades.")
+            err = RuntimeError(f"Day-pass payment failed — nothing was paid: {reason}")
+            if isinstance(exc, WalletGone):
+                # the wallet's server no longer knows this wallet: no more
+                # purchases (nor AgentHC invoices) until it works again
+                _wallet_mark(cfg, state, "gone")
+                save_state(state)
+                _daypass_alert(
+                    cfg, state, save_state, "daypass_wallet_gone_notified",
+                    "Your agent's wallet could not pay for today's day-pass "
+                    f"({amount:,} sats). Nothing was paid. {then} "
+                    + wallet_gone_alert_text(cfg))
+                err.loss_code = "day_pass_wallet_gone"
+                raise err
+            if isinstance(exc, PaymentNotSent):
+                # (a WalletKeyRejected that is not LNbits refusing the key —
+                # a proxy's or protection page's 401/403/404 — lands here:
+                # the wallet may be fine, so it is not called gone)
+                _wallet_mark(cfg, state, "unreachable")
+                save_state(state)
+                why = ("the wallet's server turned the payment away before "
+                       "reading it (it may be down, or behind a protection "
+                       "page)" if isinstance(exc, WalletKeyRejected) else
+                       "the wallet could not be reached — check this "
+                       "computer's internet connection; the wallet's server "
+                       "may also be down")
+                retry = (_retry_text() + " It asks AgentHC for a new pass "
+                         "only once the wallet answers again.")
+            elif short:
+                # what LNbits said it needs, so the owner gets the exact
+                # top-up and no new invoice is asked for until it is there
+                said = reserve_from_refusal(reason)
+                need = amount + (said if said is not None else
+                                 fee_reserve_sats(amount, cfg.get("lnbits_url")))
+                state["daypass_wallet_need"] = {"wallet": wallet_fingerprint(cfg),
+                                                "sats": need, "at": time.time()}
+                state.pop("daypass_wallet_check", None)   # read it afresh
+                save_state(state)
+                why = ("the wallet does not hold enough sats: it needs about "
+                       f"{need:,} sats (the pass plus the wallet's fee "
+                       f"reserve) — add sats in {WALLET_WHERE}")
+                retry = (_retry_text() + " It asks AgentHC for a new pass "
+                         "only once the wallet holds enough.")
+            else:
+                why = "the wallet did not make the payment"
+                retry = _retry_text()
             _daypass_alert(
                 cfg, state, save_state, "daypass_failed_notified",
                 "Your agent's wallet could not pay for today's day-pass "
-                f"({amount:,} sats): {why}. Nothing was paid. {then} "
-                f"{_retry_text()}")
-            err = RuntimeError(f"Day-pass payment failed — nothing was paid: {reason}")
+                f"({amount:,} sats): {why}. Nothing was paid. {then} {retry}")
             err.loss_code = "day_pass_short" if short else "day_pass_failed"
             raise err
         if outcome != "paid":
@@ -1993,9 +2255,11 @@ def _day_pass_loss_code(cfg, state, now=None):
     day_pass_not_live   practice or paused, and the wallet would buy
                         (a wallet, Recurring ON): only LIVE buys a day-pass;
     day_pass_off        Recurring day-pass is off: the wallet never buys;
-    day_pass_short      the last payment failed: not enough sats;
-    day_pass_failed     the last payment failed otherwise (wallet down or
-                        gone, invoice refused, a wallet without receipts);
+    day_pass_wallet_gone the wallet's server no longer knows the wallet;
+    day_pass_short      not enough sats (the last payment failed so, or the
+                        balance read before buying);
+    day_pass_failed     the last payment failed otherwise (wallet down,
+                        invoice refused, a wallet without receipts);
     no_day_pass         anything else (today already paid once, the
                         daily cap, the market closed)."""
     if state.get("daypass_pending"):
@@ -2013,9 +2277,17 @@ def _day_pass_loss_code(cfg, state, now=None):
         return "day_pass_off"
     if isinstance(state.get("daypass_no_receipt"), dict):
         return "day_pass_failed"
+    rec = _wallet_rec(cfg, state) or {}
+    if rec.get("status") == "gone":
+        return "day_pass_wallet_gone"
+    if rec.get("status") == "unreachable":
+        return "day_pass_failed"
+    if rec.get("status") == "ok" and rec.get("short"):
+        return "day_pass_short"
     if time.time() < float(state.get("daypass_retry_at") or 0):
         why = state.get("daypass_retry_why")
-        return why if why in ("day_pass_short", "day_pass_failed") else "day_pass_failed"
+        return why if why in ("day_pass_short", "day_pass_failed",
+                              "day_pass_wallet_gone") else "day_pass_failed"
     return "no_day_pass"
 
 
@@ -2041,7 +2313,8 @@ def exit_loss_reason():
     """Why the last poll() read no exit signals ("" when it did):
     pass_unchecked, pass_unpaid, pass_ended, day_pass_refused,
     feed_not_live, feed_gap, or a _day_pass_loss_code (no_day_pass, day_pass_off,
-    day_pass_short, day_pass_failed, day_pass_undecided). Also set when
+    day_pass_short, day_pass_failed, day_pass_wallet_gone, day_pass_undecided).
+    Also set when
     poll() raised because the wallet could not pay for the day-pass."""
     return "" if _LAST_POLL["exits"] else str(_LAST_POLL.get("why") or "")
 
@@ -2157,6 +2430,10 @@ def poll(cfg, state, save_state=lambda s: None, _retried=False):
     """
     # until the feed is actually read (below)
     _LAST_POLL.update(access=False, exits=False, why="")
+    # the wallet the agent buys day-passes with: a gone one is reported at
+    # agent start and within _WALLET_WATCH_S, not on the morning it can't pay
+    if not _retried:
+        _wallet_watch(cfg, state, save_state)
     # A wallet day-pass payment saved earlier and not decided yet: ask the
     # wallet first. Paid → its token is used below; still undecided → the
     # wallet path stops further down (never a second payment for one day).

@@ -34,6 +34,9 @@ Robinhood's trading MCP).
     python agent.py setup --from plan.json   # apply an assistant-written plan
                              # (everything except the owner's own steps)
     python agent.py fund N   # print a Lightning invoice to add N sats
+    python agent.py wallet check|new   # is the agent's wallet still there? /
+                             # replace it with a new, empty one (the old
+                             # one's details are saved to a file first)
     python agent.py link     # print the dashboard login link
     python agent.py pair     # pair the phone app: shows a one-time QR code
     python agent.py devices  # list paired phones (devices revoke ID removes one)
@@ -71,6 +74,7 @@ from brokers import BROKERS, account_tag, order_guard
 from brokers.market_hours import REGULAR_CLOSE_MIN, close_minute, is_trading_day
 from lightning_wallet import (DAY_PASS_SATS_EST, WalletError, print_funding_invoice,
                               wallet_from_cfg)
+import lightning_wallet as _lw
 from notifications import notify
 from notifications import setup as notifications_setup
 from sources import SOURCES
@@ -5698,6 +5702,8 @@ _SIGNAL_LOSS_WHY = {
     "day_pass_short": ("the agent's wallet does not hold enough sats for "
                        "today's day-pass"),
     "day_pass_failed": "the agent's wallet could not pay for today's day-pass",
+    "day_pass_wallet_gone": ("the agent's wallet no longer exists on its "
+                             "server, so it can't pay for today's day-pass"),
     "day_pass_undecided": ("the agent's wallet has not said whether today's "
                            "day-pass payment went through"),
     "day_pass_refused": "AgentHC refused today's day-pass",
@@ -5720,6 +5726,9 @@ _SIGNAL_LOSS_FIX = {
                        "→ Signal source)"),
     "day_pass_failed": ("check the agent's wallet in the dashboard (Settings "
                         "→ Signal source), or buy signal days there"),
+    "day_pass_wallet_gone": ("create a new wallet (dashboard → Settings → "
+                             "Signal source), then add sats, or buy signal "
+                             "days there"),
 }
 
 
@@ -9196,8 +9205,8 @@ def cmd_status():
     if wallet:
         try:
             print(f"lightning wallet : connected, {wallet.balance_sats():,} sats")
-        except WalletError as exc:
-            print(f"lightning wallet : ERROR — {exc}")
+        except Exception as exc:  # also no connection at all: status goes on
+            print(f"lightning wallet : ERROR — {_wallet_problem(exc, cfg)}")
     else:
         print("lightning wallet : not configured")
     state = _load(STATE_PATH, {"positions": {}})
@@ -9483,14 +9492,24 @@ def _feed_access_check(cfg, state, check):
             day_usd, day = _day_pass_price()
             # LNbits refuses a payment unless the wallet also holds its
             # routing-fee reserve ("You must reserve at least ...")
-            need = day + fee_reserve_sats(day)
+            need = day + fee_reserve_sats(day, cfg.get("lnbits_url"))
             check("feed_access", bal >= need, "Wallet funded",
                   f"{bal:,} sats ({'~' + str(bal // need) + ' more market day(s)' if bal >= need else f'below one ~{usd_words(day_usd)} day-pass (~{day:,} sats + ~{need - day:,} sats LNbits fee reserve)'})",
                   "python agent.py fund 100000   (the OWNER pays the invoice)",
                   who="owner")
-        except WalletError as exc:
-            check("feed_access", False, "Lightning wallet", str(exc)[:80],
-                  "python agent.py setup   (source step → recreate wallet)")
+        except _lw.WalletGone:
+            check("feed_access", False, "Lightning wallet",
+                  f"no longer exists on {_lw.host_of(cfg.get('lnbits_url')) or 'its server'}"
+                  " (the server does not accept its key; public test servers "
+                  "get reset)",
+                  "python agent.py wallet new   (or the dashboard: Signals & "
+                  "pass → Payment wallet → Create a new wallet), then add "
+                  "sats", who="owner")
+        except Exception as exc:  # also no connection at all: doctor goes on
+            check("feed_access", False, "Lightning wallet",
+                  _wallet_problem(exc, cfg)[:160],
+                  "check this computer's internet connection, then python "
+                  "agent.py wallet check")
         return
     check("feed_access", False, "Feed access",
           "nothing paid yet — the feed needs prepaid signal days",
@@ -9598,13 +9617,111 @@ def cmd_setup_from(path, as_json=False):
     sys.exit(0 if report["ok"] else 1)
 
 
+def _wallet_problem(exc, cfg):
+    """One line for a wallet that did not answer (status, doctor): the
+    owner's words for a wallet that is gone or out of reach."""
+    if isinstance(exc, _lw.WalletGone):
+        return _lw.wallet_gone_text(cfg.get("lnbits_url"), _lw.NEW_WALLET_CLI)
+    if isinstance(exc, _lw.WalletUnreachable):
+        return _lw.wallet_unreachable_text(cfg.get("lnbits_url"))
+    return str(exc)[:200]
+
+
 def cmd_fund(sats):
     cfg = _load(CONFIG_PATH, {}) or {}
     wallet = wallet_from_cfg(cfg)
     if wallet is None:
-        print("No Lightning wallet configured — run: python agent.py setup")
+        print("No Lightning wallet configured — run: python agent.py wallet new")
         sys.exit(1)
-    print_funding_invoice(wallet, sats)
+    try:
+        print_funding_invoice(wallet, sats)
+    except Exception as exc:  # the wallet's server made no invoice
+        print(_lw.funding_error_text(exc, cfg.get("lnbits_url")))
+        sys.exit(1)
+    try:  # what the wallet needs to pay one day-pass, LNbits' reserve included
+        _usd, day = _day_pass_price()
+        need = day + _lw.fee_reserve_sats(day, cfg.get("lnbits_url"))
+        print(f"One day-pass needs about {need:,} sats in the wallet "
+              f"({day:,} for the pass + {need - day:,} the wallet keeps back "
+              "for fees).")
+    except Exception:
+        pass
+
+
+def cmd_wallet(args):
+    """python agent.py wallet check|new. check: does the wallet's server
+    still know the agent's wallet, and what is in it. new: replace it with
+    a new, empty wallet in one step — the old one's details are saved to a
+    file first (keep_old_wallet; nothing is deleted), and the agent picks
+    the new one up on its next loop."""
+    sub = (args[0] if args else "check").lower()
+    cfg = _load(CONFIG_PATH, {}) or {}
+    if sub == "check":
+        wallet = wallet_from_cfg(cfg)
+        if wallet is None:
+            print("No Lightning wallet set up. Make one: python agent.py wallet new")
+            sys.exit(1)
+        try:
+            sats = wallet.balance_sats()
+        except Exception as exc:
+            print(_wallet_problem(exc, cfg))
+            sys.exit(1)
+        print(f"Wallet on {_lw.host_of(cfg.get('lnbits_url'))}: OK, "
+              f"{sats:,} sats.")
+        warn = _lw.demo_warning(cfg.get("lnbits_url"))
+        if warn:
+            print(f"⚠️  {warn}")
+        return
+    if sub != "new":
+        print("Usage: python agent.py wallet check|new")
+        sys.exit(1)
+    require_consent_or_exit()
+    had = bool(cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"))
+    if had:
+        print(f"Your agent's wallet is on {_lw.host_of(cfg['lnbits_url'])}. "
+              "A new wallet starts empty: sats in the current one are NOT "
+              "moved (its details are saved to a file first, so you can "
+              "still open it).")
+        if "--yes" not in sys.argv and input(
+                "Type REPLACE to make a new wallet, or press Enter to keep "
+                "the current one: ").strip() != "REPLACE":
+            print("Kept your current wallet. Nothing changed.")
+            return
+    try:
+        url, key, page = _lw.create_wallet()
+    except WalletError as exc:
+        print(f"No new wallet was made: {exc}"
+              + (" Your current wallet was not changed." if had else ""))
+        sys.exit(1)
+    kept = {}
+    old = (cfg.get("lnbits_url"), cfg.get("lnbits_admin_key"))
+
+    def switch(c):
+        if (c.get("lnbits_url"), c.get("lnbits_admin_key")) != old:
+            raise RuntimeError("the wallet was changed elsewhere meanwhile")
+        kept["file"] = _lw.keep_old_wallet(c)   # OSError: nothing changes
+        c["source"] = "agenthc"
+        c["lnbits_url"], c["lnbits_admin_key"] = url, key
+        c.pop("lnbits_wallet_page", None)   # that was the old wallet's page
+        if page:
+            c["lnbits_wallet_page"] = page
+        c.setdefault("max_autopay_sats", "auto")
+    try:
+        update_config(switch)
+    except (OSError, RuntimeError) as exc:
+        print(f"Your wallet was not replaced ({str(exc)[:160]}). Nothing "
+              "changed; the new, empty wallet simply goes unused.")
+        sys.exit(1)
+    print(f"New wallet made on {_lw.host_of(url)} ✓ It starts empty.")
+    if kept.get("file"):
+        print(f"Your old wallet's details are saved in {kept['file']}.")
+    warn = _lw.demo_warning(url)
+    if warn:
+        print(f"⚠️  {warn}")
+    if page:
+        print(f"Wallet page (keep it private; it opens the wallet): {page}")
+    print("Add sats: python agent.py fund 100000   (pay the invoice from Cash "
+          "App or any Lightning wallet)")
 
 
 def cmd_pair(url=None):
@@ -10134,6 +10251,8 @@ def main():
             print("Usage: python agent.py fund <sats>")
             sys.exit(1)
         cmd_fund(int(amount))
+    elif cmd == "wallet":
+        cmd_wallet([a for a in sys.argv[2:] if not a.startswith("--")])
     else:
         print(__doc__)
         sys.exit(1)

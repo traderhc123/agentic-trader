@@ -882,6 +882,7 @@ export const EXIT_LOSS_WHY: Record<ExitLoss["cause"], string> = {
   day_pass_not_live: "the agent is in practice or paused, and only LIVE buys a day-pass, so it has none for today",
   day_pass_short: "the agent's wallet does not hold enough sats for today's day-pass",
   day_pass_failed: "the agent's wallet could not pay for today's day-pass",
+  day_pass_wallet_gone: "the agent's wallet no longer exists on its server, so it can't pay for today's day-pass",
   day_pass_undecided: "the agent's wallet has not said whether today's day-pass payment went through",
   day_pass_refused: "AgentHC refused today's day-pass",
   feed_error: "the signal feed can't be read",

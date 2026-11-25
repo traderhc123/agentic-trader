@@ -873,6 +873,7 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
         <button onclick="fundInvoice()">Show invoice</button></div></div>
       <p id="fund-quote" class="muted" style="display:none;font-size:var(--fs-sm)"></p>
       <p id="fund-note" class="ok" style="display:none"></p>
+      <p id="fund-hint" class="muted" style="display:none;font-size:var(--fs-sm)"></p>
       <div class="navrow inline">
        <button id="recur-btn" onclick="toggleRecurring()">Recurring day-pass: OFF</button>
        <span class="muted" style="flex:1 1 220px;font-size:var(--fs-sm)">ON = the agent buys each day's ~<span data-pass-usd="1">$50</span> pass from its
@@ -891,8 +892,8 @@ _WIZARD_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
       invoice and paste it in any Lightning app — updates automatically after
       you pay)</span></p>
       <p class="notice">Hosted wallet on demo.lnbits.com — a public TEST server
-      (custodial; it can be reset). Keep only a few days of passes there, or use
-      your own instance below.</p>
+      (custodial; it is wiped without notice). Keep only a few days of passes
+      there, or use your own instance below.</p>
      </div>
      <p class="muted">Your own LNbits wallet:</p>
      <div class="field"><label for="ln-url">LNbits instance URL</label>
@@ -1594,8 +1595,22 @@ function showWallet(page,label){
     if(b&&b.ok){
       document.getElementById('fund-bal').textContent=b.sats.toLocaleString();
       document.getElementById('fund-open').style.display='';
-    }
+    }else if(b&&b.wallet_gone)walletTrouble(b);  // say it before a funding try
   }).catch(function(){});
+}
+// A wallet call failed: the agent's words, and, when the wallet's server no
+// longer knows the wallet, "Create a new wallet" right there (the replace
+// flow: the old wallet's details are saved to a file first).
+function walletTrouble(r){
+  const mw=document.getElementById('mw-msg');
+  mw.innerHTML=' <span class="err">'+esc(r.error)+'</span>';
+  if(!r.wallet_gone)return;
+  const b=document.createElement('button');
+  b.textContent='Create a new wallet';b.style.marginLeft='.5rem';
+  b.onclick=function(){
+    if(confirm("Make a new, empty wallet for your agent? The old wallet's"
+      +" details are saved to a file in the agent's folder first."))makeWallet(true);};
+  mw.appendChild(b);
 }
 let walletBusy=false;
 async function makeWallet(replace){
@@ -1635,12 +1650,15 @@ async function makeWallet(replace){
 async function fundInvoice(){
   const sats=document.getElementById('fund-sats').value;
   const r=await api('/api/wallet/fund',{sats:sats});
-  if(!r.ok){document.getElementById('mw-msg').innerHTML=' <span class="err">'+esc(r.error)+'</span>';return;}
+  if(!r.ok){walletTrouble(r);return;}
   const pre=document.getElementById('bolt11');pre.style.display='';pre.textContent=r.bolt11;
   renderQr(r.qr);
   const fn=document.getElementById('fund-note');
   if(r.note){fn.textContent=r.note;fn.style.display='';}
   else fn.style.display='none';
+  const fh=document.getElementById('fund-hint');
+  if(r.hint){fh.textContent=r.hint;fh.style.display='';}
+  else fh.style.display='none';
   document.getElementById('copy-msg').textContent='';
   document.getElementById('fund-open').style.display='';
   const fl=document.getElementById('fund-link');
@@ -2861,7 +2879,7 @@ def _btc_usd():
     return 0.0
 
 
-def _fund_quote(sats, invoice_cap=0):
+def _fund_quote(sats, invoice_cap=0, wallet_url=None):
     """USD context for a sats amount: value, ~day-passes covered, and the
     price of ONE day pass (the funding default — this is a day-pass
     product). The day pass's USD price is AgentHC's own (hc.day_pass_price,
@@ -2880,13 +2898,16 @@ def _fund_quote(sats, invoice_cap=0):
     usd = sats * usd_per_btc / 1e8
     day_sats = day["sats"] or int(-(-day["usd"] / usd_per_btc * 1e8 // 100) * 100)  # ceil→100
     from lightning_wallet import fee_reserve_sats
-    need = day_sats + fee_reserve_sats(day_sats)
+    need = day_sats + fee_reserve_sats(day_sats, wallet_url)
     suggested = min(need, invoice_cap) if invoice_cap else need
     return {"ok": True, "btc_usd": round(usd_per_btc, 2),
             "usd": round(usd, 2),
             "day_pass_usd": day["usd"],
             "day_passes": int(usd // day["usd"]),
             "day_pass_sats": day_sats,
+            # what the wallet keeps back on top of a pass before it pays it
+            # (LNbits' routing reserve + the server's service fee)
+            "reserve_sats": need - day_sats,
             "suggested_sats": suggested,
             "invoice_cap": invoice_cap or None}
 
@@ -3236,10 +3257,26 @@ _WALLET_EXISTS = ("Your agent already has a wallet, so no new one was created "
                   "— a new wallet starts empty, and any sats in the one you "
                   "have would be left behind. To keep using it, just add "
                   "sats to it. To replace it anyway (for example because "
-                  "that wallet no longer exists): run `python agent.py "
-                  "setup` in the agent's folder and type REPLACE when it "
-                  "asks about the wallet. The old wallet's details are "
-                  "saved to a file first.")
+                  "that wallet no longer exists): confirm the replacement "
+                  "here (or on the dashboard: Signals & pass → Payment "
+                  "wallet → Replace with a new wallet; in a terminal: "
+                  "`python agent.py wallet new`). The old wallet's details "
+                  "are saved to a file first.")
+
+
+def _wallet_trouble(exc, url):
+    """{ok: False, error, ...} for a wallet call that failed with `exc`:
+    the owner's words, and wallet_gone: true when the wallet's server no
+    longer knows the wallet (the page then offers "Create a new wallet"
+    right there), unreachable: true when it could not be asked."""
+    import lightning_wallet as lw
+    if isinstance(exc, lw.WalletGone):
+        return {"ok": False, "wallet_gone": True,
+                "error": lw.wallet_gone_text(url, lw.NEW_WALLET_BUTTON)}
+    if isinstance(exc, lw.WalletUnreachable):
+        return {"ok": False, "unreachable": True,
+                "error": lw.wallet_unreachable_text(url)}
+    return {"ok": False, "error": str(exc)[:200]}
 
 
 @_one_at_a_time
@@ -4143,6 +4180,12 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 try:
                     bal = LNbitsWallet(url, str(data["lnbits_key"]).strip()).balance_sats()
                 except WalletError as exc:
+                    import lightning_wallet as lw
+                    if isinstance(exc, lw.WalletGone):
+                        # a key the owner pasted: most often mis-copied,
+                        # not the agent's wallet gone (nothing was saved)
+                        return {"ok": False, "error": "wallet check failed: "
+                                + lw.unknown_key_text(url)}
                     return {"ok": False, "error": f"wallet check failed: {exc}"}
                 # a different wallet replaces the agent's: the old one's
                 # keys are kept on file first (sats may be left in it)
@@ -4580,28 +4623,32 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             note = (f"this wallet instance caps invoices at {cap:,} sats — "
                     f"generated {cap:,}; pay it and repeat to reach {sats:,}")
             sats = cap
+        # The wallet's own server makes the invoice: a wallet that is gone
+        # (or out of reach) gets no invoice, only the way to fix it.
         try:
             bolt11 = w.create_invoice(sats, memo="fund agentic-trader")
-        except (WalletError, ValueError) as exc:
+        except Exception as exc:
             # Learn the instance's per-invoice cap from the error, remember
             # it (clamps future suggestions too), and retry once at the cap.
-            new_cap = _invoice_cap_from_error(exc)
+            new_cap = (_invoice_cap_from_error(exc)
+                       if isinstance(exc, (WalletError, ValueError)) else None)
             if not new_cap or new_cap >= sats:
-                return {"ok": False, "error": str(exc)[:200]}
+                return _wallet_trouble(exc, w.url)
             cfg["lnbits_max_invoice_sats"] = new_cap
             save_now()
             try:
                 bolt11 = w.create_invoice(new_cap, memo="fund agentic-trader")
-            except (WalletError, ValueError) as exc2:
-                return {"ok": False, "error": str(exc2)[:200]}
+            except Exception as exc2:
+                return _wallet_trouble(exc2, w.url)
             note = (f"this wallet instance caps invoices at {new_cap:,} sats "
                     f"— generated {new_cap:,}; pay it and repeat to reach "
                     f"{sats:,}")
             sats = new_cap
         # Uppercase bolt11 in the QR = alphanumeric mode = denser, easier
         # scan (bech32 is case-insensitive; wallet scanners expect this).
+        import lightning_wallet as lw
         return {"ok": True, "bolt11": bolt11, "sats": sats, "note": note,
-                "qr": _qr_matrix(bolt11.upper())}
+                "qr": _qr_matrix(bolt11.upper()), "hint": lw.CASH_APP_HINT}
 
     def wallet_quote(h):
         from urllib.parse import parse_qs, urlparse
@@ -4613,7 +4660,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
         from sources import agenthc_day_trade_ideas as hc
         caps = hc.autopay_caps(cfg)
         return {**_fund_quote(max(0, sats),
-                              int(cfg.get("lnbits_max_invoice_sats") or 0)),
+                              int(cfg.get("lnbits_max_invoice_sats") or 0),
+                              cfg.get("lnbits_url")),
                 "autopay_cap_sats": caps["per_invoice"],
                 "autopay_cap_auto": caps["per_invoice_auto"],
                 "autopay_cap_words": hc.autopay_cap_words(cfg, caps)}
@@ -4631,8 +4679,8 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             return {"ok": False, "error": "no wallet"}
         try:
             return {"ok": True, "sats": w.balance_sats()}
-        except WalletError as exc:
-            return {"ok": False, "error": str(exc)[:150]}
+        except Exception as exc:   # gone, out of reach, a page instead of JSON
+            return _wallet_trouble(exc, w.url)
 
     def _wallet():
         if cfg.get("lnbits_url") and cfg.get("lnbits_admin_key"):
@@ -5480,6 +5528,7 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                            and not isinstance(v, bool) and v > 0 else None)
         return {"site": _host_only(url) if url else None,
                 "warning": lightning_wallet.demo_warning(url) or None,
+                "health": _wallet_health_view(),
                 "page_on_file": bool(cfg.get("lnbits_wallet_page")),
                 "autopay_cap_sats": caps["per_invoice"],
                 "autopay_cap_auto": caps["per_invoice_auto"],
@@ -5487,6 +5536,27 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
                 "invoice_cap_sats": whole(inv),
                 "new_site": _host_only(new) if new else None,
                 "new_warning": lightning_wallet.demo_warning(new) or None}
+
+    def _wallet_health_view():
+        """What the wallet's server last said about the wallet (asked again
+        in the background every lightning_wallet.HEALTH_TTL_S; never waits):
+        {status: ok|gone|unreachable|error|checking, message, checked_at}
+        — message is the owner's words for a wallet that is gone or out of
+        reach. None without a wallet."""
+        import lightning_wallet as lw
+        if not (cfg.get("lnbits_url") and cfg.get("lnbits_admin_key")):
+            return None
+        h = lw.wallet_health(cfg)
+        if not h:
+            return {"status": "checking", "message": None, "checked_at": None}
+        status = h.get("status") if h.get("status") in (
+            "ok", "gone", "unreachable", "error") else "error"
+        message = (lw.wallet_gone_text(cfg["lnbits_url"], lw.NEW_WALLET_BUTTON)
+                   if status == "gone" else
+                   lw.wallet_unreachable_text(cfg["lnbits_url"])
+                   if status == "unreachable" else None)
+        return {"status": status, "message": message,
+                "checked_at": h.get("at")}
 
     def _expiry_view():
         """The expiry sell and its alert, as saved and as they fall today
@@ -6617,11 +6687,27 @@ def start_app(get_status=None, get_trades=None, apply_command=None,
             sats = _v2_number(p.get("sats"), "sats", 1000, cap or 100_000_000,
                               whole=True)
             p = {"sats": sats}
+        heads_up = []
+        if "confirm" not in data:
+            # the review step: ask the wallet first, so a wallet that is
+            # gone says so (with its fix) before the owner confirms. Any
+            # other failed read (a slow or briefly down server) does not
+            # stop the review: the invoice itself may still be made, and
+            # if not, that step says why.
+            import lightning_wallet as lw
+            try:
+                w.balance_sats()
+            except lw.WalletGone as exc:
+                return _wallet_trouble(exc, w.url)
+            except Exception as exc:
+                heads_up = ["Heads-up: " + _wallet_trouble(exc, w.url)["error"]]
+        with A.CONFIG_LOCK:
+            _sync()
             from sources import agenthc_day_trade_ideas as hc
             auto = hc.autopay_caps(cfg)["per_invoice"]
             wait = _two_step("wallet_fund", p, data, [_change(
                 "wallet_fund", "Add to the agent's wallet", None, sats,
-                "neutral")], [
+                "neutral")], heads_up + [
                 "Nothing is paid yet: the next step shows a Lightning invoice, "
                 "and nothing is paid until you pay it from your own wallet app.",
                 ("The agent spends from this wallet only on day-passes, each "

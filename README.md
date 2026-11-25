@@ -200,8 +200,16 @@ keeps an LNbits wallet and buys a 24-hour pass each market day (only when you
 turn *Recurring day-pass* ON). Set it up under *Advanced* in the wizard, or
 with `python agent.py setup` (instance URL + Admin key), then fund it with
 `python agent.py fund 100000`. ⚠️ The one-click wallet lives on
-demo.lnbits.com, a public test server that can be reset — keep only a few
-days of passes there, or use your own LNbits instance. Safety rails: never
+demo.lnbits.com, a public test server that is wiped without notice — keep
+only a few days of passes there, or use your own LNbits instance. When the
+server no longer knows the wallet ("Wallet not found"), the agent says so on
+the dashboard, in an alert and in `python agent.py wallet check`, stops
+asking AgentHC for day-passes it can't pay, and offers one step to fix it:
+**Create a new wallet** (dashboard → Signals & pass → Payment wallet, or
+`python agent.py wallet new`). The old wallet's details are saved to an
+`old-wallet-*.json` file first. Funding amounts include what LNbits keeps
+back when it pays (1% routing reserve, plus demo.lnbits.com's service fee of
+5%, at most 1,000 sats). Safety rails: never
 pays an invoice above `max_autopay_sats` (the amount is read from the
 invoice itself). Its default, `"auto"`, follows AgentHC's own day price: that
 price in sats + 10%, rounded up to 1,000 sats, never above 150,000 (30,000

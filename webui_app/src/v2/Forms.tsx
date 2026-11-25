@@ -252,11 +252,13 @@ export function Switch({
 }
 
 /** The first POST of a two-step write: the preview, or why there is none. */
-export type Asked = { kind: "review"; preview: Preview } | { kind: "nothing"; note: string } | { kind: "error"; error: string };
+/** walletGone: the agent's wallet no longer exists on its server (the page
+ *  then offers "Create a new wallet" next to the error). */
+export type Asked = { kind: "review"; preview: Preview } | { kind: "nothing"; note: string } | { kind: "error"; error: string; walletGone?: boolean };
 
 export async function askPreview(path: string, payload: Record<string, unknown>): Promise<Asked> {
   const r = await send(path, payload);
   if (r.ok && "needs_confirm" in r && r.needs_confirm) return { kind: "review", preview: r.preview };
   if (r.ok) return { kind: "nothing", note: (r as { note?: string }).note || "Nothing to change: those are your settings already." };
-  return { kind: "error", error: r.error };
+  return { kind: "error", error: r.error, walletGone: (r as { wallet_gone?: unknown }).wallet_gone === true };
 }

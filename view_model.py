@@ -100,7 +100,8 @@ PASS_STATES = ("active", "exits_only", "waiting", "none", "unknown")
 # exit_loss_reason(), or feed_error when its read failed)
 EXIT_LOSS_CAUSES = ("pass_ended", "pass_unpaid", "pass_unchecked", "no_day_pass",
                     "day_pass_off", "day_pass_not_live", "day_pass_short",
-                    "day_pass_failed", "day_pass_undecided", "day_pass_refused",
+                    "day_pass_failed", "day_pass_wallet_gone", "day_pass_undecided",
+                    "day_pass_refused",
                     "feed_error",
                     "feed_not_live", "feed_refused")
 
@@ -1858,6 +1859,8 @@ def _capabilities(c, limits, market, signals, positions):
 
 # day-pass alerts that are about the NEXT pass while one still runs
 _RUNNING_DAYPASS_ALERTS = ("daypass_failed_notified", "daypass_invoice_notified",
+                           "daypass_wallet_gone_notified",
+                           "daypass_wallet_down_notified",
                            "daypass_low_balance_notified")
 
 

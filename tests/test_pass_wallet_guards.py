@@ -365,7 +365,9 @@ def test_wallet_exists_refusal_says_how_to_replace_it():
     alone would be a dead end."""
     text = webui._WALLET_EXISTS
     assert "already has a wallet" in text and "add sats" in text
-    assert "python agent.py setup" in text and "REPLACE" in text
+    # one step on the dashboard, or one command (no 4-step setup re-run)
+    assert "Replace with a new wallet" in text
+    assert "python agent.py wallet new" in text
     assert "saved to a file first" in text
 
 

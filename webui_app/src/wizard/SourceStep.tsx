@@ -400,6 +400,9 @@ function AgentWallet({ dayUsd }: { dayUsd: number }) {
   const [bal, setBal] = useState<number | null>(null);
   const [copied, setCopied] = useState("");
   const [recurring, setRecurring] = useState(!!st?.recurring);
+  // the wallet's server no longer knows the agent's wallet: "Create a new
+  // wallet" is offered right next to the message
+  const [gone, setGone] = useState(false);
   const quoteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // After "Fund": the balance every 4 s until it changes or 10 minutes pass
   // (paused while the page is hidden), then a Refresh button.
@@ -470,6 +473,10 @@ function AgentWallet({ dayUsd }: { dayUsd: number }) {
         if (b && b.ok) {
           setBal(b.sats);
           setBalAt(new Date());
+        } else if (b && b.wallet_gone) {
+          // say it now, before the owner tries to add sats
+          setGone(true);
+          setMwMsg(err(b.error));
         }
       })
       .catch(() => {});
@@ -505,6 +512,7 @@ function AgentWallet({ dayUsd }: { dayUsd: number }) {
       const r = await api("/api/wallet/create", replace ? { replace: true } : {});
       if (r.ok) {
         setMwMsg(null);
+        setGone(false);
         setMade({ label: replace ? "New wallet created" : "Created", page: r.page });
         setWarn(r.warning || "");
         setMadeNote(r.note || "");
@@ -537,9 +545,13 @@ function AgentWallet({ dayUsd }: { dayUsd: number }) {
 
   const fund = async () => {
     const r = await api("/api/wallet/fund", { sats });
-    if (!r.ok) return setMwMsg(err(r.error));
+    if (!r.ok) {
+      setGone(!!r.wallet_gone);
+      return setMwMsg(err(r.error));
+    }
+    setGone(false);
     setInv({ bolt11: r.bolt11, qr: r.qr });
-    setNote(r.note || "");
+    setNote([r.note, r.hint].filter(Boolean).join(" "));
     setCopied("");
     balStart.current = bal;
     balNow.current = bal;
@@ -569,6 +581,7 @@ function AgentWallet({ dayUsd }: { dayUsd: number }) {
           </span>
         )}
         <Msg m={mwMsg} />
+        {gone && <Button onClick={() => setConfirmReplace(true)}>Create a new wallet</Button>}
       </div>
       {madeNote && <p className="m-0 text-sm text-fg2">{madeNote}</p>}
       {warn && <p className="m-0 text-sm text-down">⚠ {warn}</p>}

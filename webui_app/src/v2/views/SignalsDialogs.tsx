@@ -370,13 +370,16 @@ function useDayPassUsd(): number {
 type FundStep = { kind: "amount" } | { kind: "review"; sats: number; preview: Preview } | { kind: "pay"; inv: FundInvoice };
 
 /** Add sats to the agent's wallet: amount (with its worth now) → the
- *  server's preview → an invoice the owner pays from their own wallet app. */
-export function FundDialog({ page, onClose }: { page: Page; onClose: () => void }) {
+ *  server's preview (it asks the wallet first: a wallet that no longer
+ *  exists is said here, with "Create a new wallet", before anything is
+ *  confirmed) → an invoice the owner pays from their own wallet app. */
+export function FundDialog({ page, onClose, onNewWallet }: { page: Page; onClose: () => void; onNewWallet?: () => void }) {
   const v = page.settings.view as SettingsView;
   const cap = v.signals.wallet.invoice_cap_sats;
   const [text, setText] = useState("");
   const [quote, setQuote] = useState<WalletQuote | null>(null);
   const [err, setErr] = useState("");
+  const [gone, setGone] = useState(false);
   const [busy, setBusy] = useState(false);
   const [bal, setBal] = useState("");
   const [step, setStep] = useState<FundStep>({ kind: "amount" });
@@ -399,7 +402,10 @@ export function FundDialog({ page, onClose }: { page: Page; onClose: () => void 
     const a = await askPreview(API.walletFund, { sats: n.value });
     setBusy(false);
     if (a.kind === "review") setStep({ kind: "review", sats: n.value, preview: a.preview });
-    else setErr(a.kind === "error" ? a.error : a.note);
+    else {
+      setGone(a.kind === "error" && !!a.walletGone);
+      setErr(a.kind === "error" ? a.error : a.note);
+    }
   };
   const balance = async () => {
     setBal("Reading…");
@@ -461,6 +467,7 @@ export function FundDialog({ page, onClose }: { page: Page; onClose: () => void 
           </dl>
         </PayCode>
         {step.inv.note && <p className="small">{step.inv.note}</p>}
+        {step.inv.hint && <p className="small muted">{step.inv.hint}</p>}
         {bal && (
           <p className="small" role="status">
             {bal}
@@ -501,13 +508,22 @@ export function FundDialog({ page, onClose }: { page: Page; onClose: () => void 
         />
         <span className="help">
           {quote && quote.ok
-            ? `${quote.usd > 0 ? `About ${usd(quote.usd)} now. ` : ""}One day-pass is about ${count(quote.day_pass_sats)} sats.`
+            ? `${quote.usd > 0 ? `About ${usd(quote.usd)} now. ` : ""}One day-pass is about ${count(quote.day_pass_sats)} sats${
+                quote.reserve_sats ? `, and the wallet must also keep about ${count(quote.reserve_sats)} sats back for fees when it pays one (${count(quote.day_pass_sats + quote.reserve_sats)} in all)` : ""
+              }.`
             : "From 1,000 sats."}
           {cap ? ` This wallet takes at most ${count(cap)} sats in one payment.` : ""}
         </span>
       </div>
       <TestServer text={v.signals.wallet.warning} />
       <FieldError id={`${id}-e`} text={err} />
+      {gone && onNewWallet && (
+        <p>
+          <button className="btn btn-sm btn-primary" onClick={onNewWallet}>
+            Create a new wallet
+          </button>
+        </p>
+      )}
     </Dialog>
   );
 }
